@@ -22,7 +22,10 @@ overlapping roots, case/Unicode collisions, exclusion bypass, upload scoping, Wi
 names/8.3/ADS/`\\?\` paths, rename races) passes on macOS, Windows, and Linux.
 **Tests**: `spikes/s3-throughput` benchmark harness at 0/20/50/100 ms RTT; `spikes/s11-vfs-confinement`
 automated negative-test suite (all three OSes in CI).
-**Status**: Not Started
+**Status**: In Progress
+**Note**: S11 macOS complete (12/12; Linux/Windows runs pending). S3: webrtc-rs fails the 50 ms
+RTT bar (2.2 vs ≥15 MB/s, loopback 125+ MB/s passes); evaluating datachannel-rs per DESIGN §A8
+before ADR-005 can be Accepted.
 
 ## Stage 2: spindle-proto + @spindle/proto + golden vectors
 **Goal**: Define the wire contract once — canonical CBOR (RFC 8949 §4.2.1) types and the A7b

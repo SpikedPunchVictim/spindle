@@ -59,7 +59,14 @@ DESIGN.md Part B's verification note — **ADR-005** (transport, VFS RPC, file s
 to Accepted until S3 passes. Also sets the v1 numbers referenced in DESIGN.md §A9's UX bar
 ("goals ≥ 50 MB/s LAN native and ≥ 15 MB/s at 50 ms RTT (**S3 sets the v1 numbers**)").
 
-**Status**: Not run. Skeleton available under `spikes/s3-throughput/`.
+**Status**: Run 2026-08-23 — webrtc-rs FAILS the 50 ms bar (2.2 MB/s vs ≥15 MB/s); loopback
+passes (125+ MB/s); datachannel-rs evaluation in progress per §A8 fallback.
+- Loopback (macOS arm64, 0 ms RTT): 125–128 MB/s — clears the ≥ 50 MB/s LAN bar.
+- RTT matrix (Linux container, `tc netem`): ~95 MB/s @ 0 ms, ~5 MB/s @ 20 ms, ~2.2 MB/s @ 50 ms,
+  ~1.3 MB/s @ 100 ms — misses the ≥ 15 MB/s @ 50 ms bar by ~85%.
+- Buffer/window tuning does not help: the smallest buffer was consistently fastest across the
+  matrix, pointing to a congestion-control/ACK-clocking ceiling in the crate's SCTP stack rather
+  than a bandwidth-delay-product/window-size problem. See `spikes/s3-throughput/RESULTS.md`.
 
 ---
 
@@ -163,7 +170,11 @@ CI against the real implementation, not just the Stage 1 spike"). Validates **AD
 entitlements — the confinement rules live in §A4b). Per §A9b, this suite graduates into permanent
 CI.
 
-**Status**: Not run. Skeleton available under `spikes/s11-vfs-confinement/`.
+**Status**: Run 2026-08-23 on macOS — 12/12 blocked; Linux/Windows pending.
+- Empirical finding: `cap-std` structurally guarantees only `..`-traversal, absolute-path, and
+  symlink-escape blocking; the hardlink `nlink` rule, overlapping-root rejection, case/Unicode-
+  collision detection, and TOCTOU identity checks are entirely Spindle-side (prototype helpers
+  written in the spike, to graduate into `spindle-vfs`). See `spikes/s11-vfs-confinement/RESULTS.md`.
 
 ---
 

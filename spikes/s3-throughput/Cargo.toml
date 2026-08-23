@@ -9,9 +9,30 @@ publish = false
 # workspace-pinned): `bytes` is only needed here for chunk buffers, and `async-trait` is required
 # to implement webrtc's `PeerConnectionEventHandler` trait (its methods are async-trait-attributed
 # in the crate itself, so implementors need the same macro — not re-exported by `webrtc`).
+[[bin]]
+name = "spike-s3-throughput"
+path = "src/main.rs"
+
+# `dc-throughput` (src/bin/dc-throughput.rs): the datachannel-rs fallback harness named in
+# docs/DESIGN.md §A8 ("evaluate `datachannel-rs` if S3 fails") and invoked per RESULTS.md after
+# the `webrtc`-backend binary above missed the 50 ms RTT bar. Same measurement protocol, callback
+# (not async) API — see that file's module doc comment.
+[[bin]]
+name = "dc-throughput"
+path = "src/bin/dc-throughput.rs"
+
 [dependencies]
 webrtc = { workspace = true }
 tokio = { workspace = true } # workspace already declares features = ["full"]
 anyhow = { workspace = true }
 bytes = "1"
 async-trait = "0.1"
+
+# datachannel-rs (libdatachannel bindings) — S3's designated fallback backend (docs/DESIGN.md
+# §A8), used only by src/bin/dc-throughput.rs; the `webrtc`-backend src/main.rs above is
+# untouched. `vendored-libdatachannel` builds libdatachannel itself from source via cmake (a C++
+# toolchain is required at build time) but links dynamically against a system OpenSSL, rather than
+# also vendoring+building OpenSSL from source (the plain `vendored` feature) — this host already
+# has OpenSSL via Homebrew, so the lighter feature is the right pick. See RESULTS.md for the
+# `brew install cmake` build hurdle this pulled in.
+datachannel = { version = "0.16", features = ["vendored-libdatachannel"] }
