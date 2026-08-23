@@ -1,0 +1,12 @@
+[package]
+name = "spindle-helper"
+version.workspace = true
+edition.workspace = true
+
+# No dependencies yet. Per A9c boundary rule 3, spindle-helper depends only on spindle-proto
+# and spindle-core once implementation begins — it must never grow host/client logic.
+[dependencies]
+
+[[bin]]
+name = "spindle-helper"
+path = "src/main.rs"

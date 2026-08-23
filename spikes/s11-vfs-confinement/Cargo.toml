@@ -1,0 +1,13 @@
+[package]
+name = "spike-s11-vfs-confinement"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# No dependencies yet — this is a skeleton only (docs/SPIKES.md: "Not run"). Enable the block
+# below when the spike actually runs; do not add anything not needed to answer S11's question
+# (docs/DESIGN.md §A13): VFS confinement (cap-std) against the negative-test matrix in lib.rs.
+[dependencies]
+# cap-std = { workspace = true }
+
+[dev-dependencies]

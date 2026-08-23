@@ -1,0 +1,60 @@
+# Reference deployment skeleton (docs/DESIGN.md §A9b): single-box NATS + helper + Postgres +
+# coturn. This is the demo path and the spike substrate — NOT yet runnable end to end, because
+# the helper service (crates/spindle-helper) is an unimplemented stub (see
+# IMPLEMENTATION_PLAN.md). Treat every value below as a starting point for local/dev use only;
+# see deploy/README.md before running anything.
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    volumes:
+      - ./nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+    ports:
+      - "4222:4222" # TCP listener (daemons; optional mTLS profile, A10.1)
+      - "443:443" # WebSocket listener (browsers), TLS
+    depends_on:
+      - postgres
+
+  helper:
+    # image: spindle-helper — lands once crates/spindle-helper has a real callout responder,
+    # presence service, TURN credential minting, and revocation store (IMPLEMENTATION_PLAN
+    # Stage 4). For now there is nothing to build/run here.
+    build:
+      context: ../crates/spindle-helper
+    environment:
+      DATABASE_URL: postgres://spindle:spindle@postgres:5432/spindle
+    depends_on:
+      - postgres
+      - nats
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-spindle}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spindle}
+      POSTGRES_DB: ${POSTGRES_DB:-spindle}
+    env_file:
+      - .env
+    volumes:
+      - spindle-postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  coturn:
+    image: coturn/coturn
+    # use-auth-secret: coturn issues time-limited REST-style credentials from a shared secret
+    # (docs/DESIGN.md §A8) minted by the helper; the shared secret is provided via TURN_SECRET
+    # below and must match the helper's configuration. Dual-secret overlap window during
+    # rotation is documented in A9b's secrets inventory, not yet implemented here.
+    command:
+      - "-n"
+      - "--use-auth-secret"
+      - "--static-auth-secret=${TURN_SECRET:-changeme-dev-only}"
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "5349:5349/tcp"
+
+volumes:
+  spindle-postgres-data:

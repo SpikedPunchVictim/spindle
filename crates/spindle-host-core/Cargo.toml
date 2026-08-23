@@ -1,0 +1,7 @@
+[package]
+name = "spindle-host-core"
+version.workspace = true
+edition.workspace = true
+
+# No dependencies yet.
+[dependencies]

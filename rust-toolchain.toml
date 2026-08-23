@@ -1,0 +1,5 @@
+# Pin to an exact stable version at first CI setup (ADR-009). Using the floating "stable"
+# channel until then keeps this scaffold buildable without guessing a release we haven't
+# verified on this machine (no cargo was available at scaffold time).
+[toolchain]
+channel = "stable"

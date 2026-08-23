@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+    # "spikes/*" — spike crates are added explicitly as they are created, not via glob.
+    # A bare glob here would break the workspace as soon as spikes/README.md (a non-crate
+    # directory entry) exists without a Cargo.toml — cargo errors on a glob match with no
+    # manifest, it does not skip it. Spike crates (docs/DESIGN.md A13) are listed here by
+    # hand as they're added:
+    "spikes/s3-throughput",
+    "spikes/s11-vfs-confinement",
+]
+# apps/*/src-tauri join this workspace once the Tauri apps are initialized (IMPLEMENTATION_PLAN
+# Stage 7), e.g. "apps/host/src-tauri", "apps/client/src-tauri".
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# license = "TBD (A10.24)"
+
+# Dependency pins below are documented per ADR-009 (docs/DESIGN.md §A9c dependency manifest);
+# crates adopt them (add to their own [dependencies] via `workspace = true`) as implementation
+# begins. Versions are conservative requirements, not verified exact releases — this repo was
+# scaffolded on a machine with no cargo installed, so none of these have been resolved or built.
+[workspace.dependencies]
+# Runtime
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+thiserror = "1"
+anyhow = "1"
+
+# NATS
+async-nats = "0.35"
+
+# WebRTC (DESIGN.md A9c: webrtc >=0.20; datachannel-rs is the S3 fallback if it fails)
+webrtc = ">=0.20"
+
+# Crypto
+ed25519-dalek = "2"
+x25519-dalek = "2"
+sha2 = "0.10"
+hkdf = "0.12"
+aes-gcm = "0.10"
+rand = "0.8"
+subtle = "2"
+zeroize = "1"
+
+# Encoding
+minicbor = "0.24"
+
+# Storage
+rusqlite = { version = "0.31", features = ["bundled"] }
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio"] }
+
+# Confinement
+cap-std = ">=3.4.1"
+
+# OS / shell
+keyring = "2"

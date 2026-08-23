@@ -1,0 +1,36 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+
+# Node / pnpm
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.pnpm-store/
+
+# Tauri generated
+apps/*/src-tauri/target/
+apps/*/src-tauri/gen/
+apps/*/src-tauri/Cargo.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local overrides / secrets
+*.local
+.env
+.env.*
+!.env.example
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*

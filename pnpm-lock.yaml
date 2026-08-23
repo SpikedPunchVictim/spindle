@@ -1,0 +1,27 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {}
+
+  apps/web: {}
+
+  packages/admin: {}
+
+  packages/admin-cli: {}
+
+  packages/crypto: {}
+
+  packages/engine-api: {}
+
+  packages/engine-tauri: {}
+
+  packages/engine-web: {}
+
+  packages/proto: {}
+
+  packages/ui: {}

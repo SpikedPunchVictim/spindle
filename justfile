@@ -1,0 +1,43 @@
+# Spindle — single front door over the cargo workspace + pnpm workspace (A9c/A10.27).
+# CI calls these same targets; see .github/workflows/ci.yml.
+
+default:
+    @just --list
+
+# Build everything: TS packages/apps, then the Rust workspace.
+build:
+    pnpm install --frozen-lockfile
+    pnpm -r build
+    cargo build --workspace
+
+# Test everything: TS packages/apps, then the Rust workspace.
+test:
+    pnpm install --frozen-lockfile
+    pnpm -r test
+    cargo test --workspace
+
+# Lint everything: ESLint/Prettier/TS strict, then rustfmt + clippy.
+lint:
+    pnpm install --frozen-lockfile
+    pnpm -r lint
+    cargo fmt --all -- --check
+    cargo clippy --workspace --all-targets -- -D warnings
+
+# Generate golden CBOR/signature test vectors from spindle-proto (A9b, A7b).
+# Not implemented yet — spindle-proto's gen-vectors binary does not exist until Stage 2.
+vectors:
+    @echo "just vectors: not implemented yet — see IMPLEMENTATION_PLAN.md Stage 2 (spindle-proto + golden vectors)"
+    @exit 1
+
+# Run the reference dev stack (helper in `open` admission with a local CA) for local iteration.
+# Not implemented yet — the helper binary and dev-CA scripts do not exist until Stage 4.
+dev:
+    @echo "just dev: not implemented yet — see IMPLEMENTATION_PLAN.md Stage 4 (helper + NATS callout + deploy compose)"
+    @exit 1
+
+# Produce release artifacts: signed/notarized Tauri bundles, hardened web bundle + manifest,
+# helper container image, spindle-admin npm tarball (A9b).
+# Not implemented yet — packaging/signing lands in the final stage.
+package:
+    @echo "just package: not implemented yet — see IMPLEMENTATION_PLAN.md Stage 10 (packaging/signing and release train)"
+    @exit 1

@@ -1,0 +1,12 @@
+{
+  "name": "@spindle/proto",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "build": "echo \"@spindle/proto build: not implemented — see IMPLEMENTATION_PLAN.md\" && exit 1",
+    "test": "echo \"@spindle/proto test: not implemented — see IMPLEMENTATION_PLAN.md\" && exit 1"
+  }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "spindle-proto"
+version.workspace = true
+edition.workspace = true
+
+# No dependencies yet — this crate is the bottom of the dependency chain
+# (proto ← core ← {net, vfs} ← {host-core, client-core}) and per A9c boundary rule 3
+# it has no crypto dependency.
+[dependencies]
+
+# `gen-vectors` writes the golden CBOR/signature vectors consumed by both this crate's tests
+# and @spindle/proto's tests in CI (docs/DESIGN.md A9b, A9c; see ADR-009 once written).
+# Left commented out until the wire types and canonical CBOR encoder exist (IMPLEMENTATION_PLAN
+# Stage 2) — an empty/stub bin target isn't worth wiring in ahead of the code it serializes.
+# [[bin]]
+# name = "gen-vectors"
+# path = "src/bin/gen_vectors.rs"

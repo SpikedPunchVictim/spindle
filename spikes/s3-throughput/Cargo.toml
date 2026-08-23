@@ -1,0 +1,12 @@
+[package]
+name = "spike-s3-throughput"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# No dependencies yet — this is a skeleton only (docs/SPIKES.md: "Not run"). Enable the block
+# below when the spike actually runs; do not add anything not needed to answer S3's question
+# (docs/DESIGN.md §A13): DataChannel throughput at 0/20/50/100 ms RTT, SCTP tuning.
+[dependencies]
+# webrtc = { workspace = true }
+# tokio = { workspace = true }
