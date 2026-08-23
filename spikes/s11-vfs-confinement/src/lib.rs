@@ -65,8 +65,7 @@ mod tests {
     /// Scaffold check: the crate builds and the test harness runs. Not part of the negative-test
     /// matrix — remove or replace once real tests land.
     #[test]
-    fn scaffold() {
-        assert!(true);
+    fn scaffold() { /* compilation of this crate is the assertion */
     }
 
     // ---- Path escape ----

@@ -1,0 +1,29 @@
+{
+  // Covers the Linux slice only (helper, TS, docs) — Tauri/native work happens on
+  // the host via mise (ADR-010). This container cannot build the Tauri apps or run
+  // native spikes (keyring, etc.); use it for spindle-helper, TS packages, and docs.
+  "name": "spindle-toolchain",
+  "build": {
+    "dockerfile": "../Dockerfile.toolchain",
+    "context": ".."
+  },
+  "remoteUser": "dev",
+  "mounts": [
+    // Named volume for the cargo build output, not a bind mount: on macOS hosts,
+    // bind-mounting `target/` through osxfs/virtiofs is dramatically slower than a
+    // native Docker volume, and it doesn't need to be visible outside the container.
+    "source=spindle-target,target=/workspaces/spindle/target,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "skellock.just"
+      ]
+    }
+  },
+  "postCreateCommand": "pnpm install"
+}

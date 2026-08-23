@@ -4,6 +4,12 @@
 default:
     @just --list
 
+# Bootstrap a fresh dev environment: check/install mise, provision the pinned
+# toolchain (mise.toml), run per-OS native dependency checks, and install JS deps
+# (ADR-010). Works even before `just` itself is installed: `bash scripts/bootstrap.sh`.
+bootstrap:
+    bash scripts/bootstrap.sh
+
 # Build everything: TS packages/apps, then the Rust workspace.
 build:
     pnpm install --frozen-lockfile

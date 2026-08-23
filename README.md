@@ -43,16 +43,48 @@ This layout follows `docs/DESIGN.md` §A9c exactly; see `docs/adr/ADR-009-repo-l
 (once written) for the enumerated boundary rules, including that Tauri frontends receive only
 fingerprints and display state over IPC — never keys, seeds, or capabilities.
 
-## Prerequisites
+## Prerequisites & getting started
 
-- **Rust** (stable channel, pinned in `rust-toolchain.toml`):
-  `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-- **just** (task runner, the single front door over cargo + pnpm):
-  `cargo install just` (or `brew install just`)
-- **pnpm**: `corepack enable && corepack prepare pnpm@latest --activate`
-- **Node 22 LTS** (pinned in `.nvmrc`): `nvm install` (or any Node 22.x install)
+**Primary path: mise + `just bootstrap`** (ADR-010). [mise](https://mise.jdx.dev) is
+the single toolchain front door on all three OSes — it provisions Rust, Node, pnpm,
+and `just` from the versions declared once in `mise.toml` (which mirrors
+`rust-toolchain.toml`, `.nvmrc`, and the `packageManager` pin, so there's one place to
+look). Install it, then bootstrap:
 
-Once installed, `just build` builds everything; `just --list` shows all targets.
+```
+brew install mise                    # macOS
+curl https://mise.run | sh           # Linux/macOS
+winget install jdx.mise              # Windows
+
+just bootstrap
+```
+
+`just bootstrap` provisions the pinned tool versions (`mise install`), runs per-OS
+native dependency checks (warnings, never a hard fail), and installs JS dependencies
+(`pnpm install`). Until `just` itself is installed, run the same script directly — it's
+exactly what `just bootstrap` calls, and it installs `just` for you as part of the
+pinned toolchain:
+
+```
+bash scripts/bootstrap.sh
+```
+
+Once bootstrapped, `just build` builds everything; `just --list` shows all targets.
+
+**Alternative: devcontainer / GitHub Codespaces — Linux slice only.**
+`.devcontainer/devcontainer.json` builds `Dockerfile.toolchain` (the same image used
+for Linux CI toolchain validation) and gives a ready-to-use Linux environment for
+`spindle-helper`, the TypeScript packages, and docs. **It cannot build the Tauri apps
+or run the native spikes** — Tauri, `keyring`, and other native-OS work need a real
+macOS/Windows/Linux host (ADR-010); use the mise path above for that.
+
+**Per-OS native requirements** (checked, non-fatally, by `scripts/bootstrap.sh`):
+
+| OS | Requirement | Check / install |
+|----|-------------|------------------|
+| macOS | Xcode Command Line Tools | `xcode-select -p` / `xcode-select --install` |
+| Windows | MSVC C++ Build Tools (for Tauri) | https://visualstudio.microsoft.com/visual-cpp-build-tools/ |
+| Linux | webkit2gtk (for Tauri) | `sudo apt install libwebkit2gtk-4.1-dev build-essential libssl-dev pkg-config` |
 
 ## Scaffold status
 

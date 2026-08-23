@@ -1,0 +1,50 @@
+# Single toolchain image — consumers: .devcontainer, Linux CI validation, (later) helper
+# release image. Versions come from mise.toml only.
+#
+# ADR-010 (hybrid provisioning): mise is the native front door on all three OSes;
+# this one Dockerfile installs mise and runs `mise install` against the repo's
+# mise.toml, so container and host toolchains never drift apart. Containers cover
+# only the Linux slice — Tauri/spikes/keyring work still happens on a native OS.
+#
+# Kept lean for now: Tauri's Linux GUI dependencies (e.g. libwebkit2gtk-4.1-dev) are
+# added when Linux app builds land here; today this image only needs to build/test
+# the Rust workspace + pnpm workspace, not link a GTK/WebKit UI.
+
+FROM debian:bookworm-slim
+
+# --- OS packages ------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        build-essential \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- non-root user ------------------------------------------------------------
+RUN useradd --create-home --shell /bin/bash dev
+USER dev
+
+# --- mise ------------------------------------------------------------
+ENV MISE_DATA_DIR="/home/dev/.local/share/mise" \
+    PATH="/home/dev/.local/bin:/home/dev/.local/share/mise/shims:${PATH}"
+
+RUN curl https://mise.run | sh
+
+# Activate mise (PATH + shims) in any shell started against this image later,
+# e.g. `docker exec -it ... bash`.
+RUN echo 'eval "$(~/.local/bin/mise activate bash)"' >> /home/dev/.bashrc \
+    && echo 'eval "$(~/.local/bin/mise activate bash --shims)"' >> /home/dev/.profile
+
+# --- toolchain, driven entirely by mise.toml ------------------------------------
+# Copy only the version-declaration files first so this (slow) layer stays cached
+# across source-code changes; the actual repo is bind-mounted/checked out over
+# /workspace by consumers (.devcontainer, CI) rather than baked into the image.
+WORKDIR /workspace
+COPY --chown=dev:dev mise.toml rust-toolchain.toml ./
+
+RUN mise trust && mise install
+
+CMD ["bash"]

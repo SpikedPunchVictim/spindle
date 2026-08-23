@@ -1,0 +1,23 @@
+# Spindle — mise-managed toolchain versions (ADR-010: mise is the native front door
+# on all three OSes; Dockerfile.toolchain runs `mise install` against this same file,
+# so this is the single version declaration shared by local dev, CI, and containers).
+#
+# Install mise (https://mise.jdx.dev), then run `mise install` — or `just bootstrap` /
+# `bash scripts/bootstrap.sh`, which does that plus native-dependency checks and
+# `pnpm install` — to provision every tool below into an isolated, per-project shim.
+# No system-wide installs, no version drift between contributors.
+
+[tools]
+# Node 22 LTS — matches .nvmrc.
+node = "22"
+# pnpm — matches the "packageManager": "pnpm@9.0.0" pin in package.json.
+pnpm = "9"
+# just — single front door over the cargo + pnpm workspaces (A9c/A10.27).
+just = "1"
+# Rust: mise's rust backend provisions rustup/cargo, but the EXACT channel is NOT
+# decided here. rust-toolchain.toml stays the single source of truth for the Rust
+# toolchain (ADR-009): rustup auto-selects the pinned channel from that file for any
+# cargo/rustc invocation inside this repo, overriding whatever version mise resolved
+# for "rust" below. "stable" is set only so `mise install` has something to fetch;
+# per ADR-009/ADR-010, rust-toolchain.toml remains authoritative for the exact pin.
+rust = "stable"

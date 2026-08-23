@@ -7,7 +7,6 @@
 #[cfg(test)]
 mod tests {
     #[test]
-    fn scaffold() {
-        assert!(true);
+    fn scaffold() { /* compilation of this crate is the assertion */
     }
 }
