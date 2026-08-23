@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.1) + Execution Plan
+# Spindle — System Design Document (draft v0.9.2) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -629,6 +629,14 @@ about *wire* versions, not package versions). `just package` produces: signed/no
 client) per A9b, the hardened web bundle + manifest (ADR-008), helper container image, and `spindle-admin` npm
 tarball.
 
+**Developer environment (A10.28 → ADR-010)**: hybrid provisioning — **mise** is the native front door on all three
+OSes (`mise.toml` pins node/pnpm/`just`/rust; `rust-toolchain.toml` stays authoritative for the exact Rust
+channel), with `just bootstrap` wrapping `mise install` plus per-OS native checks (Xcode CLT, MSVC note,
+webkit2gtk/pkg-config). One `Dockerfile.toolchain` is consumed by three things: `.devcontainer/`, Linux CI, and
+(later) the helper's release image. Containers cover **only the Linux slice** — Tauri bundles, spike S11's
+filesystem matrix, `keyring` OS-keystore integration, and spikes S3/S7 all need real native OSes, so devcontainer/
+Docker is explicitly not the primary dev environment.
+
 ## A10. Decisions
 
 | # | Decision | Status |
@@ -661,6 +669,7 @@ tarball.
 | 25 | UI framework | **DECIDED 2026-08-23:** React for all three frontends (Tauri client, host admin UI, web), shared via `@spindle/ui` |
 | 26 | Host app shape | **DECIDED 2026-08-23:** one Tauri 2 tray app — daemon in-process, admin window on demand, IPC-only admin surface (no localhost port); headless/NAS mode deferred |
 | 27 | Monorepo tooling | **DECIDED 2026-08-23:** cargo workspace + pnpm workspaces with a top-level `justfile` as the single build/test/dev entry point; CI runs the same `just` targets |
+| 28 | Developer environment | **DECIDED 2026-08-23:** hybrid — mise (`mise.toml`) as the native front door on all 3 OSes; single `Dockerfile.toolchain` consumed by devcontainer, Linux CI, and the helper image; devcontainer = Linux slice only; `just bootstrap` wrapper (ADR-010) |
 
 ## A11. Alternatives considered
 
@@ -776,6 +785,7 @@ tarball.
 | 10 | `docs/adr/ADR-009-repo-layout-toolchain.md` (incl. the enumerated Tauri IPC command list) | A9c, A10.25–27 |
 | 11 | `docs/SPIKES.md` + skeletons (`spikes/s3-throughput` first, then `s11-vfs-confinement`) | A13 |
 | 12 | `IMPLEMENTATION_PLAN.md` (per global CLAUDE.md) + repo scaffold per A9c | — |
+| 13 | `docs/adr/ADR-010-dev-environment-toolchain.md` + mise.toml, Dockerfile.toolchain, .devcontainer/, `just bootstrap`, CI provisioning | A9c, A10.28 |
 
 **Verification**: each ADR cites ADR-001 for every security claim; A12 reproduced in ADR-001; S1 and S11 negative
 tests automated; user reviews each ADR before the next; S3 before any transport ADR is Accepted.
@@ -853,6 +863,8 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.2 (2026-08-23)** — Developer environment decided (A10.28 → ADR-010): hybrid mise front door + single
+  toolchain image (devcontainer / Linux CI / helper image), containers scoped to the Linux slice; Part B stage 13.
 - **v0.9.1 (2026-08-23)** — Post-ADR-writing reconciliation: A10.24 added to the front-matter open list; helper
   NATS account bridging made explicit (two connections, A5 [DEFAULT], finalize in S1); [DEFAULT] lifetimes for the
   four secrets A9b left unspecified. Found by the ADR-writing agents; ADR-002/ADR-007 already reflect the gaps.

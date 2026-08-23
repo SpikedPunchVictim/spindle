@@ -4,6 +4,14 @@
 > only. Per this repo's global development conventions, **this file is deleted once every stage
 > below is Complete**.
 
+## Stage 0: Developer environment (ADR-010)
+**Goal**: mise-based toolchain provisioning + toolchain image + devcontainer, per ADR-010.
+**Success Criteria**: fresh-machine path (install mise → `just bootstrap`) yields working cargo/just/pnpm/node;
+`cargo check` passes on the scaffold; Dockerfile.toolchain builds; CI provisions via mise on all 3 OSes.
+**Tests**: `just bootstrap && just build && just test` locally; image build job green.
+**Status**: In Progress
+**Note**: local criteria verified 2026-08-23 (bootstrap, build/test/lint green, toolchain image builds with identical versions); remaining: CI green on all 3 OSes after first push to a remote.
+
 ## Stage 1: Spikes — S3 throughput + S11 VFS confinement
 **Goal**: Answer the two highest-risk open questions before any production transport or VFS code
 is written: DataChannel throughput under realistic RTT, and `cap-std`-based path confinement
