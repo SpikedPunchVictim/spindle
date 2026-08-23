@@ -1,4 +1,6 @@
-# Spindle
+<p align="center"><img src="assets/icon.svg" width="128" alt="Spindle icon"/></p>
+<h1 align="center">Spindle</h1>
+<p align="center">Peer-to-peer file sharing — direct, end-to-end encrypted, no cloud storage in the middle.</p>
 
 Spindle is peer-to-peer file sharing: you run a **host** on your own machine, share chosen
 files and directories through a virtual file system, and let approved people browse, download,
@@ -12,6 +14,40 @@ accounts, shares, groups, and entitlements live only on each host. See
 [`docs/DESIGN.md`](docs/DESIGN.md) (the source of truth for this repository) for the full
 threat model, protocol, and rationale, and [`docs/adr/`](docs/adr/) for the individual
 Architecture Decision Records as they land.
+
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph deviceGroup["Your device"]
+        client["Client app<br/>native or browser"]
+    end
+
+    subgraph registryGroup["Registry (untrusted for contents & keys — brokers connections only)"]
+        registry["NATS + broker helper"]
+    end
+
+    subgraph hostGroup["Your friend's host"]
+        host["Host daemon + virtual file system"]
+    end
+
+    turn(["TURN relay — only if direct connection fails; still end-to-end encrypted"])
+    turn -.-> client
+    turn -.-> host
+
+    client -->|"1 · E2E-encrypted signaling (SDP/ICE)"| registry
+    registry -->|"1 · routes, cannot read or alter"| host
+    client ==>|"2 · direct WebRTC DataChannel (DTLS) — files never touch the registry"| host
+```
+
+1. The host owner shares folders into a virtual tree and sends an invite (QR code or link) —
+   the invite itself carries the host's keys, so the registry never introduces them.
+2. The invitee redeems it and gets a host-signed capability. Accounts live on the host; the
+   registry stores none.
+3. Opening the host, the two apps exchange encrypted signaling through the registry, which can
+   route the exchange but cannot read or tamper with it.
+4. The file transfer runs directly between the two machines, end-to-end encrypted, with
+   entitlements enforced by the host on every request.
 
 ## Shape: one wire contract, two engines, one UI layer
 
