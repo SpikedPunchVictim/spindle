@@ -4,9 +4,14 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
-# No dependencies yet — this is a skeleton only (docs/SPIKES.md: "Not run"). Enable the block
-# below when the spike actually runs; do not add anything not needed to answer S3's question
-# (docs/DESIGN.md §A13): DataChannel throughput at 0/20/50/100 ms RTT, SCTP tuning.
+# Enabled to run S3 (docs/SPIKES.md §S3 / docs/DESIGN.md §A13): DataChannel throughput at
+# 0/20/50/100 ms RTT, SCTP tuning. `bytes` and `async-trait` are declared locally (not
+# workspace-pinned): `bytes` is only needed here for chunk buffers, and `async-trait` is required
+# to implement webrtc's `PeerConnectionEventHandler` trait (its methods are async-trait-attributed
+# in the crate itself, so implementors need the same macro — not re-exported by `webrtc`).
 [dependencies]
-# webrtc = { workspace = true }
-# tokio = { workspace = true }
+webrtc = { workspace = true }
+tokio = { workspace = true } # workspace already declares features = ["full"]
+anyhow = { workspace = true }
+bytes = "1"
+async-trait = "0.1"

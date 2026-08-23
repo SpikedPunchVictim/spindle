@@ -4,10 +4,11 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
-# No dependencies yet — this is a skeleton only (docs/SPIKES.md: "Not run"). Enable the block
-# below when the spike actually runs; do not add anything not needed to answer S11's question
-# (docs/DESIGN.md §A13): VFS confinement (cap-std) against the negative-test matrix in lib.rs.
+# docs/DESIGN.md §A13: VFS confinement (cap-std) against the negative-test matrix in lib.rs.
 [dependencies]
-# cap-std = { workspace = true }
+cap-std = { workspace = true }
 
+# tempfile is spike-local only (not a workspace dependency) — each test needs a disposable
+# sandbox directory tree; nothing here becomes a runtime dependency of spindle-vfs later.
 [dev-dependencies]
+tempfile = "3"
