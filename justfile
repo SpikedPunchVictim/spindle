@@ -40,11 +40,12 @@ vectors:
     pnpm --filter @spindle/proto test
     pnpm --filter @spindle/crypto test
 
-# Run the reference dev stack (helper in `open` admission with a local CA) for local iteration.
-# Not implemented yet — the helper binary and dev-CA scripts do not exist until Stage 4.
+# Run the reference dev stack: NATS + the graduated spindle-helper Auth Callout responder, in
+# `open` admission mode (deploy/README.md). Postgres/coturn are still commented placeholders in
+# deploy/docker-compose.yml (Stage 4 slice 3+) — the local-CA half of "open admission with a
+# local CA" (docs/DESIGN.md §A9b) isn't wired up yet either; see deploy/README.md's Status section.
 dev:
-    @echo "just dev: not implemented yet — see IMPLEMENTATION_PLAN.md Stage 4 (helper + NATS callout + deploy compose)"
-    @exit 1
+    docker compose -f deploy/docker-compose.yml up --build
 
 # Produce release artifacts: signed/notarized Tauri bundles, hardened web bundle + manifest,
 # helper container image, spindle-admin npm tarball (A9b).

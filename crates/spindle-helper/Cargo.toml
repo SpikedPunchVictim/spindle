@@ -4,16 +4,55 @@ version.workspace = true
 edition.workspace = true
 
 # Crate layering law (A9c boundary rule 3): spindle-helper depends only on spindle-proto and
-# spindle-core. Stage 4 slice 1 (the pure callout-verification core: authz.rs/permissions.rs/
-# session.rs) is deliberately free of tokio/sqlx/async-nats — no async, no I/O. Those arrive with
-# the NATS/Postgres wiring slice. Signing-key/verifying-key types are used via spindle-core's
-# re-export (`spindle_core::VerifyingKey`/`spindle_core::SigningKey`), not a direct dependency on
-# the underlying crypto crate.
+# spindle-core. The pure callout-verification core (authz.rs/permissions.rs/session.rs,
+# Stage 4 slice 1) stays free of tokio/sqlx/async-nats — no async, no I/O; that separation is
+# still enforced (see lib.rs's module docs). Stage 4 slice 2 graduates the S1 spike's real NATS
+# wiring (natsjwt.rs, src/bin/helper.rs, src/memory_store.rs) into this crate, which is where
+# ADR-009's runtime-dependency allowance (tokio, async-nats, nkeys, tracing, serde/serde_json)
+# starts applying. Signing-key/verifying-key types are used via spindle-core's re-export
+# (`spindle_core::VerifyingKey`/`spindle_core::SigningKey`), not a direct dependency on the
+# underlying crypto crate.
 [dependencies]
 spindle-proto = { path = "../spindle-proto" }
 spindle-core = { path = "../spindle-core" }
 thiserror = { workspace = true }
 
+# --- Runtime deps (Stage 4 slice 2, ADR-009-allowed: tokio, async-nats, nkeys, tracing,
+# serde/serde_json) ---
+tokio = { workspace = true }
+async-nats = { workspace = true }
+tracing = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# anyhow: ADR-009's own dependency manifest (docs/adr/ADR-009-repo-layout-toolchain.md
+# "Dependency manifest") already lists this as the standard error type for *binaries*
+# ("tokio, tracing, thiserror (libs) / anyhow (bins)") — used only in src/bin/helper.rs's
+# top-level `main`/`run` glue (connection setup, config), never in the crate's library code,
+# which stays on typed `thiserror` errors throughout (natsjwt::NatsJwtError,
+# auth_token::AuthTokenError, this bin's own HandleError/ConfigError).
+anyhow = { workspace = true }
+
+# nkeys: ed25519/nkey signing for the hand-rolled NATS v2 JWT claims (natsjwt.rs). No mature Rust
+# "nats-jwt" crate builds the NATS v2 claim JSON itself — graduated from the S1 spike's own
+# rationale (spikes/s1-callout/RESULTS.md "Dependencies added").
+nkeys = "0.4"
+
+# --- Deps beyond the slice-2 allowance list — flagged per the task brief, not silently added ---
+# base64: JWT claims are base64url(header) || base64url(claims) || base64url(sig); no viable
+# alternative to encoding this by hand without a base64 crate. Graduated from the S1 spike, same
+# rationale as nkeys above.
+base64 = "0.22"
+# futures-util: `async_nats::Subscriber` is a `futures_core::Stream`; `StreamExt::next()` is the
+# standard, minimal way to drive it in a `while let` loop. Already resolves to the same version
+# already present in this workspace's Cargo.lock (a transitive dep of async-nats/webrtc), so this
+# adds no new dependency *version* to the tree, only a direct edge to an existing one.
+futures-util = "0.3"
+# tracing-subscriber: `tracing` alone has no default subscriber — without one, every
+# `tracing::info!`/`warn!`/`error!` call in helper.rs is silently discarded. Needed to actually
+# fulfill the task's "tracing instead of println" requirement for a real service binary.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 [[bin]]
 name = "spindle-helper"
-path = "src/main.rs"
+path = "src/bin/helper.rs"

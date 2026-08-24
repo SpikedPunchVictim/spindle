@@ -87,6 +87,10 @@ pending. S1 spike: **PASS** (2026-08-24, 19/19 automated checks against a live n
 core; flags a pre-existing host_fp derivation mismatch between `decide_device_connect` (op-key)
 and `decide_host_connect` (root-key) that needs resolving before this stage's real NATS wiring.
 A10.30 cap-chain schema executed on the Rust side; TS twins + docs in flight.
+slice 2 — responder graduated into spindle-helper bin (two-connection bridging), deploy compose
+dev stack up, S1 suite re-run against it: 18/18 applicable checks passed (1 skipped by design —
+`bridging_callout_account_cannot_reach_app_subjects` needs the spike's own standalone responder
+process, not the containerized one); Postgres store + coturn pending.
 
 ## Stage 5: spindle-net WebRTC signaling E2E
 **Goal**: Implement NATS-mediated WebRTC signaling (offer/answer/trickle ICE) and presence in

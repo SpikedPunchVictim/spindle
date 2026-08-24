@@ -1,60 +1,83 @@
-# Reference deployment skeleton (docs/DESIGN.md §A9b): single-box NATS + helper + Postgres +
-# coturn. This is the demo path and the spike substrate — NOT yet runnable end to end, because
-# the helper service (crates/spindle-helper) is an unimplemented stub (see
-# IMPLEMENTATION_PLAN.md). Treat every value below as a starting point for local/dev use only;
-# see deploy/README.md before running anything.
+# Reference deployment (docs/DESIGN.md §A9b): the dev/demo path and the spike substrate.
+#
+# Stage 4 slice 2 status: nats + helper are real, runnable services — the helper is
+# crates/spindle-helper's graduated Auth Callout responder (Stage 4 slice 1's pure decision core,
+# wired to a live nats-server exactly as spikes/s1-callout proved — S1 PASS, 19/19,
+# spikes/s1-callout/RESULTS.md), running in `open` admission mode with the in-memory store
+# (spindle_helper::memory_store::InMemoryHelperView — not durable; see deploy/README.md).
+# postgres and coturn are placeholder blocks (commented out, not running services) — Postgres
+# persistence lands in Stage 4 slice 3, coturn/TURN credential minting in a later slice. See
+# deploy/README.md before running anything.
 
 services:
   nats:
     image: nats:2.10-alpine
-    command: ["-c", "/etc/nats/nats-server.conf"]
+    command: ["-c", "/etc/nats/nats-server.conf", "-m", "8222"]
     volumes:
       - ./nats/nats-server.conf:/etc/nats/nats-server.conf:ro
     ports:
-      - "4222:4222" # TCP listener (daemons; optional mTLS profile, A10.1)
-      - "443:443" # WebSocket listener (browsers), TLS
-    depends_on:
-      - postgres
+      - "4222:4222" # TCP listener (daemons/native clients)
+      - "8090:8080" # WebSocket listener (browsers) — dev-only, no TLS (see nats-server.conf).
+        # Host side published as 8090 (not 8080) to avoid colliding with whatever else on a dev
+        # box may already have 8080 bound; the container-internal port and nats-server.conf's
+        # `websocket { port: 8080 }` are unchanged — only this host-side mapping moved.
+      - "8222:8222" # HTTP monitor endpoint (/varz) — used by `just dev`'s readiness wait
 
   helper:
-    # image: spindle-helper — lands once crates/spindle-helper has a real callout responder,
-    # presence service, TURN credential minting, and revocation store (IMPLEMENTATION_PLAN
-    # Stage 4). For now there is nothing to build/run here.
     build:
-      context: ../crates/spindle-helper
+      context: ..
+      dockerfile: deploy/Dockerfile
     environment:
-      DATABASE_URL: postgres://spindle:spindle@postgres:5432/spindle
+      NATS_URL: "nats://nats:4222"
+      # Dev-only throwaway nkey seeds, matched to the public keys embedded in
+      # nats/nats-server.conf — see that file's own "Account topology" note for provenance and
+      # the regenerate-both-together warning. Never reuse this key material outside this stack.
+      CALLOUT_USER_SEED: "SUAP32HDCRWO6KRJBIRSNCD5NZGDP33A6RKOG2KZNZBQDC7MHQL5KWLDOM"
+      APP_ACCOUNT_SEED: "SAAODS72DAQRLQ2OKCAR4AHZPNKOR6YNYRPVBHXQA7T3GBUURXFECWCMXU"
+      APP_CONN_SEED: "SUAFWWQRCTGQTS6DKVAJKMMFMIJKFZ3MRFGFQ4WCRZ5RVZ5WFRB4CXPYBY"
+      ACCOUNT_NAME: "APP"
+      # `open` admission per docs/DESIGN.md §A9b: "dev mode runs helper in `open` admission with a
+      # local CA". The local-CA half of that sentence isn't wired up yet (no TLS in this stack at
+      # all — see nats-server.conf's dev-only note); `open` admission is what's real today.
+      ADMISSION_MODE: "open"
+      RUST_LOG: "info,spindle_helper=debug"
     depends_on:
-      - postgres
       - nats
+    # nats-server:2.10-alpine ships no wget/curl/nc for a compose healthcheck, and the helper's
+    # own `async-nats` connect doesn't retry a still-starting server — restart on failure instead
+    # of failing the stack outright while nats finishes coming up (a few seconds, in practice).
+    restart: on-failure
 
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-spindle}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spindle}
-      POSTGRES_DB: ${POSTGRES_DB:-spindle}
-    env_file:
-      - .env
-    volumes:
-      - spindle-postgres-data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+  # --- Postgres (Stage 4 slice 3) -------------------------------------------------------------
+  # spindle-helper still runs entirely on spindle_helper::memory_store::InMemoryHelperView (not
+  # durable — see crates/spindle-helper/src/memory_store.rs). This block is a placeholder for the
+  # sqlx-backed HelperView landing in Stage 4 slice 3; uncomment once the helper actually reads
+  # DATABASE_URL.
+  # postgres:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_USER: ${POSTGRES_USER:-spindle}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spindle}
+  #     POSTGRES_DB: ${POSTGRES_DB:-spindle}
+  #   volumes:
+  #     - spindle-postgres-data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
 
-  coturn:
-    image: coturn/coturn
-    # use-auth-secret: coturn issues time-limited REST-style credentials from a shared secret
-    # (docs/DESIGN.md §A8) minted by the helper; the shared secret is provided via TURN_SECRET
-    # below and must match the helper's configuration. Dual-secret overlap window during
-    # rotation is documented in A9b's secrets inventory, not yet implemented here.
-    command:
-      - "-n"
-      - "--use-auth-secret"
-      - "--static-auth-secret=${TURN_SECRET:-changeme-dev-only}"
-    ports:
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
-      - "5349:5349/tcp"
+  # --- coturn (TURN credential minting, a later Stage 4 slice) --------------------------------
+  # Nothing in spindle-helper mints TURN credentials yet (helper.turn.get isn't implemented — see
+  # crates/spindle-helper/src/bin/helper.rs's module docs on what's still Stage 4 slice 3+ work).
+  # Placeholder only; uncomment once that lands.
+  # coturn:
+  #   image: coturn/coturn
+  #   command:
+  #     - "-n"
+  #     - "--use-auth-secret"
+  #     - "--static-auth-secret=${TURN_SECRET:-changeme-dev-only}"
+  #   ports:
+  #     - "3478:3478/udp"
+  #     - "3478:3478/tcp"
+  #     - "5349:5349/tcp"
 
-volumes:
-  spindle-postgres-data:
+# volumes:
+#   spindle-postgres-data:

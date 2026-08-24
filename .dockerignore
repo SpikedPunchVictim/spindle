@@ -1,0 +1,19 @@
+# Build context for deploy/Dockerfile (docker-compose builds with context: .. i.e. repo root,
+# since spindle-helper is one member of the Cargo workspace and cargo needs the whole workspace
+# manifest graph to resolve — see deploy/Dockerfile's comments). Keep the context small: none of
+# this is needed to build the spindle-helper binary.
+.git/
+target/
+**/target/
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.pnpm-store/
+apps/
+packages/
+docs/
+vectors/
+*.md
+.devcontainer/
+.github/
