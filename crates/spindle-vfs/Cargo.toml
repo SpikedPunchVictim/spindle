@@ -3,5 +3,17 @@ name = "spindle-vfs"
 version.workspace = true
 edition.workspace = true
 
-# No dependencies yet.
+# Crate layering law (A9c boundary rule 3 / DESIGN.md §A9c): spindle-vfs depends on spindle-core
+# (and transitively spindle-proto) plus cap-std for path confinement. No rusqlite/tokio yet — this
+# slice (Stage 6 slice 1) is confinement + the pure entitlement algebra only, in-memory model
+# structs; SQLite persistence and the VFS RPC server are out of scope until a later slice.
 [dependencies]
+spindle-core = { path = "../spindle-core" }
+cap-std = { workspace = true }
+thiserror = { workspace = true }
+
+# tempfile is crate-local only (not a workspace dependency), matching the precedent set by the
+# S11 spike (spikes/s11-vfs-confinement/Cargo.toml) it graduates from: confinement tests need a
+# disposable sandbox directory tree; this never becomes a runtime dependency of spindle-vfs.
+[dev-dependencies]
+tempfile = "3"

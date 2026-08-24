@@ -105,7 +105,25 @@ device bootstrap; no lockout in any path) met.
 by browse, upload-without-listing, delete-required-to-overwrite, case/Unicode collision ==
 overwrite, not-found for unauthorized paths).
 **Tests**: `spindle-vfs`/`spindle-host-core` unit + integration tests; S11 suite in CI.
-**Status**: Not Started
+**Status**: In Progress
+**Note**: slice 1 — `spindle-vfs`'s two foundation modules, both pure/in-memory (no SQLite, no
+VFS RPC, no `spindle-host-core` yet). `confine` graduates S11's prototype helpers to production
+quality (real `thiserror` error types, doc comments citing the A12 rows each closes): share-root
+`cap-std` capabilities, dev+ino/file-id identity checks, the hardlink-`nlink` exclusion-bypass
+guard, overlapping-root rejection, case/Unicode fold-key collision detection, and upload-path
+scoping + overwrite-requires-delete gating — S11's tested semantics preserved exactly, spike left
+untouched. `algebra` implements the positive-only union entitlement algebra over new `model`
+structs (`Share`/`Group`/`Member`/`Entitlement`), with every §A4b edge rule unit-tested
+individually (browse-implies-ancestor-traversal, upload-implies-resolve-without-listing,
+delete-does-not-imply-download, overwrite-requires-delete, fold-collision-is-overwrite,
+not-found-is-indistinguishable-from-nonexistent) plus the negative suite (new share/member →
+nothing visible, no sibling/ancestor leakage, excluded paths invisible even to broad grants).
+`glob` is a minimal hand-rolled exclude-glob matcher (no workspace-available glob crate to reuse).
+40 tests total (36 passing, 4 real-bodied Windows-only cases compile-gated); `cargo fmt`/`clippy
+-D warnings` clean. Pending: SQLite persistence, the VFS RPC server, the tamper-evident audit
+chain, `spindle-host-core`, and the mount-path-to-share virtual-tree resolution step (flagged as
+an open ambiguity — §A4b does not specify how a raw client-facing virtual path resolves to
+`(share_id, subpath)` across multiple mounted shares).
 
 ## Stage 7: client-core + Tauri apps init + engine-api/engine-tauri/ui
 **Goal**: Implement `spindle-client-core`; initialize `apps/host` and `apps/client` as real Tauri

@@ -2632,6 +2632,12 @@ version = "0.1.0"
 [[package]]
 name = "spindle-vfs"
 version = "0.1.0"
+dependencies = [
+ "cap-std",
+ "spindle-core",
+ "tempfile",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "spki"
