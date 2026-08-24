@@ -565,8 +565,40 @@ mod tests {
         Fingerprint::of_parts(&[seed])
     }
 
-    fn host_op_key() -> SigningKey {
-        SigningKey::from_bytes(&[0x11; 32])
+    /// A full test host: identity root + operating key + the root's `HostOpKeyCert` — the chain
+    /// [`issue_capability`] now needs (decision A10.30). `host_fp` is root-derived
+    /// (`root.root_fp()`), matching what `decide_host_connect` derives from `host_root_pk` — this
+    /// is the fix for the op-key-derived `host_fp` inconsistency S1 flagged (see module docs):
+    /// before A10.30, this test module (like `issue_capability` itself) computed a capability's
+    /// `host_fp` from the *operating* key's own public key
+    /// (`Fingerprint::of_parts(&[signer.verifying_key().as_bytes()])`), which could never match
+    /// `decide_host_connect`'s `root_fp_of(presented.host_root_pk)` for any host whose root and
+    /// operating keys actually differ. That workaround is gone: every `host_fp` here now comes
+    /// from `TestHost::host_fp` (the root fingerprint), the single definition both sides share.
+    struct TestHost {
+        root: RootKey,
+        op_signer: SigningKey,
+        op_cert: HostOpKeyCert,
+        host_fp: Fingerprint,
+    }
+
+    fn test_host(root_seed: [u8; 32], op_seed: [u8; 32]) -> TestHost {
+        let root = RootKey::from_seed(root_seed);
+        let op_signer = SigningKey::from_bytes(&op_seed);
+        let op_cert = issue_host_op_key_cert(
+            &root,
+            &op_signer.verifying_key(),
+            fp(b"authz-test:op-cert-nats"),
+            0,
+            u64::MAX,
+        );
+        let host_fp = root.root_fp();
+        TestHost {
+            root,
+            op_signer,
+            op_cert,
+            host_fp,
+        }
     }
 
     fn device_setup() -> (RootKey, DeviceCertificate, Fingerprint) {
@@ -577,12 +609,30 @@ mod tests {
         (root, cert, device_fp)
     }
 
-    fn member_cap(signer: &SigningKey, subject: Fingerprint, epoch: u64, exp: u64) -> Capability {
-        issue_capability(signer, CapKind::Member, subject, epoch, exp, vec![0xAA; 8])
+    fn member_cap(host: &TestHost, subject: Fingerprint, epoch: u64, exp: u64) -> Capability {
+        issue_capability(
+            &host.root.public_key(),
+            &host.op_cert,
+            &host.op_signer,
+            CapKind::Member,
+            subject,
+            epoch,
+            exp,
+            vec![0xAA; 8],
+        )
     }
 
-    fn invite_cap(signer: &SigningKey, subject: Fingerprint, exp: u64) -> Capability {
-        issue_capability(signer, CapKind::Invite, subject, 0, exp, vec![0xBB; 8])
+    fn invite_cap(host: &TestHost, subject: Fingerprint, exp: u64) -> Capability {
+        issue_capability(
+            &host.root.public_key(),
+            &host.op_cert,
+            &host.op_signer,
+            CapKind::Invite,
+            subject,
+            0,
+            exp,
+            vec![0xBB; 8],
+        )
     }
 
     // ---- decide_device_connect ------------------------------------------------------------
@@ -609,9 +659,9 @@ mod tests {
     fn expired_cap_with_bad_signature_is_refused() {
         let (root, cert, _dfp) = device_setup();
         let root_fp = root.root_fp();
-        let signer = host_op_key();
-        let mut cap = member_cap(&signer, root_fp, 0, 1_000); // already expired at now=1_500
-        cap.sig_host[0] ^= 0xff; // forged
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let mut cap = member_cap(&host, root_fp, 0, 1_000); // already expired at now=1_500
+        cap.sig[0] ^= 0xff; // forged
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,
@@ -629,8 +679,8 @@ mod tests {
     #[test]
     fn capability_subject_mismatch_is_refused() {
         let (root, cert, _dfp) = device_setup();
-        let signer = host_op_key();
-        let cap = member_cap(&signer, fp(b"someone-else"), 0, 2_000_000);
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let cap = member_cap(&host, fp(b"someone-else"), 0, 2_000_000);
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,
@@ -649,10 +699,10 @@ mod tests {
     fn revoked_subject_is_refused_outright_never_connect_only() {
         let (root, cert, _dfp) = device_setup();
         let root_fp = root.root_fp();
-        let signer = host_op_key();
-        let host_fp = Fingerprint::of_parts(&[signer.verifying_key().as_bytes()]);
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let host_fp = host.host_fp;
         // A perfectly valid, non-expired, non-stale cap.
-        let cap = member_cap(&signer, root_fp, 0, 2_000_000);
+        let cap = member_cap(&host, root_fp, 0, 2_000_000);
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,
@@ -673,9 +723,9 @@ mod tests {
     fn expired_but_signature_valid_member_cap_is_connect_only() {
         let (root, cert, device_fp) = device_setup();
         let root_fp = root.root_fp();
-        let signer = host_op_key();
-        let host_fp = Fingerprint::of_parts(&[signer.verifying_key().as_bytes()]);
-        let cap = member_cap(&signer, root_fp, 0, 1_000); // expired at now=1_500, sig valid
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let host_fp = host.host_fp;
+        let cap = member_cap(&host, root_fp, 0, 1_000); // expired at now=1_500, sig valid
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,
@@ -695,9 +745,9 @@ mod tests {
     fn stale_epoch_signature_valid_member_cap_is_connect_only_renewal_path() {
         let (root, cert, device_fp) = device_setup();
         let root_fp = root.root_fp();
-        let signer = host_op_key();
-        let host_fp = Fingerprint::of_parts(&[signer.verifying_key().as_bytes()]);
-        let cap = member_cap(&signer, root_fp, /* cap_epoch */ 1, 2_000_000); // not expired
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let host_fp = host.host_fp;
+        let cap = member_cap(&host, root_fp, /* cap_epoch */ 1, 2_000_000); // not expired
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,
@@ -721,9 +771,9 @@ mod tests {
     fn stale_epoch_and_revoked_is_refused_not_connect_only() {
         let (root, cert, _dfp) = device_setup();
         let root_fp = root.root_fp();
-        let signer = host_op_key();
-        let host_fp = Fingerprint::of_parts(&[signer.verifying_key().as_bytes()]);
-        let cap = member_cap(&signer, root_fp, 1, 2_000_000);
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let host_fp = host.host_fp;
+        let cap = member_cap(&host, root_fp, 1, 2_000_000);
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,
@@ -743,9 +793,9 @@ mod tests {
     #[test]
     fn too_many_capabilities_is_refused_before_any_signature_work() {
         let (root, cert, _dfp) = device_setup();
-        let signer = host_op_key();
+        let host = test_host([0x11; 32], [0x12; 32]);
         let caps: Vec<Capability> = (0..(MAX_CAPS_PER_CONNECTION + 1))
-            .map(|_| member_cap(&signer, root.root_fp(), 0, 2_000_000))
+            .map(|_| member_cap(&host, root.root_fp(), 0, 2_000_000))
             .collect();
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
@@ -780,9 +830,9 @@ mod tests {
     fn invite_cap_is_always_connect_only_even_when_fresh() {
         let (root, cert, device_fp) = device_setup();
         let root_fp = root.root_fp();
-        let signer = host_op_key();
-        let host_fp = Fingerprint::of_parts(&[signer.verifying_key().as_bytes()]);
-        let cap = invite_cap(&signer, root_fp, 2_000_000);
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let host_fp = host.host_fp;
+        let cap = invite_cap(&host, root_fp, 2_000_000);
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,
@@ -804,9 +854,9 @@ mod tests {
     fn valid_member_cap_is_fully_authorized() {
         let (root, cert, device_fp) = device_setup();
         let root_fp = root.root_fp();
-        let signer = host_op_key();
-        let host_fp = Fingerprint::of_parts(&[signer.verifying_key().as_bytes()]);
-        let cap = member_cap(&signer, root_fp, 0, 2_000_000);
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let host_fp = host.host_fp;
+        let cap = member_cap(&host, root_fp, 0, 2_000_000);
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,
@@ -834,12 +884,15 @@ mod tests {
     fn mixed_full_and_connect_only_hosts_merge_permissions() {
         let (root, cert, device_fp) = device_setup();
         let root_fp = root.root_fp();
-        let signer_a = host_op_key();
-        let signer_b = SigningKey::from_bytes(&[0x22; 32]);
-        let full_host = Fingerprint::of_parts(&[signer_a.verifying_key().as_bytes()]);
-        let stale_host = Fingerprint::of_parts(&[signer_b.verifying_key().as_bytes()]);
-        let full_cap = member_cap(&signer_a, root_fp, 0, 2_000_000);
-        let stale_cap = member_cap(&signer_b, root_fp, 0, 1_000); // expired -> connect-only
+        // Two distinct hosts (distinct root seeds, not just distinct op seeds) — host_fp is now
+        // root-derived (A10.30), so two hosts must differ at the root to land in different
+        // `host.<host_fp>.>` namespaces.
+        let host_a = test_host([0x11; 32], [0x12; 32]);
+        let host_b = test_host([0x21; 32], [0x22; 32]);
+        let full_host = host_a.host_fp;
+        let stale_host = host_b.host_fp;
+        let full_cap = member_cap(&host_a, root_fp, 0, 2_000_000);
+        let stale_cap = member_cap(&host_b, root_fp, 0, 1_000); // expired -> connect-only
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,

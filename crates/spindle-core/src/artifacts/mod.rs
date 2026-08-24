@@ -8,7 +8,7 @@
 //! | Artifact | Signer |
 //! |---|---|
 //! | [`DeviceCertificate`](spindle_proto::artifacts::DeviceCertificate) | identity root |
-//! | [`Capability`](spindle_proto::artifacts::Capability) | host operating key (embedded as `host_pk`; self-verifying) |
+//! | [`Capability`](spindle_proto::artifacts::Capability) | host operating key, chained to the host root via an embedded `op_cert` (decision A10.30; `host_fp` is root-derived, self-verifying) |
 //! | [`HostOpKeyCert`](spindle_proto::artifacts::HostOpKeyCert) | host root |
 //! | [`RevocationRecord`](spindle_proto::artifacts::RevocationRecord) | host op key or identity root |
 //! | [`AdmissionToken`](spindle_proto::artifacts::AdmissionToken) | operator admission key |
@@ -52,6 +52,8 @@ pub enum ArtifactError {
     HostFingerprintMismatch,
     #[error("root_fp does not match the expected pinned root")]
     RootFingerprintMismatch,
+    #[error("capability's embedded op_cert does not decode as a valid HostOpKeyCert")]
+    MalformedOpCert,
 }
 
 pub(crate) fn check_exp(now: u64, exp: u64) -> Result<(), ArtifactError> {

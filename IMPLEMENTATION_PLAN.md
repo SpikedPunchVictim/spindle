@@ -86,6 +86,7 @@ pending. S1 spike: **PASS** (2026-08-24, 19/19 automated checks against a live n
 `spikes/s1-callout/RESULTS.md`) — real Auth Callout loop proven against the unmodified decision
 core; flags a pre-existing host_fp derivation mismatch between `decide_device_connect` (op-key)
 and `decide_host_connect` (root-key) that needs resolving before this stage's real NATS wiring.
+A10.30 cap-chain schema executed on the Rust side; TS twins + docs in flight.
 
 ## Stage 5: spindle-net WebRTC signaling E2E
 **Goal**: Implement NATS-mediated WebRTC signaling (offer/answer/trickle ICE) and presence in

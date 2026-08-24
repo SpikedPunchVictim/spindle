@@ -292,13 +292,35 @@ impl Envelope {
 // Capability (A4)
 // ============================================================================================
 
-/// `Capability { v, host_fp, host_pk, kind, subject, cap_epoch, exp, nonce, sig_host }`
-/// (DESIGN.md §A4).
+/// `Capability { v, host_fp, host_root_pk, op_cert, kind, subject, cap_epoch, exp, nonce, sig }`
+/// (DESIGN.md §A4, as revised by decision A10.30, 2026-08-24).
+///
+/// **A10.30 schema change**: the capability now carries the host **root**/op-key cert chain
+/// rather than a bare operating key. Previously `host_fp` was derived from the embedded
+/// operating key (`host_pk`) the host signed with, which put a capability's scoping identity one
+/// key-rotation away from the root identity everyone actually pins/scopes by (§A4/§A5) — S1
+/// flagged this as a real divergence between a device's capability-granted subjects and a host's
+/// own `host.<host_fp>.>` subscription namespace (see `spindle-helper`'s S1 note). A10.30 fixes
+/// this at the wire level:
+/// - `host_fp = SHA-256(host_root_pk)` — root-derived, matching every other scoping/pinning use
+///   of `host_fp` in the system.
+/// - `host_root_pk` — the host's identity root public key, embedded so the capability remains
+///   self-verifying (no external registry lookup needed for step 1 of verification).
+/// - `op_cert` — the existing [`HostOpKeyCert`] artifact (the host root's certification of its
+///   current operating key), embedded whole as its own complete canonical CBOR encoding (a byte
+///   string field here, opaque to this crate — no second op-cert wire shape was invented). This
+///   is what lets a capability chain root → operating key → capability signature without a
+///   registry: `spindle-core::verify_capability` decodes it and re-runs
+///   `spindle-core::verify_host_op_key_cert` against `host_root_pk`.
+/// - `sig` — Ed25519 by the **operating key** (the same key `op_cert` certifies) over the
+///   capability's own `spindle-cap-v1` signing input, unchanged from before (only the field name
+///   changed, from `sig_host` to `sig`, to match the decided schema literally).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capability {
     pub v: u8,
     pub host_fp: Vec<u8>,
-    pub host_pk: Vec<u8>,
+    pub host_root_pk: Vec<u8>,
+    pub op_cert: Vec<u8>,
     pub kind: CapKind,
     /// `root_fp` for a `member` cap, `device_fp` for... no — per A4, `subject` is always
     /// `root_fp | device_fp` depending on cap kind; this crate does not disambiguate further,
@@ -307,19 +329,20 @@ pub struct Capability {
     pub cap_epoch: u64,
     pub exp: u64,
     pub nonce: Vec<u8>,
-    pub sig_host: Vec<u8>,
+    pub sig: Vec<u8>,
 }
 
 const CAPABILITY_FIELDS: &[&str] = &[
     "v",
     "host_fp",
-    "host_pk",
+    "host_root_pk",
+    "op_cert",
     "kind",
     "subject",
     "cap_epoch",
     "exp",
     "nonce",
-    "sig_host",
+    "sig",
 ];
 
 impl Capability {
@@ -327,7 +350,8 @@ impl Capability {
         vec![
             ("v", CborValue::uint(self.v as u64)),
             ("host_fp", CborValue::bytes(self.host_fp.clone())),
-            ("host_pk", CborValue::bytes(self.host_pk.clone())),
+            ("host_root_pk", CborValue::bytes(self.host_root_pk.clone())),
+            ("op_cert", CborValue::bytes(self.op_cert.clone())),
             ("kind", self.kind.to_cbor()),
             ("subject", CborValue::bytes(self.subject.clone())),
             ("cap_epoch", CborValue::uint(self.cap_epoch)),
@@ -342,7 +366,7 @@ impl Capability {
 
     pub fn to_cbor(&self) -> CborValue {
         let mut entries = self.unsigned_entries();
-        entries.push(("sig_host", CborValue::bytes(self.sig_host.clone())));
+        entries.push(("sig", CborValue::bytes(self.sig.clone())));
         CborValue::map(entries)
     }
 
@@ -356,13 +380,14 @@ impl Capability {
         Ok(Capability {
             v: m.u8("v")?,
             host_fp: m.bytes("host_fp")?,
-            host_pk: m.bytes("host_pk")?,
+            host_root_pk: m.bytes("host_root_pk")?,
+            op_cert: m.bytes("op_cert")?,
             kind: CapKind::from_u64(m.u64("kind")?)?,
             subject: m.bytes("subject")?,
             cap_epoch: m.u64("cap_epoch")?,
             exp: m.u64("exp")?,
             nonce: m.bytes("nonce")?,
-            sig_host: m.bytes("sig_host")?,
+            sig: m.bytes("sig")?,
         })
     }
 
@@ -370,7 +395,7 @@ impl Capability {
         Self::from_cbor(&canonical_decode(bytes)?)
     }
 
-    /// `"spindle-cap-v1" || canonical(self minus sig_host)` (A7b).
+    /// `"spindle-cap-v1" || canonical(self minus sig)` (A7b).
     pub fn signing_input(&self) -> Vec<u8> {
         tags::signing_input(
             tags::CAPABILITY_V1,
@@ -815,13 +840,14 @@ mod tests {
         Capability {
             v: 1,
             host_fp: fp(0x33),
-            host_pk: vec![0x44; 32],
+            host_root_pk: vec![0x44; 32],
+            op_cert: vec![0x45; 96], // opaque embedded HostOpKeyCert canonical bytes (dummy length)
             kind,
             subject: fp(0x55),
             cap_epoch: 7,
             exp: 1_756_000_000,
             nonce: vec![0x66; 16],
-            sig_host: sig(0x77),
+            sig: sig(0x77),
         }
     }
 
@@ -843,7 +869,7 @@ mod tests {
         // overwrite kind with an out-of-range value
         entries.retain(|(k, _)| *k != "kind");
         entries.push(("kind", CborValue::uint(2)));
-        entries.push(("sig_host", CborValue::bytes(cap.sig_host.clone())));
+        entries.push(("sig", CborValue::bytes(cap.sig.clone())));
         let bytes = canonical_encode(&CborValue::map(entries));
         let err = Capability::from_canonical_bytes(&bytes).unwrap_err();
         assert_eq!(err, ProtoError::InvalidEnumValue("kind", 2));

@@ -361,13 +361,14 @@ fn capability_vectors_verify() {
         let cap = Capability {
             v: case.get("decoded").get("v").as_u64() as u8,
             host_fp: case.get("decoded").get("host_fp").hex(),
-            host_pk: case.get("decoded").get("host_pk").hex(),
+            host_root_pk: case.get("decoded").get("host_root_pk").hex(),
+            op_cert: case.get("decoded").get("op_cert").hex(),
             kind,
             subject: case.get("decoded").get("subject").hex(),
             cap_epoch: case.get("decoded").get("cap_epoch").as_u64(),
             exp: case.get("decoded").get("exp").as_u64(),
             nonce: case.get("decoded").get("nonce").hex(),
-            sig_host: case.get("decoded").get("sig_host").hex(),
+            sig: case.get("decoded").get("sig").hex(),
         };
         assert_eq!(
             cap.to_canonical_bytes(),

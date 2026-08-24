@@ -335,49 +335,78 @@ fn device_certificate_vectors() -> Json {
 
 // ---- Capability ----
 
+/// A10.30: `Capability` now carries the host root/op-key cert chain — `host_fp` is derived from
+/// the host **root** key, and the capability embeds the same [`HostOpKeyCert`] artifact that
+/// certifies the operating key which actually signs the capability. This vector's host reuses
+/// `HOST_ROOT_SEED`/`HOST_OP_SEED` (the same identity as `host_op_key_cert_vectors`' host) so the
+/// two vector files describe one consistent host across the whole chain.
 fn capability_vectors() -> Json {
+    use spindle_core::artifacts::issue_host_op_key_cert;
+
+    let host_root = RootKey::from_seed(HOST_ROOT_SEED);
     let host_op = SigningKey::from_bytes(&HOST_OP_SEED);
+    let op_cert_ts = 1_755_907_200;
+    let op_cert_exp = 1_763_683_200; // ts + 90 days
+    let op_cert = issue_host_op_key_cert(
+        &host_root,
+        &host_op.verifying_key(),
+        Fingerprint::of_parts(&[b"gen-crypto-vectors:capability:op-cert-nats"]),
+        op_cert_ts,
+        op_cert_exp,
+    );
     let subject = Fingerprint::of_parts(&[b"gen-crypto-vectors:capability:subject"]);
     let exp = 1_756_000_000;
 
-    let cap = issue_capability(&host_op, CapKind::Member, subject, 3, exp, vec![0x77; 16]);
+    let cap = issue_capability(
+        &host_root.public_key(),
+        &op_cert,
+        &host_op,
+        CapKind::Member,
+        subject,
+        3,
+        exp,
+        vec![0x77; 16],
+    );
     assert!(verify_capability(&cap, exp).is_ok());
 
     fn decoded(c: &spindle_proto::artifacts::Capability) -> Json {
         Json::Obj(vec![
             ("v", Json::UInt(c.v as u64)),
             ("host_fp", Json::hex(&c.host_fp)),
-            ("host_pk", Json::hex(&c.host_pk)),
+            ("host_root_pk", Json::hex(&c.host_root_pk)),
+            ("op_cert", Json::hex(&c.op_cert)),
             ("kind", Json::UInt(c.kind as u64)),
             ("subject", Json::hex(&c.subject)),
             ("cap_epoch", Json::UInt(c.cap_epoch)),
             ("exp", Json::UInt(c.exp)),
             ("nonce", Json::hex(&c.nonce)),
-            ("sig_host", Json::hex(&c.sig_host)),
+            ("sig", Json::hex(&c.sig)),
         ])
     }
 
     let mut tampered = cap.clone();
-    tampered.sig_host = flip_last_byte(&cap.sig_host);
+    tampered.sig = flip_last_byte(&cap.sig);
     assert!(verify_capability(&tampered, exp).is_err());
 
     let cases = vec![
         case(
             "valid_member_cap",
-            "Member capability self-verifying under its embedded host_pk (the host operating key).",
+            "Member capability chained root -> op cert -> capability sig (A10.30): host_fp = \
+             SHA-256(host_root_pk), op_cert is the embedded real HostOpKeyCert, sig is by the \
+             op key op_cert certifies.",
             decoded(&cap),
             &cap.to_canonical_bytes(),
             &cap.signing_input(),
-            &cap.sig_host,
+            &cap.sig,
             true,
         ),
         case(
             "tampered_signature_last_byte",
-            "sig_host's last byte flipped; verify_capability must reject with BadSignature.",
+            "sig's last byte flipped; verify_capability must reject with BadSignature.",
             decoded(&tampered),
             &tampered.to_canonical_bytes(),
             &tampered.signing_input(),
-            &tampered.sig_host,
+            &tampered.sig,
             false,
         ),
     ];
@@ -386,11 +415,24 @@ fn capability_vectors() -> Json {
         "Capability",
         spindle_proto::tags::CAPABILITY_V1,
         Json::Obj(vec![
-            ("role", Json::Str("host_operating_key".into())),
-            ("seed", seed_field("TEST-ONLY", &HOST_OP_SEED)),
             (
-                "public_key_hex",
+                "role",
+                Json::Str("host_root_and_operating_key_chain".into()),
+            ),
+            ("root_seed", seed_field("TEST-ONLY", &HOST_ROOT_SEED)),
+            (
+                "host_root_pk_hex",
+                Json::hex(host_root.public_key().as_bytes()),
+            ),
+            ("host_fp_hex", Json::hex(&host_root.root_fp().to_vec())),
+            ("op_seed", seed_field("TEST-ONLY", &HOST_OP_SEED)),
+            (
+                "op_public_key_hex",
                 Json::hex(host_op.verifying_key().as_bytes()),
+            ),
+            (
+                "op_cert_canonical_cbor_hex",
+                Json::hex(&op_cert.to_canonical_bytes()),
             ),
         ]),
         cases,

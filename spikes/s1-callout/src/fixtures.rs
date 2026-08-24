@@ -125,8 +125,25 @@ pub fn host_op_key_cert(
     )
 }
 
+/// The `op_cert` a test capability embeds (A10.30: `issue_capability` now needs the host root's
+/// certification of its operating key, not just the operating key itself). Built fresh per call
+/// with a dummy nats_fp/exp — this is a capability-issuance-time cert, not the (separately built,
+/// via [`host_op_key_cert`]) cert a host presents on its own NATS CONNECT — so it does not need
+/// to share that cert's `nats_fp`/`ts`/`exp`. `exp = u64::MAX` so it never itself expires within
+/// this suite's timescales, isolating capability-level exp/signature checks from the op cert's
+/// own freshness.
+fn capability_op_cert(host: &HostIdentity) -> HostOpKeyCert {
+    issue_host_op_key_cert(
+        &host.root,
+        &host.op_signing.verifying_key(),
+        Fingerprint::of_parts(&[b"spike-s1-callout:capability-op-cert"]),
+        0,
+        u64::MAX,
+    )
+}
+
 /// Issues a `member` capability for `subject` (a device's `root_fp`), signed by the host's
-/// operating key.
+/// operating key and chained to the host's root via an embedded `op_cert` (decision A10.30).
 pub fn member_capability(
     host: &HostIdentity,
     subject: Fingerprint,
@@ -134,7 +151,10 @@ pub fn member_capability(
     exp: u64,
     nonce: Vec<u8>,
 ) -> Capability {
+    let op_cert = capability_op_cert(host);
     issue_capability(
+        &host.root.public_key(),
+        &op_cert,
         &host.op_signing,
         CapKind::Member,
         subject,
@@ -150,7 +170,17 @@ pub fn invite_capability(
     exp: u64,
     nonce: Vec<u8>,
 ) -> Capability {
-    issue_capability(&host.op_signing, CapKind::Invite, subject, 0, exp, nonce)
+    let op_cert = capability_op_cert(host);
+    issue_capability(
+        &host.root.public_key(),
+        &op_cert,
+        &host.op_signing,
+        CapKind::Invite,
+        subject,
+        0,
+        exp,
+        nonce,
+    )
 }
 
 /// Builds the base64url canonical-CBOR `auth_token` for a device CONNECT (see module docs for

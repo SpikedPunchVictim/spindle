@@ -345,47 +345,66 @@ fn envelope_vectors() -> Json {
 // ---- Capability ----
 
 fn capability_vectors() -> Json {
-    fn build(kind: CapKind, cap_epoch: u64, exp: u64) -> Capability {
+    // The embedded `op_cert` is itself an opaque `HostOpKeyCert` canonical encoding (A10.30) —
+    // `spindle-proto` has no crypto dependency, so its `sig_host_root` here is the same kind of
+    // dummy byte pattern every other `sig*` field in this file uses, not a valid signature (see
+    // module docs). Fixed once and reused across both cap cases, matching how one host presents
+    // the same current op cert for every capability it issues.
+    let dummy_op_cert = HostOpKeyCert {
+        host_op_pk: rep(0x21, 32),
+        nats_fp: rep(0x22, 32),
+        ts: 1_755_907_200,
+        exp: 1_763_683_200, // ts + 90 days
+        sig_host_root: rep(0x23, 64),
+    };
+    let op_cert_bytes = dummy_op_cert.to_canonical_bytes();
+
+    fn build(kind: CapKind, cap_epoch: u64, exp: u64, op_cert_bytes: Vec<u8>) -> Capability {
         Capability {
             v: 1,
             host_fp: rep(0x10, 32),
-            host_pk: rep(0x20, 32),
+            host_root_pk: rep(0x20, 32),
+            op_cert: op_cert_bytes,
             kind,
             subject: rep(0x30, 32),
             cap_epoch,
             exp,
             nonce: rep(0x40, 16),
-            sig_host: rep(0x50, 64),
+            sig: rep(0x50, 64),
         }
     }
-    let invite = build(CapKind::Invite, 0, 1_755_993_600); // +24h from ts base
-    let member = build(CapKind::Member, 3, 1_759_017_600); // +6 weeks-ish
+    let invite = build(CapKind::Invite, 0, 1_755_993_600, op_cert_bytes.clone()); // +24h from ts base
+    let member = build(CapKind::Member, 3, 1_759_017_600, op_cert_bytes); // +6 weeks-ish
 
     fn decoded(c: &Capability) -> Json {
         Json::Obj(vec![
             ("v", Json::UInt(c.v as u64)),
             ("host_fp", Json::hex(&c.host_fp)),
-            ("host_pk", Json::hex(&c.host_pk)),
+            ("host_root_pk", Json::hex(&c.host_root_pk)),
+            ("op_cert", Json::hex(&c.op_cert)),
             ("kind", Json::UInt(c.kind as u64)),
             ("subject", Json::hex(&c.subject)),
             ("cap_epoch", Json::UInt(c.cap_epoch)),
             ("exp", Json::UInt(c.exp)),
             ("nonce", Json::hex(&c.nonce)),
-            ("sig_host", Json::hex(&c.sig_host)),
+            ("sig", Json::hex(&c.sig)),
         ])
     }
 
     let cases = vec![
         case(
             "invite_cap",
-            "Bearer invite capability: kind=invite(0), cap_epoch=0, 24h exp.",
+            "Bearer invite capability: kind=invite(0), cap_epoch=0, 24h exp. host_fp = SHA-256(host_root_pk) \
+             (A10.30 — root-derived, not operating-key-derived); op_cert is an opaque embedded HostOpKeyCert \
+             canonical encoding.",
             decoded(&invite),
             &invite.to_canonical_bytes(),
             &invite.signing_input(),
         ),
         case(
             "member_cap",
-            "Member capability issued post-redemption: kind=member(1), nonzero cap_epoch, weeks-scale exp.",
+            "Member capability issued post-redemption: kind=member(1), nonzero cap_epoch, weeks-scale exp. \
+             Same host_fp/host_root_pk/op_cert chain shape as invite_cap (A10.30).",
             decoded(&member),
             &member.to_canonical_bytes(),
             &member.signing_input(),
