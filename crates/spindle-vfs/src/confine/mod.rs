@@ -37,8 +37,8 @@ pub mod windows;
 
 pub use fold::{existing_entry_colliding, fold_key, names_collide};
 pub use identity::{
-    file_identity, nlink_guard, read_confined_with_identity_check, resolve_identity,
-    stat_through_dir,
+    file_identity, identity_of_ambient_path, nlink_guard, read_confined_with_identity_check,
+    resolve_identity, stat_through_dir, FileIdentity,
 };
 pub use overlap::overlap_check;
 pub use upload::{upload_target_path, write_is_authorized};
@@ -93,6 +93,22 @@ impl ConfineError {
 pub fn open_share_root(path: &Path) -> Result<Dir, ConfineError> {
     Dir::open_ambient_dir(path, ambient_authority())
         .map_err(|e| ConfineError::io(path.display().to_string(), e))
+}
+
+/// `cap_std::fs::Dir` only exposes a unified `symlink` on Unix; Windows distinguishes file vs.
+/// directory symlink targets (`symlink_file`/`symlink_dir`, `#[cfg(windows)]`-gated in `cap-std`
+/// itself). Every symlink this test suite creates targets a file, so this helper is a thin,
+/// platform-specific shim over whichever `cap-std` method exists on the current target.
+#[cfg(test)]
+#[cfg(unix)]
+fn test_symlink(dir: &Dir, original: &str, link: &str) -> io::Result<()> {
+    dir.symlink(original, link)
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+fn test_symlink(dir: &Dir, original: &str, link: &str) -> io::Result<()> {
+    dir.symlink_file(original, link)
 }
 
 #[cfg(test)]
@@ -173,7 +189,7 @@ mod tests {
         std::fs::write(&outside, b"outside-content").expect("write outside file");
 
         let dir = open_share_root(&root).expect("open share root");
-        dir.symlink("../outside.txt", "escape")
+        test_symlink(&dir, "../outside.txt", "escape")
             .expect("create symlink pointing outside the root");
 
         let opened = dir.open("escape");

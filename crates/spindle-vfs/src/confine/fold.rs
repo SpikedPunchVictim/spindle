@@ -98,7 +98,11 @@ pub fn existing_entry_colliding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::confine::{open_share_root, resolve_identity};
+    use crate::confine::open_share_root;
+    // Only used inside the `#[cfg(target_os = "macos")]` blocks below — cfg-gated here too so
+    // this import isn't flagged unused on Linux/Windows (`clippy -D warnings`).
+    #[cfg(target_os = "macos")]
+    use crate::confine::resolve_identity;
     use tempfile::tempdir;
 
     #[test]

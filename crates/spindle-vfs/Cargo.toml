@@ -12,6 +12,17 @@ spindle-core = { path = "../spindle-core" }
 cap-std = { workspace = true }
 thiserror = { workspace = true }
 
+# `std::os::windows::fs::MetadataExt::{volume_serial_number,file_index,number_of_links}` are
+# gated behind the nightly-only `windows_by_handle` feature (rust-lang/rust#63010) — unusable on
+# stable Rust, which is why this code never actually compiled on a real Windows toolchain before.
+# `same-file` (stable, via `GetFileInformationByHandle`) gives equivalent file-identity semantics;
+# `winapi-util` (the crate `same-file` itself uses internally for that same WinAPI call) gives the
+# link count `nlink_guard` needs, which `same-file`'s public API does not expose. Both are
+# Windows-only; the existing dev+ino/nlink path on Unix is untouched.
+[target.'cfg(windows)'.dependencies]
+same-file = "1"
+winapi-util = "0.1"
+
 # tempfile is crate-local only (not a workspace dependency), matching the precedent set by the
 # S11 spike (spikes/s11-vfs-confinement/Cargo.toml) it graduates from: confinement tests need a
 # disposable sandbox directory tree; this never becomes a runtime dependency of spindle-vfs.

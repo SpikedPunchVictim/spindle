@@ -4,32 +4,62 @@
 use super::ConfineError;
 use cap_std::fs::Dir;
 
-/// A cross-platform file-identity tuple: `(volume, file-id)`. On Unix this is `(dev, ino)`; on
-/// Windows it is `(volume_serial_number, file_index)`. Two dirents with equal identity are the
-/// same underlying file regardless of what name(s) reach them — the primitive every TOCTOU/
-/// overlap check in this module builds on.
+/// A cross-platform file-identity value: two dirents with equal identity are the same underlying
+/// file regardless of what name(s) reach them — the primitive every TOCTOU/overlap check in this
+/// module builds on. On Unix this is the `(dev, ino)` pair. On Windows,
+/// `std::os::windows::fs::MetadataExt`'s identity accessors (`volume_serial_number`,
+/// `file_index`) are gated behind the nightly-only `windows_by_handle` feature
+/// (rust-lang/rust#63010) and are unusable on stable Rust — going through `std`'s own `Metadata`
+/// type (rather than `cap-std`'s wrapper) does not sidestep this; the feature gate is on the
+/// accessor itself. Windows identity instead goes through the `same-file` crate's `Handle`, which
+/// gets the equivalent `(volume serial, file index)` pair via `GetFileInformationByHandle` on
+/// stable Rust.
 #[cfg(unix)]
-pub fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+pub type FileIdentity = (u64, u64);
+#[cfg(windows)]
+pub type FileIdentity = same_file::Handle;
+
+#[cfg(unix)]
+fn identity_from_metadata(meta: &std::fs::Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt;
     (meta.dev(), meta.ino())
 }
 
-#[cfg(windows)]
-pub fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
-    use std::os::windows::fs::MetadataExt;
-    (
-        u64::from(meta.volume_serial_number().unwrap_or(0)),
-        meta.file_index().unwrap_or(0),
-    )
+/// Computes the [`FileIdentity`] of an already-open `file` (e.g. one obtained through a `Dir`
+/// capability via [`resolve_identity`]).
+pub fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
+    #[cfg(unix)]
+    {
+        Ok(identity_from_metadata(&file.metadata()?))
+    }
+    #[cfg(windows)]
+    {
+        same_file::Handle::from_file(file.try_clone()?)
+    }
+}
+
+/// Computes the [`FileIdentity`] of an ambient filesystem `path` that has not been opened yet —
+/// used by [`super::overlap::overlap_check`], which compares share roots (which may be
+/// directories) by real path before either is opened as a `Dir`. On Windows this goes through
+/// `same_file::Handle::from_path`, which (unlike a plain `File::open`) opens directories
+/// correctly via `FILE_FLAG_BACKUP_SEMANTICS`.
+pub fn identity_of_ambient_path(path: &std::path::Path) -> std::io::Result<FileIdentity> {
+    #[cfg(unix)]
+    {
+        Ok(identity_from_metadata(&std::fs::metadata(path)?))
+    }
+    #[cfg(windows)]
+    {
+        same_file::Handle::from_path(path)
+    }
 }
 
 /// Fetches a real `std::fs::Metadata` for `virtual_path` through `dir`'s `cap-std` capability, by
 /// opening it (capability-checked, confined, symlink-target-inside-root only) and delegating to
-/// `std::fs::File::metadata`. This sidesteps `cap-std`'s own `Metadata` wrapper, whose
-/// identity/link-count accessors require a nightly-only feature on Windows
-/// (`cap_primitives`'s `windows_by_handle`) — going through the real `std` type keeps
-/// [`file_identity`] and [`nlink_guard`] usable on stable Rust on every platform, without ever
-/// leaving the `Dir`'s confinement to do it.
+/// `std::fs::File::metadata`. This sidesteps `cap-std`'s own `Metadata` wrapper, which is
+/// convenient for stable, cross-platform metadata fields (size, timestamps, permissions); it is
+/// **not** used for identity or link-count, which need [`file_identity`] / [`nlink_guard`]
+/// instead (see their doc comments for why `Metadata` alone cannot provide those on Windows).
 pub fn stat_through_dir(dir: &Dir, virtual_path: &str) -> Result<std::fs::Metadata, ConfineError> {
     dir.open(virtual_path)
         .and_then(|f| f.into_std().metadata())
@@ -40,28 +70,38 @@ pub fn stat_through_dir(dir: &Dir, virtual_path: &str) -> Result<std::fs::Metada
 /// resolved entry is reached via a symlink whose target is inside the root) and returns its file
 /// identity. This is the primitive both [`nlink_guard`]'s callers and
 /// [`read_confined_with_identity_check`]'s TOCTOU check build on.
-pub fn resolve_identity(dir: &Dir, virtual_path: &str) -> Result<(u64, u64), ConfineError> {
-    Ok(file_identity(&stat_through_dir(dir, virtual_path)?))
+pub fn resolve_identity(dir: &Dir, virtual_path: &str) -> Result<FileIdentity, ConfineError> {
+    let file = dir
+        .open(virtual_path)
+        .map_err(|e| ConfineError::io(virtual_path, e))?
+        .into_std();
+    file_identity(&file).map_err(|e| ConfineError::io(virtual_path, e))
 }
 
 #[cfg(unix)]
-fn nlink_of(meta: &std::fs::Metadata) -> u64 {
+fn nlink_of(file: &std::fs::File) -> std::io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
-    meta.nlink()
+    Ok(file.metadata()?.nlink())
 }
 
 #[cfg(windows)]
-fn nlink_of(meta: &std::fs::Metadata) -> u64 {
-    use std::os::windows::fs::MetadataExt;
-    u64::from(meta.number_of_links().unwrap_or(1))
+fn nlink_of(file: &std::fs::File) -> std::io::Result<u64> {
+    // `std::os::windows::fs::MetadataExt::number_of_links` is gated behind the same nightly-only
+    // `windows_by_handle` feature as the identity accessors above (rust-lang/rust#63010) and is
+    // unusable on stable Rust; `winapi-util` (the same crate `same-file` itself uses internally
+    // for `GetFileInformationByHandle`) exposes the link count directly.
+    Ok(winapi_util::file::information(file)?.number_of_links())
 }
 
 /// DESIGN.md §A4b hardlink-bypass rule, verbatim: "when a share has exclusions, files with link
 /// count > 1 are not served." Returns `true` when the file may be served, given whether the
 /// share has any exclusion globs configured at all (`crate::model::Share::has_exclusions`).
 /// Closes A12 #29 (overlapping share roots / hardlinks defeat exclusions).
-pub fn nlink_guard(meta: &std::fs::Metadata, share_has_exclusions: bool) -> bool {
-    !(share_has_exclusions && nlink_of(meta) > 1)
+pub fn nlink_guard(file: &std::fs::File, share_has_exclusions: bool) -> std::io::Result<bool> {
+    if !share_has_exclusions {
+        return Ok(true);
+    }
+    Ok(nlink_of(file)? <= 1)
 }
 
 /// Reads `relative` through `dir` in `chunk_size` chunks, re-resolving the path's identity after
@@ -132,29 +172,29 @@ mod tests {
         dir.hard_link("original.txt", &dir, "linked.txt")
             .expect("create hardlink (same filesystem, same dir)");
 
-        let linked_meta = stat_through_dir(&dir, "linked.txt").expect("stat linked.txt");
-        let solo_meta = stat_through_dir(&dir, "solo.txt").expect("stat solo.txt");
+        let linked_file = dir.open("linked.txt").expect("open linked.txt").into_std();
+        let solo_file = dir.open("solo.txt").expect("open solo.txt").into_std();
 
         assert!(
-            nlink_of(&linked_meta) > 1,
+            nlink_of(&linked_file).expect("nlink linked.txt") > 1,
             "sanity: hard_link must actually raise the link count"
         );
         assert_eq!(
-            nlink_of(&solo_meta),
+            nlink_of(&solo_file).expect("nlink solo.txt"),
             1,
             "sanity: the non-hardlinked control file must have link count 1"
         );
 
         assert!(
-            !nlink_guard(&linked_meta, true),
+            !nlink_guard(&linked_file, true).expect("guard linked.txt, exclusions"),
             "a file with link count > 1 must not be served when the share has exclusions"
         );
         assert!(
-            nlink_guard(&solo_meta, true),
+            nlink_guard(&solo_file, true).expect("guard solo.txt, exclusions"),
             "a file with link count 1 must still be served when the share has exclusions"
         );
         assert!(
-            nlink_guard(&linked_meta, false),
+            nlink_guard(&linked_file, false).expect("guard linked.txt, no exclusions"),
             "the hardlink rule only applies when the share actually has exclusions configured"
         );
     }

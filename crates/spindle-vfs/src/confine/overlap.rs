@@ -2,7 +2,7 @@
 //! by resolved real path *and* device+inode/file-id; re-checked at host start)"). Closes A12 #29
 //! (overlapping share roots / hardlinks defeat exclusions).
 
-use super::identity::file_identity;
+use super::identity::identity_of_ambient_path;
 use super::ConfineError;
 use std::path::Path;
 
@@ -18,14 +18,10 @@ pub fn overlap_check(root_a: &Path, root_b: &Path) -> Result<bool, ConfineError>
     if real_a == real_b || real_a.starts_with(&real_b) || real_b.starts_with(&real_a) {
         return Ok(true);
     }
-    let identity_a = file_identity(
-        &std::fs::metadata(&real_a)
-            .map_err(|e| ConfineError::io(real_a.display().to_string(), e))?,
-    );
-    let identity_b = file_identity(
-        &std::fs::metadata(&real_b)
-            .map_err(|e| ConfineError::io(real_b.display().to_string(), e))?,
-    );
+    let identity_a = identity_of_ambient_path(&real_a)
+        .map_err(|e| ConfineError::io(real_a.display().to_string(), e))?;
+    let identity_b = identity_of_ambient_path(&real_b)
+        .map_err(|e| ConfineError::io(real_b.display().to_string(), e))?;
     Ok(identity_a == identity_b)
 }
 
