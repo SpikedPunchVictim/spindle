@@ -530,3 +530,42 @@ JavaScript. When a later session runs this harness, `chrome://webrtc-internals`'
 are the authoritative source for "what did the congestion window actually do during this
 transfer" — the Rust-side `--stats-out` samples are the throughput-and-byte-counter half of the
 picture, not a substitute for it.
+
+### Results — 0 ms (loopback, macOS host)
+
+Date 2026-08-24 (early, same working session as the runbook above). macOS arm64 host, in-host
+loopback (no shaping) — the ~50 ms dummynet leg above remains untested. Chrome 151.0.7922.172 (host
+install), driven via browser automation. `browser-peer.html` was served over
+`http://127.0.0.1:8377` (plain `python3 -m http.server`) rather than opened via `file://` as the
+runbook above suggests — the automation extension refuses `file://` navigation, and `ws://` from an
+`http://127.0.0.1` origin behaves identically to `ws://` from a `file://` page for this harness's
+purposes; the page's own "never talks beyond 127.0.0.1" property is unchanged. Rust side:
+`browser-peer --mode <send|recv> --bytes 256 --json --stats-interval-ms 200 --stats-out <path>`,
+default buffers (`sctp_buf`=4194304, `threshold`=1048576), 64 KiB chunks.
+
+| Date | Environment | RTT (ms) | Mode / direction | MB/s | Notes |
+|------|-------------|----------|-------------------|------|-------|
+| 2026-08-24 | macOS arm64 host, in-host loopback, real Chrome dcSCTP peer | 0 | send (Rust webrtc-rs → Chrome, download path) | 70.893 (Rust-side); peer-side 71.643 | bytes=256MiB chunk=64KiB; default buffers; raw={"mode":"send","total_bytes":268435456,"chunk_bytes":65536,"sctp_buf":4194304,"threshold":1048576,"elapsed_secs":3.786500,"mb_per_s":70.893,"peer_bytes":268435456,"peer_elapsed_secs":3.746849,"peer_mb_per_s":71.643} |
+| 2026-08-24 | macOS arm64 host, in-host loopback, real Chrome dcSCTP peer | 0 | recv (Chrome → Rust webrtc-rs, upload path) | 60.236 (Rust-side); peer-side 62.004 | bytes=256MiB chunk=64KiB; default buffers; raw={"mode":"recv","total_bytes":268435456,"chunk_bytes":65536,"sctp_buf":4194304,"threshold":1048576,"elapsed_secs":4.456408,"mb_per_s":60.236,"peer_bytes":268435456,"peer_elapsed_secs":4.329300,"peer_mb_per_s":62.004} |
+
+Both directions clear the ≥ 50 MB/s LAN-class bar against a **real Chrome dcSCTP peer** on the
+first run — the harness (signaling, ICE, data channel open, backpressure, merged `--json` summary)
+works end to end. 70.9 MB/s Rust→Chrome sits inside the 74–125 MB/s band the Rust↔Rust in-process
+loopback runs produced elsewhere in this file, so interop with a third, independent SCTP
+implementation (dcSCTP, alongside `rtc-sctp` and `usrsctp`) costs little at 0 ms — consistent with
+the datachannel-rs verdict above, where the two mature stacks it compared also converged at low
+RTT. The upload direction (recv, 60.2 MB/s) is ~15% slower than download; a plausible explanation is
+that `browser-peer.html`'s JS-side 64 KiB send loop + `bufferedAmountLow` scheduling is the pacing
+constraint here rather than SCTP itself, but this is a single run each direction — no repeat runs or
+variance data yet, so treat the ~15% gap as suggestive rather than confirmed.
+
+The decisive cell — 50 ms RTT via the dummynet recipe above — remains **NOT RUN**, blocked on
+`sudo` (passwordless `sudo` was unavailable in the automated session that produced this leg).
+Stats sampling (`--stats-out`) captured 20 samples on the send run; candidate-pair RTT
+(`candidate_pair_current_rtt_secs`) was ~0.5 ms throughout, confirming the path was in fact
+unshaped as intended.
+
+One environment note on measurement agreement: the throughput numbers here are Rust-process-
+measured wall-clock over 256 MiB, and the peer's (Chrome's) own measurement of the same transfer
+agrees within ~2.5% in both directions — the two independently-clocked sides corroborate each
+other, which is some evidence against either side's number being a measurement artifact.
