@@ -18,6 +18,7 @@ import {
   AdminCommand,
   AdmissionToken,
   Capability,
+  CapKind,
   DeviceCertificate,
   HostOpKeyCert,
   RevocationRecord,
@@ -33,6 +34,7 @@ import {
   verifyHostOpKeyCert,
   verifyRevocationRecord,
 } from "../src/artifacts.js";
+import { ed25519PublicKeyFromSeed, ed25519Sign } from "../src/backend.js";
 import { rootFpOf } from "../src/fingerprint.js";
 import {
   argsFromCanonicalCbor,
@@ -105,7 +107,7 @@ describe("capability.json", () => {
     });
   }
 
-  it("rejects a capability whose host_fp does not match SHA-256(host_pk)", async () => {
+  it("rejects a capability whose host_fp does not match SHA-256(host_root_pk)", async () => {
     const cap = parseCapability(doc.cases[0].decoded);
     cap.host_fp = cap.host_fp.slice();
     cap.host_fp[0] ^= 0xff;
@@ -115,6 +117,111 @@ describe("capability.json", () => {
   it("rejects an expired capability", async () => {
     const cap = parseCapability(doc.cases[0].decoded);
     await expectArtifactError(() => verifyCapability(cap, cap.exp + 1n), "Expired");
+  });
+
+  // ---- Locally-generated fixtures for the rest of spindle-core's negative suite (A10.30) ----
+  // These aren't golden-vector conformance checks (no fixed expected bytes) — they only need
+  // internally self-consistent real Ed25519 signatures, built with this package's own primitives,
+  // mirroring `crates/spindle-core/src/artifacts/capability.rs`'s own `test_host`/`issue` helpers.
+
+  interface TestHost {
+    rootSeed: Uint8Array;
+    rootPk: Uint8Array;
+    opSeed: Uint8Array;
+    opPk: Uint8Array;
+    opCert: HostOpKeyCert;
+  }
+
+  async function makeTestHost(rootSeedFill: number, opSeedFill: number, opCertExp: bigint): Promise<TestHost> {
+    const rootSeed = new Uint8Array(32).fill(rootSeedFill);
+    const opSeed = new Uint8Array(32).fill(opSeedFill);
+    const rootPk = await ed25519PublicKeyFromSeed(rootSeed);
+    const opPk = await ed25519PublicKeyFromSeed(opSeed);
+    const unsigned: HostOpKeyCert = {
+      host_op_pk: opPk,
+      nats_fp: new Uint8Array(32).fill(0xee),
+      ts: 0n,
+      exp: opCertExp,
+      sig_host_root: new Uint8Array(64),
+    };
+    const sig = await ed25519Sign(rootSeed, HostOpKeyCert.signingInput(unsigned));
+    return { rootSeed, rootPk, opSeed, opPk, opCert: { ...unsigned, sig_host_root: sig } };
+  }
+
+  async function issueTestCapability(params: {
+    hostRootPk: Uint8Array;
+    opCert: HostOpKeyCert;
+    opSignerSeed: Uint8Array;
+    capEpoch: bigint;
+    exp: bigint;
+  }): Promise<Capability> {
+    const hostFp = await rootFpOf(params.hostRootPk);
+    const unsigned: Capability = {
+      v: 1,
+      host_fp: hostFp,
+      host_root_pk: params.hostRootPk,
+      op_cert: HostOpKeyCert.toCanonicalBytes(params.opCert),
+      kind: CapKind.Member,
+      subject: new Uint8Array(32).fill(0xaa),
+      cap_epoch: params.capEpoch,
+      exp: params.exp,
+      nonce: new Uint8Array(16).fill(0xaa),
+      sig: new Uint8Array(64),
+    };
+    const sig = await ed25519Sign(params.opSignerSeed, Capability.signingInput(unsigned));
+    return { ...unsigned, sig };
+  }
+
+  it("rejects a capability whose host_root_pk is swapped for a different (validly-encoded) root — SHA-256(host_root_pk) no longer matches host_fp", async () => {
+    const host = await makeTestHost(0x11, 0x12, 10_000n);
+    const cap = await issueTestCapability({
+      hostRootPk: host.rootPk,
+      opCert: host.opCert,
+      opSignerSeed: host.opSeed,
+      capEpoch: 0n,
+      exp: 2_000n,
+    });
+    const otherRootPk = await ed25519PublicKeyFromSeed(new Uint8Array(32).fill(0x99));
+    cap.host_root_pk = otherRootPk; // host_fp is left as-is, computed from the original root
+    await expectArtifactError(() => verifyCapability(cap, 1_500n), "HostFingerprintMismatch");
+  });
+
+  it("rejects when the embedded op cert has itself expired, even though the capability's own exp has not", async () => {
+    const host = await makeTestHost(0x21, 0x22, 1_000n); // op cert expires at 1_000
+    const cap = await issueTestCapability({
+      hostRootPk: host.rootPk,
+      opCert: host.opCert,
+      opSignerSeed: host.opSeed,
+      capEpoch: 0n,
+      exp: 2_000n, // capability's own exp is still well in the future
+    });
+    await expectArtifactError(() => verifyCapability(cap, 1_500n), "Expired");
+  });
+
+  it("rejects an op cert that was actually signed by a different root than the capability declares", async () => {
+    const realHost = await makeTestHost(0x31, 0x32, 10_000n);
+    const impostorRootPk = await ed25519PublicKeyFromSeed(new Uint8Array(32).fill(0x77));
+    const cap = await issueTestCapability({
+      hostRootPk: impostorRootPk, // host_fp/host_root_pk declare the impostor root...
+      opCert: realHost.opCert, // ...but op_cert was actually signed by realHost's root
+      opSignerSeed: realHost.opSeed,
+      capEpoch: 0n,
+      exp: 2_000n,
+    });
+    await expectArtifactError(() => verifyCapability(cap, 1_500n), "BadSignature");
+  });
+
+  it("rejects a capability signed by a key other than the one the op cert certifies", async () => {
+    const host = await makeTestHost(0x41, 0x42, 10_000n);
+    const impostorSignerSeed = new Uint8Array(32).fill(0x66);
+    const cap = await issueTestCapability({
+      hostRootPk: host.rootPk,
+      opCert: host.opCert,
+      opSignerSeed: impostorSignerSeed, // not the key op_cert.host_op_pk names
+      capEpoch: 0n,
+      exp: 2_000n,
+    });
+    await expectArtifactError(() => verifyCapability(cap, 1_500n), "BadSignature");
   });
 });
 

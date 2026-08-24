@@ -310,12 +310,13 @@ export const Envelope = {
 // Capability (A4)
 // ============================================================================================
 
-/** `Capability { v, host_fp, host_pk, kind, subject, cap_epoch, exp, nonce, sig_host }`
+/** `Capability { v, host_fp, host_root_pk, op_cert, kind, subject, cap_epoch, exp, nonce, sig }`
  * (DESIGN.md §A4). */
 export interface Capability {
   v: number;
   host_fp: Uint8Array;
-  host_pk: Uint8Array;
+  host_root_pk: Uint8Array;
+  op_cert: Uint8Array;
   kind: CapKind;
   /** `root_fp` for a `member` cap, `device_fp` for an `invite` cap — opaque fingerprint bytes
    * either way; this package does not disambiguate further. */
@@ -323,19 +324,20 @@ export interface Capability {
   cap_epoch: bigint;
   exp: bigint;
   nonce: Uint8Array;
-  sig_host: Uint8Array;
+  sig: Uint8Array;
 }
 
 const CAPABILITY_FIELDS = [
   "v",
   "host_fp",
-  "host_pk",
+  "host_root_pk",
+  "op_cert",
   "kind",
   "subject",
   "cap_epoch",
   "exp",
   "nonce",
-  "sig_host",
+  "sig",
 ] as const;
 
 export const Capability = {
@@ -343,7 +345,8 @@ export const Capability = {
     return [
       ["v", CborValue.uint(cap.v)],
       ["host_fp", CborValue.bytes(cap.host_fp)],
-      ["host_pk", CborValue.bytes(cap.host_pk)],
+      ["host_root_pk", CborValue.bytes(cap.host_root_pk)],
+      ["op_cert", CborValue.bytes(cap.op_cert)],
       ["kind", capKindToCbor(cap.kind)],
       ["subject", CborValue.bytes(cap.subject)],
       ["cap_epoch", CborValue.uint(cap.cap_epoch)],
@@ -358,7 +361,7 @@ export const Capability = {
 
   toCbor(cap: Capability): CborValue {
     const entries = Capability.unsignedEntries(cap);
-    entries.push(["sig_host", CborValue.bytes(cap.sig_host)]);
+    entries.push(["sig", CborValue.bytes(cap.sig)]);
     return CborValue.map(entries);
   },
 
@@ -372,13 +375,14 @@ export const Capability = {
     return {
       v: m.u8("v"),
       host_fp: m.bytes("host_fp"),
-      host_pk: m.bytes("host_pk"),
+      host_root_pk: m.bytes("host_root_pk"),
+      op_cert: m.bytes("op_cert"),
       kind: capKindFromU64(m.u64("kind")),
       subject: m.bytes("subject"),
       cap_epoch: m.u64("cap_epoch"),
       exp: m.u64("exp"),
       nonce: m.bytes("nonce"),
-      sig_host: m.bytes("sig_host"),
+      sig: m.bytes("sig"),
     };
   },
 
@@ -386,7 +390,7 @@ export const Capability = {
     return Capability.fromCbor(decodeCanonicalOrThrow(bytes));
   },
 
-  /** `"spindle-cap-v1" || canonical(self minus sig_host)` (A7b). */
+  /** `"spindle-cap-v1" || canonical(self minus sig)` (A7b). */
   signingInput(cap: Capability): Uint8Array {
     return tags.signingInput(tags.CAPABILITY_V1, canonicalEncode(Capability.unsignedCbor(cap)));
   },

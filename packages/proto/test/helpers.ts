@@ -91,13 +91,14 @@ export function parseCapability(d: any): Capability {
   return {
     v: Number(d.v),
     host_fp: hexToBytes(d.host_fp),
-    host_pk: hexToBytes(d.host_pk),
+    host_root_pk: hexToBytes(d.host_root_pk),
+    op_cert: hexToBytes(d.op_cert),
     kind: Number(d.kind) as CapKind,
     subject: hexToBytes(d.subject),
     cap_epoch: BigInt(d.cap_epoch),
     exp: BigInt(d.exp),
     nonce: hexToBytes(d.nonce),
-    sig_host: hexToBytes(d.sig_host),
+    sig: hexToBytes(d.sig),
   };
 }
 

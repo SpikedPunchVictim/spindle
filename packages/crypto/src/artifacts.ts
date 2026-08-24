@@ -7,7 +7,7 @@
 // | Artifact | Signer |
 // |---|---|
 // | DeviceCertificate | identity root |
-// | Capability | host operating key (embedded as `host_pk`; self-verifying) |
+// | Capability | host operating key, certified by an embedded op_cert chained to host_root_pk (A10.30) |
 // | HostOpKeyCert | host root |
 // | RevocationRecord | host op key or identity root |
 // | AdmissionToken | operator admission key |
@@ -42,7 +42,8 @@ export type ArtifactErrorKind =
   | "Expired"
   | "TimestampSkew"
   | "HostFingerprintMismatch"
-  | "RootFingerprintMismatch";
+  | "RootFingerprintMismatch"
+  | "MalformedOpCert";
 
 export class ArtifactError extends Error {
   readonly kind: ArtifactErrorKind;
@@ -71,11 +72,17 @@ export class ArtifactError extends Error {
   static hostFingerprintMismatch(): ArtifactError {
     return new ArtifactError(
       "HostFingerprintMismatch",
-      "host_fp does not match SHA-256(host_pk) — capability is not self-verifying",
+      "host_fp does not match SHA-256(host_root_pk) — capability is not self-verifying",
     );
   }
   static rootFingerprintMismatch(): ArtifactError {
     return new ArtifactError("RootFingerprintMismatch", "root_fp does not match the expected pinned root");
+  }
+  static malformedOpCert(): ArtifactError {
+    return new ArtifactError(
+      "MalformedOpCert",
+      "capability's embedded op_cert does not decode as a valid HostOpKeyCert",
+    );
   }
 }
 
@@ -135,19 +142,39 @@ export async function verifyDeviceCertificate(
   checkExp(now, cert.exp);
 }
 
-/** Verifies a capability's self-verifying property (`host_fp == SHA-256(host_pk)` — no external
- * root or registry lookup needed, DESIGN.md §A4), `sig_host`, and `exp`.
+/** Verifies a capability's full root -> operating-key -> capability chain (DESIGN.md §A4,
+ * decision A10.30): no external root or registry lookup needed beyond the capability's own
+ * embedded fields.
  *
- * **Ambiguity flagged, not resolved** (mirrors the note in `spindle-core`'s
- * `artifacts/capability.rs`): DESIGN.md §A7b's signed-artifact table lists `nbf = issue ts` as
- * part of a capability's time rule, but `spindle_proto::artifacts::Capability` — the schema of
- * record — has no `nbf` field. This function therefore checks only `exp`, matching the wire
- * schema that actually exists. */
+ * 1. `host_fp == SHA-256(host_root_pk)` — the capability's declared root identity is
+ *    self-consistent with its own `host_fp`.
+ * 2. The embedded `op_cert` decodes as a `HostOpKeyCert` and verifies under `host_root_pk` (via
+ *    `verifyHostOpKeyCert`, which also checks the op cert's own `exp` against `now`).
+ * 3. `sig` verifies under the op cert's `host_op_pk` — i.e. the capability was actually signed by
+ *    the operating key the root certified, not merely by *some* key.
+ *
+ * Each step's failure surfaces its own `ArtifactError` variant (steps 2/3 reuse
+ * `verifyHostOpKeyCert`'s own variants for its half of the chain).
+ */
 export async function verifyCapability(cap: Capability, now: bigint, opts?: BackendOption): Promise<void> {
-  requirePublicKeyLen(cap.host_pk);
-  const expectedFp = await rootFpOf(cap.host_pk);
+  // 1. host_fp == SHA-256(host_root_pk) — self-consistency of the capability's own fields.
+  requirePublicKeyLen(cap.host_root_pk);
+  const expectedFp = await rootFpOf(cap.host_root_pk);
   if (!bytesEqual(expectedFp, cap.host_fp)) throw ArtifactError.hostFingerprintMismatch();
-  await verifySigOrThrow(cap.host_pk, Capability.signingInput(cap), cap.sig_host, opts?.backend);
+
+  // 2. Decode + verify the embedded op cert chains to host_root_pk, including its own `exp`.
+  let opCert: HostOpKeyCert;
+  try {
+    opCert = HostOpKeyCert.fromCanonicalBytes(cap.op_cert);
+  } catch {
+    throw ArtifactError.malformedOpCert();
+  }
+  await verifyHostOpKeyCert(opCert, cap.host_root_pk, cap.host_fp, now, opts);
+
+  // 3. `sig` verifies under the op cert's own operating key.
+  requirePublicKeyLen(opCert.host_op_pk);
+  await verifySigOrThrow(opCert.host_op_pk, Capability.signingInput(cap), cap.sig, opts?.backend);
+
   checkExp(now, cap.exp);
 }
 
