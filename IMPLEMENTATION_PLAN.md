@@ -38,9 +38,11 @@ CI; any divergence fails the build.
 **Tests**: Rust unit tests for each artifact type's canonical encoding; TS vector-comparison
 tests in `@spindle/proto`; the `vectors` CI job wired to actually compare (no longer a
 placeholder).
-**Status**: In Progress
-**Note**: spindle-proto + golden vectors done (25 tests, byte-stable regeneration); @spindle/proto
-TS twin in progress.
+**Status**: Complete
+**Note**: spindle-proto + golden vectors (25 Rust tests, byte-stable regeneration) and the
+@spindle/proto TS twin (171 tests, zero byte mismatches against every vector) both done;
+`just vectors` runs the full gate locally (regenerate → git diff --exit-code → TS conformance)
+and the CI vectors job runs the same commands. CI cross-check on 3 OSes confirms on next push.
 
 ## Stage 3: spindle-core identity/caps/envelope + @spindle/crypto
 **Goal**: Implement identity roots, device certs, capabilities, and the A7 end-to-end envelope in
