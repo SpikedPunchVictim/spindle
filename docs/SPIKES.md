@@ -67,6 +67,12 @@ passes (125+ MB/s); datachannel-rs evaluation in progress per §A8 fallback.
 - Buffer/window tuning does not help: the smallest buffer was consistently fastest across the
   matrix, pointing to a congestion-control/ACK-clocking ceiling in the crate's SCTP stack rather
   than a bandwidth-delay-product/window-size problem. See `spikes/s3-throughput/RESULTS.md`.
+- **Follow-up (2026-08-23)**: TCP through the same netem path does 60 MB/s @ 50 ms with zero drops
+  — the environment is not the bottleneck. Parallel SCTP associations scale sub-linearly (1.9/3.7/
+  6.8/7.7 MB/s at N=1/2/4/8), plateauing below the ≥ 15 MB/s bar.
+- **Decision A10.29 (2026-08-23)**: investigate deeper first — measure against a real Chrome peer
+  (dcSCTP) and profile webrtc-rs cwnd before revising the A9 bar or reopening the transport choice;
+  ADR-005 stays Proposed; Stages 2–4 proceed meanwhile.
 
 ---
 

@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.2) + Execution Plan
+# Spindle — System Design Document (draft v0.9.3) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -445,10 +445,22 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 Root keys sign two artifact types (device certs, self-revocations) — the distinct tags prevent cross-artifact
 signature confusion. Host and helper both use helper server time for `exp`/`nbf` checks (single authority; ±2 min).
 
+**Schema-of-record**: the canonical CBOR field-level schema for every artifact above now lives in
+`crates/spindle-proto/src/lib.rs` (Stage 2 implementation), superseding this table for field-level detail. Two
+clarifications resolved during implementation: (1) **Device certificate carries no `label` field** — A4's "labels
+never baked into certificates" rule supersedes the older inline notation that listed `label`; (2) only **Envelope**,
+**Member/invite cap** (Capability), and **Admin command** carry an explicit `v` field — for the other four artifacts
+(Admission token, Device certificate, Revocation record, Host op-key cert) the A7b domain tag above is itself the
+version discriminant.
+
 ## A8. Transport, VFS RPC, and file safety (→ ADR-005)
 
 - Rust: `webrtc-rs` (≥ 0.20, sans-I/O core); evaluate `datachannel-rs` if S3 fails. **Throughput is RTT-bound by SCTP
   windows** — window/buffer tuning is a required S3 outcome.
+- **S3 result (2026-08:)** loopback/LAN passes; single-association SCTP fails the 50 ms bar in both Rust stacks
+  (~1–2 MB/s) while TCP on the same path does 60 MB/s; parallel associations reach ~7.7 MB/s at N=8. Decision
+  A10.29: investigate deeper (Chrome dcSCTP peer measurement + cwnd profiling) before revising the A9 bar or
+  reopening the transport alternative; ADR-005 remains Proposed.
 - Channels: one reliable-ordered control channel (VFS RPC) + **one** unordered-reliable data channel (all channels
   share one SCTP association/cwnd; more channels don't add throughput); 64 KiB chunks; backpressure via
   `bufferedAmountLow`; resumable transfers (manifest + offsets + per-chunk hashes); UI shows direct/relayed and speed.
@@ -616,7 +628,7 @@ spindle/
 | NATS | async-nats | nats.ws |
 | WebRTC | webrtc ≥0.20 (datachannel-rs = S3 fallback) | browser RTCPeerConnection |
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
-| Encoding | minicbor (hand-driven canonical encode; no serde-derive ambiguity) | own canonical encoder in @spindle/proto |
+| Encoding | hand-rolled zero-dep canonical codec in spindle-proto (strict non-canonical rejection; minicbor rejected — decoder abstracts the raw bytes) | own canonical encoder in @spindle/proto |
 | Storage | rusqlite (bundled) host-side; sqlx/Postgres helper-side | IndexedDB (caps, resume manifests) |
 | Confinement | cap-std ≥3.4.1 | — (browser sandbox) |
 | OS / shell | keyring, tauri 2 + plugins (tray, autostart, single-instance, updater), qrcode | @tauri-apps/api |
@@ -670,6 +682,7 @@ Docker is explicitly not the primary dev environment.
 | 26 | Host app shape | **DECIDED 2026-08-23:** one Tauri 2 tray app — daemon in-process, admin window on demand, IPC-only admin surface (no localhost port); headless/NAS mode deferred |
 | 27 | Monorepo tooling | **DECIDED 2026-08-23:** cargo workspace + pnpm workspaces with a top-level `justfile` as the single build/test/dev entry point; CI runs the same `just` targets |
 | 28 | Developer environment | **DECIDED 2026-08-23:** hybrid — mise (`mise.toml`) as the native front door on all 3 OSes; single `Dockerfile.toolchain` consumed by devcontainer, Linux CI, and the helper image; devcontainer = Linux slice only; `just bootstrap` wrapper (ADR-010) |
+| 29 | S3 throughput shortfall | **DECIDED 2026-08-23:** investigate deeper first — browser-peer (dcSCTP) measurement + webrtc-rs cwnd profiling before revising the A9 WAN bar or reopening the transport choice; Stages 2–4 proceed; parallel associations (~7.7 MB/s @ N=8) recorded as the current mitigation ceiling |
 
 ## A11. Alternatives considered
 
@@ -863,6 +876,9 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.3 (2026-08-24)** — S3 follow-up recorded (TCP baseline exonerates the environment; parallel-association
+  ceiling; A10.29 investigate-deeper decision). Stage 2: spindle-proto schema-of-record (zero-dep canonical CBOR —
+  A9c manifest amended), device-cert label + version-field clarifications.
 - **v0.9.2 (2026-08-23)** — Developer environment decided (A10.28 → ADR-010): hybrid mise front door + single
   toolchain image (devcontainer / Linux CI / helper image), containers scoped to the Linux slice; Part B stage 13.
 - **v0.9.1 (2026-08-23)** — Post-ADR-writing reconciliation: A10.24 added to the front-matter open list; helper

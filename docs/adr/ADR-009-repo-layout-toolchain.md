@@ -110,7 +110,7 @@ display state, or opaque handles across the Tauri IPC boundary — never a priva
 | NATS | async-nats | nats.ws |
 | WebRTC | webrtc ≥0.20 (datachannel-rs = S3 fallback) | browser RTCPeerConnection |
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
-| Encoding | minicbor (hand-driven canonical encode; no serde-derive ambiguity) | own canonical encoder in @spindle/proto |
+| Encoding | hand-rolled zero-dep canonical codec in spindle-proto (strict non-canonical rejection; minicbor rejected — decoder abstracts the raw bytes) **[amended v0.9.3]** | own canonical encoder in @spindle/proto |
 | Storage | rusqlite (bundled) host-side; sqlx/Postgres helper-side | IndexedDB (caps, resume manifests) |
 | Confinement | cap-std ≥3.4.1 | — (browser sandbox) |
 | OS / shell | keyring, tauri 2 + plugins (tray, autostart, single-instance, updater), qrcode | @tauri-apps/api |

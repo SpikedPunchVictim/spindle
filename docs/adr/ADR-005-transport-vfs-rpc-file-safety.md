@@ -9,6 +9,12 @@ v1 throughput numbers. DESIGN.md's verification rule is explicit: *"S3 before an
 (DESIGN.md Part B, Verification). Do not move this ADR to Accepted before S3 has run and its pass criterion (≥ 50
 MB/s LAN; ≥ 15 MB/s @ 50 ms; knobs documented) has been met and recorded in ../SPIKES.md.
 
+**2026-08-23 update**: TCP through the same netem path does 60 MB/s @ 50 ms with zero drops, exonerating the test
+environment; single-association SCTP still fails the 50 ms bar in both Rust stacks (~1–2 MB/s), and parallel SCTP
+associations scale sub-linearly, plateauing around ~7.7 MB/s at N=8 — short of the ≥ 15 MB/s bar. Per decision
+A10.29, this stays **Proposed** pending deeper investigation (a real browser-peer/dcSCTP throughput measurement plus
+webrtc-rs cwnd profiling) before the A9 bar is revised or the transport choice is reopened.
+
 ## Context
 
 Once a WebRTC DataChannel is established (ADR-004 envelope negotiates the session; ADR-002 carries offer/answer),
