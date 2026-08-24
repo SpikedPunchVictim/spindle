@@ -1,0 +1,15 @@
+# Raw per-cell artifacts and scratch tables written by rtt-run.sh / browser-rtt-run.sh —
+# RESULTS.md is the curated, committed record; these are the underlying evidence the tables above
+# were built from, kept locally for follow-up debugging but not meant to be committed wholesale
+# (they're large, regenerable, and per-machine).
+
+# browser-rtt-run.sh (A10.29 — webrtc-rs vs. real Chrome dcSCTP)
+.browser-rtt-raw/
+.browser-rtt-qdisc.tmp
+.browser-rtt-results.tmp
+
+# rtt-run.sh (webrtc-rs / datachannel-rs / tcp-baseline / parallel-associations matrices)
+.rtt-dc-rows.tmp
+.rtt-tcp-rows.tmp
+.rtt-qdisc-stats.tmp
+.rtt-parallel-rows.tmp

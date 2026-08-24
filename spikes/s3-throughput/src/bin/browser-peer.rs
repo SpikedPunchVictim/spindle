@@ -595,6 +595,13 @@ async fn shutdown_signal() -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Diagnostic-only: installs a `log`-facade logger to stderr, controlled by `RUST_LOG` (e.g.
+    // `RUST_LOG=rtc_sctp=trace`). Without this, `webrtc`/`rtc-sctp`'s internal `log::{trace,debug,
+    // warn}!` calls (cwnd, a_rwnd, SACK send/receive) are silently dropped — no logger was ever
+    // installed. `try_init()` (not `init()`) so a second call in a future harness doesn't panic;
+    // failure (e.g. already initialized) is intentionally ignored.
+    let _ = env_logger::try_init();
+
     let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
     rt.block_on(async {
         tokio::select! {

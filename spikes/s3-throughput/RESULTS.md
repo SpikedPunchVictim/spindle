@@ -7,9 +7,14 @@ documented. See `docs/SPIKES.md` (§S3) for the full method.
 `datachannel-rs` is not the fix** — see "datachannel-rs backend" below. Buffer/window tuning
 does not fix either backend.
 
-**A10.29 (real Chrome dcSCTP peer + cwnd profiling): harness built, no measurements taken yet.**
-See "Browser-peer (dcSCTP) measurement plan" below for the runbook (`src/bin/browser-peer.rs` +
-`browser-peer.html`) — a later session drives Chrome and appends results.
+**A10.29 (real Chrome dcSCTP peer + cwnd profiling): DONE — the full 0/20/50/100 ms matrix, both
+directions, has been measured.** Both directions fail the ≥ 15 MB/s @ 50 ms bar against a real
+Chrome `dcSCTP` peer, for two independently-diagnosed reasons — see "Results — RTT matrix (Linux
+container, headless Chromium 151.0.7922.137, tc netem)" near the bottom of this file for the
+matrix, the `rtc_sctp`-trace-based diagnosis, and the verdict. The runbook immediately below
+("Browser-peer (dcSCTP) measurement plan") is kept for its harness/protocol documentation and its
+0 ms macOS-host results; its macOS `dummynet` 50 ms recipe was superseded by a Linux-container
+approach (`browser-rtt-run.sh`, `tc netem`) — see the dummynet dead-end note in the new section.
 
 - **0 ms (LAN-class, loopback)**: 90–200 MB/s depending on run/config — clears the ≥ 50 MB/s bar
   comfortably on both macOS (in-process) and Linux (container, `spindle-toolchain:local`).
@@ -403,14 +408,20 @@ Run both directions at least once at 0 ms before attempting the 50 ms recipe bel
 harness itself (signaling, data channel open, backpressure) works before adding network shaping as
 a variable.
 
-### With ~50 ms RTT — macOS dummynet recipe (NOT YET RUN — requires `sudo`)
+### With ~50 ms RTT — macOS dummynet recipe (ABANDONED — kernel applies no delay on modern macOS)
 
 macOS has no `tc netem` equivalent (that's why `rtt-run.sh`'s existing 0/20/50/100 ms matrix runs
 inside a Linux container instead — see that script's module doc comment); shaping loopback
 directly on macOS goes through the BSD firewall stack instead: `pfctl` (packet filter, decides
 *which* packets get shaped) handing packets to `dnctl`/`ipfw` **dummynet** pipes (which *apply* the
-delay). This has not been run as part of this task — the exact recipe below is written out for the
-later session that drives Chrome, and is marked untested.
+delay).
+
+**Update: this recipe was tried and does not work on this development host — see the "macOS
+dummynet: non-functional" note in the "Results — RTT matrix" section near the bottom of this file
+for the finding (pipes/anchor configure without error; the kernel applies no delay). The recipe
+below is kept for reference only — do not spend more time on it on this class of macOS host.**
+`browser-rtt-run.sh` (a Linux-container `tc netem` harness, same technique as `rtt-run.sh`)
+replaced this approach entirely for the matrix in that section.
 
 **Caveat before running**: both peers in this harness bind to an ephemeral UDP port
 (`with_udp_addrs(vec!["127.0.0.1:0"])` in `src/bin/browser-peer.rs`/`src/main.rs` — port `0` means
@@ -559,8 +570,10 @@ that `browser-peer.html`'s JS-side 64 KiB send loop + `bufferedAmountLow` schedu
 constraint here rather than SCTP itself, but this is a single run each direction — no repeat runs or
 variance data yet, so treat the ~15% gap as suggestive rather than confirmed.
 
-The decisive cell — 50 ms RTT via the dummynet recipe above — remains **NOT RUN**, blocked on
-`sudo` (passwordless `sudo` was unavailable in the automated session that produced this leg).
+The decisive cells — 20/50/100 ms RTT — were **not** obtained via the dummynet recipe above; that
+approach was later confirmed non-functional on this macOS host (see the "macOS dummynet:
+non-functional" note in "Results — RTT matrix" below) and abandoned in favor of a Linux-container
+`tc netem` harness (`browser-rtt-run.sh`), which produced the full matrix — see that section.
 Stats sampling (`--stats-out`) captured 20 samples on the send run; candidate-pair RTT
 (`candidate_pair_current_rtt_secs`) was ~0.5 ms throughout, confirming the path was in fact
 unshaped as intended.
@@ -569,3 +582,181 @@ One environment note on measurement agreement: the throughput numbers here are R
 measured wall-clock over 256 MiB, and the peer's (Chrome's) own measurement of the same transfer
 agrees within ~2.5% in both directions — the two independently-clocked sides corroborate each
 other, which is some evidence against either side's number being a measurement artifact.
+
+### Results — RTT matrix (Linux container, headless Chromium 151.0.7922.137, tc netem)
+
+The decisive A10.29 leg: the full 0/20/50/100 ms matrix, both directions, against a real Chrome
+`dcSCTP` peer. **Environment**: Debian 12 (bookworm) aarch64 container (`spindle-toolchain:local`),
+headless Chromium 151.0.7922.137 (`--headless=new`), `webrtc` 0.20.3 (the `rtc-sctp` 0.20.3 crate)
+on the Rust side, `tc netem delay <RTT/2>ms limit 10000` applied to `lo` (crossed twice per round
+trip, same RTT/2-on-`lo` convention as `rtt-run.sh`), driven by `browser-rtt-run.sh` (this
+directory) — a fully containerized harness that builds and runs `src/bin/browser-peer.rs` and
+launches headless Chromium against `browser-peer.html` inside the same network namespace, so both
+peers sit behind identical shaping.
+
+| Date | Environment | RTT (ms) | Direction | MB/s | Notes |
+|------|-------------|----------|-----------|------|-------|
+| 2026-08-24 | Linux container (aarch64), Chromium 151.0.7922.137, tc netem on lo, spindle-toolchain:local | 0 | send (webrtc-rs → Chrome, download path) | 9.776 | bytes=128MiB chunk=64KiB; default buffers |
+| 2026-08-24 | Linux container (aarch64), Chromium 151.0.7922.137, tc netem on lo, spindle-toolchain:local | 20 | send (webrtc-rs → Chrome, download path) | 2.076 | bytes=128MiB chunk=64KiB; default buffers |
+| 2026-08-24 | Linux container (aarch64), Chromium 151.0.7922.137, tc netem on lo, spindle-toolchain:local | 50 | send (webrtc-rs → Chrome, download path) | 0.885 | bytes=64MiB chunk=64KiB; default buffers |
+| 2026-08-24 | Linux container (aarch64), Chromium 151.0.7922.137, tc netem on lo, spindle-toolchain:local | 100 | send (webrtc-rs → Chrome, download path) | 0.484 | bytes=64MiB chunk=64KiB; default buffers |
+| 2026-08-24 | Linux container (aarch64), Chromium 151.0.7922.137, tc netem on lo, spindle-toolchain:local | 0 | recv (Chrome dcSCTP → webrtc-rs, upload path) | 90.360 | bytes=128MiB chunk=64KiB; default buffers |
+| 2026-08-24 | Linux container (aarch64), Chromium 151.0.7922.137, tc netem on lo, spindle-toolchain:local | 20 | recv (Chrome dcSCTP → webrtc-rs, upload path) | 0.179 | bytes=128MiB chunk=64KiB; default buffers; **hit the 300 s per-cell timeout** — MB/s computed from bytes actually transferred, not a completed run |
+| 2026-08-24 | Linux container (aarch64), Chromium 151.0.7922.137, tc netem on lo, spindle-toolchain:local | 50 | recv (Chrome dcSCTP → webrtc-rs, upload path) | 0.083 | bytes=64MiB chunk=64KiB; default buffers; **hit the 300 s per-cell timeout** — MB/s computed from bytes actually transferred, not a completed run |
+| 2026-08-24 | Linux container (aarch64), Chromium 151.0.7922.137, tc netem on lo, spindle-toolchain:local | 100 | recv (Chrome dcSCTP → webrtc-rs, upload path) | 0.044 | bytes=64MiB chunk=64KiB; default buffers; **hit the 300 s per-cell timeout** — MB/s computed from bytes actually transferred, not a completed run |
+
+Both directions clear the ≥ 50 MB/s LAN bar at 0 ms (9.776 and 90.360 MB/s — the send/recv
+asymmetry at 0 ms is consistent with the ~15% send/recv gap already noted in the macOS-host 0 ms
+result above). **Both directions miss the ≥ 15 MB/s @ 50 ms bar (docs/DESIGN.md §A13) by a wide
+margin** — send at 0.885 MB/s (~94% short), recv at 0.083 MB/s (~99.4% short) — and both get worse,
+not better, at 100 ms. For scale: plain TCP on this exact same shaped path already measured
+60.685 MB/s at 50 ms (see "Follow-up: environment baseline & parallel associations" above) — 4×
+the bar and ~69× this section's send number — so the shaped environment itself is nowhere near the
+bottleneck.
+
+#### Why the shaped `recv` cells crawl
+
+The `recv`-direction numbers (Chrome `dcSCTP` is the sender, `webrtc-rs` the receiver) show the
+same signature seen earlier in this file's host-level `webrtc-rs`↔`webrtc-rs` matrix: throughput
+that looks like **a fixed number of bytes moved once per RTT**, not a ramping congestion window.
+Working out bytes-per-RTT from the measured rates (`MB/s × RTT`) lands at **~4.3–4.6 KB per
+round trip at every shaped RTT** — RFC 4960's default *initial* congestion window,
+`min(4·MTU, max(2·MTU, 4380))`, which for this harness's ~1228 B SCTP MTU evaluates to exactly
+4380 B. The number never grows past that value for the life of a multi-second-to-multi-minute
+transfer with zero loss.
+
+**Harness artifacts ruled out**:
+- **Not a `tc netem` queue-drop artifact.** Re-running the 50 ms `recv` cell with netem's queue
+  raised to `limit 10000` (this section's harness now applies that limit unconditionally, up from
+  the implicit ~1000-packet default) still shows **zero drops** (`tc -s qdisc show dev lo`:
+  `dropped 0` after the cell) and **zero UDP-socket-layer errors**
+  (`nstat -az UdpInErrors UdpRcvbufErrors`: both `0` before and after) — consistent with the
+  existing "Follow-up: environment baseline" section's zero-drop finding for the `webrtc-rs`↔
+  `webrtc-rs` matrix.
+- **Not JS-side pacing.** `browser-peer.html`'s send loop is event-driven (`bufferedamountlow`,
+  64 KiB chunks, 8 MiB high-water mark) — it keeps up to 8 MiB queued ahead of the SCTP layer, far
+  more than the ~4.4 KB/RTT actually being drained, so the page is never the limiting stage.
+- **Wire overhead is normal.** `transport_bytes_received` vs. `dc_bytes_received` in the stats
+  samples runs ~6% over application bytes throughout — SCTP/DTLS header cost, not a sign of
+  retransmission or excess control traffic.
+
+**The `rtc_sctp`-trace evidence exonerates the `webrtc-rs` receiver.** Added `env_logger` (gated
+behind `RUST_LOG`, e.g. `RUST_LOG=rtc_sctp=trace`) to `browser-peer.rs` so `rtc-sctp` 0.20.3's own
+`log`-facade tracing (module target `rtc_sctp::association` — this is webrtc-rs 0.20's
+restructured SCTP crate, *not* a crate literally named `webrtc-sctp`) reaches stderr. An 8 MiB
+`recv` cell at 50 ms RTT recorded:
+
+- **6,087 DATA fragments** received, average payload 1,139.5 B (SCTP-MTU-bound fragmentation of
+  the page's 64 KiB chunks).
+- **1,494 outgoing SACKs** — 4.07 DATA fragments acked per SACK on average; **1,378/1,494 (92%)**
+  advance the cumulative TSN by exactly 4, matching the ~4.3–4.6 KB/RTT invariant almost exactly.
+- Steady-state cadence **~17–19 SACKs/sec**, i.e. roughly **one SACK per RTT** (≈55–59 ms apart,
+  tracking the configured 50 ms RTT, not a slow fixed delayed-ack timer) — corroborated
+  independently by `candidate_pair_current_rtt_secs` ≈ 0.0513–0.0529 s in the same run's stats.
+- Advertised receive window (`a_rwnd`) healthy and stable throughout, **~4.13–4.19 MB** (default
+  `max_receive_buffer_size` minus whatever is briefly queued in the reassembly queue) — never
+  remotely close to being the limiting factor for a ~4.4 KB cwnd.
+- **`dupTsn=[]` in all 1,494 SACKs** — zero loss, zero gap-ack blocks, zero reneging — and **no
+  `T3-rtx timed out` events** anywhere in the log (only harmless startup timer-start noise).
+
+Representative lines (`.browser-rtt-raw/rtt50_recv-rust-trace.log`):
+
+```
+[2026-08-24T18:06:38Z DEBUG rtc_sctp::association] [Server] DATA: tsn=1252081413 peer_last_tsn=1252081412 immediateSack=false len=1160, unordered=true
+[2026-08-24T18:06:38Z DEBUG rtc_sctp::association] [Server] sending SACK: SACK cumTsnAck=1252081423 arwnd=4182592 dupTsn=[]
+[2026-08-24T18:06:38Z DEBUG rtc_sctp::association] [Server] sending SACK: SACK cumTsnAck=1252081427 arwnd=4177952 dupTsn=[]
+```
+
+**Conclusion**: every RTT, Chrome sends almost exactly one initial-cwnd's worth of data (~4 SCTP
+fragments) and gets back one clean cumulative SACK acking all of it, with no loss and no
+artificial ACK delay — the textbook RFC 4960 slow-start growth precondition (bytes acked == cwnd,
+no loss) is satisfied on essentially every RTT for the whole transfer, yet the effective congestion
+window never grows. With the receiver's behavior clean by every wire-visible measure, the freeze
+is inside Chrome `dcSCTP`'s own cwnd-growth ("was cwnd fully utilized when this data was sent")
+gating, evaluated against this clean 1-SACK-per-RTT cadence — not a defect reachable or fixable
+from the `webrtc-rs` receiver side. Confirming the exact internal cause would need either a
+debug/non-release Chromium build (dcSCTP's own verbose logging, `RTC_DLOG`, is compiled out of
+release Chromium — confirmed empirically: `--enable-logging=stderr --vmodule=*dcsctp*=9` produced
+zero matching lines even though other Chromium `stderr` logging worked) or a raw packet capture
+correlated against dcSCTP's source — both out of scope for this harness.
+
+#### Why the shaped `send` cells crawl
+
+The `send`-direction numbers (`webrtc-rs` is the sender, Chrome `dcSCTP` the receiver) show the
+same RTT-bound collapse already documented for the host-level `webrtc-rs`↔`webrtc-rs` matrix
+earlier in this file (e.g. 4.3–5.7 MB/s at 20 ms, 1.6–2.3 MB/s at 50 ms in that matrix) — this
+section's 2.076 MB/s at 20 ms and 0.885 MB/s at 50 ms against a *real* Chrome receiver land in the
+same range and follow the same shape, consistent with the congestion-window collapse being
+internal to `webrtc-rs`'s own SCTP sender logic rather than specific to talking to another
+`webrtc-rs` process. As already documented in "Stats field availability" above, `rtc-sctp`'s
+`cwnd`/`ssthresh` fields are `pub(crate)` — not reachable through any public API — so this harness
+cannot read the sender's congestion window directly the way `chrome://webrtc-internals` can for
+Chrome. Unlike the `recv` direction, this session did not run `RUST_LOG=rtc_sctp=trace` against
+the `send` cells; `rtc-sctp`'s `trace!`/`debug!` cwnd-update log lines (`"updated cwnd=... (SS)"`,
+`"cwnd did not grow: ..."`) fire on whichever side is transmitting bulk data, so a send-direction
+trace run would likely surface `webrtc-rs`'s own cwnd trajectory directly from Rust-side logs —
+that is a natural, low-cost follow-up this session did not have time to take.
+
+#### macOS dummynet: non-functional
+
+On this development host (Darwin 25.3, modern macOS), the `dnctl pipe` / `pfctl` anchor recipe
+documented earlier in this file (see the "macOS dummynet recipe" section above) configures without
+any error — the pipes are created and the `spindle-s3-dummynet` pf anchor loads and evaluates, pf
+itself reports enabled — but the kernel applies **no delay at all**: a 25 ms pipe per direction
+(50 ms round trip configured) left measured loopback UDP RTT at ~0.1 ms, indistinguishable from
+unshaped. This is a recorded dead end on this macOS version, not a one-off configuration mistake,
+and it is why the RTT matrix in this section moved entirely into a Linux container
+(`spindle-toolchain:local`, `tc netem`) instead.
+
+#### Verdict (A10.29)
+
+**The `webrtc-rs`↔Chrome pairing fails the ≥ 15 MB/s @ 50 ms bar in both directions, for two
+independent reasons**: sender-side congestion-control collapse internal to `webrtc-rs` (`send`
+direction, consistent with the pre-existing `webrtc-rs`↔`webrtc-rs` matrix), and a receiver-clean,
+Chrome-`dcSCTP`-side cwnd-growth freeze (`recv` direction, positively diagnosed via `rtc_sctp`
+trace evidence above). Zero packet loss on the path in either case (0 netem drops, 0 UDP-socket
+errors), and plain TCP on the identical shaped path already clears the bar 4× over — so the
+bottleneck is squarely the Rust WebRTC stack's SCTP implementation, not this harness's environment
+and not a hard protocol ceiling. This does not decide ADR-005; it narrows the open options:
+
+1. **Upstream `webrtc-rs`/`rtc-sctp` congestion-control work** — file the evidence in this section
+   against the crate, focusing on the sender-side collapse (directly reachable/fixable) and the
+   `recv`-direction interop freeze (would need dcSCTP-side collaboration or a debug Chromium build
+   to pin down further).
+2. **Switch the Rust SCTP stack.** Already tried once as S3's designated fallback —
+   `datachannel-rs`/libdatachannel (`usrsctp`) shows the *same* RTT-bound collapse and is measurably
+   *worse* than `webrtc-rs` at 50/100 ms (see "datachannel-rs backend" above) — so this option's
+   track record in this codebase so far is poor, not a clean escape hatch.
+3. **A Chromium↔Chromium control cell** (two headless Chrome peers, no Rust SCTP stack on either
+   end) — would isolate whether dcSCTP itself is RTT-bound in this environment independent of
+   `webrtc-rs`, or whether the freeze is specific to pairing with `webrtc-rs`. Not run in this
+   session.
+4. **Revise the A9 ≥ 15 MB/s @ 50 ms WAN bar** — if none of the above close the gap in a reasonable
+   timeframe.
+
+#### Reproduction
+
+```
+export PATH="$HOME/.local/share/mise/shims:$PATH"
+cd spikes/s3-throughput
+
+# Default: full 0/20/50/100 ms matrix, both directions (this section's table).
+./browser-rtt-run.sh
+
+# Single-cell diagnostic form (env-var overrides; all optional, default to the full matrix above):
+#   CELLS=recv                 -> only this direction ("send" or "recv")
+#   RTTS="50"                  -> only this RTT list
+#   BYTES_MIB=8                -> fixed transfer size instead of the matrix's per-RTT default
+#   PER_RUN_TIMEOUT_S=90       -> override the per-cell watchdog (default 300 s)
+#   RUST_LOG=rtc_sctp=trace    -> webrtc-rs/rtc-sctp SCTP-layer congestion-control logging on
+#                                  stderr (also copied to .browser-rtt-raw/<cell>-rust-trace.log)
+CELLS=recv RTTS="50" BYTES_MIB=8 PER_RUN_TIMEOUT_S=90 RUST_LOG=rtc_sctp=trace ./browser-rtt-run.sh
+
+# DCSCTP_LOG=1 also exists (adds --enable-logging=stderr --vmodule=*dcsctp*=9 to the Chromium
+# invocation) but is a confirmed dead end — dcSCTP's verbose logs are compiled out of release
+# Chromium; it produces zero matching lines. Kept in the script for completeness, not recommended.
+```
+
+Raw per-cell artifacts (`.jsonl` stats, `.err`/`-rust-trace.log`, `-chrome.log`, qdisc/UDP-error
+snapshots) live under `.browser-rtt-raw/` and `.browser-rtt-qdisc.tmp` — not committed (see
+`.gitignore`), regenerable by the reproduction commands above.

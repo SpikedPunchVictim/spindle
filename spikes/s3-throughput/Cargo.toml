@@ -80,6 +80,15 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Diagnostic-only: `webrtc` 0.20.3's SCTP layer (the `rtc-sctp` crate) logs its congestion-control
+# internals (cwnd, a_rwnd, SACK send/receive, T3-rtx) via the `log` facade — see its
+# `src/association/mod.rs` (module target `rtc_sctp::association`). `env_logger` is the standard,
+# zero-config way to route those `log` records to stderr under `RUST_LOG` (e.g.
+# `RUST_LOG=rtc_sctp=trace`); `browser-peer`'s own diagnostics still go through plain `eprintln!`
+# elsewhere in this file, this only turns on the dependency-crate logging that was previously
+# silently dropped (no global logger was ever installed).
+env_logger = "0.11"
+
 # datachannel-rs (libdatachannel bindings) — S3's designated fallback backend (docs/DESIGN.md
 # §A8), used only by src/bin/dc-throughput.rs; the `webrtc`-backend src/main.rs above is
 # untouched. `vendored-libdatachannel` builds libdatachannel itself from source via cmake (a C++
