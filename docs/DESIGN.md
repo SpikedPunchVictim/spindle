@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.4) + Execution Plan
+# Spindle — System Design Document (draft v0.9.5) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -211,14 +211,20 @@ signer, result).
 
 **Capabilities (host-signed, self-verifying)**
 ```
-cap = { v, host_fp, host_pk, kind: invite|member, subject: root_fp | device_fp, cap_epoch, exp, nonce, sig_host }
+cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp | device_fp, cap_epoch, exp, nonce,
+        sig }
 ```
+`op_cert` is the existing Host op-key cert (`spindle-host-cert-v1`, A7b) embedded as its complete canonical encoding;
+`sig` is the operating key's signature over the capability.
 - **`cap_epoch` vs `grants_version`** (two jobs, two counters): `cap_epoch` bumps only on security events (member/
   device revocation) and invalidates caps; `grants_version` is host-internal (entitlement edits, cache invalidation)
   and **never leaves the host**. Revoking one member does not invalidate other members' caps unless the host chooses
   a full rotation.
-- Self-verifying: `host_fp == hash(host_pk)` and `sig_host` checks under `host_pk` — the callout needs **no registry
-  of hosts or members**.
+- Self-verifying, in three steps: (1) `host_fp == hash(host_root_pk)`; (2) `op_cert` valid under `host_root_pk`
+  (including its own `exp`); (3) `sig` valid under the op key certified by `op_cert` — the callout needs **no
+  registry of hosts or members**. **[amended v0.9.5, A10.30]** The cap now embeds the root→op-key chain instead of
+  being signed directly by the host root, so `host_fp` is always root-derived (§A4/§A5's pinning assumption) even
+  though the day-to-day signer is the operating key — the root stays cold and op-key rotation never re-walls members.
 - `invite`: **bearer** token — single-use enforced by the **host** (nonce burned on redemption; the helper cannot
   enforce single-use), `exp` in **hours** (default 24 h, owner-adjustable), scope = `connect` only, rate-limited per
   nonce at the host, may embed an initial group (A4b). Shared as QR/link; the payload also carries the **registry
@@ -233,9 +239,10 @@ cap = { v, host_fp, host_pk, kind: invite|member, subject: root_fp | device_fp, 
   useless without the device key). **Renewal path (no lockout)**: a cap that is expired or stale-epoch but
   signature-valid still earns **connect-only** NATS permissions (same as an invite); the host verifies the device
   over the E2E channel and re-issues the current cap in the reply. Only *revoked* subjects are refused outright.
-- **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (~200 B each, base64url). nats-server's
-  default `max_control_line` is 4 KiB, so the registry sets it to **32 KiB** (A10.10) and clients present **only the
-  caps for hosts they will use this session** (pinned/open hosts), max **32** per connection (A10.5). S12 measures.
+- **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (~330 B each, chain-carrying, v0.9.5,
+  base64url). nats-server's default `max_control_line` is 4 KiB, so the registry sets it to **32 KiB** (A10.10) and
+  clients present **only the caps for hosts they will use this session** (pinned/open hosts), max **32** per
+  connection (A10.5). S12 measures.
 
 **NATS authentication = Auth Callout for every connection**
 1. Device connects signing the server nonce with its session nkey and presents: device certificate (root-signed),
@@ -368,7 +375,8 @@ Photos because they're in Family") derived directly from the union model.
 - **Helper account bridging [DEFAULT]**: the broker helper holds **two separate NATS connections** — one on the
   system account (callout responder, `$SYS` events, CONNZ, KICK) and one on the application account
   (`helper.*` request/reply, `host.<hfp>.presence` publishing, `registry.*` subscriptions) — rather than one
-  dual-privileged connection; finalized in S1 and recorded in ADR-002's topology table.
+  dual-privileged connection; finalized in S1 and recorded in ADR-002's topology table (confirmed in S1: account
+  isolation prevents a single dual-privileged connection).
 - **Host MUST validate** on every `connect`: reply subject starts with `_INBOX_<from_fp>.`; sender is an active member
   device (cheap check **before** crypto) or holds a valid unused invite; per-`from_fp` token bucket and
   max-concurrent-sessions; `sid` not bound to a different `from_fp`. All rejections are **uniform silent drops**
@@ -435,7 +443,7 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 | Artifact | Tag | Signer | Time rule | Replay rule |
 |----------|-----|--------|-----------|-------------|
 | Envelope | `spindle-env-v1` | device key | `ts` ±2 min (helper server-time offset) | (sid, direction, seq) monotonic |
-| Member/invite cap | `spindle-cap-v1` | host root (via op key) | `exp` (no `nbf`; schema-of-record carries none [amended v0.9.4]) | invite: nonce burn (idempotent replay of result); member: n/a |
+| Member/invite cap | `spindle-cap-v1` | host op key (chained: embedded root-signed HostOpKeyCert) [amended v0.9.5] | `exp` (no `nbf`; schema-of-record carries none [amended v0.9.4]) | invite: nonce burn (idempotent replay of result); member: n/a |
 | Admission token | `spindle-adm-v1` | operator key | `exp` days | nonce burn at helper (CAS, idempotent) |
 | Device certificate | `spindle-dev-cert-v1` | identity root | `exp` 1 y; re-sign on contact | n/a (revocable) |
 | Revocation record | `spindle-rev-v1` | host op key / identity root | none (permanent) | **max-wins, never decreases**; old records cannot roll back |
@@ -454,7 +462,10 @@ never baked into certificates" rule supersedes the older inline notation that li
 version discriminant; (3) the Capability artifact carries no `nbf` field — `exp` is the sole time bound; (4) the
 pre-committed root-rotation record (`sig_old_root(new_root_pk)`, §A4) is not one of the seven cataloged wire
 artifacts — v1 implements it crate-locally in spindle-core with its own domain tag; promoting it to a spindle-proto
-wire type (with golden vectors) is flagged for when rotation records first cross the wire (device↔host sync).
+wire type (with golden vectors) is flagged for when rotation records first cross the wire (device↔host sync); (5)
+**[amended v0.9.5, A10.30]** the Capability now embeds the HostOpKeyCert (complete canonical encoding, a byte-string
+field) and is op-key signed rather than host-root signed; `host_fp` is always root-derived — resolving the S1-
+discovered divergence between op-key-signed caps and the root-derived `host_fp` that §A4/§A5 pin and scope by.
 
 ## A8. Transport, VFS RPC, and file safety (→ ADR-005)
 
@@ -686,6 +697,7 @@ Docker is explicitly not the primary dev environment.
 | 27 | Monorepo tooling | **DECIDED 2026-08-23:** cargo workspace + pnpm workspaces with a top-level `justfile` as the single build/test/dev entry point; CI runs the same `just` targets |
 | 28 | Developer environment | **DECIDED 2026-08-23:** hybrid — mise (`mise.toml`) as the native front door on all 3 OSes; single `Dockerfile.toolchain` consumed by devcontainer, Linux CI, and the helper image; devcontainer = Linux slice only; `just bootstrap` wrapper (ADR-010) |
 | 29 | S3 throughput shortfall | **DECIDED 2026-08-23:** investigate deeper first — browser-peer (dcSCTP) measurement + webrtc-rs cwnd profiling before revising the A9 WAN bar or reopening the transport choice; Stages 2–4 proceed; parallel associations (~7.7 MB/s @ N=8) recorded as the current mitigation ceiling |
+| 30 | Capability signer model | **DECIDED 2026-08-24:** cap embeds host_root_pk + root-signed op-key cert, signed by the op key; host_fp always root-derived (S1 finding; keeps root cold) |
 
 ## A11. Alternatives considered
 
@@ -879,6 +891,10 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.5 (2026-08-24)** — A10.30: capability signer model decided after S1 flagged root-vs-op host_fp divergence —
+  caps carry the chain (host_root_pk + embedded HostOpKeyCert, op-key signature); §A4 layout, §A7b row, cap size
+  updated. S1 spike PASSED 19/19 against live NATS 2.10 (helper two-connection bridging confirmed by account
+  isolation).
 - **v0.9.4 (2026-08-24)** — Stage 3 (spindle-core) clarifications: Capability has no `nbf` (schema-of-record wins;
   A7b row amended); root-rotation record is crate-local in v1, promotion to a proto wire artifact flagged for when
   it first crosses the wire. Stage 3 Rust half + real-signature vectors (vectors/signed/) landed.

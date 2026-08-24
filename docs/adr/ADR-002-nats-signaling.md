@@ -6,6 +6,10 @@ Proposed — revises the original `SPINDLE_ADR.pdf` ADR-002 ("NATS Core over mTL
 and WebRTC Signaling"). Remains **Proposed** until spikes **S1** (callout negative-test suite) and **S12** (CONNECT
 size / callout cost at scale) pass; see `docs/SPIKES.md`.
 
+**2026-08-24**: S1 (callout negative-test suite) **PASSED 19/19** against live NATS 2.10, confirming the helper's
+two-connection account bridging by account isolation (see topology table below). S12 (CONNECT size / callout cost at
+scale) is still pending — Status stays **Proposed** until it passes.
+
 ## Context
 
 The original ADR-002 assumed NATS static `verify_and_map` authorization and registry-held accounts. DESIGN.md v0.5
@@ -169,7 +173,7 @@ derived faithfully from §A3 (components) and §A5 (subject table); rows not dir
 | `registry.admin.>` | APP account (operator, mTLS + operator cert) | APP account, imported by broker helper only | Service (request/reply via `allow_responses`) | Signed admin commands (ADR-007, §A3b) | Pinned by §A5 |
 | `host.<hfp>.>` (`connect`, `sess.<cfp>.<sid>.c2h`/`h2c`, `presence`) | APP account | APP account, scoped per-connection by callout-issued permissions (no wildcard subs) | Pub/sub, request/reply | Signaling subjects (§A5) | Pinned by §A5 |
 | `_INBOX_<dfp>.>` | APP account (private per-device prefix) | APP account; only the owning device subscribes; host publishes into it via `allow_responses` after prefix validation | Reply-only | Private reply inbox (§A5; closes ADR-001 §A12 #2) | Pinned by §A5 |
-| **Broker helper's own connection(s)**: whether the helper holds one dual-privileged connection (SYS + APP) or two separate connections (one per account) bridging `$SYS` events into APP-account publishes (`host.<hfp>.presence`, replies on `helper.*`) | — | — | — | DESIGN.md's diagram shows the helper touching both `$SYS.*` and `registry.*`/`helper.*` subjects but does not specify single- vs. dual-connection wiring | **To be finalized in S1** |
+| **Broker helper's own connection(s)**: two separate connections (one per account) — one on the system account (callout responder, `$SYS` events, CONNZ, KICK) and one on the application account (`helper.*` request/reply, `host.<hfp>.presence` publishing, `registry.*` subscriptions) — bridging `$SYS` events into APP-account publishes, rather than one dual-privileged connection | — | — | — | Confirmed by S1's negative-test suite: account isolation prevents a single dual-privileged connection from holding both SYS and APP grants | **Finalized 2026-08-24 (S1 PASSED 19/19)** |
 | Explicit deny: `$SYS.>` (all other system subjects) | — | Denied for every APP-account connection (device, host) | n/a | Prevents devices/hosts from reading arbitrary system events (A10.15) | Pinned by §A5 permissions list |
 | Explicit deny: `$JS.>` | — | Denied for every APP-account connection | n/a | No JetStream in v1 (§A3, Alternatives Considered) | Pinned by §A3/§A11 |
 | Explicit deny: `_INBOX.>` (broad wildcard) | — | Denied for every APP-account connection; only the caller's own `_INBOX_<dfp>.>` is permitted | n/a | Prevents reading other devices' inboxes (ADR-001 §A12 #2) | Pinned by §A5 |

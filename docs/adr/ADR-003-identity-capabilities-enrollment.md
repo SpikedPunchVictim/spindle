@@ -47,15 +47,23 @@ signaling protocol); and how enrollment, key introduction, revocation, root rota
 ### Capabilities (host-signed, self-verifying)
 
 ```
-cap = { v, host_fp, host_pk, kind: invite|member, subject: root_fp | device_fp, cap_epoch, exp, nonce, sig_host }
+cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp | device_fp, cap_epoch, exp, nonce,
+        sig }
 ```
+
+`op_cert` is the existing Host op-key cert (`spindle-host-cert-v1`) embedded as its complete canonical encoding;
+`sig` is the operating key's signature over the capability.
 
 - **`cap_epoch` vs `grants_version`** (two jobs, two counters): `cap_epoch` bumps only on security events (member/
   device revocation) and invalidates caps; `grants_version` is host-internal (entitlement edits, cache invalidation)
   and **never leaves the host**. Revoking one member does not invalidate other members' caps unless the host chooses
   a full rotation.
-- Self-verifying: `host_fp == hash(host_pk)` and `sig_host` checks under `host_pk` — the callout needs **no registry
-  of hosts or members** (ADR-001 §A12 #11, #12, #13).
+- Self-verifying, in three steps: (1) `host_fp == hash(host_root_pk)`; (2) `op_cert` valid under `host_root_pk`
+  (including its own `exp`); (3) `sig` valid under the op key certified by `op_cert` — the callout needs **no
+  registry of hosts or members** (ADR-001 §A12 #11, #12, #13). **[amended v0.9.5, A10.30]** The cap now embeds the
+  root→op-key chain instead of being signed directly by the host root, so `host_fp` is always root-derived even
+  though the day-to-day signer is the operating key — the root stays cold and op-key rotation never re-walls
+  members.
 - `invite`: **bearer** token — single-use enforced by the **host** (nonce burned on redemption; the helper cannot
   enforce single-use), `exp` in **hours** (default 24 h, owner-adjustable), scope = `connect` only, rate-limited per
   nonce at the host, may embed an initial group (ADR-006). Shared as QR/link; the payload also carries the
@@ -70,10 +78,10 @@ cap = { v, host_fp, host_pk, kind: invite|member, subject: root_fp | device_fp, 
   useless without the device key). **Renewal path (no lockout)**: a cap that is expired or stale-epoch but
   signature-valid still earns **connect-only** NATS permissions (same as an invite); the host verifies the device
   over the E2E channel and re-issues the current cap in the reply. Only *revoked* subjects are refused outright.
-- **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (~200 B each, base64url). nats-server's
-  default `max_control_line` is 4 KiB, so the registry sets it to **32 KiB** (see Open items, A10.10 — full config
-  detail in ADR-002) and clients present **only the caps for hosts they will use this session** (pinned/open hosts),
-  max **32** per connection (see Open items, A10.5). S12 measures.
+- **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (~330 B each, chain-carrying, v0.9.5,
+  base64url). nats-server's default `max_control_line` is 4 KiB, so the registry sets it to **32 KiB** (see Open
+  items, A10.10 — full config detail in ADR-002) and clients present **only the caps for hosts they will use this
+  session** (pinned/open hosts), max **32** per connection (see Open items, A10.5). S12 measures.
 
 ### NATS authentication = Auth Callout for every connection
 
@@ -146,7 +154,7 @@ envelope and admin-command rows, belongs to the signaling and control-plane ADRs
 
 | Artifact | Tag | Signer | Time rule | Replay rule |
 |----------|-----|--------|-----------|-------------|
-| Member/invite cap | `spindle-cap-v1` | host root (via op key) | `exp`; `nbf` = issue ts [amended v0.9.4: the schema-of-record Capability carries no `nbf`; `exp` is the sole time bound] | invite: nonce burn (idempotent replay of result); member: n/a |
+| Member/invite cap | `spindle-cap-v1` | host op key (chained: embedded root-signed HostOpKeyCert) [amended v0.9.5] | `exp`; `nbf` = issue ts [amended v0.9.4: the schema-of-record Capability carries no `nbf`; `exp` is the sole time bound] | invite: nonce burn (idempotent replay of result); member: n/a |
 | Device certificate | `spindle-dev-cert-v1` | identity root | `exp` 1 y; re-sign on contact | n/a (revocable) |
 | Revocation record | `spindle-rev-v1` | host op key / identity root | none (permanent) | **max-wins, never decreases**; old records cannot roll back |
 | Host op-key cert | `spindle-host-cert-v1` | host root | `exp` 90 d | n/a (rotation) |
