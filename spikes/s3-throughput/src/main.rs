@@ -75,6 +75,8 @@
 //! hit those numbers is documented. These numbers also become the v1 UX bar in §A9 ("S3 sets the
 //! v1 numbers"). Results: `spikes/s3-throughput/RESULTS.md`.
 
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -87,7 +89,7 @@ use tokio::time::interval;
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
-    RTCIceGatheringState,
+    RTCIceGatheringState, StatsSelector,
 };
 use webrtc::runtime::{default_runtime, Runtime};
 
@@ -112,6 +114,14 @@ struct Config {
     parallel: usize,
     /// Emit a single machine-readable JSON result line instead of the human-readable report.
     json: bool,
+    /// Stats-sampling interval in milliseconds; 0 (default) disables sampling
+    /// (`--stats-interval-ms`) — see `spawn_stats_sampler` and `RESULTS.md`'s "Browser-peer
+    /// (dcSCTP) measurement plan" section for exactly which fields are sampled.
+    stats_interval_ms: u64,
+    /// JSON-lines output path for stats samples (`--stats-out`); required together with
+    /// `--stats-interval-ms`. Shared across all `--parallel` associations — each sample line is
+    /// tagged with its `assoc` index.
+    stats_out: Option<PathBuf>,
 }
 
 impl Config {
@@ -128,6 +138,8 @@ impl Config {
         let mut threshold = DEFAULT_THRESHOLD;
         let mut parallel = DEFAULT_PARALLEL;
         let mut json = false;
+        let mut stats_interval_ms = 0u64;
+        let mut stats_out: Option<PathBuf> = None;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -148,6 +160,13 @@ impl Config {
                     parallel = next_val(&mut args, "--parallel")?;
                 }
                 "--json" => json = true,
+                "--stats-interval-ms" => {
+                    stats_interval_ms = next_val(&mut args, "--stats-interval-ms")?;
+                }
+                "--stats-out" => {
+                    let raw: String = next_val(&mut args, "--stats-out")?;
+                    stats_out = Some(PathBuf::from(raw));
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -159,6 +178,19 @@ impl Config {
         if parallel == 0 {
             return Err(anyhow!("--parallel must be >= 1"));
         }
+        match (stats_interval_ms > 0, &stats_out) {
+            (true, None) => {
+                return Err(anyhow!(
+                    "--stats-interval-ms requires --stats-out <path> (nothing to write samples to)"
+                ))
+            }
+            (false, Some(_)) => {
+                return Err(anyhow!(
+                    "--stats-out requires --stats-interval-ms <N> (nothing would ever be sampled)"
+                ))
+            }
+            _ => {}
+        }
 
         Ok(Config {
             total_bytes: bytes_mib * 1024 * 1024,
@@ -167,6 +199,8 @@ impl Config {
             threshold,
             parallel,
             json,
+            stats_interval_ms,
+            stats_out,
         })
     }
 }
@@ -199,6 +233,8 @@ fn print_usage() {
         "    --parallel <N>      independent RTCPeerConnection pairs run concurrently (default: 1)"
     );
     println!("    --json              print one machine-readable JSON result line");
+    println!("    --stats-interval-ms <N>  sample sender/receiver stats every N ms (default: 0, disabled)");
+    println!("    --stats-out <path>  JSON-lines file for stats samples (required with the above)");
 }
 
 /// Waits for `RTCIceGatheringState::Complete`, then unblocks a oneshot for the caller. Used for
@@ -294,6 +330,71 @@ async fn wait_gather_complete(rx: oneshot::Receiver<()>) -> Result<()> {
     rx.await.context("ICE gathering never completed")
 }
 
+/// Shared handle for `--stats-interval-ms`/`--stats-out` (A10.29): one file, opened once in
+/// `async_main`, written from every association's sampler task (each sample line tagged with its
+/// `assoc` index) guarded by a plain sync `Mutex` — writes are infrequent (bounded by
+/// `--stats-interval-ms`) and each one is a single short `writeln!`, so a sync lock held across a
+/// blocking file write is not a meaningful contention risk here.
+#[derive(Clone)]
+struct StatsConfig {
+    interval_ms: u64,
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+/// Spawns a task that samples both peer connections' stats every `interval_ms` and appends one
+/// JSON line per sample to `stats.file`, tagged with `assoc`. See `RESULTS.md`'s "Browser-peer
+/// (dcSCTP) measurement plan" section for exactly which fields are populated and why SCTP
+/// cwnd/ssthresh/rwnd are **not** among them: `webrtc` 0.20.3's public `get_stats()` surface (the
+/// W3C `RTCStatsReport` shape) has no SCTP-transport-specific stats type at all — cwnd/ssthresh
+/// live as `pub(crate)` fields deep inside `rtc-sctp`'s internal `Association` struct, never
+/// reachable from any public API this crate exposes. Returns a `JoinHandle` the caller must
+/// `abort()` once the association finishes — this task otherwise loops forever, and unlike the
+/// watchdog/receiver tasks elsewhere in this file (which are fine to leave detached until process
+/// exit, since there's only ever one "run" per process), a `--parallel N` run has other
+/// associations still measuring after this one finishes, so a stats sampler that outlived its own
+/// association would keep appending post-close noise to the shared file.
+fn spawn_stats_sampler(
+    assoc: usize,
+    sender_pc: Arc<dyn PeerConnection>,
+    receiver_pc: Arc<dyn PeerConnection>,
+    stats: StatsConfig,
+    start: Instant,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_millis(stats.interval_ms));
+        loop {
+            ticker.tick().await;
+            let now = Instant::now();
+            let t_ms = now.duration_since(start).as_millis();
+            let sender_report = sender_pc.get_stats(now, StatsSelector::None).await;
+            let receiver_report = receiver_pc.get_stats(now, StatsSelector::None).await;
+
+            let s_dc = sender_report.data_channels().next();
+            let s_pair = sender_report.candidate_pairs().next();
+            let r_dc = receiver_report.data_channels().next();
+            let r_pair = receiver_report.candidate_pairs().next();
+
+            let line = format!(
+                "{{\"assoc\":{assoc},\"t_ms\":{t_ms},\"sender_dc_bytes_sent\":{},\"sender_dc_bytes_received\":{},\"sender_candidate_pair_current_rtt_secs\":{},\"receiver_dc_bytes_sent\":{},\"receiver_dc_bytes_received\":{},\"receiver_candidate_pair_current_rtt_secs\":{}}}",
+                s_dc.map(|d| d.bytes_sent).unwrap_or(0),
+                s_dc.map(|d| d.bytes_received).unwrap_or(0),
+                s_pair
+                    .map(|p| p.current_round_trip_time.to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+                r_dc.map(|d| d.bytes_sent).unwrap_or(0),
+                r_dc.map(|d| d.bytes_received).unwrap_or(0),
+                r_pair
+                    .map(|p| p.current_round_trip_time.to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+            );
+            let mut f = stats.file.lock().expect("stats file mutex poisoned");
+            if let Err(e) = writeln!(f, "{line}") {
+                eprintln!("spike-s3-throughput: warning: failed to write stats sample: {e}");
+            }
+        }
+    })
+}
+
 /// Splits `total` bytes into `n` roughly-equal parts (any remainder goes to the first parts, one
 /// extra byte each) — `--parallel`'s "even split of `--bytes` across N associations."
 fn split_bytes(total: usize, n: usize) -> Vec<usize> {
@@ -321,6 +422,8 @@ async fn run_association(
     chunk_bytes: usize,
     sctp_buf: usize,
     threshold: u32,
+    assoc: usize,
+    stats: Option<StatsConfig>,
 ) -> Result<Duration> {
     // ── Set up sender ("requester") and receiver ("responder") peer connections ──
     let (sender_gather_tx, sender_gather_rx) = oneshot::channel();
@@ -459,6 +562,13 @@ async fn run_association(
     // ── Sender loop: push `target_bytes` in `chunk_bytes`-sized messages ──
     let payload = vec![0xABu8; chunk_bytes];
     let start = Instant::now();
+
+    // Stats sampler (A10.29, `--stats-interval-ms`/`--stats-out`): started once both peer
+    // connections exist and the data channel is open, so `t_ms=0` roughly lines up with the
+    // start of the actual transfer, same reference instant (`start`) used for `elapsed` below.
+    let stats_handle =
+        stats.map(|s| spawn_stats_sampler(assoc, sender_pc.clone(), receiver_pc.clone(), s, start));
+
     let sender_tx = outcome_tx.clone();
     tokio::spawn(async move {
         let mut sent = 0usize;
@@ -485,6 +595,9 @@ async fn run_association(
 
     let elapsed = end.duration_since(start);
 
+    if let Some(handle) = stats_handle {
+        handle.abort();
+    }
     let _ = sender_pc.close().await;
     let _ = receiver_pc.close().await;
 
@@ -506,6 +619,23 @@ async fn async_main() -> Result<ExitCode> {
     let cfg = Config::from_args()?;
     let runtime = default_runtime().ok_or_else(|| anyhow!("no webrtc runtime available"))?;
 
+    // A10.29 stats sampler (`--stats-interval-ms`/`--stats-out`): one file, opened once here,
+    // shared (behind a `Mutex`) across every association's own sampler task — see `StatsConfig`.
+    let stats: Option<StatsConfig> = match (&cfg.stats_out, cfg.stats_interval_ms) {
+        (Some(path), ms) if ms > 0 => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("opening --stats-out {path:?}"))?;
+            Some(StatsConfig {
+                interval_ms: ms,
+                file: Arc::new(Mutex::new(file)),
+            })
+        }
+        _ => None,
+    };
+
     let elapsed = if cfg.parallel == 1 {
         // Single association: identical to this harness's original (pre-`--parallel`) behavior.
         run_association(
@@ -514,6 +644,8 @@ async fn async_main() -> Result<ExitCode> {
             cfg.chunk_bytes,
             cfg.sctp_buf,
             cfg.threshold,
+            0,
+            stats,
         )
         .await?
     } else {
@@ -522,11 +654,21 @@ async fn async_main() -> Result<ExitCode> {
         let parts = split_bytes(cfg.total_bytes, cfg.parallel);
         let start = Instant::now();
         let mut handles = Vec::with_capacity(cfg.parallel);
-        for part in parts {
+        for (assoc, part) in parts.into_iter().enumerate() {
             let runtime = runtime.clone();
             let (chunk_bytes, sctp_buf, threshold) = (cfg.chunk_bytes, cfg.sctp_buf, cfg.threshold);
+            let stats = stats.clone();
             handles.push(tokio::spawn(async move {
-                run_association(runtime, part, chunk_bytes, sctp_buf, threshold).await
+                run_association(
+                    runtime,
+                    part,
+                    chunk_bytes,
+                    sctp_buf,
+                    threshold,
+                    assoc,
+                    stats,
+                )
+                .await
             }));
         }
         for handle in handles {

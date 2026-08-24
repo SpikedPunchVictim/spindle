@@ -41,12 +41,44 @@ required-features = ["datachannel-backend"]
 name = "tcp-baseline"
 path = "src/bin/tcp-baseline.rs"
 
+# `browser-peer` (src/bin/browser-peer.rs): A10.29 — measure DataChannel throughput against a
+# REAL Chrome peer (dcSCTP), not another `webrtc-rs`/`datachannel-rs` process. Runs a WebSocket
+# signaling server (`tokio-tungstenite`) that `browser-peer.html` (opened directly via `file://`,
+# no HTTP server) connects to; the Rust side is always the SDP offerer/data-channel creator, same
+# `webrtc` 0.20.3 backend and CLI knobs (`--sctp-buf`/`--chunk`/`--bytes`/`--threshold`) as
+# `src/main.rs`. See RESULTS.md's "Browser-peer (dcSCTP) measurement plan" section for exactly how
+# to run it and what it measures — this is a harness only; A10.29's Chrome-driven measurements
+# have not been taken yet (a later session drives Chrome).
+[[bin]]
+name = "browser-peer"
+path = "src/bin/browser-peer.rs"
+
 [dependencies]
 webrtc = { workspace = true }
 tokio = { workspace = true } # workspace already declares features = ["full"]
 anyhow = { workspace = true }
 bytes = "1"
 async-trait = "0.1"
+
+# WebSocket signaling for `browser-peer` (A10.29) — the lightest crates that give an async
+# WebSocket accept/read/write loop on top of the existing `tokio` runtime. Deliberately NOT
+# axum/hyper (a full HTTP server stack) per the task's dependency budget — `browser-peer.html` is
+# opened via `file://` with no HTTP server involved at all, so all this binary needs is the raw
+# WebSocket upgrade + frame handling `tokio-tungstenite` provides. `futures-util` is only needed
+# for its `StreamExt`/`SinkExt` (`.next()`/`.send()`) on the split WebSocket stream.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+# JSON signaling messages (`browser-peer`) and JSON-lines stats samples (`browser-peer` +
+# `src/main.rs`, `--stats-out`) — both already resolve transitively in this workspace's dependency
+# tree (`webrtc`'s own stats types derive `serde::{Serialize,Deserialize}`; `serde_json` is
+# already in `Cargo.lock` via another transitive dependency), so declaring them directly here adds
+# no new crates to the build, just a direct (rather than incidental) dependency. `serde` is the
+# only realistic way to correctly encode/decode SDP text (embedded `\r\n`, potential quotes) as
+# JSON string values without hand-rolling an escaper — see `src/bin/browser-peer.rs`'s module doc
+# comment.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # datachannel-rs (libdatachannel bindings) — S3's designated fallback backend (docs/DESIGN.md
 # §A8), used only by src/bin/dc-throughput.rs; the `webrtc`-backend src/main.rs above is

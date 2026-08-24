@@ -7,6 +7,10 @@ documented. See `docs/SPIKES.md` (§S3) for the full method.
 `datachannel-rs` is not the fix** — see "datachannel-rs backend" below. Buffer/window tuning
 does not fix either backend.
 
+**A10.29 (real Chrome dcSCTP peer + cwnd profiling): harness built, no measurements taken yet.**
+See "Browser-peer (dcSCTP) measurement plan" below for the runbook (`src/bin/browser-peer.rs` +
+`browser-peer.html`) — a later session drives Chrome and appends results.
+
 - **0 ms (LAN-class, loopback)**: 90–200 MB/s depending on run/config — clears the ≥ 50 MB/s bar
   comfortably on both macOS (in-process) and Linux (container, `spindle-toolchain:local`).
 - **20/50/100 ms RTT** (Linux container, `tc netem` on `lo`, via `rtt-run.sh`): throughput
@@ -342,3 +346,187 @@ leans on "just parallelize the associations" should budget for further work (fin
 plateau's bottleneck actually is — host-side CPU/thread/socket contention is the leading
 suspect — before assuming higher N keeps scaling) rather than treating this result as closing the
 question.
+
+## Browser-peer (dcSCTP) measurement plan (A10.29)
+
+Decision A10.29 (`docs/DESIGN.md` §A8): before revising the ≥ 15 MB/s @ 50 ms bar or reopening the
+transport question, measure DataChannel throughput against a **real Chrome peer** (`dcSCTP`, a
+third, independent SCTP implementation alongside `rtc-sctp` and `usrsctp`) instead of only
+`webrtc-rs`/`datachannel-rs` talking to themselves, and get visibility into SCTP congestion-window
+behavior during a run. This section is a **runbook — no measurements have been taken yet**. A
+later session drives Chrome and records results here (append a results table under this section
+the same way the tables above do, rather than replacing this runbook text).
+
+### What's here
+
+- `src/bin/browser-peer.rs` — Rust half: a signaling WebSocket server (`tokio-tungstenite`) plus
+  the same `webrtc` 0.20.3 harness conventions as `src/main.rs` (one unordered-reliable data
+  channel, `--sctp-buf`/`--chunk`/`--bytes`/`--threshold`, `--json` summary). Always the SDP
+  offerer/data-channel creator; `--mode send|recv` controls which side pushes payload bytes once
+  the channel is open. Full flag reference: `browser-peer --help`.
+- `browser-peer.html` — Chrome half: a plain-JS page (no build step) opened directly via `file://`,
+  connects out to the signaling WebSocket, does the offer/answer/ICE dance, and implements both
+  transfer roles (receive-and-count, or send in fixed 64 KiB chunks with `bufferedAmountLow`
+  backpressure). Shows live progress and posts its own measured result back over the WebSocket so
+  the Rust side can print one merged `--json` summary.
+- See `src/bin/browser-peer.rs`'s module doc comment for the full signaling protocol and exactly
+  which side's number is authoritative for each `--mode`.
+
+### How to run — LAN-class (loopback, no added RTT)
+
+```
+export PATH="$HOME/.local/share/mise/shims:$PATH"
+cd spikes/s3-throughput
+
+# Direction 1: send — Rust pushes bytes to Chrome (download path, the primary A9 metric)
+cargo run --release --bin browser-peer -- --mode send --bytes 128
+
+# Direction 2: recv — Chrome pushes bytes to Rust (upload path)
+cargo run --release --bin browser-peer -- --mode recv --bytes 128 --json
+```
+
+Then open `browser-peer.html` (this directory) directly in Chrome — e.g. `open -a "Google Chrome"
+browser-peer.html` on macOS, or drag the file into a tab. The page auto-connects to
+`ws://127.0.0.1:9333/` on load (change the port field + click Connect if `--port` was overridden)
+and drives the rest of the session automatically: SDP offer/answer, data channel open, the
+transfer itself, live progress on the page, and a final result posted back to the terminal running
+`browser-peer`, which prints one merged summary (human-readable by default, or `--json`).
+
+With stats sampling (either direction):
+
+```
+cargo run --release --bin browser-peer -- --mode send --bytes 128 \
+  --stats-interval-ms 200 --stats-out /tmp/browser-peer-stats.jsonl
+```
+
+Run both directions at least once at 0 ms before attempting the 50 ms recipe below — confirms the
+harness itself (signaling, data channel open, backpressure) works before adding network shaping as
+a variable.
+
+### With ~50 ms RTT — macOS dummynet recipe (NOT YET RUN — requires `sudo`)
+
+macOS has no `tc netem` equivalent (that's why `rtt-run.sh`'s existing 0/20/50/100 ms matrix runs
+inside a Linux container instead — see that script's module doc comment); shaping loopback
+directly on macOS goes through the BSD firewall stack instead: `pfctl` (packet filter, decides
+*which* packets get shaped) handing packets to `dnctl`/`ipfw` **dummynet** pipes (which *apply* the
+delay). This has not been run as part of this task — the exact recipe below is written out for the
+later session that drives Chrome, and is marked untested.
+
+**Caveat before running**: both peers in this harness bind to an ephemeral UDP port
+(`with_udp_addrs(vec!["127.0.0.1:0"])` in `src/bin/browser-peer.rs`/`src/main.rs` — port `0` means
+"OS picks one"), so the exact port isn't known ahead of time. The rule below scopes by loopback
+interface + protocol instead of by port, which is fine in an otherwise-quiet dev environment (nothing
+else should be pushing UDP over `lo0` during a timed run) but will shape *all* loopback UDP
+traffic system-wide while the pipe is active, not just this harness's traffic — worth being aware
+of if anything else on the machine is sensitive to loopback latency during the test window.
+
+```
+# 1. One dummynet pipe per direction, 25 ms delay each way = 50 ms RTT round trip.
+#    (Two separate pipes, not one pipe referenced twice, so each direction's queue is independent.)
+sudo dnctl pipe 1 config delay 25ms
+sudo dnctl pipe 2 config delay 25ms
+
+# 2. pf rule set (a scoped anchor, not /etc/pf.conf directly) steering loopback UDP through the
+#    pipes — one file, loaded into a named anchor so it can be removed cleanly later.
+cat <<'EOF' | sudo pfctl -a spindle-s3-dummynet -f -
+dummynet in  quick on lo0 proto udp from any to any pipe 1
+dummynet out quick on lo0 proto udp from any to any pipe 2
+EOF
+
+# 3. Enable pf if it isn't already running (idempotent; harmless if already enabled).
+sudo pfctl -e 2>/dev/null || true
+
+# 4. Run the harness exactly as in the 0 ms section above (both --mode send and --mode recv).
+
+# 5. Tear down — remove ONLY this anchor's rules (leaves any other pf configuration alone) and
+#    delete both pipes. Do this even if a run fails/is interrupted, before doing anything else
+#    that depends on normal loopback latency.
+sudo pfctl -a spindle-s3-dummynet -F all
+sudo dnctl -q flush
+```
+
+If `pfctl -e` reports pf was already enabled by something else (e.g. an existing firewall
+configuration), do **not** run `sudo pfctl -d` during teardown — that would disable pf entirely,
+not just remove this anchor. `pfctl -a spindle-s3-dummynet -F all` alone is sufficient and scoped.
+
+### What to capture per cell
+
+- **Rust `--json` summary** (`elapsed_secs`, `mb_per_s`, `peer_bytes`, `peer_elapsed_secs`,
+  `peer_mb_per_s`) — one line per run, both `--mode send` and `--mode recv`, at 0 ms and ~50 ms.
+- **`--stats-out` JSON-lines samples** — `t_ms`, `dc_bytes_sent`/`dc_bytes_received`,
+  `transport_bytes_sent`/`transport_bytes_received`, `transport_packets_sent`/`transport_packets_received`,
+  `candidate_pair_current_rtt_secs`, `candidate_pair_available_outgoing_bitrate`/`available_incoming_bitrate`
+  (see "Stats field availability" below for what these mean and what's missing).
+- **`chrome://webrtc-internals`** (open this tab *before* opening `browser-peer.html`, so it's
+  capturing from the start of the session): find the peer connection's SCTP transport / data
+  channel stats graphs and record dcSCTP's congestion window and RTT over time — this is the only
+  side of this harness that can show real SCTP cwnd (see below). The page has a "Download the
+  PeerConnection updates and stats data" control that exports the full session as a single file;
+  save that alongside the Rust-side `--json`/`--stats-out` output for the same run.
+
+### Stats field availability (Deliverable 3 finding)
+
+`--stats-interval-ms`/`--stats-out` (both `src/main.rs` and `src/bin/browser-peer.rs`) sample
+`PeerConnection::get_stats(Instant::now(), StatsSelector::None)` — `webrtc` 0.20.3's only public
+stats surface, re-exported from the `rtc` crate as the W3C `RTCStatsReport` shape
+(`webrtc::peer_connection::{RTCStatsReport, RTCStatsReportEntry, StatsSelector}`). Confirmed by
+reading the vendored source directly (`~/.cargo/registry/src/.../rtc-0.20.3/src/statistics/`), not
+by trial and error:
+
+**Reachable and sampled by this harness** (`RTCDataChannelStats` via `report.data_channels()`,
+`RTCTransportStats` via `report.transport()`, `RTCIceCandidatePairStats` via
+`report.candidate_pairs()`):
+
+| Field | Source stat | Notes |
+|---|---|---|
+| `dc_bytes_sent` / `dc_bytes_received` | `RTCDataChannelStats.bytes_sent`/`bytes_received` | Application data only, no SCTP/DTLS overhead |
+| `dc_messages_sent` / `dc_messages_received` | `RTCDataChannelStats.messages_sent`/`messages_received` | |
+| `transport_bytes_sent` / `transport_bytes_received` | `RTCTransportStats.bytes_sent`/`bytes_received` | Includes STUN/DTLS/SCTP overhead — always ≥ the `dc_*` counters |
+| `transport_packets_sent` / `transport_packets_received` | `RTCTransportStats.packets_sent`/`packets_received` | |
+| `candidate_pair_current_rtt_secs` | `RTCIceCandidatePairStats.current_round_trip_time` | **ICE/STUN connectivity-check RTT, not SCTP RTT** — a reasonable proxy on an otherwise-idle path (this harness's only traffic) but not literally the same number dcSCTP's own RTT estimator computes |
+| `candidate_pair_available_outgoing_bitrate` / `available_incoming_bitrate` | `RTCIceCandidatePairStats.available_outgoing_bitrate`/`available_incoming_bitrate` | Congestion-feedback-derived bandwidth *estimate*, not a raw counter |
+
+Also present in the report but not currently sampled by this harness (available if a future need
+justifies extending the sampler): `RTCTransportStats` DTLS/ICE role and state, cipher suite, TLS
+version, selected-candidate-pair-change count; `RTCIceCandidatePairStats` request/response counts,
+discarded packets/bytes, nominated flag.
+
+**NOT reachable through any public API — confirmed, not assumed** (this is the Deliverable 3
+"cwnd?" answer): `webrtc` 0.20.3's `RTCStatsReportEntry` enum (the complete list of stats object
+types `get_stats()` can ever return) has **no SCTP-transport-specific variant at all** — no
+`RTCSctpTransportStats`, nothing analogous. Confirmed by reading
+`rtc-0.20.3/src/statistics/report.rs`'s `RTCStatsReportEntry` enum definition directly: its
+variants are `PeerConnection`, `Transport`, `IceCandidatePair`, `LocalCandidate`, `RemoteCandidate`,
+`Certificate`, `Codec`, `DataChannel`, `InboundRtp`, `OutboundRtp`, `RemoteInboundRtp`,
+`RemoteOutboundRtp`, `AudioSource`, `VideoSource`, `AudioPlayout` — an SCTP association's
+congestion-control state isn't among them. Tracing further, in `rtc-sctp-0.20.3/src/association/mod.rs`,
+the association's congestion-control fields are declared:
+
+```rust
+pub(crate) cwnd: u32,
+rwnd: u32,
+pub(crate) ssthresh: u32,
+```
+
+— `cwnd`/`ssthresh` are `pub(crate)` (visible only inside the `rtc-sctp` crate itself, not
+re-exported anywhere), and `rwnd` (the receive window) isn't even `pub(crate)`, just private. The
+`sctp::Association` struct that owns these fields is itself reachable only via a `pub(crate)`
+field (`sctp_associations: HashMap<AssociationHandle, Association>`) buried inside `webrtc`'s own
+internal peer-connection state (`peer_connection/transport/sctp/mod.rs`) — there is no public
+method anywhere in `webrtc`, `rtc`, or `rtc-sctp` that returns cwnd, ssthresh, the receive window,
+or bytes-in-flight for an SCTP association. Per the task brief's constraint (use what IS public;
+do not fork or patch the crate), this harness does not attempt to reach these fields — doing so
+would require either a patched fork of `rtc-sctp` or reflection-style unsafe code reaching into
+`pub(crate)` internals from outside the crate, neither of which this task allows.
+
+**The practical consequence**: on the Rust side, this harness can only *infer* backpressure/window
+behavior indirectly — from throughput over time, `dc_bytes_sent`/`dc_bytes_received` growth
+between samples, and (loosely) `transport_bytes_sent` vs. `dc_bytes_sent` as an overhead ratio —
+never cwnd/rwnd/bytes-in-flight directly. **`chrome://webrtc-internals` is the only side of this
+harness that can show real dcSCTP congestion-window behavior**: Chrome's `dcSCTP` implementation
+exposes its own internal stats (including congestion window and RTT) through that page's data
+channel / SCTP transport graphs, independent of whatever the W3C `getStats()` API surfaces to page
+JavaScript. When a later session runs this harness, `chrome://webrtc-internals`'s cwnd/rtt graphs
+are the authoritative source for "what did the congestion window actually do during this
+transfer" — the Rust-side `--stats-out` samples are the throughput-and-byte-counter half of the
+picture, not a substitute for it.

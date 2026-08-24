@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>browser-peer — A10.29 DataChannel throughput vs. Chrome</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2f3a;
+    --text: #e6e8ec;
+    --muted: #8a8f9c;
+    --accent: #4da3ff;
+    --good: #3ecf6a;
+    --bad: #ff5c5c;
+    --warn: #e0a72e;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  body {
+    margin: 0;
+    padding: 2rem;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.4;
+  }
+  main {
+    max-width: 780px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 1.15rem;
+    margin: 0 0 0.25rem;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin: 0 0 1.5rem;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1rem;
+  }
+  .panel h2 {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin: 0 0 0.75rem;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+  label {
+    font-size: 0.85rem;
+    color: var(--muted);
+    min-width: 5.5rem;
+  }
+  input[type="number"], input[type="text"] {
+    background: #0b0d11;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 0.35rem 0.5rem;
+    font-size: 0.85rem;
+    width: 6rem;
+  }
+  button {
+    background: var(--accent);
+    color: #0b0d11;
+    border: none;
+    border-radius: 4px;
+    padding: 0.45rem 0.9rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .status-line {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+  }
+  .dot {
+    width: 0.6rem;
+    height: 0.6rem;
+    border-radius: 50%;
+    background: var(--muted);
+    flex: none;
+  }
+  .dot.connecting { background: var(--warn); }
+  .dot.connected { background: var(--good); }
+  .dot.error { background: var(--bad); }
+  dl {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.25rem 1rem;
+    margin: 0;
+    font-size: 0.85rem;
+  }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-variant-numeric: tabular-nums; }
+  progress {
+    width: 100%;
+    height: 0.9rem;
+    accent-color: var(--accent);
+  }
+  .big-number {
+    font-size: 1.6rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .big-number .unit {
+    font-size: 0.9rem;
+    font-weight: 400;
+    color: var(--muted);
+  }
+  #log {
+    background: #0b0d11;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.6rem 0.75rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    color: var(--muted);
+    height: 12rem;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  #log .err { color: var(--bad); }
+  #log .ok { color: var(--good); }
+  .hint {
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin-top: 0.5rem;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>browser-peer — A10.29</h1>
+  <p class="subtitle">
+    DataChannel throughput vs. a real Chrome peer (docs/DESIGN.md §A8). Harness page only — the
+    Rust <code>browser-peer</code> binary must already be running. This page never talks to the
+    network beyond <code>127.0.0.1</code>.
+  </p>
+
+  <section class="panel" aria-label="Signaling connection">
+    <h2>Signaling connection</h2>
+    <div class="row">
+      <label for="port">WS port</label>
+      <input type="number" id="port" value="9333" min="1" max="65535">
+      <button id="connect-btn" type="button">Connect</button>
+    </div>
+    <div class="status-line" role="status" aria-live="polite">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">Not connected</span>
+    </div>
+  </section>
+
+  <section class="panel" aria-label="Session configuration" id="config-panel" hidden>
+    <h2>Session (from Rust offer)</h2>
+    <dl>
+      <dt>Mode</dt><dd id="cfg-mode">—</dd>
+      <dt>Target bytes</dt><dd id="cfg-bytes">—</dd>
+      <dt>My role</dt><dd id="cfg-role">—</dd>
+    </dl>
+  </section>
+
+  <section class="panel" aria-label="Transfer progress" id="progress-panel" hidden>
+    <h2>Transfer</h2>
+    <progress id="progress-bar" value="0" max="1"></progress>
+    <div class="row" style="margin-top: 0.75rem;">
+      <div class="big-number" id="live-rate">0.0 <span class="unit">MB/s</span></div>
+    </div>
+    <dl>
+      <dt>Transferred</dt><dd id="live-bytes">0 / 0 MB</dd>
+      <dt>Elapsed</dt><dd id="live-elapsed">0.0 s</dd>
+    </dl>
+  </section>
+
+  <section class="panel" aria-label="Result" id="result-panel" hidden>
+    <h2>Result (this page's side)</h2>
+    <div class="big-number" id="result-rate">— <span class="unit">MB/s</span></div>
+    <dl>
+      <dt>Bytes</dt><dd id="result-bytes">—</dd>
+      <dt>Elapsed</dt><dd id="result-elapsed">—</dd>
+    </dl>
+    <p class="hint">
+      Sent back to the Rust binary over the signaling WebSocket as this page's <code>result</code>
+      message; see <code>RESULTS.md</code>'s "Browser-peer (dcSCTP) measurement plan" for how the
+      Rust side merges this into its own <code>--json</code> summary, and
+      <code>chrome://webrtc-internals</code> for this session's real dcSCTP cwnd/rtt.
+    </p>
+  </section>
+
+  <section class="panel" aria-label="Diagnostic log">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// ── Constants ──────────────────────────────────────────────────────────────
+// Deliverable-specified fixed chunk size for this page's own send loop
+// (--mode recv, browser → Rust). Independent of the Rust harness's --chunk flag, which only
+// governs the Rust side's own send loop when --mode send.
+const SEND_CHUNK_BYTES = 64 * 1024;
+// bufferedAmount backpressure watermarks for this page's send loop. Not tied to the Rust
+// harness's --sctp-buf/--threshold — those bound the Rust-side SCTP association buffers; this is
+// just how much unsent data this page is willing to queue locally before pausing.
+const BUFFERED_HIGH_WATER = 8 * 1024 * 1024;
+const BUFFERED_LOW_WATER = 1 * 1024 * 1024;
+// How often the live progress UI refreshes. Deliberately NOT on every dc.onmessage/send — a 64
+// KiB chunking scheme at LAN-class speed can fire thousands of events per second, and touching
+// the DOM that often would make the page itself the bottleneck under measurement.
+const PROGRESS_UPDATE_MS = 200;
+
+// ── DOM handles ──────────────────────────────────────────────────────────────
+const el = {
+  port: document.getElementById("port"),
+  connectBtn: document.getElementById("connect-btn"),
+  statusDot: document.getElementById("status-dot"),
+  statusText: document.getElementById("status-text"),
+  configPanel: document.getElementById("config-panel"),
+  cfgMode: document.getElementById("cfg-mode"),
+  cfgBytes: document.getElementById("cfg-bytes"),
+  cfgRole: document.getElementById("cfg-role"),
+  progressPanel: document.getElementById("progress-panel"),
+  progressBar: document.getElementById("progress-bar"),
+  liveRate: document.getElementById("live-rate"),
+  liveBytes: document.getElementById("live-bytes"),
+  liveElapsed: document.getElementById("live-elapsed"),
+  resultPanel: document.getElementById("result-panel"),
+  resultRate: document.getElementById("result-rate"),
+  resultBytes: document.getElementById("result-bytes"),
+  resultElapsed: document.getElementById("result-elapsed"),
+  log: document.getElementById("log"),
+};
+
+function log(msg, kind) {
+  const line = document.createElement("div");
+  if (kind) line.className = kind;
+  const t = new Date().toISOString().split("T")[1].replace("Z", "");
+  line.textContent = `[${t}] ${msg}`;
+  el.log.appendChild(line);
+  el.log.scrollTop = el.log.scrollHeight;
+}
+
+function setStatus(text, cls) {
+  el.statusText.textContent = text;
+  el.statusDot.className = "dot" + (cls ? " " + cls : "");
+}
+
+function fmtMB(bytes) {
+  return (bytes / 1_000_000).toFixed(1);
+}
+
+// ── State ──────────────────────────────────────────────────────────────────
+let ws = null;
+let pc = null;
+let dc = null;
+let targetBytes = 0;
+let mode = null; // "send" | "recv" — Rust's mode; this page's role is the opposite direction
+let transferredBytes = 0;
+let t0 = null;
+let progressTimer = null;
+let finished = false;
+
+// ── Signaling ──────────────────────────────────────────────────────────────
+function connect() {
+  const port = Number(el.port.value) || 9333;
+  const url = `ws://127.0.0.1:${port}/`;
+  setStatus(`Connecting to ${url}…`, "connecting");
+  log(`connecting to ${url}`);
+  el.connectBtn.disabled = true;
+
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    setStatus(`Connected — waiting for offer`, "connected");
+    log("signaling WebSocket open", "ok");
+  };
+
+  ws.onclose = () => {
+    setStatus("Signaling connection closed", "error");
+    log("signaling WebSocket closed");
+    el.connectBtn.disabled = false;
+  };
+
+  ws.onerror = () => {
+    setStatus("Signaling connection error", "error");
+    log("signaling WebSocket error — is the browser-peer binary running on this port?", "err");
+    el.connectBtn.disabled = false;
+  };
+
+  ws.onmessage = (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch (e) {
+      log(`ignoring non-JSON signaling message: ${e}`, "err");
+      return;
+    }
+    handleSignal(msg).catch((e) => {
+      log(`error handling ${msg.type} message: ${e}`, "err");
+      reportError(String(e));
+    });
+  };
+}
+
+function sendSignal(obj) {
+  ws.send(JSON.stringify(obj));
+}
+
+function reportError(message) {
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      sendSignal({ type: "error", message });
+    }
+  } catch (e) {
+    // Best-effort — nothing more useful to do if even this fails.
+  }
+}
+
+async function handleSignal(msg) {
+  switch (msg.type) {
+    case "offer":
+      await handleOffer(msg);
+      break;
+    case "ice":
+      // Non-trickle signaling on both ends (see src/bin/browser-peer.rs's module doc comment) —
+      // this page waits for its own ICE gathering to complete before sending the answer, so a
+      // separate trickle candidate is not expected. Accepted here as a no-op rather than an
+      // error, for robustness.
+      log("ignoring unexpected \"ice\" signaling message (non-trickle signaling)");
+      break;
+    default:
+      log(`ignoring unknown signaling message type: ${msg.type}`);
+  }
+}
+
+async function handleOffer(msg) {
+  mode = msg.mode;
+  targetBytes = msg.bytes;
+  log(`offer received: mode=${mode} bytes=${targetBytes} chunk=${msg.chunk}`);
+
+  el.configPanel.hidden = false;
+  el.cfgMode.textContent = mode;
+  el.cfgBytes.textContent = `${fmtMB(targetBytes)} MB`;
+  el.cfgRole.textContent =
+    mode === "send" ? "receive-and-count (download)" : "send (upload)";
+
+  pc = new RTCPeerConnection({}); // host-only ICE — no STUN/TURN needed on loopback
+
+  pc.oniceconnectionstatechange = () => log(`ICE connection state: ${pc.iceConnectionState}`);
+  pc.onconnectionstatechange = () => log(`peer connection state: ${pc.connectionState}`);
+
+  pc.ondatachannel = (event) => {
+    dc = event.channel;
+    dc.binaryType = "arraybuffer";
+    setupDataChannel();
+  };
+
+  await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  await waitForIceGatheringComplete(pc);
+
+  log("sending answer", "ok");
+  sendSignal({ type: "answer", sdp: pc.localDescription.sdp });
+}
+
+function waitForIceGatheringComplete(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const check = () => {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", check);
+        resolve();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+
+// ── Data channel: setup + both roles ────────────────────────────────────────
+function setupDataChannel() {
+  log(`data channel "${dc.label}" received, waiting for open`);
+
+  dc.onopen = () => {
+    log("data channel open", "ok");
+    t0 = performance.now();
+    transferredBytes = 0;
+    el.progressPanel.hidden = false;
+    progressTimer = setInterval(updateProgressUI, PROGRESS_UPDATE_MS);
+
+    if (mode === "recv") {
+      // Rust is receiving; this page sends.
+      dc.bufferedAmountLowThreshold = BUFFERED_LOW_WATER;
+      dc.onbufferedamountlow = pumpSend;
+      pumpSend();
+    }
+    // mode === "send": Rust is sending; this page just waits on dc.onmessage below.
+  };
+
+  dc.onmessage = (event) => {
+    if (mode !== "send" || finished) return;
+    const len = event.data.byteLength;
+    transferredBytes += len;
+    if (transferredBytes >= targetBytes) {
+      finishTransfer();
+    }
+  };
+
+  dc.onclose = () => {
+    log("data channel closed");
+  };
+
+  dc.onerror = (event) => {
+    const message = (event && event.error && event.error.message) || "data channel error";
+    log(`data channel error: ${message}`, "err");
+    reportError(message);
+  };
+}
+
+function pumpSend() {
+  if (finished) return;
+  const payload = new ArrayBuffer(SEND_CHUNK_BYTES);
+  while (transferredBytes < targetBytes && dc.bufferedAmount < BUFFERED_HIGH_WATER) {
+    const remaining = targetBytes - transferredBytes;
+    const chunk = remaining < SEND_CHUNK_BYTES ? new ArrayBuffer(remaining) : payload;
+    try {
+      dc.send(chunk);
+    } catch (e) {
+      log(`send() failed: ${e}`, "err");
+      reportError(`send() failed: ${e}`);
+      return;
+    }
+    transferredBytes += chunk.byteLength;
+  }
+  if (transferredBytes >= targetBytes) {
+    finishTransfer();
+  }
+  // else: waiting for the next "bufferedamountlow" event to resume.
+}
+
+function updateProgressUI() {
+  const elapsedSecs = (performance.now() - t0) / 1000;
+  const rate = elapsedSecs > 0 ? (transferredBytes / 1_000_000) / elapsedSecs : 0;
+  el.progressBar.value = targetBytes > 0 ? transferredBytes / targetBytes : 0;
+  el.liveRate.innerHTML = `${rate.toFixed(1)} <span class="unit">MB/s</span>`;
+  el.liveBytes.textContent = `${fmtMB(transferredBytes)} / ${fmtMB(targetBytes)} MB`;
+  el.liveElapsed.textContent = `${elapsedSecs.toFixed(1)} s`;
+}
+
+function finishTransfer() {
+  if (finished) return;
+  finished = true;
+  if (progressTimer) {
+    clearInterval(progressTimer);
+    progressTimer = null;
+  }
+  updateProgressUI();
+
+  const elapsedSecs = (performance.now() - t0) / 1000;
+  const mbPerS = elapsedSecs > 0 ? (transferredBytes / 1_000_000) / elapsedSecs : 0;
+
+  el.resultPanel.hidden = false;
+  el.resultRate.innerHTML = `${mbPerS.toFixed(3)} <span class="unit">MB/s</span>`;
+  el.resultBytes.textContent = `${transferredBytes} bytes (${fmtMB(transferredBytes)} MB)`;
+  el.resultElapsed.textContent = `${elapsedSecs.toFixed(3)} s`;
+
+  log(
+    `transfer complete: ${transferredBytes} bytes in ${elapsedSecs.toFixed(3)} s ` +
+      `(${mbPerS.toFixed(3)} MB/s) — sending result`,
+    "ok"
+  );
+
+  sendSignal({
+    type: "result",
+    bytes: transferredBytes,
+    elapsed_secs: elapsedSecs,
+    mb_per_s: mbPerS,
+  });
+}
+
+el.connectBtn.addEventListener("click", connect);
+
+// Auto-connect on load using the default port field value — the common case is "start the Rust
+// binary, then open this page", so requiring a manual click every time would just be friction.
+// The Connect button stays available for a different port or a manual retry.
+connect();
+</script>
+</body>
+</html>
