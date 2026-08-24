@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Spindle">
-  <!-- Spindle project icon: a drop spindle (shaft + wound thread + whorl) with a
-       thread splitting into two peer nodes, evoking peer-to-peer file sharing. -->
+  <!-- Spindle project icon: a spindle shaft through a solid wound-thread cocoon,
+       with a loose thread escaping toward the upper right. -->
 
   <defs>
     <!-- Badge background: deep indigo (top) to violet (bottom) -->
@@ -13,31 +13,27 @@
   <!-- Rounded-square badge -->
   <rect x="0" y="0" width="256" height="256" rx="56" ry="56" fill="url(#bgGrad)"/>
 
-  <!-- Spindle shaft: rounded top, tapering to a point that meets the whorl -->
-  <path d="M122,90
-           C122,86 124.7,83 128,83
-           C131.3,83 134,86 134,90
-           L133,178
-           C133,178 130.5,190 128,193
-           C125.5,190 123,178 123,178
-           Z"
-        fill="#ffffff" fill-opacity="0.92"/>
+  <!-- Shaft above the cocoon -->
+  <line x1="128" y1="40" x2="128" y2="80" stroke="#ffffff" stroke-opacity="0.9" stroke-width="7" stroke-linecap="round"/>
 
-  <!-- Whorl disc near the bottom of the shaft -->
-  <ellipse cx="128" cy="194" rx="26" ry="9" fill="#ffffff" fill-opacity="1"/>
+  <!-- Cocoon: solid wound-thread bundle -->
+  <path d="M128,78 C150,88 164,108 164,130 C164,152 150,172 128,182 C106,172 92,152 92,130 C92,108 106,88 128,78 Z"
+        fill="#ffffff" fill-opacity="0.95"/>
 
-  <!-- Thread wound around the shaft's middle: gentle wrap arcs -->
-  <path d="M118,108 Q128,113 138,108" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="3.5" stroke-linecap="round"/>
-  <path d="M117,124 Q128,130 139,124" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="3.5" stroke-linecap="round"/>
-  <path d="M117,140 Q128,146 139,140" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="3.5" stroke-linecap="round"/>
-  <path d="M118,156 Q128,161 138,156" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="3.5" stroke-linecap="round"/>
+  <!-- Wrap lines on the cocoon -->
+  <path d="M99,100 Q128,110 157,100" fill="none" stroke="#312e81" stroke-opacity="0.5" stroke-width="5" stroke-linecap="round"/>
+  <path d="M94,118 Q128,128 162,118" fill="none" stroke="#312e81" stroke-opacity="0.5" stroke-width="5" stroke-linecap="round"/>
+  <path d="M94,136 Q128,146 162,136" fill="none" stroke="#312e81" stroke-opacity="0.5" stroke-width="5" stroke-linecap="round"/>
+  <path d="M97,154 Q128,163 159,154" fill="none" stroke="#312e81" stroke-opacity="0.5" stroke-width="5" stroke-linecap="round"/>
 
-  <!-- Thread rising from the shaft top, splitting into two peer connections -->
-  <path d="M128,83 L128,60" fill="none" stroke="#ffffff" stroke-opacity="1" stroke-width="8" stroke-linecap="round"/>
-  <path d="M128,60 C110,54 92,50 76,50" fill="none" stroke="#ffffff" stroke-opacity="1" stroke-width="8" stroke-linecap="round"/>
-  <path d="M128,60 C146,54 164,50 180,50" fill="none" stroke="#ffffff" stroke-opacity="1" stroke-width="8" stroke-linecap="round"/>
+  <!-- Shaft below the cocoon, tapering to a point -->
+  <path d="M125,182 L131,182 C131,182 129.5,194 128,200 C126.5,194 125,182 125,182 Z"
+        fill="#ffffff" fill-opacity="0.9"/>
 
-  <!-- Peer nodes -->
-  <circle cx="76" cy="50" r="11" fill="#ffffff" fill-opacity="1"/>
-  <circle cx="180" cy="50" r="11" fill="#ffffff" fill-opacity="1"/>
+  <!-- Whorl -->
+  <ellipse cx="128" cy="202" rx="20" ry="6.5" fill="#ffffff" fill-opacity="1"/>
+
+  <!-- Loose thread escaping the cocoon toward the upper right -->
+  <path d="M131,80 C142,64 162,58 180,60 C198,62 208,50 210,38"
+        fill="none" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
 </svg>
