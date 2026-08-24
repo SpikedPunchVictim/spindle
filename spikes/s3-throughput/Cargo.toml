@@ -17,9 +17,22 @@ path = "src/main.rs"
 # docs/DESIGN.md §A8 ("evaluate `datachannel-rs` if S3 fails") and invoked per RESULTS.md after
 # the `webrtc`-backend binary above missed the 50 ms RTT bar. Same measurement protocol, callback
 # (not async) API — see that file's module doc comment.
+#
+# Gated behind the `datachannel-backend` feature (see [dependencies] below): the `datachannel`
+# crate's `vendored-libdatachannel` feature fails to LINK on macOS out of the box (`ld: library
+# 'ssl' not found` against Homebrew's keg-only openssl@3), which broke `cargo build`/`cargo test
+# --workspace` for everyone on this crate, not just people exercising the fallback backend.
+# `required-features` here means a plain `cargo build -p spike-s3-throughput` (no `--bin`) skips
+# this binary entirely — no cfg changes needed in dc-throughput.rs itself. To build/run it on
+# macOS:
+#   RUSTFLAGS="-L$(brew --prefix openssl@3)/lib" \
+#     cargo build -p spike-s3-throughput --release --features datachannel-backend --bin dc-throughput
+# (Linux, e.g. this crate's rtt-run.sh container, doesn't need the RUSTFLAGS override — libssl-dev
+# puts the library in a standard search path there.)
 [[bin]]
 name = "dc-throughput"
 path = "src/bin/dc-throughput.rs"
+required-features = ["datachannel-backend"]
 
 # `tcp-baseline` (src/bin/tcp-baseline.rs): follow-up environment baseline — is `tc netem`-shaped
 # loopback itself capable of >= 15 MB/s @ 50 ms RTT over plain TCP, independent of either SCTP
@@ -42,4 +55,17 @@ async-trait = "0.1"
 # also vendoring+building OpenSSL from source (the plain `vendored` feature) — this host already
 # has OpenSSL via Homebrew, so the lighter feature is the right pick. See RESULTS.md for the
 # `brew install cmake` build hurdle this pulled in.
-datachannel = { version = "0.16", features = ["vendored-libdatachannel"] }
+#
+# `optional = true`, gated behind the `datachannel-backend` feature (NOT default; see [features]
+# below): unconditionally depending on this made `vendored-libdatachannel`'s C++/cmake build a
+# hard requirement for every `cargo build`/`cargo test --workspace` on this workspace, and on
+# macOS the final link step fails outright (`ld: library 'ssl' not found`, against Homebrew's
+# keg-only openssl@3) unless RUSTFLAGS points at it — see the [[bin]] dc-throughput comment above
+# for the exact command, and RESULTS.md's "datachannel-rs backend" section for the full writeup.
+datachannel = { version = "0.16", features = ["vendored-libdatachannel"], optional = true }
+
+[features]
+# Not default: see the `datachannel` dependency comment above for why. `cargo test --workspace`,
+# `cargo build -p spike-s3-throughput`, and clippy with default features all skip this dependency
+# and the dc-throughput binary entirely unless this feature is explicitly requested.
+datachannel-backend = ["dep:datachannel"]

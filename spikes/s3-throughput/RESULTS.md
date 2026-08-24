@@ -119,6 +119,22 @@ above.
   encoded anywhere in this crate (per the task's touch-only constraint, no `.cargo/config.toml`
   was added) — anyone rebuilding this binary on similar macOS setups will hit the same link error
   and need the same env var.
+
+**Follow-up fix: `datachannel` made an optional dependency.** The above originally meant this
+host's `ld: library 'ssl' not found` link failure applied to *every* build of this crate —
+`cargo build -p spike-s3-throughput`, `cargo test --workspace`, `just build`/`just test` — not
+just to someone deliberately building `dc-throughput`, since `datachannel` was an unconditional
+dependency. Fixed by making `datachannel` `optional = true`, behind a new (non-default)
+`datachannel-backend` feature, with `dc-throughput`'s `[[bin]]` entry carrying
+`required-features = ["datachannel-backend"]` (see this crate's `Cargo.toml`). Default builds/
+tests on macOS no longer touch `datachannel`/`datachannel-sys` at all. **To build `dc-throughput`
+on macOS**, both the feature and the RUSTFLAGS override above are needed together:
+```
+RUSTFLAGS="-L$(brew --prefix openssl@3)/lib" \
+  cargo build -p spike-s3-throughput --release --features datachannel-backend --bin dc-throughput
+```
+`rtt-run.sh` was updated to pass `--features datachannel-backend` when it builds `dc-throughput`
+inside the Linux container (no RUSTFLAGS needed there — see the build hurdle above).
 - **`set_local_description(Answer)` on the receiver side raced libdatachannel's own
   auto-negotiation and failed with `RuntimeError`.** Not a build hurdle but the one functional bug
   hit getting the harness running at all: per libdatachannel's `DOC.md`, setting a remote offer

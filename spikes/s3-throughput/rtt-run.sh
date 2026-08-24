@@ -56,14 +56,16 @@ if [ "${1:-}" = "--in-container" ]; then
   # libdatachannel: cmake drives the C++ build, and datachannel-sys's build script separately runs
   # `bindgen` over libdatachannel's headers, which needs `libclang.so` — not provided by cmake or
   # a plain C++ toolchain. g++, pkg-config and libssl-dev are already present in this image).
-  # Installed here, before ANY `cargo build` of this package, because `cargo build
-  # -p spike-s3-throughput` with no `--bin` builds every binary target in the package (including
-  # `dc-throughput`, which pulls in the `datachannel-sys` build script) even when only chasing the
-  # webrtc binary; each binary's own build below is still `--bin`-scoped so a failure in one
-  # backend doesn't block the other, but these packages have to exist up front regardless. Gated
-  # on `tc` alone (not each package individually) — every container run starts from the same
-  # fresh, throwaway image (`--rm`), so this is really "first time in this container", not a
-  # true incremental cache; checking one representative binary keeps the guard simple.
+  # Installed here, before ANY `cargo build` of this package: the `dc-throughput` binary build
+  # below (line ~134, `--features datachannel-backend --bin dc-throughput`) needs both, and this
+  # is the one place in the script that installs apt packages. `datachannel` is now an optional
+  # dependency behind the `datachannel-backend` feature (not default — see this crate's
+  # Cargo.toml), so the plain `--bin spike-s3-throughput` build just below does NOT pull in
+  # datachannel-sys/cmake/bindgen at all; that build no longer needs these packages, but the
+  # dc-throughput build later in this script still does. Gated on `tc` alone (not each package
+  # individually) — every container run starts from the same fresh, throwaway image (`--rm`), so
+  # this is really "first time in this container", not a true incremental cache; checking one
+  # representative binary keeps the guard simple.
   if ! command -v tc >/dev/null 2>&1; then
     apt-get update -qq
     apt-get install -y -qq iproute2 cmake libclang-dev >/dev/null
@@ -131,7 +133,13 @@ if [ "${1:-}" = "--in-container" ]; then
   # cmake and needs a C++ toolchain + OpenSSL dev headers. g++, pkg-config and libssl-dev are
   # already in this image; cmake was installed above, alongside `tc`. (Reported as a build hurdle
   # in RESULTS.md; the macOS host needed the equivalent `brew install cmake`.)
-  cargo build -p spike-s3-throughput --release --bin dc-throughput
+  #
+  # `datachannel` is an optional dependency behind the `datachannel-backend` feature (not
+  # default — see this crate's Cargo.toml), and the `dc-throughput` binary carries
+  # `required-features = ["datachannel-backend"]`, so it must be requested explicitly here. No
+  # RUSTFLAGS override needed in this container (unlike macOS): libssl-dev already puts libssl on
+  # a standard linker search path.
+  cargo build -p spike-s3-throughput --release --features datachannel-backend --bin dc-throughput
   DC_BIN="$CARGO_TARGET_DIR/release/dc-throughput"
 
   DC_ROWS_FILE="$SPIKE_DIR/.rtt-dc-rows.tmp"
