@@ -1,0 +1,301 @@
+{
+  "description": "Primitive canonical-CBOR encoding cases (RFC 8949 §4.2.1), independent of any Spindle artifact type — for validating a canonical CBOR encoder at the byte level.",
+  "cases": [
+    {
+      "name": "uint_0",
+      "description": "Smallest uint; fits in the initial byte.",
+      "value": {
+        "type": "uint",
+        "value": 0
+      },
+      "canonical_cbor_hex": "00"
+    },
+    {
+      "name": "uint_23",
+      "description": "Largest uint that fits in the initial byte (additional info 0-23).",
+      "value": {
+        "type": "uint",
+        "value": 23
+      },
+      "canonical_cbor_hex": "17"
+    },
+    {
+      "name": "uint_24",
+      "description": "Smallest uint requiring the 1-byte-argument form (additional info 24).",
+      "value": {
+        "type": "uint",
+        "value": 24
+      },
+      "canonical_cbor_hex": "1818"
+    },
+    {
+      "name": "uint_255",
+      "description": "Largest uint fitting the 1-byte-argument form.",
+      "value": {
+        "type": "uint",
+        "value": 255
+      },
+      "canonical_cbor_hex": "18ff"
+    },
+    {
+      "name": "uint_256",
+      "description": "Smallest uint requiring the 2-byte-argument form (additional info 25).",
+      "value": {
+        "type": "uint",
+        "value": 256
+      },
+      "canonical_cbor_hex": "190100"
+    },
+    {
+      "name": "uint_65535",
+      "description": "Largest uint fitting the 2-byte-argument form.",
+      "value": {
+        "type": "uint",
+        "value": 65535
+      },
+      "canonical_cbor_hex": "19ffff"
+    },
+    {
+      "name": "uint_65536",
+      "description": "Smallest uint requiring the 4-byte-argument form (additional info 26).",
+      "value": {
+        "type": "uint",
+        "value": 65536
+      },
+      "canonical_cbor_hex": "1a00010000"
+    },
+    {
+      "name": "uint_4294967295",
+      "description": "Largest uint fitting the 4-byte-argument form.",
+      "value": {
+        "type": "uint",
+        "value": 4294967295
+      },
+      "canonical_cbor_hex": "1affffffff"
+    },
+    {
+      "name": "uint_4294967296",
+      "description": "Smallest uint requiring the 8-byte-argument form (additional info 27).",
+      "value": {
+        "type": "uint",
+        "value": 4294967296
+      },
+      "canonical_cbor_hex": "1b0000000100000000"
+    },
+    {
+      "name": "negint_minus_1",
+      "description": "Smallest-magnitude negative integer: CBOR major type 1, argument 0, logical value -1.",
+      "value": {
+        "type": "negint",
+        "magnitude": 0,
+        "value": -1
+      },
+      "canonical_cbor_hex": "20"
+    },
+    {
+      "name": "negint_minus_100",
+      "description": "A negative integer requiring the 1-byte-argument form (magnitude 99, logical value -100).",
+      "value": {
+        "type": "negint",
+        "magnitude": 99,
+        "value": -100
+      },
+      "canonical_cbor_hex": "3863"
+    },
+    {
+      "name": "byte_string_empty",
+      "description": "Zero-length byte string.",
+      "value": {
+        "type": "bytes",
+        "value": ""
+      },
+      "canonical_cbor_hex": "40"
+    },
+    {
+      "name": "byte_string_short",
+      "description": "A short byte string.",
+      "value": {
+        "type": "bytes",
+        "value": "deadbeef"
+      },
+      "canonical_cbor_hex": "44deadbeef"
+    },
+    {
+      "name": "text_string",
+      "description": "A short UTF-8 text string.",
+      "value": {
+        "type": "text",
+        "value": "spindle"
+      },
+      "canonical_cbor_hex": "677370696e646c65"
+    },
+    {
+      "name": "array_of_uints",
+      "description": "A definite-length array of three small unsigned integers.",
+      "value": {
+        "type": "array",
+        "value": [
+          {
+            "type": "uint",
+            "value": 1
+          },
+          {
+            "type": "uint",
+            "value": 2
+          },
+          {
+            "type": "uint",
+            "value": 3
+          }
+        ]
+      },
+      "canonical_cbor_hex": "83010203"
+    },
+    {
+      "name": "array_empty",
+      "description": "Zero-length array.",
+      "value": {
+        "type": "array",
+        "value": []
+      },
+      "canonical_cbor_hex": "80"
+    },
+    {
+      "name": "map_key_ordering_by_length",
+      "description": "Map with keys \"aa\" and \"z\", constructed in that insertion order. Canonical order sorts by each key's own encoded bytes, so the shorter key \"z\" (1-byte header) is emitted before the longer key \"aa\" (2-byte header) even though \"aa\" < \"z\" lexicographically — this is the encoder reordering entries, not an input error.",
+      "value": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "aa"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "z"
+            },
+            "value": {
+              "type": "uint",
+              "value": 2
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2617a0262616101"
+    },
+    {
+      "name": "map_key_ordering_same_length",
+      "description": "Map with same-length keys \"bb\" and \"ac\", constructed out of canonical order; canonical order falls back to byte-lexicographic comparison of the key content, so \"ac\" sorts before \"bb\".",
+      "value": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "bb"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "ac"
+            },
+            "value": {
+              "type": "uint",
+              "value": 2
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a26261630262626201"
+    },
+    {
+      "name": "map_nested",
+      "description": "A map whose value is itself an array and whose value is itself a map, exercising recursive canonical encoding.",
+      "value": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "items"
+            },
+            "value": {
+              "type": "array",
+              "value": [
+                {
+                  "type": "map",
+                  "value": [
+                    {
+                      "key": {
+                        "type": "text",
+                        "value": "id"
+                      },
+                      "value": {
+                        "type": "uint",
+                        "value": 1
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "map",
+                  "value": [
+                    {
+                      "key": {
+                        "type": "text",
+                        "value": "id"
+                      },
+                      "value": {
+                        "type": "uint",
+                        "value": 2
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a1656974656d7382a162696401a162696402"
+    },
+    {
+      "name": "bool_true",
+      "description": "The simple value `true`.",
+      "value": {
+        "type": "bool",
+        "value": true
+      },
+      "canonical_cbor_hex": "f5"
+    },
+    {
+      "name": "bool_false",
+      "description": "The simple value `false`.",
+      "value": {
+        "type": "bool",
+        "value": false
+      },
+      "canonical_cbor_hex": "f4"
+    },
+    {
+      "name": "null",
+      "description": "The simple value `null`.",
+      "value": {
+        "type": "null"
+      },
+      "canonical_cbor_hex": "f6"
+    }
+  ]
+}

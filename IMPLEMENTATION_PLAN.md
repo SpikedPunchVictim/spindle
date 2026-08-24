@@ -25,7 +25,9 @@ automated negative-test suite (all three OSes in CI).
 **Status**: In Progress
 **Note**: S11 macOS complete (12/12; Linux/Windows runs pending). S3: webrtc-rs fails the 50 ms
 RTT bar (2.2 vs ≥15 MB/s, loopback 125+ MB/s passes); evaluating datachannel-rs per DESIGN §A8
-before ADR-005 can be Accepted.
+before ADR-005 can be Accepted. S3 follow-up complete: env exonerated (TCP 60 MB/s), parallel
+assoc. ceiling ~7.7 MB/s @ N=8; A10.29: deeper investigation (Chrome peer + cwnd profiling) runs
+alongside Stages 2–4.
 
 ## Stage 2: spindle-proto + @spindle/proto + golden vectors
 **Goal**: Define the wire contract once — canonical CBOR (RFC 8949 §4.2.1) types and the A7b
@@ -36,7 +38,9 @@ CI; any divergence fails the build.
 **Tests**: Rust unit tests for each artifact type's canonical encoding; TS vector-comparison
 tests in `@spindle/proto`; the `vectors` CI job wired to actually compare (no longer a
 placeholder).
-**Status**: Not Started
+**Status**: In Progress
+**Note**: spindle-proto + golden vectors done (25 tests, byte-stable regeneration); @spindle/proto
+TS twin in progress.
 
 ## Stage 3: spindle-core identity/caps/envelope + @spindle/crypto
 **Goal**: Implement identity roots, device certs, capabilities, and the A7 end-to-end envelope in

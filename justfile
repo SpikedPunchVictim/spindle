@@ -29,11 +29,14 @@ lint:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Generate golden CBOR/signature test vectors from spindle-proto (A9b, A7b).
-# Not implemented yet — spindle-proto's gen-vectors binary does not exist until Stage 2.
+# Generate golden CBOR/signature test vectors from spindle-proto (A9b, A7b), verify the
+# regeneration is byte-identical to what's committed (no drift between the Rust encoder and
+# vectors/*.json), then cross-check @spindle/proto's TypeScript encoder against those same
+# vectors.
 vectors:
-    @echo "just vectors: not implemented yet — see IMPLEMENTATION_PLAN.md Stage 2 (spindle-proto + golden vectors)"
-    @exit 1
+    cargo run -p spindle-proto --bin gen-vectors
+    git diff --exit-code vectors/
+    pnpm --filter @spindle/proto test
 
 # Run the reference dev stack (helper in `open` admission with a local CA) for local iteration.
 # Not implemented yet — the helper binary and dev-CA scripts do not exist until Stage 4.

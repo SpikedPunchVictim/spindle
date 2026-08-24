@@ -6,7 +6,12 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "build": "echo \"@spindle/proto build: not implemented — see IMPLEMENTATION_PLAN.md\" && exit 0",
-    "test": "echo \"@spindle/proto test: not implemented — see IMPLEMENTATION_PLAN.md\" && exit 0"
+    "build": "tsc -b",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
   }
 }

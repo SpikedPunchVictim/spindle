@@ -2,5 +2,30 @@
 // small, hand-written canonical CBOR encoder/decoder (RFC 8949 §4.2.1) and the A7b
 // signed-artifact domain-separation tags. Third-party CBOR libraries are not used here because
 // they are not guaranteed byte-canonical; this package's output is verified byte-identical to
-// the Rust encoder's via the golden vectors in /vectors, in CI. Not implemented yet — see
-// IMPLEMENTATION_PLAN.md Stage 2.
+// the Rust encoder's via the golden vectors in /vectors, in CI.
+
+export {
+  CborValue,
+  CborError,
+  canonicalEncode,
+  canonicalDecode,
+  cborValueEquals,
+} from "./canonical.js";
+export type { CborErrorKind } from "./canonical.js";
+
+export { hexToBytes, bytesToHex } from "./hex.js";
+
+export * as tags from "./tags.js";
+
+export {
+  ProtoError,
+  CapKind,
+  Envelope,
+  Capability,
+  AdmissionToken,
+  DeviceCertificate,
+  RevocationRecord,
+  AdminCommand,
+  HostOpKeyCert,
+} from "./artifacts.js";
+export type { ProtoErrorKind } from "./artifacts.js";

@@ -79,10 +79,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Placeholder — golden vector cross-check
+      # ADR-010: mise is the single toolchain front door on all 3 OSes, in CI as in
+      # local dev. This provisions Rust (rustup/cargo per mise.toml) and Node + pnpm,
+      # since this job runs both the Rust vector generator and the TS test suite.
+      - name: Install toolchain (mise)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Regenerate golden vectors and verify they're byte-identical to committed vectors/
         run: |
-          echo "vector cross-check lands with spindle-proto gen-vectors"
-          echo "see IMPLEMENTATION_PLAN.md Stage 2 (spindle-proto + @spindle/proto + golden vectors)"
+          cargo run -p spindle-proto --bin gen-vectors
+          git diff --exit-code vectors/
+
+      - name: Cross-check @spindle/proto's TypeScript canonical CBOR encoder against vectors/
+        run: pnpm --filter @spindle/proto test
 
   changes:
     name: detect toolchain changes

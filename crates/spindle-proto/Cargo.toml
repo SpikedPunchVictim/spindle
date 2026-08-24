@@ -3,15 +3,17 @@ name = "spindle-proto"
 version.workspace = true
 edition.workspace = true
 
-# No dependencies yet — this crate is the bottom of the dependency chain
-# (proto ← core ← {net, vfs} ← {host-core, client-core}) and per A9c boundary rule 3
-# it has no crypto dependency.
+# Zero dependencies, by design — not just "no crypto dependency" (A9c boundary rule 3), but no
+# dependencies at all. The canonical CBOR codec (src/canonical.rs) is hand-rolled rather than
+# built on the workspace's `minicbor` pin (see src/canonical.rs and src/lib.rs doc comments for
+# why), and `gen-vectors`'s JSON vector writer (src/bin/gen_vectors.rs) is a small hand-rolled
+# writer for the same reason: this crate sits at the bottom of the dependency chain
+# (proto ← core ← {net, vfs} ← {host-core, client-core}) and stays that way for both its library
+# and its bin target.
 [dependencies]
 
-# `gen-vectors` writes the golden CBOR/signature vectors consumed by both this crate's tests
-# and @spindle/proto's tests in CI (docs/DESIGN.md A9b, A9c; see ADR-009 once written).
-# Left commented out until the wire types and canonical CBOR encoder exist (IMPLEMENTATION_PLAN
-# Stage 2) — an empty/stub bin target isn't worth wiring in ahead of the code it serializes.
-# [[bin]]
-# name = "gen-vectors"
-# path = "src/bin/gen_vectors.rs"
+# `gen-vectors` writes the golden CBOR vectors consumed by both this crate's tests and
+# @spindle/proto's tests in CI (docs/DESIGN.md A9b, A9c; see ADR-009 once written).
+[[bin]]
+name = "gen-vectors"
+path = "src/bin/gen_vectors.rs"
