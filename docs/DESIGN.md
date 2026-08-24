@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.3) + Execution Plan
+# Spindle — System Design Document (draft v0.9.4) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -435,7 +435,7 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 | Artifact | Tag | Signer | Time rule | Replay rule |
 |----------|-----|--------|-----------|-------------|
 | Envelope | `spindle-env-v1` | device key | `ts` ±2 min (helper server-time offset) | (sid, direction, seq) monotonic |
-| Member/invite cap | `spindle-cap-v1` | host root (via op key) | `exp`; `nbf` = issue ts | invite: nonce burn (idempotent replay of result); member: n/a |
+| Member/invite cap | `spindle-cap-v1` | host root (via op key) | `exp` (no `nbf`; schema-of-record carries none [amended v0.9.4]) | invite: nonce burn (idempotent replay of result); member: n/a |
 | Admission token | `spindle-adm-v1` | operator key | `exp` days | nonce burn at helper (CAS, idempotent) |
 | Device certificate | `spindle-dev-cert-v1` | identity root | `exp` 1 y; re-sign on contact | n/a (revocable) |
 | Revocation record | `spindle-rev-v1` | host op key / identity root | none (permanent) | **max-wins, never decreases**; old records cannot roll back |
@@ -451,7 +451,10 @@ clarifications resolved during implementation: (1) **Device certificate carries 
 never baked into certificates" rule supersedes the older inline notation that listed `label`; (2) only **Envelope**,
 **Member/invite cap** (Capability), and **Admin command** carry an explicit `v` field — for the other four artifacts
 (Admission token, Device certificate, Revocation record, Host op-key cert) the A7b domain tag above is itself the
-version discriminant.
+version discriminant; (3) the Capability artifact carries no `nbf` field — `exp` is the sole time bound; (4) the
+pre-committed root-rotation record (`sig_old_root(new_root_pk)`, §A4) is not one of the seven cataloged wire
+artifacts — v1 implements it crate-locally in spindle-core with its own domain tag; promoting it to a spindle-proto
+wire type (with golden vectors) is flagged for when rotation records first cross the wire (device↔host sync).
 
 ## A8. Transport, VFS RPC, and file safety (→ ADR-005)
 
@@ -876,6 +879,9 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.4 (2026-08-24)** — Stage 3 (spindle-core) clarifications: Capability has no `nbf` (schema-of-record wins;
+  A7b row amended); root-rotation record is crate-local in v1, promotion to a proto wire artifact flagged for when
+  it first crosses the wire. Stage 3 Rust half + real-signature vectors (vectors/signed/) landed.
 - **v0.9.3 (2026-08-24)** — S3 follow-up recorded (TCP baseline exonerates the environment; parallel-association
   ceiling; A10.29 investigate-deeper decision). Stage 2: spindle-proto schema-of-record (zero-dep canonical CBOR —
   A9c manifest amended), device-cert label + version-field clarifications.

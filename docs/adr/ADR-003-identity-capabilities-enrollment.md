@@ -146,7 +146,7 @@ envelope and admin-command rows, belongs to the signaling and control-plane ADRs
 
 | Artifact | Tag | Signer | Time rule | Replay rule |
 |----------|-----|--------|-----------|-------------|
-| Member/invite cap | `spindle-cap-v1` | host root (via op key) | `exp`; `nbf` = issue ts | invite: nonce burn (idempotent replay of result); member: n/a |
+| Member/invite cap | `spindle-cap-v1` | host root (via op key) | `exp`; `nbf` = issue ts [amended v0.9.4: the schema-of-record Capability carries no `nbf`; `exp` is the sole time bound] | invite: nonce burn (idempotent replay of result); member: n/a |
 | Device certificate | `spindle-dev-cert-v1` | identity root | `exp` 1 y; re-sign on contact | n/a (revocable) |
 | Revocation record | `spindle-rev-v1` | host op key / identity root | none (permanent) | **max-wins, never decreases**; old records cannot roll back |
 | Host op-key cert | `spindle-host-cert-v1` | host root | `exp` 90 d | n/a (rotation) |
