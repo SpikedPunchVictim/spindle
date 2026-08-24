@@ -1,0 +1,44 @@
+[package]
+name = "spike-s1-callout"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# S1 (docs/SPIKES.md / docs/DESIGN.md §A13): NATS Auth Callout loop, wired to
+# spindle-helper's pure decision core (crates/spindle-helper/src/{authz,permissions,session}.rs),
+# against a real nats-server 2.10+ in a container. See RESULTS.md for the full dependency
+# rationale and the hand-rolled NATS v2 JWT claim structures.
+[dependencies]
+spindle-core = { path = "../../crates/spindle-core" }
+spindle-helper = { path = "../../crates/spindle-helper" }
+spindle-proto = { path = "../../crates/spindle-proto" }
+
+tokio = { workspace = true }
+async-nats = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+
+# nkeys: ed25519/nkey signing for the hand-rolled NATS v2 JWT claims (operator/account/user
+# nkeys, and signing the AuthorizationResponse). There is no mature Rust "nats-jwt" crate that
+# builds the NATS v2 claim JSON itself — this spike hand-rolls that JSON and uses `nkeys` only
+# for the underlying key material + signature primitive. Spike-local only, not added to
+# spindle-helper/spindle-core (task constraint).
+nkeys = "0.4"
+
+# JWT claims are plain JSON objects per the NATS v2 JWT spec (base64url(header) ||
+# base64url(payload) || base64url(sig), Ed25519 over "header.payload"), hand-built as
+# serde_json::Value rather than through any JWT crate (none understand NATS's specific v2 claim
+# shape). base64 is `URL_SAFE_NO_PAD` throughout, matching both the JWT convention and
+# DESIGN.md §A4's "compact CBOR, base64url" capability presentation.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+rand = { workspace = true }
+ed25519-dalek = { workspace = true }
+futures-util = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

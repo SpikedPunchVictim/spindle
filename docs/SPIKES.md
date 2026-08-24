@@ -132,7 +132,19 @@ own success criteria require "S1 (callout negative-test suite) all green." Valid
 (NATS signaling, §A5 subject/permission model) and **ADR-003** (identity, capabilities,
 enrollment). Per §A9b, this suite graduates into permanent CI.
 
-**Status**: Not run.
+**Status**: **PASS — run 2026-08-24.** 19/19 automated checks green against a live
+`nats-server:2.10-alpine` (v2.10.29), covering all five A13 attacks plus positive-permission and
+`$SYS`/`$JS` denial checks. `spindle-helper`'s decision core
+(`crates/spindle-helper/src/{authz,permissions,session}.rs`) wired unmodified to the real Auth
+Callout loop. Also answers ADR-002's "to be finalized in S1" broker-connection-topology row: two
+separate NATS connections (one per account) are required — account boundaries, not permission
+lists, enforce the isolation. One significant pre-existing design ambiguity found and **not**
+patched here (out of this spike's scope): `decide_device_connect` scopes host subjects by the
+host's *operating*-key-derived `host_fp`, while `decide_host_connect` scopes the host's own
+connection permissions by its *root*-key-derived `host_fp` — these diverge whenever a host's root
+and op keys differ, which needs a DESIGN.md/ADR-002 decision before Stage 4 wires this up for
+real. Full detail, JWT claim structures, and a harness bug found/fixed (double subscription
+delivery silently burning the `allow_responses` budget) in `spikes/s1-callout/RESULTS.md`.
 
 ---
 
