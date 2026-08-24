@@ -38,6 +38,7 @@ vectors:
     cargo run -p spindle-core --bin gen-crypto-vectors
     git diff --exit-code vectors/
     pnpm --filter @spindle/proto test
+    pnpm --filter @spindle/crypto test
 
 # Run the reference dev stack (helper in `open` admission with a local CA) for local iteration.
 # Not implemented yet — the helper binary and dev-CA scripts do not exist until Stage 4.

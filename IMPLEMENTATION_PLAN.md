@@ -59,8 +59,15 @@ parity tests; S6 cross-browser interop harness.
 round-trip/bidirectional-session tests (55 unit tests total). `src/bin/gen-crypto-vectors` adds
 real-Ed25519-signature/real-AEAD golden vectors under `vectors/signed/*.json` (deterministic,
 TEST-ONLY seeds, byte-stable across reruns, wired into `just vectors`/CI); `tests/vectors.rs`
-independently reloads and re-verifies them (7 tests). Still pending: `@spindle/crypto`'s
-TypeScript twin and the S6 cross-browser interop harness (tracked separately).
+independently reloads and re-verifies them (7 tests). TypeScript half done: `@spindle/crypto`
+implements the browser-side twin on top of `@spindle/proto`'s canonical CBOR — dual-backend
+Ed25519/X25519 (WebCrypto with `@noble/curves` fallback; HKDF-SHA256/AES-256-GCM/SHA-256 are
+WebCrypto-only per A7), fingerprints (`rootFpOf`/`deviceFpOf`/RFC 4648 base32), `verify*` for all
+six non-`Envelope` A7b signed artifacts, and `seal`/`open` with the same distinct-error-per-
+MUST-check behavior as the Rust `open` — verified byte-for-byte against the real-signature
+golden vectors in `vectors/signed/*.json` plus MUST-check negatives and WebCrypto/`@noble/curves`
+backend-parity tests (88 tests total). Still pending: the S6 cross-browser interop harness
+(tracked separately).
 
 ## Stage 4: Helper + NATS callout + deploy compose
 **Goal**: Implement the broker helper (`spindle-helper`): Auth Callout responder, presence,

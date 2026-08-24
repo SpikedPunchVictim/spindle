@@ -99,6 +99,9 @@ jobs:
       - name: Cross-check @spindle/proto's TypeScript canonical CBOR encoder against vectors/
         run: pnpm --filter @spindle/proto test
 
+      - name: Cross-check @spindle/crypto's TypeScript twin against the real-signature vectors/signed/
+        run: pnpm --filter @spindle/crypto test
+
   changes:
     name: detect toolchain changes
     runs-on: ubuntu-latest
