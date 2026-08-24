@@ -17,6 +17,21 @@
 #     script already appends to — splicing that section in (with its own header + verdict
 #     paragraph) is a one-time follow-up edit, not something worth this script special-casing.
 #
+# Two follow-up sections after both backends above (docs/SPIKES.md §S3 follow-up: "is the
+# collapse partly a tc-netem artifact, and does parallelism scale throughput back up?"), rows
+# also written to scratch files rather than appended straight to RESULTS.md, same reasoning:
+#
+#   - TCP baseline (`tcp-baseline`, src/bin/tcp-baseline.rs, std-only): same 0/20/50/100 ms
+#     matrix, PLUS a raised-netem-queue rerun at 50 ms (`limit 100000` vs netem's default ~1000
+#     packets) for both TCP and the webrtc backend, to test whether the SCTP collapse is partly a
+#     netem queue-drop artifact rather than purely SCTP congestion control. `tc -s qdisc show dev
+#     lo` is captured after every cell in this section (not just TCP's) so drop counts are
+#     directly visible alongside each throughput number. Rows: $SPIKE_DIR/.rtt-tcp-rows.tmp
+#     (TCP + the one bonus raised-limit webrtc row); qdisc dumps: $SPIKE_DIR/.rtt-qdisc-stats.tmp.
+#   - Parallel associations (`spike-s3-throughput --parallel N`, N=1/2/4/8, default netem queue,
+#     50 ms RTT, default 4 MiB buffer config): does splitting the transfer across N independent
+#     SCTP associations (N congestion windows) scale aggregate throughput back up? Rows:
+#     $SPIKE_DIR/.rtt-parallel-rows.tmp.
 # Usage (from anywhere — path-independent):
 #   spikes/s3-throughput/rtt-run.sh
 #
@@ -137,12 +152,109 @@ if [ "${1:-}" = "--in-container" ]; then
       >>"$DC_ROWS_FILE"
   done
 
+  echo "Done. datachannel-rs-backend rows written to $DC_ROWS_FILE (not yet in RESULTS.md):" >&2
+  cat "$DC_ROWS_FILE" >&2
+
+  # ── TCP baseline (environment/artifact check, follow-up) ──
+  #
+  # Answers: is the environment (`tc netem`-shaped loopback in this container) itself capable of
+  # >= 15 MB/s @ 50 ms RTT, or is part of the SCTP collapse actually netem's default ~1000-packet
+  # queue dropping packets under a bandwidth-delay-product burst? std-only binary
+  # (src/bin/tcp-baseline.rs), no new crate dependencies. `tc -s qdisc show dev lo` is captured
+  # after every cell so drop counts are directly visible next to each throughput number.
+  cargo build -p spike-s3-throughput --release --bin tcp-baseline
+  TCP_BIN="$CARGO_TARGET_DIR/release/tcp-baseline"
+
+  TCP_ROWS_FILE="$SPIKE_DIR/.rtt-tcp-rows.tmp"
+  QDISC_FILE="$SPIKE_DIR/.rtt-qdisc-stats.tmp"
+  : >"$TCP_ROWS_FILE"
+  : >"$QDISC_FILE"
+
+  for rtt in $RTTS; do
+    half=$((rtt / 2))
+    tc qdisc del dev lo root >/dev/null 2>&1 || true
+    if [ "$half" -gt 0 ]; then
+      tc qdisc add dev lo root netem delay "${half}ms"
+    fi
+
+    echo "== [tcp] RTT=${rtt}ms (default netem queue limit) ==" >&2
+    out="$("$TCP_BIN" --bytes "$BYTES" --json)"
+    mb_per_s="$(printf '%s' "$out" | sed -n 's/.*"mb_per_s":\([0-9.]*\).*/\1/p')"
+    printf '| %s | %s | %s | default netem queue limit | %s | bytes=%sMiB chunk=64KiB; raw=%s |\n' \
+      "$DATE_STR" "$ENV_LABEL" "$rtt" "$mb_per_s" "$BYTES" "$out" \
+      >>"$TCP_ROWS_FILE"
+
+    {
+      echo "== RTT=${rtt}ms (default netem queue limit), after tcp-baseline =="
+      tc -s qdisc show dev lo
+      echo
+    } >>"$QDISC_FILE"
+  done
+
+  # ── 50 ms cell, netem queue limit raised (`limit 100000` packets, vs netem's default ~1000) ──
+  # Re-run BOTH the TCP baseline and the webrtc backend (default 4 MiB buffer config) at 50 ms
+  # with the larger queue, so the artifact question is answered for the SCTP collapse itself, not
+  # only for TCP — a cheap, high-value addition beyond the literal TCP-only ask.
+  tc qdisc del dev lo root >/dev/null 2>&1 || true
+  tc qdisc add dev lo root netem delay 25ms limit 100000
+
+  echo "== [tcp] RTT=50ms (raised netem queue limit=100000) ==" >&2
+  out="$("$TCP_BIN" --bytes "$BYTES" --json)"
+  mb_per_s="$(printf '%s' "$out" | sed -n 's/.*"mb_per_s":\([0-9.]*\).*/\1/p')"
+  printf '| %s | %s | 50 | netem limit=100000 (raised from default ~1000) | %s | bytes=%sMiB chunk=64KiB; raw=%s |\n' \
+    "$DATE_STR" "$ENV_LABEL" "$mb_per_s" "$BYTES" "$out" \
+    >>"$TCP_ROWS_FILE"
+  {
+    echo "== RTT=50ms (raised netem queue limit=100000), after tcp-baseline =="
+    tc -s qdisc show dev lo
+    echo
+  } >>"$QDISC_FILE"
+
+  echo "== [webrtc, bonus artifact check] RTT=50ms (raised netem queue limit=100000) ==" >&2
+  out="$("$BIN" --bytes "$BYTES" --sctp-buf 4194304 --json)"
+  mb_per_s="$(printf '%s' "$out" | sed -n 's/.*"mb_per_s":\([0-9.]*\).*/\1/p')"
+  printf '| %s | %s | 50 | webrtc backend, send=4194304/recv=4194304/threshold=1048576, netem limit=100000 (raised) | %s | bytes=%sMiB chunk=64KiB; raw=%s |\n' \
+    "$DATE_STR" "$ENV_LABEL" "$mb_per_s" "$BYTES" "$out" \
+    >>"$TCP_ROWS_FILE"
+  {
+    echo "== RTT=50ms (raised netem queue limit=100000), after webrtc backend (default 4 MiB buf) =="
+    tc -s qdisc show dev lo
+    echo
+  } >>"$QDISC_FILE"
+
+  tc qdisc del dev lo root >/dev/null 2>&1 || true
+
+  echo "Done. TCP-baseline (+ bonus webrtc raised-limit) rows written to $TCP_ROWS_FILE, qdisc stats in $QDISC_FILE:" >&2
+  cat "$TCP_ROWS_FILE" >&2
+  echo "---" >&2
+  cat "$QDISC_FILE" >&2
+
+  # ── Parallel associations (follow-up): does N independent SCTP associations scale throughput? ──
+  #
+  # N=1/2/4/8 independent RTCPeerConnection pairs (`spike-s3-throughput --parallel N`), 50 ms RTT,
+  # default netem queue limit, default 4 MiB buffer config, --bytes held fixed across N so this is
+  # an apples-to-apples aggregate-throughput comparison (each connection gets total_bytes/N).
+  PARALLEL_ROWS_FILE="$SPIKE_DIR/.rtt-parallel-rows.tmp"
+  : >"$PARALLEL_ROWS_FILE"
+
+  tc qdisc del dev lo root >/dev/null 2>&1 || true
+  tc qdisc add dev lo root netem delay 25ms
+
+  for n in 1 2 4 8; do
+    echo "== [parallel] RTT=50ms parallel=${n} ==" >&2
+    out="$("$BIN" --bytes "$BYTES" --parallel "$n" --json)"
+    mb_per_s="$(printf '%s' "$out" | sed -n 's/.*"mb_per_s":\([0-9.]*\).*/\1/p')"
+    printf '| %s | %s | 50 | parallel=%s, send=4194304/recv=4194304/threshold=1048576 (default) | %s | bytes=%sMiB chunk=64KiB; raw=%s |\n' \
+      "$DATE_STR" "$ENV_LABEL" "$n" "$mb_per_s" "$BYTES" "$out" \
+      >>"$PARALLEL_ROWS_FILE"
+  done
+
   # Leave `lo` unshaped even though the container is `--rm` and about to disappear — cheap
   # insurance if this script is ever changed to run without `--rm` or on a longer-lived container.
   tc qdisc del dev lo root >/dev/null 2>&1 || true
 
-  echo "Done. datachannel-rs-backend rows written to $DC_ROWS_FILE (not yet in RESULTS.md):" >&2
-  cat "$DC_ROWS_FILE" >&2
+  echo "Done. Parallel-association rows written to $PARALLEL_ROWS_FILE (not yet in RESULTS.md):" >&2
+  cat "$PARALLEL_ROWS_FILE" >&2
   exit 0
 fi
 

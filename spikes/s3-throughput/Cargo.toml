@@ -21,6 +21,13 @@ path = "src/main.rs"
 name = "dc-throughput"
 path = "src/bin/dc-throughput.rs"
 
+# `tcp-baseline` (src/bin/tcp-baseline.rs): follow-up environment baseline — is `tc netem`-shaped
+# loopback itself capable of >= 15 MB/s @ 50 ms RTT over plain TCP, independent of either SCTP
+# backend above? Deliberately std-only (no new dependencies) — see that file's module doc comment.
+[[bin]]
+name = "tcp-baseline"
+path = "src/bin/tcp-baseline.rs"
+
 [dependencies]
 webrtc = { workspace = true }
 tokio = { workspace = true } # workspace already declares features = ["full"]

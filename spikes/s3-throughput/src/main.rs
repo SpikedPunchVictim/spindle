@@ -53,6 +53,22 @@
 //! *externally* (Linux `tc netem`; loopback, so run inside `spikes/s3-throughput/rtt-run.sh`,
 //! which drives the 0/20/50/100 ms matrix in a Linux container and appends rows to `RESULTS.md`).
 //!
+//! ## `--parallel <N>` — independent SCTP associations (follow-up)
+//!
+//! Per A8 ("more channels don't add throughput — all channels share one SCTP association/cwnd"),
+//! the single-association harness above intentionally opens only one data channel. `--parallel`
+//! is a *separate* follow-up question: not more channels on one association, but **N independent
+//! `RTCPeerConnection` pairs**, each its own SCTP association (and so its own congestion window),
+//! each with one data channel, `--bytes` split evenly across them and all N transferring
+//! concurrently. `N=1` (the default) reuses the exact single-association code path above
+//! unchanged, so existing single-connection results/methodology are unaffected. For `N>1`, each
+//! association's full lifecycle (SDP exchange, channel open, transfer, teardown) runs inside one
+//! `tokio::spawn`ed task via `run_association`; the reported number is **aggregate** MB/s = total
+//! bytes (across all N) / wall-clock time from just before spawning all N tasks to just after the
+//! last one finishes — deliberately inclusive of each association's own setup, since with N
+//! associations racing concurrently that setup overlaps rather than serializing, and "how long did
+//! moving all the bytes actually take" is the real question, not a hand-picked sub-interval.
+//!
 //! ## Pass criteria (verbatim, `docs/DESIGN.md` §A13)
 //!
 //! ≥ 50 MB/s on a LAN (0 ms) path; ≥ 15 MB/s at 50 ms RTT; the buffer/knob configuration needed to
@@ -90,6 +106,10 @@ struct Config {
     sctp_buf: usize,
     /// `bufferedAmountLowThreshold`, in bytes (`--threshold`).
     threshold: u32,
+    /// Number of independent `RTCPeerConnection` pairs (SCTP associations) to run concurrently,
+    /// each carrying an even split of `total_bytes` (`--parallel`, default 1). See the module doc
+    /// comment's "`--parallel <N>`" section.
+    parallel: usize,
     /// Emit a single machine-readable JSON result line instead of the human-readable report.
     json: bool,
 }
@@ -100,11 +120,13 @@ impl Config {
         const DEFAULT_CHUNK_KIB: usize = 64;
         const DEFAULT_SCTP_BUF: usize = 4 * 1024 * 1024;
         const DEFAULT_THRESHOLD: u32 = 1024 * 1024;
+        const DEFAULT_PARALLEL: usize = 1;
 
         let mut bytes_mib = DEFAULT_BYTES_MIB;
         let mut chunk_kib = DEFAULT_CHUNK_KIB;
         let mut sctp_buf = DEFAULT_SCTP_BUF;
         let mut threshold = DEFAULT_THRESHOLD;
+        let mut parallel = DEFAULT_PARALLEL;
         let mut json = false;
 
         let mut args = std::env::args().skip(1);
@@ -122,6 +144,9 @@ impl Config {
                 "--threshold" => {
                     threshold = next_val(&mut args, "--threshold")?;
                 }
+                "--parallel" => {
+                    parallel = next_val(&mut args, "--parallel")?;
+                }
                 "--json" => json = true,
                 "-h" | "--help" => {
                     print_usage();
@@ -131,11 +156,16 @@ impl Config {
             }
         }
 
+        if parallel == 0 {
+            return Err(anyhow!("--parallel must be >= 1"));
+        }
+
         Ok(Config {
             total_bytes: bytes_mib * 1024 * 1024,
             chunk_bytes: chunk_kib * 1024,
             sctp_buf,
             threshold,
+            parallel,
             json,
         })
     }
@@ -165,6 +195,9 @@ fn print_usage() {
         "    --sctp-buf <bytes>  SCTP receive-buffer size AND send back-pressure limit (default: 4194304)"
     );
     println!("    --threshold <bytes> bufferedAmountLowThreshold (default: 1048576)");
+    println!(
+        "    --parallel <N>      independent RTCPeerConnection pairs run concurrently (default: 1)"
+    );
     println!("    --json              print one machine-readable JSON result line");
 }
 
@@ -261,26 +294,39 @@ async fn wait_gather_complete(rx: oneshot::Receiver<()>) -> Result<()> {
     rx.await.context("ICE gathering never completed")
 }
 
-fn main() -> ExitCode {
-    let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
-    match rt.block_on(async_main()) {
-        Ok(code) => code,
-        Err(err) => {
-            eprintln!("spike-s3-throughput: error: {err:#}");
-            ExitCode::FAILURE
-        }
-    }
+/// Splits `total` bytes into `n` roughly-equal parts (any remainder goes to the first parts, one
+/// extra byte each) — `--parallel`'s "even split of `--bytes` across N associations."
+fn split_bytes(total: usize, n: usize) -> Vec<usize> {
+    let base = total / n;
+    let remainder = total % n;
+    (0..n)
+        .map(|i| if i < remainder { base + 1 } else { base })
+        .collect()
 }
 
-async fn async_main() -> Result<ExitCode> {
-    let cfg = Config::from_args()?;
-    let runtime = default_runtime().ok_or_else(|| anyhow!("no webrtc runtime available"))?;
-
+/// Runs one full, independent association: builds a sender/receiver `RTCPeerConnection` pair
+/// (its own SCTP association, hence its own congestion window — see the module doc comment's
+/// "`--parallel <N>`" section), opens one data channel, transfers `target_bytes` from sender to
+/// receiver, waits for the receiver to confirm completion, and tears both connections down.
+///
+/// Returns the "pure transfer" elapsed time — measured from just before the sender starts
+/// enqueuing chunks to the instant the receiver reaches `target_bytes` — the same measurement
+/// window the original (pre-`--parallel`) single-association code always used. `async_main`'s
+/// `--parallel 1` path uses this value directly, so single-association output/methodology is
+/// unaffected by this refactor; the `--parallel N>1` path ignores it in favor of an outer
+/// wall-clock spanning all N concurrent associations (see the module doc comment).
+async fn run_association(
+    runtime: Arc<dyn Runtime>,
+    target_bytes: usize,
+    chunk_bytes: usize,
+    sctp_buf: usize,
+    threshold: u32,
+) -> Result<Duration> {
     // ── Set up sender ("requester") and receiver ("responder") peer connections ──
     let (sender_gather_tx, sender_gather_rx) = oneshot::channel();
     let sender_pc = build_peer_connection(
         runtime.clone(),
-        cfg.sctp_buf,
+        sctp_buf,
         Arc::new(GatherHandler {
             gather_tx: Mutex::new(Some(sender_gather_tx)),
         }),
@@ -299,7 +345,7 @@ async fn async_main() -> Result<ExitCode> {
         )
         .await
         .context("creating data channel")?;
-    dc.set_buffered_amount_low_threshold(cfg.threshold)
+    dc.set_buffered_amount_low_threshold(threshold)
         .await
         .context("setting bufferedAmountLowThreshold")?;
 
@@ -319,11 +365,11 @@ async fn async_main() -> Result<ExitCode> {
     let (receiver_gather_tx, receiver_gather_rx) = oneshot::channel();
     let receiver_pc = build_peer_connection(
         runtime.clone(),
-        cfg.sctp_buf,
+        sctp_buf,
         Arc::new(ReceiverHandler {
             runtime: runtime.clone(),
             gather_tx: Mutex::new(Some(receiver_gather_tx)),
-            target: cfg.total_bytes,
+            target: target_bytes,
             received: received.clone(),
             done_tx: Mutex::new(Some(done_tx)),
         }),
@@ -370,8 +416,8 @@ async fn async_main() -> Result<ExitCode> {
     // `done_rx`/the watchdog for "first to finish" (an earlier version of this harness did
     // exactly that and misreported every run as a stall). Only two things end the run: the
     // receiver reaching `target` (success) or a genuine failure (a `send()` error, or the
-    // watchdog's no-progress timeout) — both funnelled into one `outcome` channel so `main` just
-    // awaits the first real outcome instead of racing "sender loop exited" against it.
+    // watchdog's no-progress timeout) — both funnelled into one `outcome` channel so the caller
+    // just awaits the first real outcome instead of racing "sender loop exited" against it.
     let (outcome_tx, mut outcome_rx) = tokio::sync::mpsc::channel::<Result<Instant>>(1);
 
     // Bridge the receiver's oneshot completion into the shared outcome channel.
@@ -402,7 +448,7 @@ async fn async_main() -> Result<ExitCode> {
                     .send(Err(anyhow!(
                         "transfer stalled: no progress for {:?} ({now_seen} / {} bytes received)",
                         WATCHDOG_TIMEOUT,
-                        cfg.total_bytes,
+                        target_bytes,
                     )))
                     .await;
                 return;
@@ -410,16 +456,14 @@ async fn async_main() -> Result<ExitCode> {
         }
     });
 
-    // ── Sender loop: push `total_bytes` in `chunk_bytes`-sized messages ──
-    let payload = vec![0xABu8; cfg.chunk_bytes];
-    let total_bytes = cfg.total_bytes;
-    let chunk_bytes = cfg.chunk_bytes;
+    // ── Sender loop: push `target_bytes` in `chunk_bytes`-sized messages ──
+    let payload = vec![0xABu8; chunk_bytes];
     let start = Instant::now();
     let sender_tx = outcome_tx.clone();
     tokio::spawn(async move {
         let mut sent = 0usize;
-        while sent < total_bytes {
-            let this_chunk = chunk_bytes.min(total_bytes - sent);
+        while sent < target_bytes {
+            let this_chunk = chunk_bytes.min(target_bytes - sent);
             let buf = BytesMut::from(&payload[..this_chunk]);
             if let Err(e) = dc.send(buf).await.context("send() failed") {
                 let _ = sender_tx.send(Err(e)).await;
@@ -440,28 +484,81 @@ async fn async_main() -> Result<ExitCode> {
         .ok_or_else(|| anyhow!("all worker tasks exited without producing an outcome"))??;
 
     let elapsed = end.duration_since(start);
+
+    let _ = sender_pc.close().await;
+    let _ = receiver_pc.close().await;
+
+    Ok(elapsed)
+}
+
+fn main() -> ExitCode {
+    let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
+    match rt.block_on(async_main()) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("spike-s3-throughput: error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn async_main() -> Result<ExitCode> {
+    let cfg = Config::from_args()?;
+    let runtime = default_runtime().ok_or_else(|| anyhow!("no webrtc runtime available"))?;
+
+    let elapsed = if cfg.parallel == 1 {
+        // Single association: identical to this harness's original (pre-`--parallel`) behavior.
+        run_association(
+            runtime,
+            cfg.total_bytes,
+            cfg.chunk_bytes,
+            cfg.sctp_buf,
+            cfg.threshold,
+        )
+        .await?
+    } else {
+        // N independent associations, each an even split of `total_bytes`, running concurrently.
+        // Aggregate MB/s = total bytes / this outer wall-clock — see the module doc comment.
+        let parts = split_bytes(cfg.total_bytes, cfg.parallel);
+        let start = Instant::now();
+        let mut handles = Vec::with_capacity(cfg.parallel);
+        for part in parts {
+            let runtime = runtime.clone();
+            let (chunk_bytes, sctp_buf, threshold) = (cfg.chunk_bytes, cfg.sctp_buf, cfg.threshold);
+            handles.push(tokio::spawn(async move {
+                run_association(runtime, part, chunk_bytes, sctp_buf, threshold).await
+            }));
+        }
+        for handle in handles {
+            handle.await.context("association task panicked")??;
+        }
+        start.elapsed()
+    };
+
     let mb = cfg.total_bytes as f64 / 1_000_000.0;
     let mbps = mb / elapsed.as_secs_f64();
 
     if cfg.json {
         println!(
-            "{{\"total_bytes\":{},\"chunk_bytes\":{},\"sctp_buf\":{},\"threshold\":{},\"elapsed_secs\":{:.6},\"mb_per_s\":{:.3}}}",
+            "{{\"total_bytes\":{},\"chunk_bytes\":{},\"sctp_buf\":{},\"threshold\":{},\"parallel\":{},\"elapsed_secs\":{:.6},\"mb_per_s\":{:.3}}}",
             cfg.total_bytes,
             cfg.chunk_bytes,
             cfg.sctp_buf,
             cfg.threshold,
+            cfg.parallel,
             elapsed.as_secs_f64(),
             mbps,
         );
     } else {
         println!("spike-s3-throughput: DataChannel throughput spike (docs/DESIGN.md §A13, S3)");
         println!(
-            "config: bytes={} MiB ({} B), chunk={} KiB, sctp_buf={} B, threshold={} B",
+            "config: bytes={} MiB ({} B), chunk={} KiB, sctp_buf={} B, threshold={} B, parallel={}",
             cfg.total_bytes / (1024 * 1024),
             cfg.total_bytes,
             cfg.chunk_bytes / 1024,
             cfg.sctp_buf,
             cfg.threshold,
+            cfg.parallel,
         );
         println!(
             "result: {:.3} MB/s ({:.3} s for {:.1} MB, decimal)",
@@ -470,9 +567,6 @@ async fn async_main() -> Result<ExitCode> {
             mb
         );
     }
-
-    let _ = sender_pc.close().await;
-    let _ = receiver_pc.close().await;
 
     Ok(ExitCode::SUCCESS)
 }
