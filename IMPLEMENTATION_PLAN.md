@@ -79,7 +79,10 @@ re-auth in a minute, no failed auths) met; S16 (control-plane admit/evict/mode-s
 tests) all fail closed.
 **Tests**: S1/S8/S12/S16 automated suites graduated into CI; `just dev` brings up a working local
 stack.
-**Status**: Not Started
+**Status**: In Progress
+**Note**: slice 1 — pure callout-verification core (authz decisions, §A5 permission sets, session
+records) done with S1-at-logic-level negative suite; NATS wiring, Postgres store, compose stack
+pending.
 
 ## Stage 5: spindle-net WebRTC signaling E2E
 **Goal**: Implement NATS-mediated WebRTC signaling (offer/answer/trickle ICE) and presence in

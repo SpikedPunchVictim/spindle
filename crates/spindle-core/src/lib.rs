@@ -43,3 +43,9 @@ pub use identity::{
     device_fp_of, generate_next_root, root_fp_of, sign_root_rotation, verify_root_rotation,
     DeviceKey, IdentityError, NextRoot, RootKey, ALG_ID_V1,
 };
+
+/// Re-exported so downstream crates (e.g. `spindle-helper`) can name these types without taking
+/// their own direct dependency on `ed25519-dalek` — per A9c's crate-layering law, use this
+/// re-export rather than adding `ed25519-dalek` to a crate that is only supposed to depend on
+/// `spindle-core`.
+pub use ed25519_dalek::{SigningKey, VerifyingKey};

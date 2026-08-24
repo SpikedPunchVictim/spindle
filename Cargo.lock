@@ -2381,6 +2381,11 @@ dependencies = [
 [[package]]
 name = "spindle-helper"
 version = "0.1.0"
+dependencies = [
+ "spindle-core",
+ "spindle-proto",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "spindle-host-core"

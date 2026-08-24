@@ -3,9 +3,16 @@ name = "spindle-helper"
 version.workspace = true
 edition.workspace = true
 
-# No dependencies yet. Per A9c boundary rule 3, spindle-helper depends only on spindle-proto
-# and spindle-core once implementation begins — it must never grow host/client logic.
+# Crate layering law (A9c boundary rule 3): spindle-helper depends only on spindle-proto and
+# spindle-core. Stage 4 slice 1 (the pure callout-verification core: authz.rs/permissions.rs/
+# session.rs) is deliberately free of tokio/sqlx/async-nats — no async, no I/O. Those arrive with
+# the NATS/Postgres wiring slice. Signing-key/verifying-key types are used via spindle-core's
+# re-export (`spindle_core::VerifyingKey`/`spindle_core::SigningKey`), not a direct dependency on
+# the underlying crypto crate.
 [dependencies]
+spindle-proto = { path = "../spindle-proto" }
+spindle-core = { path = "../spindle-core" }
+thiserror = { workspace = true }
 
 [[bin]]
 name = "spindle-helper"
