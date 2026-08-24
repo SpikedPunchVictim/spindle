@@ -3,5 +3,24 @@ name = "spindle-core"
 version.workspace = true
 edition.workspace = true
 
-# No dependencies yet.
+# Crate layering law (A9c boundary rule 3 / DESIGN.md §A9c): spindle-core depends on
+# spindle-proto only, plus the crypto primitives listed in the A9c dependency manifest. No tokio,
+# no async — this crate is pure logic + crypto.
 [dependencies]
+spindle-proto = { path = "../spindle-proto" }
+
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+x25519-dalek = { workspace = true, features = ["static_secrets"] }
+sha2 = { workspace = true }
+hkdf = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+
+# `gen-crypto-vectors` writes vectors/signed/ (real Ed25519 signatures over spindle-proto's
+# canonical bytes) — the Stage 3 counterpart to spindle-proto's `gen-vectors` bin.
+[[bin]]
+name = "gen-crypto-vectors"
+path = "src/bin/gen_crypto_vectors.rs"

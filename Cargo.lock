@@ -560,6 +560,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
+ "digest",
  "fiat-crypto",
  "rustc_version",
  "subtle",
@@ -710,6 +711,31 @@ dependencies = [
  "rfc6979",
  "signature",
  "spki",
+]
+
+[[package]]
+name = "ed25519"
+version = "2.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+dependencies = [
+ "pkcs8",
+ "signature",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519",
+ "rand_core 0.6.4",
+ "serde",
+ "sha2",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1001,6 +1027,22 @@ checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest",
 ]
+
+[[package]]
+name = "http"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
+dependencies = [
+ "bytes",
+ "itoa",
+]
+
+[[package]]
+name = "httparse"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "icu_collections"
@@ -1517,6 +1559,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
+name = "ppv-lite86"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
+dependencies = [
+ "zerocopy",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1603,6 +1654,17 @@ dependencies = [
 
 [[package]]
 name = "rand"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
+dependencies = [
+ "libc",
+ "rand_chacha",
+ "rand_core 0.6.4",
+]
+
+[[package]]
+name = "rand"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
@@ -1610,6 +1672,16 @@ dependencies = [
  "chacha20 0.10.1",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -1751,7 +1823,7 @@ dependencies = [
  "bytes",
  "hex",
  "log",
- "rand",
+ "rand 0.10.2",
  "rcgen",
  "ring",
  "rtc-datachannel",
@@ -1808,7 +1880,7 @@ dependencies = [
  "log",
  "p256",
  "p384",
- "rand",
+ "rand 0.10.2",
  "rand_core 0.6.4",
  "rcgen",
  "ring",
@@ -1832,7 +1904,7 @@ dependencies = [
  "bytes",
  "crc",
  "log",
- "rand",
+ "rand 0.10.2",
  "rtc-mdns",
  "rtc-shared",
  "rtc-stun",
@@ -1849,7 +1921,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9436633af4a6beff6fee08c99464012017fcd1e0a4c0559b1f0d733e8812217a"
 dependencies = [
  "log",
- "rand",
+ "rand 0.10.2",
  "rtc-interceptor-derive",
  "rtc-rtcp",
  "rtc-rtp",
@@ -1889,7 +1961,7 @@ checksum = "709a571ed5d88854f3f8c0b92e4a445d77ee54fd33dd45f9297a3d91e3e96d67"
 dependencies = [
  "byteorder",
  "bytes",
- "rand",
+ "rand 0.10.2",
  "rtc-rtp",
  "rtc-shared",
  "thiserror 2.0.20",
@@ -1913,7 +1985,7 @@ checksum = "b2aa84012c4a3d855586878e9f891af5062bd5690278b2c54bfcfb0a0ddd9098"
 dependencies = [
  "bytes",
  "memchr",
- "rand",
+ "rand 0.10.2",
  "rtc-shared",
  "serde",
 ]
@@ -1927,7 +1999,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "log",
- "rand",
+ "rand 0.10.2",
  "rtc-shared",
  "rustc-hash",
  "slab",
@@ -1940,7 +2012,7 @@ version = "0.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54ab04410496c8ea47350490298fb135f5432f8fa1aa88edf5dadc81c855a324"
 dependencies = [
- "rand",
+ "rand 0.10.2",
  "rtc-shared",
  "url",
 ]
@@ -1957,7 +2029,7 @@ dependencies = [
  "bytes",
  "nix",
  "p256",
- "rand",
+ "rand 0.10.2",
  "rcgen",
  "sec1",
  "serde",
@@ -1997,7 +2069,7 @@ dependencies = [
  "crc",
  "lazy_static",
  "md-5",
- "rand",
+ "rand 0.10.2",
  "ring",
  "rtc-shared",
  "sansio",
@@ -2278,7 +2350,11 @@ dependencies = [
  "async-trait",
  "bytes",
  "datachannel",
+ "futures-util",
+ "serde",
+ "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "webrtc",
 ]
 
@@ -2289,6 +2365,18 @@ version = "0.1.0"
 [[package]]
 name = "spindle-core"
 version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "ed25519-dalek",
+ "hkdf",
+ "rand 0.8.7",
+ "sha2",
+ "spindle-proto",
+ "subtle",
+ "thiserror 1.0.69",
+ "x25519-dalek",
+ "zeroize",
+]
 
 [[package]]
 name = "spindle-helper"
@@ -2511,6 +2599,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18e5b8366ee7a95b16d32197d0b2604b43a0be89dc5fac9f8e96ccafbaedda8a"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.8.7",
+ "sha1",
+ "thiserror 1.0.69",
+ "utf-8",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2561,6 +2679,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf-8"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8_iter"
@@ -2951,6 +3075,26 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
+]
+
+[[package]]
+name = "zerocopy"
+version = "0.8.56"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb"
+dependencies = [
+ "zerocopy-derive",
+]
+
+[[package]]
+name = "zerocopy-derive"
+version = "0.8.56"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

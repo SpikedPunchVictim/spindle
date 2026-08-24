@@ -3,10 +3,43 @@
 //! `spindle-proto` for wire types; per A9c boundary rule 3 nothing below `apps/*/src-tauri`
 //! depends on `tauri`, and this crate sits below both `spindle-net` and `spindle-vfs` in the
 //! dependency chain (`proto ← core ← {net, vfs} ← {host-core, client-core}`).
+//!
+//! # Modules
+//! - [`fingerprint`] — [`Fingerprint`], the shared 32-byte SHA-256 identifier type (`root_fp`,
+//!   `device_fp`, `host_fp`), with a base32 (RFC 4648, no padding, lowercase) `Display`.
+//! - [`identity`] — [`RootKey`] (person/host identity root, pre-committed rotation) and
+//!   [`DeviceKey`] (Ed25519 sign + X25519 agree keypair).
+//! - [`artifacts`] — issue/verify functions for the six non-`Envelope` A7b signed-artifact types.
+//! - [`envelope`] — the A7 end-to-end signaling envelope: session-key derivation, `seal`/`open`.
+//!
+//! # Design notes and ambiguities (reported, not silently resolved)
+//!
+//! - **Capability `nbf`**: DESIGN.md §A7b / ADR-003 list `nbf = issue ts` as part of a
+//!   capability's time rule, but `spindle_proto::artifacts::Capability` (the schema of record)
+//!   has no `nbf` field. [`artifacts::verify_capability`] therefore checks only `exp`. See that
+//!   function's doc comment.
+//! - **Root rotation has no proto wire type**: DESIGN.md §A4's `sig_old_root(new_root_pk)` /
+//!   pre-committed-hash rotation is not one of spindle-proto's seven A7b-cataloged artifacts.
+//!   [`identity::sign_root_rotation`]/[`identity::verify_root_rotation`] define their own minimal
+//!   domain-separated signing input inside this crate rather than adding an unauthorized type to
+//!   `spindle-proto`.
+//! - **Session-key `from_fp`/`to_fp` are session roles, not per-message envelope fields**: see
+//!   the [`envelope`] module docs for the interpretation this crate follows (DESIGN.md §A7 does
+//!   not spell this out explicitly).
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn scaffold() { /* compilation of this crate is the assertion */
-    }
-}
+pub mod artifacts;
+pub mod envelope;
+pub mod fingerprint;
+pub mod identity;
+
+mod base32;
+
+pub use envelope::{
+    derive_session_key, direction_byte, open, seal, EnvelopeError, OpenParams, SealParams,
+    SessionKey,
+};
+pub use fingerprint::{Fingerprint, FingerprintError, FINGERPRINT_LEN};
+pub use identity::{
+    device_fp_of, generate_next_root, root_fp_of, sign_root_rotation, verify_root_rotation,
+    DeviceKey, IdentityError, NextRoot, RootKey, ALG_ID_V1,
+};

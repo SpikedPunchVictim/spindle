@@ -93,6 +93,7 @@ jobs:
       - name: Regenerate golden vectors and verify they're byte-identical to committed vectors/
         run: |
           cargo run -p spindle-proto --bin gen-vectors
+          cargo run -p spindle-core --bin gen-crypto-vectors
           git diff --exit-code vectors/
 
       - name: Cross-check @spindle/proto's TypeScript canonical CBOR encoder against vectors/

@@ -1,0 +1,44 @@
+{
+  "artifact": "AdmissionToken",
+  "domain_tag": "spindle-adm-v1",
+  "signer": {
+    "role": "operator_admission_key",
+    "seed": {
+      "label": "TEST-ONLY",
+      "seed_hex": "0707070707070707070707070707070707070707070707070707070707070707"
+    },
+    "public_key_hex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+  },
+  "cases": [
+    {
+      "name": "valid",
+      "description": "Admission token signed by the operator admission key.",
+      "decoded": {
+        "nonce": "61616161616161616161616161616161",
+        "exp": 1756512000,
+        "label": "workshop-nas",
+        "quota_profile": "default",
+        "sig_operator": "b25cf533167eac43bb5e82fb51eebb535c874929879aac80f05d665b95bdcc6ad6ea778ea86fb5e1632c51fad19623263f78dabca19bd23f22f99f2c5922f80b"
+      },
+      "canonical_cbor_hex": "a5636578701a68b23f00656c6162656c6c776f726b73686f702d6e6173656e6f6e636550616161616161616161616161616161616c7369675f6f70657261746f725840b25cf533167eac43bb5e82fb51eebb535c874929879aac80f05d665b95bdcc6ad6ea778ea86fb5e1632c51fad19623263f78dabca19bd23f22f99f2c5922f80b6d71756f74615f70726f66696c656764656661756c74",
+      "signing_input_hex": "7370696e646c652d61646d2d7631a4636578701a68b23f00656c6162656c6c776f726b73686f702d6e6173656e6f6e636550616161616161616161616161616161616d71756f74615f70726f66696c656764656661756c74",
+      "signature_hex": "b25cf533167eac43bb5e82fb51eebb535c874929879aac80f05d665b95bdcc6ad6ea778ea86fb5e1632c51fad19623263f78dabca19bd23f22f99f2c5922f80b",
+      "signature_valid": true
+    },
+    {
+      "name": "tampered_signature_last_byte",
+      "description": "sig_operator's last byte flipped; verify_admission_token must reject with BadSignature.",
+      "decoded": {
+        "nonce": "61616161616161616161616161616161",
+        "exp": 1756512000,
+        "label": "workshop-nas",
+        "quota_profile": "default",
+        "sig_operator": "b25cf533167eac43bb5e82fb51eebb535c874929879aac80f05d665b95bdcc6ad6ea778ea86fb5e1632c51fad19623263f78dabca19bd23f22f99f2c5922f8f4"
+      },
+      "canonical_cbor_hex": "a5636578701a68b23f00656c6162656c6c776f726b73686f702d6e6173656e6f6e636550616161616161616161616161616161616c7369675f6f70657261746f725840b25cf533167eac43bb5e82fb51eebb535c874929879aac80f05d665b95bdcc6ad6ea778ea86fb5e1632c51fad19623263f78dabca19bd23f22f99f2c5922f8f46d71756f74615f70726f66696c656764656661756c74",
+      "signing_input_hex": "7370696e646c652d61646d2d7631a4636578701a68b23f00656c6162656c6c776f726b73686f702d6e6173656e6f6e636550616161616161616161616161616161616d71756f74615f70726f66696c656764656661756c74",
+      "signature_hex": "b25cf533167eac43bb5e82fb51eebb535c874929879aac80f05d665b95bdcc6ad6ea778ea86fb5e1632c51fad19623263f78dabca19bd23f22f99f2c5922f8f4",
+      "signature_valid": false
+    }
+  ]
+}

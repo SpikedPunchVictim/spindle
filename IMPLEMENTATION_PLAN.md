@@ -52,7 +52,15 @@ Rust↔browser across 3 browsers; every A7 MUST-check has an automated negative 
 `to_fp`, revocation, `sid`/`seq`, `ts` skew, `kind`, version floor).
 **Tests**: `spindle-core` unit tests for each MUST-check; `@spindle/crypto` WebCrypto/`@noble/curves`
 parity tests; S6 cross-browser interop harness.
-**Status**: Not Started
+**Status**: In Progress
+**Note**: Rust half done: `spindle-core` implements identity (`RootKey` pre-committed rotation,
+`DeviceKey`), issue/verify for all six non-`Envelope` A7b signed artifacts, and the A7 envelope
+(`seal`/`open`) with a distinct `EnvelopeError` variant and negative test per MUST-check plus
+round-trip/bidirectional-session tests (55 unit tests total). `src/bin/gen-crypto-vectors` adds
+real-Ed25519-signature/real-AEAD golden vectors under `vectors/signed/*.json` (deterministic,
+TEST-ONLY seeds, byte-stable across reruns, wired into `just vectors`/CI); `tests/vectors.rs`
+independently reloads and re-verifies them (7 tests). Still pending: `@spindle/crypto`'s
+TypeScript twin and the S6 cross-browser interop harness (tracked separately).
 
 ## Stage 4: Helper + NATS callout + deploy compose
 **Goal**: Implement the broker helper (`spindle-helper`): Auth Callout responder, presence,

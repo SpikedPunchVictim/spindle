@@ -29,12 +29,13 @@ lint:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Generate golden CBOR/signature test vectors from spindle-proto (A9b, A7b), verify the
-# regeneration is byte-identical to what's committed (no drift between the Rust encoder and
-# vectors/*.json), then cross-check @spindle/proto's TypeScript encoder against those same
-# vectors.
+# Generate golden CBOR/signature test vectors from spindle-proto (A9b, A7b) and the real-signature
+# crypto vectors from spindle-core (A4/A7/A7b), verify the regeneration is byte-identical to
+# what's committed (no drift between the Rust encoders and vectors/*.json / vectors/signed/*.json),
+# then cross-check @spindle/proto's TypeScript encoder against those same vectors.
 vectors:
     cargo run -p spindle-proto --bin gen-vectors
+    cargo run -p spindle-core --bin gen-crypto-vectors
     git diff --exit-code vectors/
     pnpm --filter @spindle/proto test
 

@@ -1,0 +1,78 @@
+{
+  "artifact": "AdminCommand",
+  "domain_tag": "spindle-adm-cmd-v1",
+  "signer": {
+    "role": "operator_admission_key",
+    "seed": {
+      "label": "TEST-ONLY",
+      "seed_hex": "0707070707070707070707070707070707070707070707070707070707070707"
+    },
+    "public_key_hex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+  },
+  "cases": [
+    {
+      "name": "valid",
+      "description": "Admin command signed by the operator admission key.",
+      "decoded": {
+        "v": 1,
+        "cmd": "evict_host",
+        "args": {
+          "type": "map",
+          "value": [
+            {
+              "key": {
+                "type": "text",
+                "value": "host_fp"
+              },
+              "value": {
+                "type": "bytes",
+                "value": "cc52a5a77a36adcb6dbcdaddc580cd6b4fdab65fdc9a8312cee5d21b6e42abc7"
+              }
+            }
+          ]
+        },
+        "signer_fp": "55b4304d9bfa6b93372e8aa943e4e1d88396aec80bf61f7240c18027cb770cb0",
+        "seq": 12,
+        "nonce": "93939393939393939393939393939393",
+        "ts": 1755907200,
+        "sig": "7c575249f5a4b0e05423c64f79e916f652cb54c9aa4fbed3f114091dbe4f58156c1c1ff492987f75c43cd08258d3bbbc187f6d93520f6848c4bfe679c56c5c08"
+      },
+      "canonical_cbor_hex": "a86176016274731a68a9048063636d646a65766963745f686f7374637365710c6373696758407c575249f5a4b0e05423c64f79e916f652cb54c9aa4fbed3f114091dbe4f58156c1c1ff492987f75c43cd08258d3bbbc187f6d93520f6848c4bfe679c56c5c086461726773a167686f73745f66705820cc52a5a77a36adcb6dbcdaddc580cd6b4fdab65fdc9a8312cee5d21b6e42abc7656e6f6e63655093939393939393939393939393939393697369676e65725f6670582055b4304d9bfa6b93372e8aa943e4e1d88396aec80bf61f7240c18027cb770cb0",
+      "signing_input_hex": "7370696e646c652d61646d2d636d642d7631a76176016274731a68a9048063636d646a65766963745f686f7374637365710c6461726773a167686f73745f66705820cc52a5a77a36adcb6dbcdaddc580cd6b4fdab65fdc9a8312cee5d21b6e42abc7656e6f6e63655093939393939393939393939393939393697369676e65725f6670582055b4304d9bfa6b93372e8aa943e4e1d88396aec80bf61f7240c18027cb770cb0",
+      "signature_hex": "7c575249f5a4b0e05423c64f79e916f652cb54c9aa4fbed3f114091dbe4f58156c1c1ff492987f75c43cd08258d3bbbc187f6d93520f6848c4bfe679c56c5c08",
+      "signature_valid": true
+    },
+    {
+      "name": "tampered_signature_last_byte",
+      "description": "sig's last byte flipped; verify_admin_command must reject with BadSignature.",
+      "decoded": {
+        "v": 1,
+        "cmd": "evict_host",
+        "args": {
+          "type": "map",
+          "value": [
+            {
+              "key": {
+                "type": "text",
+                "value": "host_fp"
+              },
+              "value": {
+                "type": "bytes",
+                "value": "cc52a5a77a36adcb6dbcdaddc580cd6b4fdab65fdc9a8312cee5d21b6e42abc7"
+              }
+            }
+          ]
+        },
+        "signer_fp": "55b4304d9bfa6b93372e8aa943e4e1d88396aec80bf61f7240c18027cb770cb0",
+        "seq": 12,
+        "nonce": "93939393939393939393939393939393",
+        "ts": 1755907200,
+        "sig": "7c575249f5a4b0e05423c64f79e916f652cb54c9aa4fbed3f114091dbe4f58156c1c1ff492987f75c43cd08258d3bbbc187f6d93520f6848c4bfe679c56c5cf7"
+      },
+      "canonical_cbor_hex": "a86176016274731a68a9048063636d646a65766963745f686f7374637365710c6373696758407c575249f5a4b0e05423c64f79e916f652cb54c9aa4fbed3f114091dbe4f58156c1c1ff492987f75c43cd08258d3bbbc187f6d93520f6848c4bfe679c56c5cf76461726773a167686f73745f66705820cc52a5a77a36adcb6dbcdaddc580cd6b4fdab65fdc9a8312cee5d21b6e42abc7656e6f6e63655093939393939393939393939393939393697369676e65725f6670582055b4304d9bfa6b93372e8aa943e4e1d88396aec80bf61f7240c18027cb770cb0",
+      "signing_input_hex": "7370696e646c652d61646d2d636d642d7631a76176016274731a68a9048063636d646a65766963745f686f7374637365710c6461726773a167686f73745f66705820cc52a5a77a36adcb6dbcdaddc580cd6b4fdab65fdc9a8312cee5d21b6e42abc7656e6f6e63655093939393939393939393939393939393697369676e65725f6670582055b4304d9bfa6b93372e8aa943e4e1d88396aec80bf61f7240c18027cb770cb0",
+      "signature_hex": "7c575249f5a4b0e05423c64f79e916f652cb54c9aa4fbed3f114091dbe4f58156c1c1ff492987f75c43cd08258d3bbbc187f6d93520f6848c4bfe679c56c5cf7",
+      "signature_valid": false
+    }
+  ]
+}
