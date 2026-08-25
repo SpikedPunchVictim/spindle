@@ -67,8 +67,13 @@ if [ "${1:-}" = "--in-container" ]; then
   #                            quic-peer's own 16 MiB CLI default)
   #   PER_RUN_TIMEOUT_S=60  -> override the per-cell watchdog below
   #   OVERALL_TIMEOUT_S=... -> override the outer `timeout` wrapper (see bottom of this file)
+  #   TRANSPORT=ice         -> S19 leg 2: punch the QUIC socket via rtc-ice + --signal instead of
+  #                            addressing it directly via --listen/--connect (default "direct",
+  #                            leg 1's original, unmodified behavior). See quic-peer.rs's module
+  #                            doc comment for what "ice" mode actually does.
   RTTS="${RTTS:-0 20 50 100}"
   CCS="${CELLS:-cubic bbr}"
+  TRANSPORT="${TRANSPORT:-direct}"
 
   # --window override (2026-08-25, first real matrix run): quic-peer's own CLI default (16 MiB,
   # chosen "generous vs BDP so flow control never masks congestion control" — see quic-peer.rs's
@@ -135,42 +140,80 @@ if [ "${1:-}" = "--in-container" ]; then
       : >"$recv_out"; : >"$recv_err"; : >"$send_out"; : >"$send_err"; : >"$stats_out"
 
       set +e
-      timeout "${PER_RUN_TIMEOUT_S}s" "$BIN" \
-        --mode recv --listen "$addr" --bytes "$bytes" --cc "$cc" --window "$WINDOW_MIB" --json \
-        --stats-interval-ms 500 --stats-out "$stats_out" \
-        >"$recv_out" 2>"$recv_err" &
-      recv_pid=$!
+      if [ "$TRANSPORT" = "ice" ]; then
+        # S19 leg 2: recv punches via --signal listen:<port> (no --listen/--connect at all — the
+        # QUIC socket address is discovered by ICE, not chosen up front); the cert fingerprint is
+        # exchanged automatically over --signal instead of grepped from stderr (contrast the
+        # "direct" branch below).
+        timeout "${PER_RUN_TIMEOUT_S}s" "$BIN" \
+          --mode recv --transport ice --signal "listen:${port}" --bytes "$bytes" --cc "$cc" \
+          --window "$WINDOW_MIB" --json --stats-interval-ms 500 --stats-out "$stats_out" \
+          >"$recv_out" 2>"$recv_err" &
+        recv_pid=$!
 
-      # Wait for recv to report "listening" AND print its cert-fp before starting send — send
-      # needs the fingerprint on its command line (this harness's stand-in for the A7-verified
-      # envelope; see quic-peer.rs's module doc comment). Polled against recv's own stderr,
-      # bounded well under PER_RUN_TIMEOUT_S so a recv-side startup failure surfaces as a failed
-      # cell instead of hanging here.
-      listening=0
-      fp=""
-      for _ in $(seq 1 50); do
-        if grep -q "listening on" "$recv_err" 2>/dev/null; then
-          fp="$(sed -n 's/.*cert-fp \(sha256:[0-9a-f]*\).*/\1/p' "$recv_err" | head -1)"
-          if [ -n "$fp" ]; then
+        # Wait for recv to report its --signal listener is up before starting send — bounded well
+        # under PER_RUN_TIMEOUT_S so a recv-side startup failure surfaces as a failed cell instead
+        # of hanging here.
+        listening=0
+        for _ in $(seq 1 50); do
+          if grep -q "signal: listening on" "$recv_err" 2>/dev/null; then
             listening=1
             break
           fi
-        fi
-        if ! kill -0 "$recv_pid" 2>/dev/null; then
-          break
-        fi
-        sleep 0.2
-      done
+          if ! kill -0 "$recv_pid" 2>/dev/null; then
+            break
+          fi
+          sleep 0.2
+        done
 
-      send_rc=1
-      if [ "$listening" -eq 1 ]; then
-        timeout "${PER_RUN_TIMEOUT_S}s" "$BIN" \
-          --mode send --connect "$addr" --cert-fp "$fp" --bytes "$bytes" --cc "$cc" \
-          --window "$WINDOW_MIB" --json \
-          >"$send_out" 2>"$send_err"
-        send_rc=$?
+        send_rc=1
+        if [ "$listening" -eq 1 ]; then
+          timeout "${PER_RUN_TIMEOUT_S}s" "$BIN" \
+            --mode send --transport ice --signal "connect:127.0.0.1:${port}" --bytes "$bytes" \
+            --cc "$cc" --window "$WINDOW_MIB" --json \
+            >"$send_out" 2>"$send_err"
+          send_rc=$?
+        else
+          echo "s19-rtt-run: recv never reported its --signal listener up for $cell" >&2
+        fi
       else
-        echo "s19-rtt-run: recv never reported \"listening\"+cert-fp for $cell" >&2
+        timeout "${PER_RUN_TIMEOUT_S}s" "$BIN" \
+          --mode recv --listen "$addr" --bytes "$bytes" --cc "$cc" --window "$WINDOW_MIB" --json \
+          --stats-interval-ms 500 --stats-out "$stats_out" \
+          >"$recv_out" 2>"$recv_err" &
+        recv_pid=$!
+
+        # Wait for recv to report "listening" AND print its cert-fp before starting send — send
+        # needs the fingerprint on its command line (this harness's stand-in for the A7-verified
+        # envelope; see quic-peer.rs's module doc comment). Polled against recv's own stderr,
+        # bounded well under PER_RUN_TIMEOUT_S so a recv-side startup failure surfaces as a failed
+        # cell instead of hanging here.
+        listening=0
+        fp=""
+        for _ in $(seq 1 50); do
+          if grep -q "listening on" "$recv_err" 2>/dev/null; then
+            fp="$(sed -n 's/.*cert-fp \(sha256:[0-9a-f]*\).*/\1/p' "$recv_err" | head -1)"
+            if [ -n "$fp" ]; then
+              listening=1
+              break
+            fi
+          fi
+          if ! kill -0 "$recv_pid" 2>/dev/null; then
+            break
+          fi
+          sleep 0.2
+        done
+
+        send_rc=1
+        if [ "$listening" -eq 1 ]; then
+          timeout "${PER_RUN_TIMEOUT_S}s" "$BIN" \
+            --mode send --connect "$addr" --cert-fp "$fp" --bytes "$bytes" --cc "$cc" \
+            --window "$WINDOW_MIB" --json \
+            >"$send_out" 2>"$send_err"
+          send_rc=$?
+        else
+          echo "s19-rtt-run: recv never reported \"listening\"+cert-fp for $cell" >&2
+        fi
       fi
 
       wait "$recv_pid"
@@ -235,6 +278,7 @@ exec docker run --rm \
   -e RTTS \
   -e BYTES_MIB \
   -e WINDOW_MIB \
+  -e TRANSPORT \
   -e PER_RUN_TIMEOUT_S \
   -e OVERALL_TIMEOUT_S \
   -v "$REPO_ROOT:/workspace" \

@@ -12,6 +12,14 @@ publish = false
 name = "quic-peer"
 path = "src/bin/quic-peer.rs"
 
+# S19 leg 2 milestone 6 (NAT-punch matrix): a minimal STUN Binding-Request responder, run inside
+# each network namespace's reachable bridge/host during the NAT matrix so `quic-peer --stun <addr>`
+# has a server-reflexive address to gather. See its module doc comment for why this in-repo binary
+# was chosen over installing coturn.
+[[bin]]
+name = "stun-server"
+path = "src/bin/stun-server.rs"
+
 [dependencies]
 tokio = { workspace = true } # workspace already declares features = ["full"]
 anyhow = { workspace = true }
@@ -40,3 +48,59 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # Self-signed per-session QUIC certificate (A10.32) — fresh cert+key generated once per `--mode
 # recv` run. Not a workspace dependency (single-consumer, spike-local).
 rcgen = "0.13"
+
+# S19 leg 2 (ICE punch -> quinn adapter, docs/DESIGN.md §A8/A10.32): `rtc-ice` is what `webrtc`
+# 0.20.3 actually uses for ICE — confirmed empirically (`cargo tree`/Cargo.lock), NOT the older
+# standalone `webrtc-ice` crate, which does not appear anywhere in this workspace's dependency
+# graph at all. Same restructuring precedent already documented for SCTP in
+# spikes/s3-throughput/Cargo.toml (`rtc-sctp`): webrtc-rs 0.20.x replaced its internal ice/dtls/
+# sctp/etc. stack with a family of sans-I/O `rtc-*` crates glued together by the `rtc` facade
+# crate; the old async, standalone `webrtc-ice`/`webrtc-sctp` crates are not part of that facade's
+# dependency tree at all as of 0.20.3. `rtc-ice` resolves and builds standalone with no other part
+# of `webrtc`/`rtc` pulled in (verified via `cargo add --dry-run` before adding it for real).
+#
+# Sans-I/O is the load-bearing fact for the adapter design (see quic-peer.rs's module doc comment):
+# `rtc_ice::agent::Agent` "owns no sockets and no clock" (its own doc comment) — the caller always
+# owns the UDP socket, feeds inbound datagrams to the agent, and sends whatever the agent emits.
+# That means there is no `Conn`-like async socket abstraction to bridge into a `quinn::AsyncUdpSocket`
+# at all (design (b) in the task brief doesn't apply to this crate); once the agent reports a
+# selected candidate pair, the caller already holds the exact `std::net::UdpSocket` quinn needs and
+# just hands it to `quinn::Endpoint::new` directly (design (a), the brief's preferred path) — zero
+# custom trait implementation. `default-features = false` + `["ring"]` mirrors quinn/rustls's own
+# crypto-provider choice above (`cargo add --dry-run` showed the same `ring`/`aws-lc-rs` feature
+# choice on this crate).
+rtc-ice = { version = "0.20.3", default-features = false, features = ["ring"] }
+
+# S19 leg 2 milestone 6 (NAT-punch matrix): server-reflexive candidate gathering, hand-rolled
+# directly against this crate (see quic-peer.rs's `stun_gather`) because `rtc_ice::AgentConfig.urls`
+# is accepted but not wired to any gathering logic in rtc-ice 0.20.3 (verified by grepping every
+# `agent/*.rs`). Already resolves transitively via `rtc-ice`; declared directly because
+# `stun-server.rs` (the harness's own minimal STUN responder — see its module doc comment for why
+# an in-repo binary was chosen over installing coturn) and `quic-peer.rs`'s STUN client both build
+# `rtc_stun::message::Message` values by hand. Version pinned to match `rtc-ice` 0.20.3's own
+# dependency exactly, same rationale as `rtc-shared` above.
+rtc-stun = "0.20.3"
+
+# `TaggedBytesMut`/`TransportContext`/`TransportProtocol` — the message/context types
+# `rtc_ice::agent::Agent`'s `sansio::Protocol` impl reads and writes (see quic-peer.rs's ICE
+# driving loop). Not re-exported by `rtc-ice` itself, so declared directly; version pinned to
+# match `rtc-ice` 0.20.3's own dependency exactly (both are part of the same `rtc` release train).
+rtc-shared = "0.20.3"
+
+# The `sansio::Protocol` trait itself (`handle_read`/`poll_write`/`poll_event`/`poll_timeout`/
+# `handle_timeout`) — `rtc_ice::agent::Agent` implements it; the trait must be in scope to call
+# those methods. Version pinned to match what `rtc-ice` 0.20.3 itself depends on.
+sansio = "1.0.1"
+
+# `BytesMut` for `TaggedBytesMut`'s message field (ICE driving loop) — already resolves
+# transitively via `rtc-ice`, declared directly since quic-peer.rs constructs `BytesMut` values by
+# hand.
+bytes = "1.12.1"
+
+# JSON signaling messages for `--signal listen:<port>`/`--signal connect:<host:port>` (S19 leg 2's
+# stand-in for the A7-verified `connect` envelope — see quic-peer.rs's module doc comment): exchanges
+# {ufrag, pwd, candidates[], cert_fp} between the two `quic-peer` processes over a plain TCP socket
+# before ICE connectivity checks start. Same rationale as spikes/s3-throughput's `browser-peer.rs`
+# JSON signaling dependency.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

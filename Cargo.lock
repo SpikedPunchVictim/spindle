@@ -2853,9 +2853,16 @@ name = "spike-s19-quic-transport"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "quinn",
  "rcgen 0.13.2",
+ "rtc-ice",
+ "rtc-shared",
+ "rtc-stun",
  "rustls",
+ "sansio",
+ "serde",
+ "serde_json",
  "sha2",
  "tokio",
 ]

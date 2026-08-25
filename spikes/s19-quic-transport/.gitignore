@@ -6,3 +6,4 @@
 .s19-rtt-results.tmp
 .s19-rtt-qdisc.tmp
 *.tmp
+.s19-nat-raw/

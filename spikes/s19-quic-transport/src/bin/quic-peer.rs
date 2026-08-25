@@ -12,38 +12,63 @@
 //! ## What this binary actually does (and does not) measure
 //!
 //! Two OS processes — one `--mode recv` (the quinn **server**), one `--mode send` (the quinn
-//! **client**) — talk QUIC directly over a plain UDP socket pair on `127.0.0.1`. This is **leg 1**
-//! of S19's method sketch only: raw quinn throughput under `tc netem`-shaped loopback (see
-//! `s19-rtt-run.sh`), with congestion-control comparison (`--cc cubic|bbr`) folded in per the
-//! spike's method sketch ("vary ... buffer sizes at each RTT point"). It deliberately does **not**
-//! cover:
+//! **client**) — talk QUIC over UDP. `--transport direct` (default, leg 1): a plain bound UDP
+//! socket pair on `127.0.0.1`, addressed directly via `--listen`/`--connect` — raw quinn throughput
+//! under `tc netem`-shaped loopback (see `s19-rtt-run.sh`), with congestion-control comparison
+//! (`--cc cubic|bbr`). `--transport ice` (leg 2): the UDP socket is punched by a standalone
+//! `rtc_ice::agent::Agent` first (candidates/credentials exchanged over a minimal TCP `--signal`
+//! channel — this harness's stand-in for the A7-verified `connect` envelope), and *that* punched
+//! socket is handed to quinn — see "The ICE↔quinn adapter" below for why this needed no custom
+//! `quinn::AsyncUdpSocket` implementation at all. Still not covered by this binary:
 //!
-//! - **NAT punching** (leg 2): the socket here is a bound-and-connected loopback UDP pair, not a
-//!   `webrtc-rs` `ice`-crate-punched one. See "Why the ICE↔quinn adapter is deferred" below.
 //! - **TURN-relay fallback** (leg 3) or **real-two-host validation** (leg 4).
 //!
-//! `RESULTS.md` records all four legs and their status; only leg 1 has a harness in this
-//! directory today.
+//! `RESULTS.md` records all four legs and their status.
 //!
-//! ## Why the ICE↔quinn adapter is deferred (leg 2)
+//! ## The ICE↔quinn adapter (leg 2)
 //!
-//! `docs/DESIGN.md` §A8/A10.32: standalone ICE (reusing `webrtc-rs`'s `ice` crate rather than
-//! duplicating it) punches the NAT, and "the resulting punched UDP socket is handed to `quinn`,
-//! which owns the QUIC connection from there." That sentence hides the actual integration work:
-//! quinn does not take a `std::net::UdpSocket` or a `tokio::net::UdpSocket` as its I/O — it takes
-//! an [`quinn::AsyncUdpSocket`] (a `quinn-udp`-flavored trait with GSO/GRO/ECN-aware batch
-//! send/recv methods and a poll-based readiness model, wired in via
-//! [`quinn::Endpoint::new_with_abstract_socket`]). `webrtc-rs`'s `ice::Conn` is a plain async
-//! `send`/`recv` socket trait built for one-packet-at-a-time SCTP/DTLS traffic, not quinn's batched
-//! `Transmit`/`RecvMeta` shape. Bridging the two means writing a `quinn::AsyncUdpSocket` adapter
-//! that queues `ice::Conn::send`/`recv` under quinn's poll contract — real work, but *orthogonal*
-//! to the throughput question this leg answers (once bytes are flowing over *any* UDP socket,
-//! quinn's congestion control and stream layer behave identically regardless of how that socket's
-//! packets got NAT-traversed). Building the adapter now would spend budget on plumbing before
-//! knowing whether the pass bar is even reachable; this harness answers that question first with a
-//! loopback-bound socket pair, exactly as S3's `src/main.rs` measured `webrtc-rs`↔`webrtc-rs`
-//! throughput before A10.29 spent budget on a real-Chrome harness. The adapter is scoped as
-//! follow-up work once this leg's numbers are in.
+//! `docs/DESIGN.md` §A8/A10.32: standalone ICE (reusing `webrtc-rs`'s ICE implementation rather
+//! than duplicating it) punches the NAT, and "the resulting punched UDP socket is handed to
+//! `quinn`, which owns the QUIC connection from there." The task brief anticipated needing to
+//! choose between (a) a bare socket handoff or (b) a custom `quinn::AsyncUdpSocket` bridging some
+//! `Conn`-like async abstraction, depending on what the ICE crate exposes. Empirically, no such
+//! choice exists here:
+//!
+//! - **Which crate `webrtc` 0.20.3 actually uses**: `rtc-ice`, not the older standalone
+//!   `webrtc-ice` — confirmed via `Cargo.lock` (`webrtc` 0.20.3 depends on a `rtc` facade crate,
+//!   which depends on `rtc-ice`; plain `webrtc-ice` does not appear anywhere in this workspace's
+//!   dependency graph). Same restructuring already established empirically for SCTP in
+//!   `spikes/s3-throughput/Cargo.toml` (`rtc-sctp`) — webrtc-rs 0.20.x replaced its entire
+//!   ice/dtls/sctp/etc. internals with a family of **sans-I/O** `rtc-*` crates. `rtc-ice` resolves
+//!   and builds standalone (verified via `cargo add --dry-run` before depending on it for real) —
+//!   it does not require the rest of `webrtc`/`rtc`.
+//! - **What "sans-I/O" means for the adapter question**: `rtc_ice::agent::Agent`'s own doc comment
+//!   states it plainly — the agent "owns no sockets and no clock." The caller always owns the UDP
+//!   socket: bind it, feed every inbound datagram to `Agent::handle_read` (via its
+//!   `sansio::Protocol` impl), and send whatever `Agent::poll_write` emits. There is no `Conn`
+//!   object, async or otherwise, ever handed back — design (b) in the task brief doesn't apply to
+//!   this crate at all, because there is nothing socket-shaped to bridge. Once the agent reports a
+//!   selected pair (`Event::SelectedCandidatePairChange` / `get_selected_candidate_pair()`), the
+//!   caller *already holds* the exact `std::net::UdpSocket` quinn needs, punched and nominated.
+//! - **The handoff itself**: quinn 0.11 has `Endpoint::new(EndpointConfig, Option<ServerConfig>,
+//!   std::net::UdpSocket, Arc<dyn Runtime>) -> io::Result<Self>` (`quinn::default_runtime()` for
+//!   the last argument) — a `std::net::UdpSocket`, not an `AsyncUdpSocket` impl, is exactly the
+//!   input type. `Endpoint::server`/`Endpoint::client` (used by `--transport direct` below) are
+//!   thin convenience wrappers around this same function that bind their own fresh socket; ICE
+//!   mode just supplies an already-punched one instead. **Design (a), zero custom trait
+//!   implementation — no `AsyncUdpSocket` adapter was written, because none was needed.**
+//!
+//! One real limitation this surfaced: `rtc_ice::agent::Agent`'s `poll_read` always returns `None`
+//! — the sans-I/O agent has no built-in STUN-vs-application-data demuxing on a shared socket (that
+//! demuxing is the *full* `rtc` facade's job, one layer up, not this crate's). This harness accepts
+//! that: once a pair is selected, it stops feeding the socket's future datagrams to the ICE agent
+//! at all and hands the socket to quinn outright, foregoing ICE's RFC 7675 consent-freshness
+//! keepalives for the life of the QUIC connection. Acceptable for a throughput/punch-success spike;
+//! a production implementation sharing one socket between ongoing consent checks and QUIC traffic
+//! would need that demux layer. Also surprising: `AgentConfig.urls` (meant for STUN/TURN server
+//! URLs) is accepted but not wired to any actual gathering logic in this crate version — server-
+//! reflexive candidate gathering, where needed (the NAT-punch matrix), is done by hand with
+//! `rtc-stun` rather than by passing `urls` and expecting the agent to gather automatically.
 //!
 //! ## Certificate pinning (A10.32, mirrors the DTLS `a=fingerprint` rule)
 //!
@@ -92,7 +117,8 @@
 //! 0/20/50/100 ms under container `tc netem` (RTT matrix) — see `RESULTS.md` for the other three
 //! clauses' status.
 
-use std::net::SocketAddr;
+use std::io::{BufRead, BufReader, Write as _};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,12 +126,25 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use bytes::BytesMut;
 use quinn::congestion::{BbrConfig, CubicConfig};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{Endpoint, TransportConfig, VarInt};
+use quinn::{Endpoint, EndpointConfig, TransportConfig, VarInt};
+use rtc_ice::agent::agent_config::AgentConfig as IceAgentConfig;
+use rtc_ice::agent::Agent as IceAgent;
+use rtc_ice::candidate::candidate_host::CandidateHostConfig;
+use rtc_ice::candidate::candidate_server_reflexive::CandidateServerReflexiveConfig;
+use rtc_ice::candidate::{unmarshal_candidate, CandidateConfig};
+use rtc_ice::state::ConnectionState as IceConnectionState;
+use rtc_ice::Event as IceEvent;
+use rtc_shared::{TaggedBytesMut, TransportContext, TransportProtocol};
+use rtc_stun::message::{Getter as _, Message as StunMessage, TransactionId, BINDING_REQUEST};
+use rtc_stun::xoraddr::XorMappedAddress;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
+use sansio::Protocol as _;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::time::interval;
 
@@ -163,6 +202,82 @@ impl std::str::FromStr for Cc {
     }
 }
 
+/// `--transport` (S19 leg 2): `direct` (default) is leg 1's unmodified bound-UDP-socket-pair
+/// behavior — zero regression, `--listen`/`--connect` address the QUIC socket exactly as before.
+/// `ice` is leg 2: the UDP socket is punched by a standalone `rtc_ice::agent::Agent` first (see
+/// this file's module doc comment for why that needed no `quinn::AsyncUdpSocket` adapter), and
+/// candidates/credentials/the cert fingerprint are exchanged over `--signal` instead of
+/// `--listen`/`--connect`/`--cert-fp`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Direct,
+    Ice,
+}
+
+impl std::str::FromStr for Transport {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "direct" => Ok(Transport::Direct),
+            "ice" => Ok(Transport::Ice),
+            other => Err(anyhow!(
+                "--transport must be \"direct\" or \"ice\", got {other:?}"
+            )),
+        }
+    }
+}
+
+/// `--signal listen:<port>` / `--signal connect:<host:port>` (S19 leg 2 only): a minimal TCP
+/// channel the two `quic-peer` processes use to exchange ICE credentials, candidates, and the cert
+/// fingerprint before ICE connectivity checks start. This is this harness's stand-in for the
+/// A7-verified `connect` envelope (`docs/DESIGN.md` §A8) — in production this JSON blob's contents
+/// travel inside that envelope; here, with no envelope in this harness, they travel over a plain,
+/// unauthenticated TCP socket instead. The two roles have a fixed, deadlock-free message order
+/// (see `run_signal_listen`/`run_signal_connect`): `connect` always writes its own message first,
+/// then reads the peer's; `listen` always reads first, then writes.
+#[derive(Clone, Copy)]
+enum Signal {
+    Listen(SocketAddr),
+    Connect(SocketAddr),
+}
+
+impl std::str::FromStr for Signal {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        if let Some(rest) = s.strip_prefix("listen:") {
+            // Bare port, matching the flag's own documented shape (`listen:<port>`); binds
+            // 0.0.0.0 so the container NAT-namespace harness (leg 2 milestone 6) can reach it from
+            // outside its own namespace.
+            let port: u16 = rest
+                .parse()
+                .map_err(|_| anyhow!("--signal listen:<port> port {rest:?} is not valid"))?;
+            Ok(Signal::Listen(SocketAddr::from(([0, 0, 0, 0], port))))
+        } else if let Some(rest) = s.strip_prefix("connect:") {
+            let addr: SocketAddr = rest.parse().map_err(|_| {
+                anyhow!("--signal connect:<host:port> address {rest:?} is not valid")
+            })?;
+            Ok(Signal::Connect(addr))
+        } else {
+            Err(anyhow!(
+                "--signal must be \"listen:<port>\" or \"connect:<host:port>\", got {s:?}"
+            ))
+        }
+    }
+}
+
+/// The JSON message exchanged over `--signal` (S19 leg 2's envelope stand-in — see `Signal`'s doc
+/// comment). `candidates` are SDP `a=candidate` lines (`rtc_ice::candidate::Candidate::marshal`);
+/// `cert_fp` is `Some("sha256:<hex>")` only from the side that has already generated a certificate
+/// (`--mode recv`, which always generates one — see `run_recv`) — the `--mode send` side's own
+/// message carries `cert_fp: None`, it has no certificate of its own to offer.
+#[derive(Serialize, Deserialize)]
+struct SignalMessage {
+    ufrag: String,
+    pwd: String,
+    candidates: Vec<String>,
+    cert_fp: Option<String>,
+}
+
 struct Config {
     mode: Mode,
     /// Total payload size in bytes (`--bytes`, MiB, default 64). Passed to BOTH sides by
@@ -187,11 +302,33 @@ struct Config {
     /// JSON-lines output path for stats samples (`--stats-out`); required together with
     /// `--stats-interval-ms`.
     stats_out: Option<PathBuf>,
-    /// `--mode send` only, required: SHA-256 fingerprint of the cert `--mode recv` printed
-    /// (`cert-fp sha256:<hex>` on its stderr), `sha256:<64 hex chars>`.
+    /// `--mode send` only when `--transport direct`, required: SHA-256 fingerprint of the cert
+    /// `--mode recv` printed (`cert-fp sha256:<hex>` on its stderr), `sha256:<64 hex chars>`. When
+    /// `--transport ice`, this fingerprint normally arrives over `--signal` instead (see
+    /// `SignalMessage`); passing `--cert-fp` explicitly in `ice` mode OVERRIDES the signaled
+    /// fingerprint — the harness's hook for testing that a wrong pin is still rejected under ICE
+    /// (see RESULTS.md's loopback verification).
     cert_fp: Option<[u8; 32]>,
     /// Emit a single machine-readable JSON result line instead of the human-readable report.
     json: bool,
+    /// `--transport direct` (default) or `--transport ice` (S19 leg 2). See `Transport`'s doc
+    /// comment.
+    transport: Transport,
+    /// `--signal listen:<port>` / `--signal connect:<host:port>`, required (and only valid) when
+    /// `--transport ice`. See `Signal`'s doc comment.
+    signal: Option<Signal>,
+    /// `--stun <addr>` (S19 leg 2 NAT-punch matrix only): a STUN server to gather a server-
+    /// reflexive candidate from, in addition to the host candidate. Unused (and harmless to omit)
+    /// on loopback, where both peers can already reach each other's host candidates directly.
+    stun: Option<SocketAddr>,
+    /// `--ice-bind <ip>` (`--transport ice` only, default `127.0.0.1`): which local interface
+    /// address to bind the ICE/QUIC UDP socket on and advertise as the host candidate. Binding the
+    /// wildcard address (`0.0.0.0`) instead would advertise an unroutable `0.0.0.0` host candidate
+    /// to the peer — found empirically (`No route to host`) during this leg's loopback
+    /// verification, not assumed. The NAT-punch matrix (milestone 6) overrides this per network
+    /// namespace (e.g. its own private bridge IP), since each namespace's "the" outbound interface
+    /// differs.
+    ice_bind_ip: std::net::IpAddr,
 }
 
 impl Config {
@@ -211,6 +348,10 @@ impl Config {
         let mut stats_out: Option<PathBuf> = None;
         let mut cert_fp: Option<[u8; 32]> = None;
         let mut json = false;
+        let mut transport = Transport::Direct;
+        let mut signal: Option<Signal> = None;
+        let mut stun: Option<SocketAddr> = None;
+        let mut ice_bind_ip: std::net::IpAddr = std::net::IpAddr::from([127, 0, 0, 1]);
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -235,6 +376,12 @@ impl Config {
                     )?)?)
                 }
                 "--json" => json = true,
+                "--transport" => {
+                    transport = next_val::<String>(&mut args, "--transport")?.parse()?
+                }
+                "--signal" => signal = Some(next_val::<String>(&mut args, "--signal")?.parse()?),
+                "--stun" => stun = Some(next_val(&mut args, "--stun")?),
+                "--ice-bind" => ice_bind_ip = next_val(&mut args, "--ice-bind")?,
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -247,27 +394,64 @@ impl Config {
             anyhow!("--mode is required (\"send\" or \"recv\"); run with --help for usage")
         })?;
 
-        match mode {
-            Mode::Recv => {
-                if listen.is_none() {
-                    return Err(anyhow!("--mode recv requires --listen <addr>"));
+        match transport {
+            Transport::Direct => {
+                if signal.is_some() {
+                    return Err(anyhow!("--signal requires --transport ice"));
                 }
-                if connect.is_some() {
-                    return Err(anyhow!("--mode recv does not take --connect"));
+                if stun.is_some() {
+                    return Err(anyhow!("--stun requires --transport ice"));
+                }
+                match mode {
+                    Mode::Recv => {
+                        if listen.is_none() {
+                            return Err(anyhow!("--mode recv requires --listen <addr>"));
+                        }
+                        if connect.is_some() {
+                            return Err(anyhow!("--mode recv does not take --connect"));
+                        }
+                    }
+                    Mode::Send => {
+                        if connect.is_none() {
+                            return Err(anyhow!("--mode send requires --connect <addr>"));
+                        }
+                        if listen.is_some() {
+                            return Err(anyhow!("--mode send does not take --listen"));
+                        }
+                        if cert_fp.is_none() {
+                            return Err(anyhow!(
+                                "--mode send requires --cert-fp sha256:<hex> (from --mode recv's \"cert-fp\" stderr line)"
+                            ));
+                        }
+                    }
                 }
             }
-            Mode::Send => {
-                if connect.is_none() {
-                    return Err(anyhow!("--mode send requires --connect <addr>"));
-                }
-                if listen.is_some() {
-                    return Err(anyhow!("--mode send does not take --listen"));
-                }
-                if cert_fp.is_none() {
+            Transport::Ice => {
+                if listen.is_some() || connect.is_some() {
                     return Err(anyhow!(
-                        "--mode send requires --cert-fp sha256:<hex> (from --mode recv's \"cert-fp\" stderr line)"
+                        "--transport ice punches its own socket; it does not take --listen/--connect (use --signal instead)"
                     ));
                 }
+                match (mode, signal) {
+                    (Mode::Recv, Some(Signal::Listen(_))) | (Mode::Send, Some(Signal::Connect(_))) => {}
+                    (Mode::Recv, Some(Signal::Connect(_))) => {
+                        return Err(anyhow!(
+                            "--mode recv with --transport ice requires --signal listen:<port>, not connect:"
+                        ))
+                    }
+                    (Mode::Send, Some(Signal::Listen(_))) => {
+                        return Err(anyhow!(
+                            "--mode send with --transport ice requires --signal connect:<host:port>, not listen:"
+                        ))
+                    }
+                    (_, None) => {
+                        return Err(anyhow!(
+                            "--transport ice requires --signal listen:<port> (recv side) or --signal connect:<host:port> (send side)"
+                        ))
+                    }
+                }
+                // --cert-fp is optional and meaningful only as an override for both modes under
+                // ice (see Config::cert_fp's doc comment) — no requiredness check here.
             }
         }
 
@@ -297,6 +481,10 @@ impl Config {
             stats_out,
             cert_fp,
             json,
+            transport,
+            signal,
+            stun,
+            ice_bind_ip,
         })
     }
 }
@@ -355,12 +543,30 @@ fn print_usage() {
         "    --stats-interval-ms <N>  sample quinn path stats every N ms (default: 0, disabled)"
     );
     println!("    --stats-out <path>  JSON-lines file for stats samples (required with --stats-interval-ms)");
-    println!("    --cert-fp sha256:<hex>  --mode send: required, pins the server cert by SHA-256");
+    println!("    --cert-fp sha256:<hex>  --transport direct/--mode send: required, pins the server cert by SHA-256");
+    println!("                        --transport ice: optional override of the --signal-exchanged fingerprint");
     println!("    --json              print one machine-readable JSON result line");
+    println!(
+        "    --transport <direct|ice>  direct (default): --listen/--connect address the QUIC socket."
+    );
+    println!("                        ice (S19 leg 2): punch the socket via rtc-ice first, see --signal");
+    println!(
+        "    --signal <listen:<port>|connect:<host:port>>  required with --transport ice: TCP"
+    );
+    println!("                        channel exchanging ICE credentials/candidates/cert-fp before punching");
+    println!("    --stun <addr>       --transport ice only: STUN server for a server-reflexive candidate");
+    println!("                        (NAT-punch matrix; unused/unneeded on loopback)");
+    println!("    --ice-bind <ip>     --transport ice only: local interface IP to bind+advertise (default 127.0.0.1)");
     println!();
     println!("EXAMPLES:");
     println!("    quic-peer --mode recv --listen 127.0.0.1:5701 --bytes 64 --json");
     println!("    quic-peer --mode send --connect 127.0.0.1:5701 --cert-fp sha256:ab12... --bytes 64 --json");
+    println!(
+        "    quic-peer --mode recv --transport ice --signal listen:6000 --bytes 64 --json"
+    );
+    println!(
+        "    quic-peer --mode send --transport ice --signal connect:127.0.0.1:6000 --bytes 64 --json"
+    );
 }
 
 // ── Certificate pinning (A10.32) ────────────────────────────────────────────────────────────
@@ -506,11 +712,316 @@ fn spawn_stats_sampler(
     }))
 }
 
+// ── S19 leg 2: signaling channel (--signal), stand-in for the A7-verified envelope ─────────────
+
+fn write_signal_line(stream: &mut TcpStream, msg: &SignalMessage) -> Result<()> {
+    let line = serde_json::to_string(msg).context("encoding SignalMessage as JSON")?;
+    stream
+        .write_all(line.as_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .context("writing signal message")
+}
+
+fn read_signal_line(reader: &mut BufReader<TcpStream>) -> Result<SignalMessage> {
+    let mut line = String::new();
+    let n = reader
+        .read_line(&mut line)
+        .context("reading signal message")?;
+    if n == 0 {
+        return Err(anyhow!(
+            "signal peer closed the connection before sending a message"
+        ));
+    }
+    serde_json::from_str(line.trim_end()).context("decoding peer's SignalMessage JSON")
+}
+
+/// Exchanges `local` with the peer over `--signal`. Fixed, deadlock-free message order (see
+/// `Signal`'s doc comment): `Connect` (the offerer) always writes first, then reads; `Listen` (the
+/// answerer) always reads first, then writes. Blocking std TCP I/O on the async runtime: fine here
+/// — a one-shot, sub-millisecond-to-low-seconds JSON exchange before any other task exists on this
+/// process's (multi-worker-thread, see `main`) tokio runtime, not a steady-state hot path.
+fn exchange_signal(signal: Signal, local: &SignalMessage) -> Result<SignalMessage> {
+    match signal {
+        Signal::Listen(addr) => {
+            let listener = TcpListener::bind(addr)
+                .with_context(|| format!("binding --signal listener on {addr}"))?;
+            eprintln!("quic-peer: signal: listening on {addr}, waiting for peer...");
+            let (mut stream, peer) = listener.accept().context("accepting signal connection")?;
+            eprintln!("quic-peer: signal: peer connected from {peer}");
+            let mut reader = BufReader::new(stream.try_clone().context("cloning signal stream")?);
+            let remote = read_signal_line(&mut reader)?;
+            write_signal_line(&mut stream, local)?;
+            Ok(remote)
+        }
+        Signal::Connect(addr) => {
+            eprintln!("quic-peer: signal: connecting to {addr}...");
+            let mut stream = TcpStream::connect(addr)
+                .with_context(|| format!("connecting --signal to {addr}"))?;
+            write_signal_line(&mut stream, local)?;
+            let mut reader = BufReader::new(stream);
+            read_signal_line(&mut reader)
+        }
+    }
+}
+
+// ── S19 leg 2: ICE punch (rtc_ice::agent::Agent -> std::net::UdpSocket handoff) ─────────────────
+
+/// Drives `agent` (already given its local candidate, remote credentials, and remote
+/// candidate(s), with `start_connectivity_checks` already called) until it reports a selected
+/// candidate pair, returning the peer's punched address. Once this returns, the caller stops
+/// feeding the socket's datagrams to `agent` entirely and hands the raw socket to quinn instead —
+/// see the module doc comment for why (no STUN/application-data demuxing exists in this crate to
+/// let the two share the socket afterward).
+async fn drive_ice_agent(
+    agent: &mut IceAgent,
+    socket: &tokio::net::UdpSocket,
+    timeout: Duration,
+) -> Result<SocketAddr> {
+    let local_addr = socket.local_addr().context("reading ICE socket local addr")?;
+    let mut buf = vec![0u8; 2048];
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        while let Some(transmit) = agent.poll_write() {
+            socket
+                .send_to(&transmit.message[..], transmit.transport.peer_addr)
+                .await
+                .context("sending ICE packet")?;
+        }
+
+        while let Some(event) = agent.poll_event() {
+            if let IceEvent::ConnectionStateChange(state) = event {
+                eprintln!("quic-peer: ice: connection state -> {state}");
+                if state == IceConnectionState::Failed {
+                    return Err(anyhow!(
+                        "ICE punch failed: connectivity checks exhausted with no pair selected"
+                    ));
+                }
+            }
+        }
+
+        if let Some((_local, remote)) = agent.get_selected_candidate_pair() {
+            return Ok(remote.addr());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "ICE punch timed out after {:.1}s with no pair selected",
+                timeout.as_secs_f64()
+            ));
+        }
+
+        let wake_at = agent
+            .poll_timeout()
+            .unwrap_or_else(|| Instant::now() + Duration::from_millis(100));
+        let sleep_for = wake_at
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_for) => {
+                agent
+                    .handle_timeout(Instant::now())
+                    .context("ICE agent timeout handling failed")?;
+            }
+            res = socket.recv_from(&mut buf) => {
+                let (n, peer_addr) = res.context("receiving ICE packet")?;
+                agent
+                    .handle_read(TaggedBytesMut {
+                        now: Instant::now(),
+                        transport: TransportContext {
+                            local_addr,
+                            peer_addr,
+                            transport_protocol: TransportProtocol::UDP,
+                            ecn: None,
+                        },
+                        message: BytesMut::from(&buf[..n]),
+                    })
+                    .with_context(|| format!("ICE agent rejected inbound packet from {peer_addr}"))?;
+            }
+        }
+    }
+}
+
+/// Result of a successful ICE punch: the raw punched socket (ready to hand straight to
+/// `quinn::Endpoint::new` — see the module doc comment for why no adapter trait is needed), the
+/// peer's selected address, and — `--mode send` only — the peer's cert fingerprint as learned over
+/// `--signal` (unless `--cert-fp` was passed to override it; see `Config::cert_fp`).
+struct IcePunchResult {
+    socket: std::net::UdpSocket,
+    remote_addr: SocketAddr,
+    remote_cert_fp: Option<[u8; 32]>,
+}
+
+/// Sends one STUN Binding Request (RFC 5389) to `stun_addr` over `socket` and returns the
+/// XOR-MAPPED-ADDRESS from the response — this harness's server-reflexive gathering (S19 leg 2
+/// milestone 6). Hand-rolled directly against `rtc-stun` rather than reusing `rtc_ice::Agent`'s
+/// own driving loop, which has no STUN-server concept at all (only peer-to-peer connectivity
+/// checks — see the module doc comment). One-shot, no retries: fine for a spike hitting a STUN
+/// server on the same container/bridge; a production gatherer would retry with backoff per
+/// RFC 5389 §7.2.1.
+async fn stun_gather(
+    socket: &tokio::net::UdpSocket,
+    stun_addr: SocketAddr,
+    timeout: Duration,
+) -> Result<SocketAddr> {
+    let mut req = StunMessage::new();
+    req.build(&[Box::new(TransactionId::new()), Box::new(BINDING_REQUEST)])
+        .context("building STUN Binding Request")?;
+    socket
+        .send_to(&req.raw, stun_addr)
+        .await
+        .context("sending STUN Binding Request")?;
+
+    let mut buf = [0u8; 1500];
+    let (n, from) = tokio::time::timeout(timeout, socket.recv_from(&mut buf))
+        .await
+        .context("STUN Binding Request timed out waiting for a response")?
+        .context("receiving STUN Binding Response")?;
+    if from != stun_addr {
+        return Err(anyhow!(
+            "STUN response arrived from {from}, expected the server at {stun_addr}"
+        ));
+    }
+
+    let mut resp = StunMessage::new();
+    resp.raw = buf[..n].to_vec();
+    resp.decode().context("decoding STUN Binding Response")?;
+
+    let mut mapped = XorMappedAddress::default();
+    mapped
+        .get_from(&resp)
+        .context("reading XOR-MAPPED-ADDRESS from STUN Binding Response")?;
+    Ok(SocketAddr::new(mapped.ip, mapped.port))
+}
+
+/// Punches a UDP socket to the peer named by `signal`'s counterpart process, via a standalone
+/// `rtc_ice::agent::Agent`. `is_controlling` follows this harness's fixed role mapping: `--signal
+/// listen:` (the `--mode recv` side, by convention) is ICE-controlled; `--signal connect:` (the
+/// `--mode send` side) is ICE-controlling — mirrors send-initiates-the-TCP-connection /
+/// send-is-the-offerer already true of `--signal`'s own message order.
+async fn ice_punch(
+    is_controlling: bool,
+    signal: Signal,
+    own_cert_fp_hex: Option<String>,
+    stun: Option<SocketAddr>,
+    bind_ip: std::net::IpAddr,
+    handshake_timeout: Duration,
+) -> Result<IcePunchResult> {
+    // Bind a concrete interface address, not the wildcard `0.0.0.0` — found empirically (`No
+    // route to host`) when this bound `0.0.0.0:0` and then advertised `0.0.0.0` itself as the
+    // host candidate's address: an address the peer obviously cannot route packets back to. See
+    // `Config::ice_bind_ip`'s doc comment.
+    let udp = tokio::net::UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+        .await
+        .context("binding ICE UDP socket")?;
+    let local_addr = udp
+        .local_addr()
+        .context("reading ICE UDP socket local addr")?;
+
+    let mut agent = IceAgent::new(Arc::new(IceAgentConfig {
+        is_controlling,
+        disconnected_timeout: Some(Duration::from_secs(5)),
+        failed_timeout: Some(handshake_timeout),
+        ..Default::default()
+    }))
+    .context("constructing rtc_ice::Agent")?;
+
+    let host_candidate = CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_string(),
+            address: local_addr.ip().to_string(),
+            port: local_addr.port(),
+            component: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+    .new_candidate_host()
+    .context("constructing local host candidate")?;
+    agent
+        .add_local_candidate(host_candidate.clone())
+        .context("adding local host candidate")?;
+
+    // S19 leg 2 milestone 6 (NAT-punch matrix): server-reflexive gathering, hand-rolled directly
+    // against `rtc-stun` — `rtc_ice::agent::AgentConfig.urls` is accepted but not wired to any
+    // gathering logic in rtc-ice 0.20.3 (verified by grepping every `agent/*.rs`: the field is
+    // only ever stored, never read). Not needed on loopback (milestones 1-5), where both peers
+    // already reach each other's host candidates directly with no NAT in the way.
+    let mut candidates = vec![host_candidate.marshal()];
+    if let Some(stun_addr) = stun {
+        let mapped = stun_gather(&udp, stun_addr, Duration::from_secs(5))
+            .await
+            .context("STUN server-reflexive gathering")?;
+        let srflx_candidate = CandidateServerReflexiveConfig {
+            base_config: CandidateConfig {
+                network: "udp".to_string(),
+                address: mapped.ip().to_string(),
+                port: mapped.port(),
+                component: 1,
+                ..Default::default()
+            },
+            rel_addr: local_addr.ip().to_string(),
+            rel_port: local_addr.port(),
+            url: Some(format!("stun:{stun_addr}")),
+        }
+        .new_candidate_server_reflexive()
+        .context("constructing server-reflexive candidate")?;
+        agent
+            .add_local_candidate(srflx_candidate.clone())
+            .context("adding local server-reflexive candidate")?;
+        eprintln!(
+            "quic-peer: ice: gathered server-reflexive candidate {mapped} via STUN {stun_addr}"
+        );
+        candidates.push(srflx_candidate.marshal());
+    }
+
+    let credentials = agent.get_local_credentials();
+    let local_msg = SignalMessage {
+        ufrag: credentials.ufrag.clone(),
+        pwd: credentials.pwd.clone(),
+        candidates,
+        cert_fp: own_cert_fp_hex,
+    };
+
+    let remote_msg = exchange_signal(signal, &local_msg)?;
+
+    for raw in &remote_msg.candidates {
+        let remote_candidate = unmarshal_candidate(raw)
+            .with_context(|| format!("unmarshaling remote candidate {raw:?}"))?;
+        agent
+            .add_remote_candidate(remote_candidate)
+            .context("adding remote candidate")?;
+    }
+
+    agent
+        .start_connectivity_checks(is_controlling, remote_msg.ufrag.clone(), remote_msg.pwd.clone())
+        .context("starting ICE connectivity checks")?;
+
+    let remote_addr = drive_ice_agent(&mut agent, &udp, handshake_timeout).await?;
+    eprintln!("quic-peer: ice: punched — selected remote address {remote_addr}");
+
+    let std_socket = udp
+        .into_std()
+        .context("converting ICE tokio UdpSocket to std::net::UdpSocket for quinn")?;
+
+    let remote_cert_fp = remote_msg
+        .cert_fp
+        .as_deref()
+        .map(parse_fingerprint)
+        .transpose()
+        .context("parsing peer's signaled cert-fp")?;
+
+    Ok(IcePunchResult {
+        socket: std_socket,
+        remote_addr,
+        remote_cert_fp,
+    })
+}
+
 // ── recv (quinn server) ─────────────────────────────────────────────────────────────────────
 
 async fn run_recv(cfg: &Config) -> Result<(u64, f64)> {
-    let listen = cfg.listen.expect("validated by Config::from_args");
-
     // Fresh self-signed cert every run (A10.32: per-session cert). `rcgen::generate_simple_self_signed`
     // returns a `CertifiedKey { cert, key_pair }` (rcgen 0.13); `cert.cert` converts to
     // `CertificateDer<'static>` and `cert.key_pair.serialize_der()` gives the matching PKCS#8
@@ -538,13 +1049,42 @@ async fn run_recv(cfg: &Config) -> Result<(u64, f64)> {
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_crypto));
     server_config.transport_config(build_transport_config(cfg.cc, cfg.window_bytes)?);
 
-    let endpoint = Endpoint::server(server_config, listen)
-        .with_context(|| format!("binding quinn server endpoint on {listen}"))?;
+    let endpoint = match cfg.transport {
+        Transport::Direct => {
+            let listen = cfg.listen.expect("validated by Config::from_args");
+            Endpoint::server(server_config, listen)
+                .with_context(|| format!("binding quinn server endpoint on {listen}"))?
+        }
+        Transport::Ice => {
+            let signal = cfg.signal.expect("validated by Config::from_args");
+            let punch = ice_punch(
+                /* is_controlling = */ false,
+                signal,
+                Some(format!("sha256:{}", hex_encode(&fingerprint))),
+                cfg.stun,
+                cfg.ice_bind_ip,
+                Duration::from_secs(15),
+            )
+            .await
+            .context("ICE punch (recv side)")?;
+            Endpoint::new(
+                EndpointConfig::default(),
+                Some(server_config),
+                punch.socket,
+                quinn::default_runtime().ok_or_else(|| anyhow!("no quinn async runtime found"))?,
+            )
+            .context("constructing quinn endpoint over the ICE-punched socket")?
+        }
+    };
     eprintln!(
-        "quic-peer: listening on {} (cc={}, window={} MiB)",
+        "quic-peer: listening on {} (cc={}, window={} MiB, transport={})",
         endpoint.local_addr()?,
         cfg.cc.as_str(),
         cfg.window_bytes / (1024 * 1024),
+        match cfg.transport {
+            Transport::Direct => "direct",
+            Transport::Ice => "ice",
+        },
     );
 
     let incoming = endpoint
@@ -625,10 +1165,12 @@ async fn run_recv(cfg: &Config) -> Result<(u64, f64)> {
 
 // ── send (quinn client) ──────────────────────────────────────────────────────────────────────
 
-async fn run_send(cfg: &Config) -> Result<(u64, f64)> {
-    let connect_addr = cfg.connect.expect("validated by Config::from_args");
-    let expected_fp = cfg.cert_fp.expect("validated by Config::from_args");
-
+/// Builds the quinn client config (rustls `ClientConfig` wrapped for QUIC, ALPN set, transport
+/// config applied) around a fingerprint-pinning verifier for `expected_fp`. Shared by both
+/// `--transport direct` (where `expected_fp` comes straight from `--cert-fp`) and `--transport
+/// ice` (where it comes from the `--signal` exchange, or `--cert-fp` if given as an override —
+/// see `Config::cert_fp`'s doc comment) — the verifier and transport config don't care which.
+fn build_client_config(cfg: &Config, expected_fp: [u8; 32]) -> Result<quinn::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(PinnedFingerprintVerifier {
         expected: expected_fp,
@@ -646,15 +1188,59 @@ async fn run_send(cfg: &Config) -> Result<(u64, f64)> {
         .context("wrapping rustls ClientConfig for quinn")?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
     client_config.transport_config(build_transport_config(cfg.cc, cfg.window_bytes)?);
+    Ok(client_config)
+}
 
-    let bind_addr: SocketAddr = if connect_addr.is_ipv6() {
-        "[::]:0".parse().unwrap()
-    } else {
-        "0.0.0.0:0".parse().unwrap()
+async fn run_send(cfg: &Config) -> Result<(u64, f64)> {
+    let (endpoint, connect_addr) = match cfg.transport {
+        Transport::Direct => {
+            let connect_addr = cfg.connect.expect("validated by Config::from_args");
+            let expected_fp = cfg.cert_fp.expect("validated by Config::from_args");
+            let client_config = build_client_config(cfg, expected_fp)?;
+
+            let bind_addr: SocketAddr = if connect_addr.is_ipv6() {
+                "[::]:0".parse().unwrap()
+            } else {
+                "0.0.0.0:0".parse().unwrap()
+            };
+            let mut endpoint = Endpoint::client(bind_addr)
+                .with_context(|| format!("binding quinn client endpoint on {bind_addr}"))?;
+            endpoint.set_default_client_config(client_config);
+            (endpoint, connect_addr)
+        }
+        Transport::Ice => {
+            let signal = cfg.signal.expect("validated by Config::from_args");
+            let punch = ice_punch(
+                /* is_controlling = */ true,
+                signal,
+                None, // send side never has a cert of its own to offer
+                cfg.stun,
+                cfg.ice_bind_ip,
+                Duration::from_secs(15),
+            )
+            .await
+            .context("ICE punch (send side)")?;
+            // --cert-fp, if given under --transport ice, OVERRIDES the signaled fingerprint (see
+            // Config::cert_fp's doc comment) — this is the hook the loopback verification uses to
+            // confirm a wrong pin is still rejected even when ICE punching itself succeeds.
+            let expected_fp = cfg.cert_fp.or(punch.remote_cert_fp).ok_or_else(|| {
+                anyhow!(
+                    "peer's --signal message carried no cert-fp and no --cert-fp override was given"
+                )
+            })?;
+            let client_config = build_client_config(cfg, expected_fp)?;
+
+            let mut endpoint = Endpoint::new(
+                EndpointConfig::default(),
+                None,
+                punch.socket,
+                quinn::default_runtime().ok_or_else(|| anyhow!("no quinn async runtime found"))?,
+            )
+            .context("constructing quinn endpoint over the ICE-punched socket")?;
+            endpoint.set_default_client_config(client_config);
+            (endpoint, punch.remote_addr)
+        }
     };
-    let mut endpoint = Endpoint::client(bind_addr)
-        .with_context(|| format!("binding quinn client endpoint on {bind_addr}"))?;
-    endpoint.set_default_client_config(client_config);
 
     eprintln!("quic-peer: connecting to {connect_addr}");
     let connection = endpoint
