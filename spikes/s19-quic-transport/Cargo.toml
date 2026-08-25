@@ -104,3 +104,31 @@ bytes = "1.12.1"
 # JSON signaling dependency.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+
+# S19 leg 3 (TURN relay fallback, docs/DESIGN.md §A8): `rtc-turn` is what `webrtc` 0.20.3 actually
+# uses for TURN — confirmed empirically (`cargo add --dry-run` then a real add + `cargo check`),
+# same restructuring precedent as `rtc-ice` (leg 2, above) and `rtc-sctp`
+# (spikes/s3-throughput/Cargo.toml): a sans-I/O `rtc-*` crate, not the older async `turn` crate.
+# `rtc_turn::client::Client` implements the identical `sansio::Protocol<TaggedBytesMut,
+# TaggedBytesMut, ()>` shape already used for `rtc_ice::agent::Agent` above (own doc comment:
+# "Sans-I/O TURN client... It owns no sockets") — the coordinator's anticipated "older async
+# client with allocate() -> an async Conn" branch does not apply here, same as leg 2's finding.
+# This means relay traffic (STUN Send-indication / ChannelData framing) must be actively
+# encoded/decoded by this crate rather than handed to quinn as a raw socket (unlike leg 2's plain
+# socket handoff) — see quic-peer.rs's `TurnRelaySocket`, a custom `quinn::runtime::AsyncUdpSocket`
+# bridging this sans-I/O client, mirroring `drive_ice_agent`'s hand-rolled driving-loop idiom
+# rather than introducing a second, older `turn` crate alongside `rtc-ice`/`rtc-turn` (both from
+# the same 0.20.3 release train) purely to get an async `Conn`. `default-features = false` +
+# `["ring"]` mirrors `rtc-ice`'s own crypto-provider choice above (same dry-run finding: `+ ring`,
+# `- aws-lc-rs`, `- metrics`).
+rtc-turn = { version = "0.20.3", default-features = false, features = ["ring"] }
+
+# S19 leg 3 REST TURN credentials (docs/DESIGN.md §A8's coturn `use-auth-secret` model:
+# `username = "<expiry>:<label>"`, `password = base64(HMAC-SHA1(shared-secret, username))`) — see
+# quic-peer.rs's `mint_turn_credentials`. `hmac`/`sha1` compute the MAC; `base64` encodes it.
+# Pinned to versions already resolving cleanly elsewhere in this workspace's dependency graph
+# (`sha1`/`hmac` are common, small, pure-Rust crates with no C-toolchain requirement — same
+# no-cmake bar as every other crypto dependency in this file).
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"

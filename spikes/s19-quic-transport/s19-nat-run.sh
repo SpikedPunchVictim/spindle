@@ -56,8 +56,14 @@
 # STUN, tell my peer that address, they dial it" assumption ICE's srflx candidates depend on — the
 # expected-fail case the task brief anticipated (leg 3's TURN relay is the fix, not attempted here).
 #
+# S19 leg 3 addition (RELAY=1): after the ICE matrix above runs (unchanged), also installs coturn
+# on the root namespace's br-wan interface and re-runs the symmetric:symmetric cell — the matrix's
+# documented 12/12 hard-failure combo — via `--transport relay` instead, to confirm TURN relaying
+# completes it. See the `RELAY=1` diagnostic-override comment inside `--in-container` for details.
+#
 # Usage (from anywhere — path-independent):
 #   spikes/s19-quic-transport/s19-nat-run.sh
+#   RELAY=1 spikes/s19-quic-transport/s19-nat-run.sh   # also verify leg 3's relay fallback
 #
 # Requires: docker, and the `spindle-toolchain:local` image already built locally.
 #
@@ -83,6 +89,19 @@ if [ "${1:-}" = "--in-container" ]; then
   if ! command -v ip >/dev/null 2>&1 || ! command -v iptables >/dev/null 2>&1; then
     apt-get update -qq
     apt-get install -y -qq iproute2 iptables >/dev/null
+  fi
+
+  # S19 leg 3 (RELAY=1): install coturn HERE, before any namespace/bridge/iptables NAT state
+  # exists — found empirically necessary (2 attempts timed out otherwise, both hanging at
+  # `apt-get install coturn` for the full run budget with zero further output): installing coturn
+  # from inside the leg-3 block, AFTER the ICE COMBOS loop above had already built and left up
+  # (not torn down until the very end) a bridge + two NAT namespaces + MASQUERADE iptables rules,
+  # broke this root namespace's own outbound networking badly enough that `apt-get` never
+  # completed. Installing before any of that topology exists (i.e. here, on plain container
+  # networking) avoids the interaction entirely.
+  if [ "${RELAY:-0}" = "1" ] && ! command -v turnserver >/dev/null 2>&1; then
+    apt-get update -qq
+    apt-get install -y -qq coturn >/dev/null
   fi
 
   # See the module doc comment above: Docker masks /proc/sys read-only by default even with
@@ -115,10 +134,25 @@ if [ "${1:-}" = "--in-container" ]; then
   #   PER_RUN_TIMEOUT_S=20              -> per-cell watchdog (ICE punch itself also self-times-out
   #                                        after its own internal 15s — see ice_punch's
   #                                        handshake_timeout)
+  #   RELAY=1                           -> S19 leg 3: after the ICE matrix above, ALSO install
+  #                                        coturn on the root namespace's br-wan interface
+  #                                        (10.0.0.1:3479, use-auth-secret) and re-run the
+  #                                        symmetric:symmetric cell (the ICE matrix's documented
+  #                                        hard-failure combo) via `--transport relay` instead of
+  #                                        `--transport ice`, appending its own result row. Does
+  #                                        NOT change the default (RELAY unset) matrix above at
+  #                                        all — additive, so existing invocations/results are
+  #                                        unaffected.
+  #   TURN_SECRET=<string>              -> coturn use-auth-secret shared secret (RELAY=1 only);
+  #                                        default below is fine for this ephemeral per-run
+  #                                        container, never persisted or reused across runs.
   COMBOS="${COMBOS:-cone:cone symmetric:cone cone:symmetric symmetric:symmetric}"
   BYTES_MIB="${BYTES_MIB:-4}"
   WINDOW_MIB="${WINDOW_MIB:-2}"
   PER_RUN_TIMEOUT_S="${PER_RUN_TIMEOUT_S:-20}"
+  RELAY="${RELAY:-0}"
+  TURN_SECRET="${TURN_SECRET:-s19-leg3-spike-secret}"
+  TURN_PORT=3479
 
   teardown() {
     pkill -f "$STUN_BIN" >/dev/null 2>&1 || true
@@ -274,6 +308,108 @@ if [ "${1:-}" = "--in-container" ]; then
     fi
   done
 
+  # S19 leg 3 (docs/DESIGN.md §A8): re-run the symmetric:symmetric cell — the ICE matrix's
+  # documented 12/12 hard-failure combo (random-fully MASQUERADE on both sides breaks the "learn
+  # my one stable mapped address via STUN" assumption ICE's srflx candidates depend on) — via
+  # `--transport relay` instead, to confirm TURN relaying is the fix leg 2's own module doc
+  # comment anticipated. Additive: only runs when RELAY=1, appends one more row, does not touch
+  # the COMBOS loop above.
+  if [ "$RELAY" = "1" ]; then
+    echo "== S19 leg 3: symmetric:symmetric via --transport relay (RELAY=1) ==" >&2
+
+    # coturn is already installed above (before the ICE COMBOS loop built any namespace/bridge
+    # state) — see that install step's comment for why it has to happen there, not here.
+
+    # SIGNAL_PORT must be set BEFORE calling setup_topology: that function reads the global
+    # $SIGNAL_PORT to install the signaling DNAT rule (see its body above, "DNAT the signaling
+    # TCP port through gwB"). Calling it before bumping SIGNAL_PORT here would DNAT the *previous*
+    # cell's port (15000, from the ICE COMBOS loop above) instead of this block's port (15001) —
+    # found empirically: this exact ordering bug caused the send side's --signal connect to get
+    # "Connection refused" (nothing forwarded 15001 through gwB) while the recv side sat listening
+    # on 15001 inside its own namespace, unreachable, until its own timeout wrapper fired.
+    SIGNAL_PORT=$((port))
+    port=$((port + 1))
+    setup_topology symmetric symmetric
+
+    # coturn on the root namespace's br-wan interface (10.0.0.1) — the harness's stand-in for a
+    # public TURN server, at the same network position as the root-ns STUN server above (directly
+    # on br-wan, not behind either gwA/gwB NAT). Port 3479, not 3478, so it can run alongside the
+    # existing hand-rolled `stun-server` binary (used by the ICE matrix above) without colliding.
+    # `use-auth-secret` + a static shared secret mirrors docs/DESIGN.md §A8's coturn model
+    # (`username = expiry:device_fp`, REST-minted credentials) — see quic-peer.rs's
+    # `mint_turn_credentials`, which each `quic-peer --transport relay` process calls itself with
+    # this same secret (no separate credential-minting helper exists in this harness).
+    cat >/tmp/s19-turnserver.conf <<TURNEOF
+listening-port=${TURN_PORT}
+listening-ip=10.0.0.1
+relay-ip=10.0.0.1
+external-ip=10.0.0.1
+use-auth-secret
+static-auth-secret=${TURN_SECRET}
+realm=spindle-s19-spike
+no-tls
+no-dtls
+no-cli
+fingerprint
+min-port=49152
+max-port=54999
+log-file=$(pwd)/$SPIKE_DIR/.s19-nat-raw/turnserver.log
+TURNEOF
+    turnserver -c /tmp/s19-turnserver.conf -o
+    sleep 0.5
+
+    relay_recv_out="$RAW_DIR/relay_symmetric_symmetric-recv.json"
+    relay_recv_err="$RAW_DIR/relay_symmetric_symmetric-recv.err"
+    relay_send_out="$RAW_DIR/relay_symmetric_symmetric-send.json"
+    relay_send_err="$RAW_DIR/relay_symmetric_symmetric-send.err"
+    : >"$relay_recv_out"; : >"$relay_recv_err"; : >"$relay_send_out"; : >"$relay_send_err"
+
+    set +e
+    # Both sides watchdogged with `timeout` — unlike the ICE cells above, `run_recv`'s
+    # `endpoint.accept().await` has no internal timeout of its own once TURN setup completes (only
+    # `turn_relay_setup` itself is capped, at 15s), so an unwatchdogged recv would hang forever
+    # (found empirically: two earlier attempts hung the whole script to its overall budget with no
+    # further output once one side's connect never reached the other).
+    timeout "${PER_RUN_TIMEOUT_S}s" ip netns exec peerB "$BIN" --mode recv --transport relay \
+      --signal "listen:${SIGNAL_PORT}" \
+      --turn "10.0.0.1:${TURN_PORT}" --turn-secret "$TURN_SECRET" --turn-user-label peerB \
+      --ice-bind 192.168.20.2 --bytes "$BYTES_MIB" --window "$WINDOW_MIB" --json \
+      >"$relay_recv_out" 2>"$relay_recv_err" &
+    relay_recv_pid=$!
+    sleep 0.3
+
+    timeout "${PER_RUN_TIMEOUT_S}s" ip netns exec peerA "$BIN" --mode send --transport relay \
+      --signal "connect:10.0.0.12:${SIGNAL_PORT}" --turn "10.0.0.1:${TURN_PORT}" \
+      --turn-secret "$TURN_SECRET" --turn-user-label peerA --ice-bind 192.168.10.2 \
+      --bytes "$BYTES_MIB" --window "$WINDOW_MIB" --json \
+      >"$relay_send_out" 2>"$relay_send_err"
+    relay_send_rc=$?
+
+    wait "$relay_recv_pid"
+    relay_recv_rc=$?
+    set -e
+
+    pkill turnserver >/dev/null 2>&1 || true
+
+    if [ "$relay_recv_rc" -eq 0 ] && [ "$relay_send_rc" -eq 0 ] && [ -s "$relay_recv_out" ]; then
+      raw="$(cat "$relay_recv_out")"
+      mb_per_s="$(printf '%s' "$raw" | sed -n 's/.*"mb_per_s":\([0-9.]*\).*/\1/p')"
+      printf '| %s | %s | %s | %s | RELAYED + TRANSFER OK (leg 3, --transport relay) | %s MB/s | bytes=%sMiB window=%sMiB |\n' \
+        "$DATE_STR" "$ENV_LABEL" "symmetric" "symmetric" "$mb_per_s" "$BYTES_MIB" "$WINDOW_MIB" \
+        >>"$RESULTS_TMP"
+    else
+      reason="recv_exit=${relay_recv_rc} send_exit=${relay_send_rc}"
+      if [ "$relay_send_rc" -eq 124 ]; then
+        reason="TURN relay setup/transfer TIMEOUT after ${PER_RUN_TIMEOUT_S}s ($reason)"
+      fi
+      tail_err="$(tail -c 300 "$relay_send_err" 2>/dev/null | tr '\n' ' ')"
+      printf '| %s | %s | %s | %s | FAILED (leg 3, --transport relay) | %s | send_stderr_tail=%s |\n' \
+        "$DATE_STR" "$ENV_LABEL" "symmetric" "symmetric" "$reason" "$tail_err" \
+        >>"$RESULTS_TMP"
+      echo "s19-nat-run: RELAY CELL FAILED ($reason)" >&2
+    fi
+  fi
+
   teardown
 
   echo "" >&2
@@ -295,6 +431,8 @@ exec docker run --rm \
   -e BYTES_MIB \
   -e WINDOW_MIB \
   -e PER_RUN_TIMEOUT_S \
+  -e RELAY \
+  -e TURN_SECRET \
   -v "$REPO_ROOT:/workspace" \
   -w /workspace \
   spindle-toolchain:local \

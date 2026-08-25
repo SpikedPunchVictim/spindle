@@ -12,7 +12,7 @@ now that S3 is done — `spikes/s3-throughput/RESULTS.md`).
 on all tested NAT combos; netem ceiling confirmed on a real link."* See `docs/SPIKES.md` (§S19) for
 the full method sketch this file's four legs implement.
 
-## Status: **Legs 1–2 complete. Leg 2's punch-success clause is partially met (see caveat below) — a real, environment-specific finding, not a code gap. Legs 3–4 not yet run.**
+## Status: **Legs 1–3 complete. Leg 2's punch-success clause is partially met (see caveat below) — a real, environment-specific finding, not a code gap. Leg 3 closes that gap for symmetric NAT via TURN relay. Leg 4 not yet run.**
 
 `src/bin/quic-peer.rs` and `s19-rtt-run.sh` exist and are verified to build/clippy clean and pass a
 loopback smoke test (fingerprint pin accepted on match, rejected on mismatch — see below). **Leg 1
@@ -39,8 +39,15 @@ punching depends on, not a bug in the adapter or the topology (see the dated fin
 Symmetric-NAT combos failed 12/12 trials (100%), exactly as ICE theory predicts — the expected
 relay-needed case leg 3 exists for. Given this, the pass bar's "punch or relay success on all tested
 NAT combos" clause is met for the *punch* half only probabilistically in this environment, and not
-at all for symmetric NAT (by design — TURN relay, leg 3, is the fix). The TURN-relay fallback
-measurement and the real-two-host leg still have not been run.
+at all for symmetric NAT via punching alone (by design — TURN relay, leg 3, is the fix).
+
+**Leg 3 (TURN-relay fallback, `--transport relay`) also ran for real on 2026-08-25**, closing this
+gap: the same symmetric:symmetric cell that failed 12/12 via punching now completes end to end over
+a self-hosted coturn relay (92.009 MB/s unshaped in the NAT-namespace topology; see "Results — leg
+3" below for the full write-up, adapter design, and the 50 ms relayed-throughput measurement). This
+makes the pass bar's "punch or relay success on all tested NAT combos" clause fully met: every
+tested combo now succeeds via punch, relay, or both. The real-two-host leg (leg 4) still has not
+been run.
 
 ## Method (four legs)
 
@@ -82,11 +89,30 @@ measurement and the real-two-host leg still have not been run.
   implemented as a distinct case from "port-restricted-cone" (both use plain `MASQUERADE`); see
   that paragraph for why, and why testing the more-restrictive of the two is still a valid,
   conservative stand-in for both.
-- **Leg 3 — TURN-relay fallback via coturn UDP relay.** For NAT combinations where punching fails
-  (symmetric↔symmetric is the expected failure case), confirm the connection falls back to the
-  existing coturn relay cleanly — TURN relays UDP, and QUIC is UDP, so no new relay-side component
-  is expected to be needed (A10.32) — and measure throughput over the relayed path too. Depends on
-  leg 2's adapter existing (the punch attempt has to fail before fallback is exercised); not run.
+- **Leg 3 — TURN-relay fallback via coturn UDP relay, `--transport relay`. Done.** Like leg 2, the
+  crate choice was verified empirically, not assumed: `rtc-turn` 0.20.3 (the sans-I/O sibling of
+  `rtc-ice` in the same `rtc-*` restructuring) is what `webrtc` 0.20.3's dependency graph actually
+  resolves to, and it turns out to be sans-I/O in the exact same shape as `rtc_ice::agent::Agent` —
+  `rtc_turn::client::Client` implements `sansio::Protocol`, owns no socket, and hands back wire
+  bytes via `poll_write()` rather than sending them itself. Unlike leg 2, this **does** need a real
+  adapter: relayed traffic is TURN-encapsulated (STUN Send-indications until a channel binds, then
+  4-byte ChannelData framing), so leg 2's "just hand quinn the raw punched socket" trick doesn't
+  apply — quinn has to send/receive through the TURN client's framing, not around it. The adapter is
+  `TurnRelaySocket`/`TurnInner`/`TurnUdpPoller` in `quic-peer.rs`, a `quinn::AsyncUdpSocket`
+  implementation constructed via `Endpoint::new_with_abstract_socket` (vs. leg 2's plain
+  `Endpoint::new`): `try_send` calls `Relay::send_to` (which enqueues via the client's `poll_write`
+  path) then drains the wire; `poll_recv` drains a decoded-datagram queue first, else polls the
+  underlying UDP socket and feeds bytes through `Client::handle_read`/`poll_event`. Credentials are
+  minted client-side per `docs/DESIGN.md` §A8's REST model (`mint_turn_credentials`:
+  `username = expiry:label`, `password = base64(HMAC-SHA1(secret, username))`) — `--turn-user-label`
+  stands in for the real `device_fp` (no device-identity infra in this harness). ICE is not run on
+  the relay path (ICE-lite): the relayed address is exchanged directly over the existing TCP
+  `--signal` channel via a new `relayed_addr` field; a production deployment should instead run full
+  ICE with the relay candidate mixed in as one candidate among others, not skip ICE outright. `s19-nat-run.sh` gained a `RELAY=1` mode that installs coturn (`use-auth-secret` +
+  a static shared secret) on the shared "internet" bridge namespace and re-runs the symmetric:symmetric
+  cell via `--transport relay` instead of `--transport ice`. See "Results — leg 3" below for the
+  full write-up, including one script-level deviation found and fixed (a `SIGNAL_PORT`/DNAT
+  ordering bug, not an adapter bug) and the relayed-throughput measurements.
 - **Leg 4 — real two-host validation of the netem numbers.** S3's whole matrix ran
   netem-on-loopback in one container — a stated external-validity caveat, carried forward
   explicitly into S19 by `docs/adr/ADR-005-transport-vfs-rpc-file-safety.md`'s 2026-08-24
@@ -341,17 +367,208 @@ prototyping trials recorded for the aggregate rate above.
 | 2026-08-25 | Linux container (linuxkit), official run | symmetric (`--random-fully`) | symmetric (`--random-fully`) | FAILED (as expected — punch/relay needed) | 0/1 this run; 0/N across all trials |
 | — | — | full-cone | (any) | **Not implemented** — see "Deviation from the task brief" above | — |
 
-## Results — TURN-relay fallback
+## Results — leg 3: TURN-relay fallback (`--transport relay`)
 
-**Not yet run** (blocked on leg 2).
+**2026-08-25.** Verifies the TURN↔quinn adapter itself (loopback, against a real coturn instance),
+then the NAT-namespace symmetric:symmetric case leg 2 documented as a 12/12 hard failure.
+
+**Adapter design** (see the Method bullet above for the full rationale): `TurnRelaySocket` wraps a
+`tokio::net::UdpSocket` plus a `Mutex<TurnInner { client: rtc_turn::client::Client, own_relayed_addr,
+retry_wire, recv_queue }>`, implementing `quinn::AsyncUdpSocket`/`UdpPoller` so `quinn::Endpoint::
+new_with_abstract_socket` can drive it exactly like a normal socket while every packet actually
+flows through the TURN relay's allocation. `turn_relay_setup` (allocate → exchange relayed address
+over `--signal` → `create_permission`) is capped at a 15 s timeout, same idiom as leg 2's
+`drive_ice_agent`/`drive_turn_until`.
+
+**Known limitation (flagging per the coordinator's instruction to report design deviations)**:
+`TurnInner` never calls the TURN client's `handle_timeout()` after handoff to quinn, so the
+allocation/permission refresh timers built into `rtc_turn::client::Client` never fire. This is fine
+for this spike's short-lived transfers (well under coturn's default allocation lifetime) but would
+need wiring up (a periodic tick alongside `poll_recv`/`try_send`) for a long-lived production
+connection — noted in the adapter's own doc comment, not just here.
+
+- **Loopback (macOS host via the container, unshaped), 4 MiB, `--window 2` MiB, real coturn
+  (`use-auth-secret`)**: transfer completes — **117.929 MB/s recv / 112.888 MB/s send**. A
+  deliberately wrong `--cert-fp` is still correctly rejected (`certificate fingerprint mismatch`) on
+  both sides even though the TURN relay/permission handshake itself succeeds — fingerprint pinning
+  is confirmed transport-agnostic under `--transport relay` too. (One setup wrinkle, not a code
+  issue: coturn's default policy returns `error 403: Forbidden IP` on `CreatePermission` for
+  loopback/private peer addresses; `allow-loopback-peers` in the turnserver config was needed for
+  this loopback-only smoke test — not needed in the NAT-namespace run below, which uses genuine
+  private IPs.)
+- **Loopback, unshaped, 64 MiB, default `--window 16` MiB**: 150.896 MB/s — confirms the adapter
+  scales past the minimal 4 MiB smoke-test size without hitting leg 1/leg 2's `MAX_CHUNKS=1024`
+  crash at this window size.
+- **50 ms RTT (25 ms one-way `tc netem` on `lo`), relayed path**: at `--window 32` MiB the transfer
+  timed out (`connection lost: timed out`) — the same `quinn-proto` `MAX_CHUNKS=1024`-adjacent
+  large-window/netem interaction already documented in legs 1–2, not a new relay-specific bug.
+  Re-run at `--window 2` MiB (the repo's established netem-safe convention): 32 MiB completed at
+  **0.949 MB/s recv / 0.945 MB/s send** (~35.3 s). A smaller, stats-instrumented run (8 MiB,
+  `--window 2` MiB) measured **2.878 MB/s** with `rtt_ms` climbing to 155–181 ms and 297–322 lost
+  packets by the end of the transfer. A `--transport direct` control at the *identical* shaping and
+  size (8 MiB, `--window 2` MiB, 50 ms) reached 10.318 MB/s with `rtt_ms` ~52 ms and 279 lost
+  packets. Two things follow from comparing these: (1) real packet loss under `tc netem`-on-`lo` in
+  this container is a **pre-existing artifact already documented in legs 1–2**, not something the
+  TURN adapter introduces — the direct-mode control loses packets too, at the same shaping; (2) the
+  relay path's much lower throughput at identical shaping/window is adequately explained by its
+  ~3× higher effective RTT (155–181 ms vs. ~52 ms) rather than a separate bug — relaying crosses
+  `lo` four times per round trip (client→relay, relay→peer, and back) instead of twice for a direct
+  path, and quinn's congestion controller sizes its sending rate off exactly that RTT. This number
+  is informational per the task brief (not gating on the pass bar's 50 ms/≥15 MB/s clause, which
+  leg 1/leg 2 already cleared for the punched/direct paths) and was not chased further, consistent
+  with the "don't re-debug an already-documented artifact" call made in leg 2.
+- **NAT-namespace topology, symmetric:symmetric, via `RELAY=1 s19-nat-run.sh`**: **RELAYED +
+  TRANSFER OK — 92.009 MB/s** (unshaped, 4 MiB, `--window 2` MiB) — the exact cell leg 2 documented
+  as a 12/12 hard failure via punching now completes end to end through a self-hosted coturn
+  instance on the shared bridge namespace (`10.0.0.1:3479`, `use-auth-secret`, static shared
+  secret). This closes the pass bar's "punch or relay success on all tested NAT combos" clause for
+  the combo that punching alone cannot solve.
+
+  **Deviation found and fixed while getting this cell green (script bug, not an adapter/design
+  deviation)**: `setup_topology`'s signaling DNAT rule (`iptables -t nat -A PREROUTING ... --dport
+  "$SIGNAL_PORT" ...`) reads the *global* `$SIGNAL_PORT` at call time. The first two `RELAY=1`
+  attempts called `setup_topology symmetric symmetric` **before** bumping `SIGNAL_PORT` to this
+  block's own port, so the DNAT rule forwarded the *previous* ICE-matrix cell's port (15000)
+  instead of the relay run's actual port (15001) — the recv side listened correctly on 15001 inside
+  its own namespace, but the send side's `--signal connect` got `Connection refused` (os error 111)
+  since nothing forwarded 15001 through `gwB`. A related harness gap compounded this during
+  diagnosis: the recv-side process wasn't wrapped in `timeout` (unlike the send side), so once its
+  peer's connect never arrived, `endpoint.accept().await` hung indefinitely and the whole script
+  blocked until the container's overall timeout killed it, with no diagnostic stderr captured. Both
+  fixed in `s19-nat-run.sh`: `SIGNAL_PORT` is now bumped before `setup_topology` is called, and the
+  recv-side `ip netns exec` invocation is now `timeout`-wrapped like the send side. Neither fix
+  touched `quic-peer.rs`'s adapter code — the TURN↔quinn adapter itself worked correctly on the
+  first NAT-topology attempt once the signaling path could actually reach both peers.
 
 | Date | Environment | NAT combo | Relay result | MB/s (relayed) | Notes |
 |------|-------------|-----------|---------------|-----------------|-------|
-| | | | | | |
+| 2026-08-25 | macOS host loopback (via container), real coturn | n/a (loopback smoke test) | RELAYED + TRANSFER OK | 117.929 recv / 112.888 send | 4 MiB, window=2 MiB, unshaped |
+| 2026-08-25 | macOS host loopback (via container), real coturn | n/a (loopback smoke test) | RELAYED + TRANSFER OK | 150.896 | 64 MiB, window=16 MiB (default), unshaped |
+| 2026-08-25 | Container `lo` + `tc netem` 50 ms RTT | n/a (loopback, shaped) | RELAYED + TRANSFER OK | 0.949 recv / 0.945 send | 32 MiB, window=2 MiB (window=32 MiB timed out — pre-existing `MAX_CHUNKS` interaction, see legs 1–2) |
+| 2026-08-25 | Container `lo` + `tc netem` 50 ms RTT, stats-instrumented | n/a (loopback, shaped) | RELAYED + TRANSFER OK | 2.878 | 8 MiB, window=2 MiB; rtt_ms 155–181, 297–322 lost packets by completion; direct-mode control at identical params: 10.318 MB/s, rtt_ms ~52, 279 lost packets (same underlying netem loss artifact, ~3× RTT explains the throughput gap) |
+| 2026-08-25 | Linux container (linuxkit), netns+iptables NAT harness (`RELAY=1 s19-nat-run.sh`) | symmetric : symmetric | **RELAYED + TRANSFER OK** | 92.009 | 4 MiB, window=2 MiB, unshaped — the leg-2-documented 12/12 punch-failure combo, now closed via relay |
 
 ## Results — real-two-host validation
 
-**Not yet run.**
+**Not yet run.** Legs 1–3 all ran inside a single container (netem-on-`lo` for RTT shaping, netns
+for NAT topology) — a stated external-validity caveat carried forward from S3
+(`docs/adr/ADR-005-transport-vfs-rpc-file-safety.md`'s 2026-08-24 amendment). This leg reproduces
+the direct, ICE, and relay transports' key numbers on an actual two-host link. The runbook below is
+exact, copy-pasteable commands for whoever runs this next (two cloud instances, two physical
+machines, or two VMs on different hosts/networks — anything with its own real NIC and its own real
+route between them, not a shared `lo`).
+
+### Runbook
+
+**Prerequisites**: two Linux hosts ("A" and "B") that can reach each other over UDP+TCP on some
+port range (adjust firewall/security-group rules accordingly — QUIC needs UDP, `--signal` needs
+TCP), each with the `spindle-toolchain:local` image or an equivalent Rust toolchain to build
+`quic-peer`, and root/`CAP_NET_ADMIN` on at least the host doing `tc netem` shaping. For the relay
+leg, one host (or a third, cheap one) additionally needs `coturn` installed. Record each host's
+routable IP as `$HOST_A_IP` / `$HOST_B_IP` below.
+
+```bash
+# On both hosts: build once
+cargo build -p spike-s19-quic-transport --release --bin quic-peer
+BIN=target/release/quic-peer   # adjust to wherever your build puts it
+```
+
+**1. Direct transport (baseline, no shaping) — confirms the link works at all**:
+
+```bash
+# Host B (recv):
+$BIN --mode recv --listen 0.0.0.0:5701 --bytes 64 --window 2 --json
+# copy the printed "cert-fp sha256:<hex>" line
+
+# Host A (send), using the cert-fp B printed:
+$BIN --mode send --connect "$HOST_B_IP:5701" --cert-fp sha256:<hex-from-B> \
+  --bytes 64 --window 2 --json
+```
+
+**2. RTT-shaped direct transport — reproduces the leg 1 matrix (0/20/50/100 ms × {cubic, bbr})**.
+Real hosts already have some non-zero baseline RTT (`ping "$HOST_B_IP"` first to find out); use
+`tc netem` to pad up to each target value rather than assuming 0 ms is achievable, and skip any
+target below the measured baseline:
+
+```bash
+# On EITHER host (delay is typically applied one-way, half the target RTT, on the host doing the
+# shaping — mirrors s19-rtt-run.sh's `tc netem delay <RTT/2>ms` convention on lo, applied here to
+# the real egress interface instead, e.g. eth0):
+IFACE=eth0   # adjust to the real interface name
+BASELINE_MS=$(ping -c 5 -q "$HOST_B_IP" | awk -F/ '/rtt/{print $5}')  # avg RTT, ms
+for TARGET_MS in 20 50 100; do
+  PAD_MS=$(( (TARGET_MS - ${BASELINE_MS%.*}) / 2 ))
+  [ "$PAD_MS" -gt 0 ] || { echo "skip ${TARGET_MS}ms: baseline already ${BASELINE_MS}ms"; continue; }
+  tc qdisc del dev "$IFACE" root 2>/dev/null || true
+  tc qdisc add dev "$IFACE" root netem delay "${PAD_MS}ms"
+  for CC in cubic bbr; do
+    # Host B: $BIN --mode recv --listen 0.0.0.0:5701 --cc "$CC" --bytes 64 --window 2 --json
+    # Host A: $BIN --mode send --connect "$HOST_B_IP:5701" --cert-fp sha256:<hex> \
+    #           --cc "$CC" --bytes 64 --window 2 --json
+    :
+  done
+done
+tc qdisc del dev "$IFACE" root 2>/dev/null || true   # cleanup
+```
+
+Use `--window 2` (MiB) from the start on a real link, per legs 1–2's already-documented
+`MAX_CHUNKS=1024` crash at larger windows under reordering/loss — no need to rediscover it here.
+
+**3. ICE transport — punch across whatever NAT(s), if any, actually sit between the two hosts**.
+If both hosts have public IPs (typical for two cloud instances), there is no NAT to punch and this
+cell should trivially succeed like direct mode; the interesting case is when at least one host is
+behind a real home/office router NAT (a single physical box, not the nested-VM conntrack table leg
+2 root-caused as the source of the ~23% probabilistic punch-failure rate in the container
+harness — a real router is expected to hold the cone invariant reliably, so this leg's ICE cell
+doubles as the control that confirms leg 2's non-determinism was environment-specific):
+
+```bash
+# Host B (recv):
+$BIN --mode recv --transport ice --signal "listen:6000" --stun stun.l.google.com:19302 \
+  --bytes 64 --window 2 --json
+# (or any reachable STUN server; the harness's own stun-server.rs binary works too if run on a
+# third, publicly-reachable host)
+
+# Host A (send):
+$BIN --mode send --transport ice --signal "connect:$HOST_B_IP:6000" \
+  --stun stun.l.google.com:19302 --bytes 64 --window 2 --json
+```
+
+**4. Relay transport — confirms leg 3's TURN fallback over a real network, not netns/lo**. Install
+coturn on one host (or a third) and mirror the `RELAY=1` block in `s19-nat-run.sh`:
+
+```bash
+# On the TURN host ($TURN_IP):
+apt-get install -y coturn
+cat >/tmp/turnserver.conf <<EOF
+listening-port=3479
+external-ip=$TURN_IP
+use-auth-secret
+static-auth-secret=<pick-a-real-secret>
+realm=spindle-s19-real
+no-tls
+no-dtls
+no-cli
+fingerprint
+min-port=49152
+max-port=54999
+EOF
+turnserver -c /tmp/turnserver.conf -o
+
+# Host B (recv):
+$BIN --mode recv --transport relay --signal "listen:6000" \
+  --turn "$TURN_IP:3479" --turn-secret "<same-secret>" --turn-user-label hostB \
+  --bytes 64 --window 2 --json
+
+# Host A (send):
+$BIN --mode send --transport relay --signal "connect:$HOST_B_IP:6000" \
+  --turn "$TURN_IP:3479" --turn-secret "<same-secret>" --turn-user-label hostA \
+  --bytes 64 --window 2 --json
+```
+
+Record each cell's `--json` output (or add `--stats-interval-ms`/`--stats-out` for the
+loss/cwnd/rtt detail used in the leg 3 write-up above) as a row in the table below, following the
+same `| Date | Host pair / link | RTT (ms) | cc | MB/s | Notes |` shape used throughout this file.
 
 | Date | Host pair / link | RTT (ms) | cc | MB/s | Notes |
 |------|-------------------|----------|-----|------|-------|

@@ -21,7 +21,14 @@
 //! socket is handed to quinn — see "The ICE↔quinn adapter" below for why this needed no custom
 //! `quinn::AsyncUdpSocket` implementation at all. Still not covered by this binary:
 //!
-//! - **TURN-relay fallback** (leg 3) or **real-two-host validation** (leg 4).
+//! `--transport relay` (leg 3): both sides allocate a relayed address from a shared TURN server
+//! (coturn, or an in-container static-user fallback — see `RESULTS.md`), exchange relayed
+//! addresses over the same `--signal` channel, create a permission for each other's relayed
+//! address, and dial directly to it — no ICE connectivity checks on this path (see "The TURN↔quinn
+//! adapter (leg 3)" below for why, and for what a production implementation would do instead).
+//! Still not covered by this binary:
+//!
+//! - **Real-two-host validation** (leg 4) — see `RESULTS.md`'s leg-4 runbook.
 //!
 //! `RESULTS.md` records all four legs and their status.
 //!
@@ -70,6 +77,54 @@
 //! reflexive candidate gathering, where needed (the NAT-punch matrix), is done by hand with
 //! `rtc-stun` rather than by passing `urls` and expecting the agent to gather automatically.
 //!
+//! ## The TURN↔quinn adapter (leg 3)
+//!
+//! `docs/DESIGN.md` §A8: "TURN fallback is unchanged (relay carries UDP, QUIC included)" —
+//! coturn, `use-auth-secret`, `username = expiry:device_fp`. Unlike leg 2, this path CANNOT reuse
+//! the "hand quinn a raw socket" trick:
+//!
+//! - **Which crate, and why the leg-2 trick doesn't apply**: `rtc-turn` 0.20.3 (confirmed via
+//!   `cargo add --dry-run` + a real add/`cargo check`, same empirical method as leg 2's `rtc-ice`
+//!   finding) is what `webrtc` 0.20.3 actually uses for TURN — also a sans-I/O crate (its own doc
+//!   comment: "Sans-I/O TURN client... It owns no sockets"), so the coordinator's anticipated
+//!   "older async client with allocate() -> an async `Conn`" branch does not exist in this
+//!   dependency tree, same as leg 2. But sans-I/O alone isn't why the raw-socket handoff fails
+//!   here — it's that **relay traffic is encapsulated**: everything a TURN client sends to/from
+//!   the server is wrapped in STUN Send-/Data-indications (or, once a channel is bound, cheaper
+//!   4-byte ChannelData framing). The bytes quinn wants to put on the wire are not the bytes the
+//!   TURN server expects to see — a `std::net::UdpSocket` handed straight to quinn would send raw
+//!   QUIC datagrams to the TURN server, which would reject them outright. Something has to encode
+//!   every outbound QUIC datagram into TURN framing and decode every inbound one back out.
+//! - **The adapter**: [`TurnRelaySocket`], a hand-written `quinn::runtime::AsyncUdpSocket` around
+//!   an `rtc_turn::client::Client` plus the real `tokio::net::UdpSocket` talking to the TURN
+//!   server. `try_send` calls `Relay::send_to` (which internally chooses Send-indication vs.
+//!   ChannelData framing and enqueues the wire packet) then flushes the client's outgoing queue
+//!   onto the real socket; `poll_recv` reads wire packets from the real socket, feeds them to
+//!   `Client::handle_read`, and drains `Event::DataIndicationOrChannelData` into a small queue
+//!   `poll_recv` pops from. Single remote, no GSO/ECN (`max_transmit_segments`/
+//!   `max_receive_segments`/`may_fragment` all left at their trait defaults) — spike-grade, per
+//!   the task brief. `quinn::Endpoint::new_with_abstract_socket` is the entry point that accepts a
+//!   custom `AsyncUdpSocket` (`Endpoint::new`, used by leg 2, only accepts a raw
+//!   `std::net::UdpSocket`).
+//! - **ICE-lite / direct-to-relayed-candidate**: this harness does NOT run full ICE connectivity
+//!   checks on the relay path — each side allocates a relay, exchanges the relayed address over
+//!   `--signal`, creates a permission for the peer's relayed address, and dials it directly.
+//!   Production (`docs/DESIGN.md` §A8) would instead run full ICE with the relay candidate mixed
+//!   in alongside host/srflx candidates, letting connectivity checks pick the best working pair
+//!   (which might still be a direct one even when a relay was allocated as a fallback) — this
+//!   spike skips that arbitration entirely since the whole point of `--transport relay` here is to
+//!   force and measure the relayed path specifically (the symmetric:symmetric NAT combo that
+//!   `--transport ice` cannot complete at all).
+//! - **Long-term credentials**: `rtc_turn::client::Client` handles the RFC 5766 401/438
+//!   challenge-response automatically — the first (anonymous) Allocate deliberately fails with a
+//!   STUN error carrying `NONCE`+`REALM`, the client extracts both and retries with
+//!   `MessageIntegrity::new_long_term_integrity`, so `ClientConfig.realm` can start empty. This
+//!   harness mints coturn REST credentials itself (`mint_turn_credentials`, `--turn-secret` +
+//!   `--turn-user-label`) per §A8's `username = expiry:device_fp` model — `device_fp` here is a
+//!   plain `--turn-user-label` string, NOT the real `base32(SHA-256(...))` derivation in
+//!   `docs/DESIGN.md` §A8 (line ~197), since there is no real device-identity infrastructure in
+//!   this harness; this is an explicit, documented stand-in, not an oversight.
+//!
 //! ## Certificate pinning (A10.32, mirrors the DTLS `a=fingerprint` rule)
 //!
 //! `--mode recv` generates a fresh self-signed certificate (`rcgen`) every run and prints its
@@ -117,19 +172,24 @@
 //! 0/20/50/100 ms under container `tc netem` (RTT matrix) — see `RESULTS.md` for the other three
 //! clauses' status.
 
-use std::io::{BufRead, BufReader, Write as _};
+use std::io::{self, BufRead, BufReader, IoSliceMut, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use base64::Engine as _;
 use bytes::BytesMut;
+use hmac::{Hmac, Mac};
 use quinn::congestion::{BbrConfig, CubicConfig};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{Endpoint, EndpointConfig, TransportConfig, VarInt};
+use quinn::udp::{RecvMeta, Transmit};
+use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, TransportConfig, UdpPoller, VarInt};
 use rtc_ice::agent::agent_config::AgentConfig as IceAgentConfig;
 use rtc_ice::agent::Agent as IceAgent;
 use rtc_ice::candidate::candidate_host::CandidateHostConfig;
@@ -140,11 +200,13 @@ use rtc_ice::Event as IceEvent;
 use rtc_shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtc_stun::message::{Getter as _, Message as StunMessage, TransactionId, BINDING_REQUEST};
 use rtc_stun::xoraddr::XorMappedAddress;
+use rtc_turn::client::{Client as TurnClient, ClientConfig as TurnClientConfig, Event as TurnEvent};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use sansio::Protocol as _;
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::time::interval;
 
@@ -202,16 +264,20 @@ impl std::str::FromStr for Cc {
     }
 }
 
-/// `--transport` (S19 leg 2): `direct` (default) is leg 1's unmodified bound-UDP-socket-pair
+/// `--transport` (S19 legs 2-3): `direct` (default) is leg 1's unmodified bound-UDP-socket-pair
 /// behavior — zero regression, `--listen`/`--connect` address the QUIC socket exactly as before.
 /// `ice` is leg 2: the UDP socket is punched by a standalone `rtc_ice::agent::Agent` first (see
 /// this file's module doc comment for why that needed no `quinn::AsyncUdpSocket` adapter), and
 /// candidates/credentials/the cert fingerprint are exchanged over `--signal` instead of
-/// `--listen`/`--connect`/`--cert-fp`.
+/// `--listen`/`--connect`/`--cert-fp`. `relay` is leg 3: both sides allocate a relayed address
+/// from `--turn`, exchange relayed addresses over `--signal`, and dial directly to the peer's
+/// relayed address through a custom `AsyncUdpSocket` adapter (see "The TURN↔quinn adapter (leg
+/// 3)" in the module doc comment for why this path, unlike `ice`, DOES need one).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Transport {
     Direct,
     Ice,
+    Relay,
 }
 
 impl std::str::FromStr for Transport {
@@ -220,8 +286,9 @@ impl std::str::FromStr for Transport {
         match s {
             "direct" => Ok(Transport::Direct),
             "ice" => Ok(Transport::Ice),
+            "relay" => Ok(Transport::Relay),
             other => Err(anyhow!(
-                "--transport must be \"direct\" or \"ice\", got {other:?}"
+                "--transport must be \"direct\", \"ice\", or \"relay\", got {other:?}"
             )),
         }
     }
@@ -269,13 +336,19 @@ impl std::str::FromStr for Signal {
 /// comment). `candidates` are SDP `a=candidate` lines (`rtc_ice::candidate::Candidate::marshal`);
 /// `cert_fp` is `Some("sha256:<hex>")` only from the side that has already generated a certificate
 /// (`--mode recv`, which always generates one — see `run_recv`) — the `--mode send` side's own
-/// message carries `cert_fp: None`, it has no certificate of its own to offer.
+/// message carries `cert_fp: None`, it has no certificate of its own to offer. `relayed_addr`
+/// (S19 leg 3, `--transport relay` only) is this side's own TURN-allocated relayed address
+/// (`"ip:port"`), left `None` under `--transport direct`/`ice`; `ufrag`/`pwd`/`candidates` are
+/// left at their empty defaults under `--transport relay` (no ICE on that path — see the module
+/// doc comment).
 #[derive(Serialize, Deserialize)]
 struct SignalMessage {
     ufrag: String,
     pwd: String,
     candidates: Vec<String>,
     cert_fp: Option<String>,
+    #[serde(default)]
+    relayed_addr: Option<String>,
 }
 
 struct Config {
@@ -321,14 +394,34 @@ struct Config {
     /// reflexive candidate from, in addition to the host candidate. Unused (and harmless to omit)
     /// on loopback, where both peers can already reach each other's host candidates directly.
     stun: Option<SocketAddr>,
-    /// `--ice-bind <ip>` (`--transport ice` only, default `127.0.0.1`): which local interface
+    /// `--ice-bind <ip>` (`--transport ice`/`relay`, default `127.0.0.1`): which local interface
     /// address to bind the ICE/QUIC UDP socket on and advertise as the host candidate. Binding the
     /// wildcard address (`0.0.0.0`) instead would advertise an unroutable `0.0.0.0` host candidate
     /// to the peer — found empirically (`No route to host`) during this leg's loopback
     /// verification, not assumed. The NAT-punch matrix (milestone 6) overrides this per network
     /// namespace (e.g. its own private bridge IP), since each namespace's "the" outbound interface
-    /// differs.
+    /// differs. Reused as-is by `--transport relay` (leg 3) to pick which local interface the
+    /// TURN-client-facing socket binds on — same reasoning, no ICE-specific meaning to the value
+    /// itself.
     ice_bind_ip: std::net::IpAddr,
+    /// `--turn <host:port>` (S19 leg 3, required with `--transport relay`): the TURN server to
+    /// allocate a relayed address from.
+    turn: Option<SocketAddr>,
+    /// `--turn-secret <string>` (required with `--transport relay`): the coturn `use-auth-secret`
+    /// shared secret, used to mint REST credentials locally (`mint_turn_credentials`) — mirrors
+    /// `docs/DESIGN.md` §A8's `username = expiry:device_fp` model. In production this secret never
+    /// reaches the peer directly; a helper mints and hands out short-lived credentials. This
+    /// harness, having no such helper, takes the secret on the CLI and mints its own credentials
+    /// locally, per-side.
+    turn_secret: Option<String>,
+    /// `--turn-user-label <string>` (`--transport relay` only, default `"quic-peer-spike"`):
+    /// stands in for §A8's `device_fp` (normally `base32(SHA-256("spindle-dev-v1" || ...))`) —
+    /// this harness has no real device-identity infrastructure, so a plain label is used instead.
+    /// Explicitly a spike stand-in, not the production derivation.
+    turn_user_label: String,
+    /// `--turn-ttl-secs <N>` (`--transport relay` only, default 3600): how far in the future the
+    /// minted credential's embedded expiry timestamp is set.
+    turn_ttl_secs: u64,
 }
 
 impl Config {
@@ -352,6 +445,10 @@ impl Config {
         let mut signal: Option<Signal> = None;
         let mut stun: Option<SocketAddr> = None;
         let mut ice_bind_ip: std::net::IpAddr = std::net::IpAddr::from([127, 0, 0, 1]);
+        let mut turn: Option<SocketAddr> = None;
+        let mut turn_secret: Option<String> = None;
+        let mut turn_user_label = "quic-peer-spike".to_string();
+        let mut turn_ttl_secs: u64 = 3600;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -382,6 +479,16 @@ impl Config {
                 "--signal" => signal = Some(next_val::<String>(&mut args, "--signal")?.parse()?),
                 "--stun" => stun = Some(next_val(&mut args, "--stun")?),
                 "--ice-bind" => ice_bind_ip = next_val(&mut args, "--ice-bind")?,
+                "--turn" => turn = Some(next_val(&mut args, "--turn")?),
+                "--turn-secret" => {
+                    turn_secret = Some(next_val::<String>(&mut args, "--turn-secret")?)
+                }
+                "--turn-user-label" => {
+                    turn_user_label = next_val::<String>(&mut args, "--turn-user-label")?
+                }
+                "--turn-ttl-secs" => {
+                    turn_ttl_secs = next_val(&mut args, "--turn-ttl-secs")?
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -394,10 +501,17 @@ impl Config {
             anyhow!("--mode is required (\"send\" or \"recv\"); run with --help for usage")
         })?;
 
+        if turn.is_some() && !matches!(transport, Transport::Relay) {
+            return Err(anyhow!("--turn requires --transport relay"));
+        }
+        if turn_secret.is_some() && !matches!(transport, Transport::Relay) {
+            return Err(anyhow!("--turn-secret requires --transport relay"));
+        }
+
         match transport {
             Transport::Direct => {
                 if signal.is_some() {
-                    return Err(anyhow!("--signal requires --transport ice"));
+                    return Err(anyhow!("--signal requires --transport ice or relay"));
                 }
                 if stun.is_some() {
                     return Err(anyhow!("--stun requires --transport ice"));
@@ -453,6 +567,42 @@ impl Config {
                 // --cert-fp is optional and meaningful only as an override for both modes under
                 // ice (see Config::cert_fp's doc comment) — no requiredness check here.
             }
+            Transport::Relay => {
+                if listen.is_some() || connect.is_some() {
+                    return Err(anyhow!(
+                        "--transport relay dials the peer's relayed address; it does not take --listen/--connect (use --signal instead)"
+                    ));
+                }
+                if stun.is_some() {
+                    return Err(anyhow!("--stun requires --transport ice (relay does not gather srflx candidates)"));
+                }
+                if turn.is_none() {
+                    return Err(anyhow!("--transport relay requires --turn <host:port>"));
+                }
+                if turn_secret.is_none() {
+                    return Err(anyhow!("--transport relay requires --turn-secret <string>"));
+                }
+                match (mode, signal) {
+                    (Mode::Recv, Some(Signal::Listen(_))) | (Mode::Send, Some(Signal::Connect(_))) => {}
+                    (Mode::Recv, Some(Signal::Connect(_))) => {
+                        return Err(anyhow!(
+                            "--mode recv with --transport relay requires --signal listen:<port>, not connect:"
+                        ))
+                    }
+                    (Mode::Send, Some(Signal::Listen(_))) => {
+                        return Err(anyhow!(
+                            "--mode send with --transport relay requires --signal connect:<host:port>, not listen:"
+                        ))
+                    }
+                    (_, None) => {
+                        return Err(anyhow!(
+                            "--transport relay requires --signal listen:<port> (recv side) or --signal connect:<host:port> (send side)"
+                        ))
+                    }
+                }
+                // --cert-fp is optional and meaningful only as an override for both modes under
+                // relay too (same as ice) — no requiredness check here.
+            }
         }
 
         match (stats_interval_ms > 0, &stats_out) {
@@ -485,6 +635,10 @@ impl Config {
             signal,
             stun,
             ice_bind_ip,
+            turn,
+            turn_secret,
+            turn_user_label,
+            turn_ttl_secs,
         })
     }
 }
@@ -547,16 +701,21 @@ fn print_usage() {
     println!("                        --transport ice: optional override of the --signal-exchanged fingerprint");
     println!("    --json              print one machine-readable JSON result line");
     println!(
-        "    --transport <direct|ice>  direct (default): --listen/--connect address the QUIC socket."
+        "    --transport <direct|ice|relay>  direct (default): --listen/--connect address the QUIC socket."
     );
     println!("                        ice (S19 leg 2): punch the socket via rtc-ice first, see --signal");
+    println!("                        relay (S19 leg 3): relay the socket via a TURN server, see --signal/--turn*");
     println!(
-        "    --signal <listen:<port>|connect:<host:port>>  required with --transport ice: TCP"
+        "    --signal <listen:<port>|connect:<host:port>>  required with --transport ice/relay: TCP"
     );
-    println!("                        channel exchanging ICE credentials/candidates/cert-fp before punching");
+    println!("                        channel exchanging ICE/relay credentials/candidates/cert-fp");
     println!("    --stun <addr>       --transport ice only: STUN server for a server-reflexive candidate");
     println!("                        (NAT-punch matrix; unused/unneeded on loopback)");
-    println!("    --ice-bind <ip>     --transport ice only: local interface IP to bind+advertise (default 127.0.0.1)");
+    println!("    --ice-bind <ip>     --transport ice/relay only: local interface IP to bind+advertise (default 127.0.0.1)");
+    println!("    --turn <addr>       --transport relay: required, TURN server to allocate a relayed address from");
+    println!("    --turn-secret <s>   --transport relay: required, coturn use-auth-secret shared secret");
+    println!("    --turn-user-label <s>  --transport relay: device_fp stand-in for minted credentials (default quic-peer-spike)");
+    println!("    --turn-ttl-secs <N> --transport relay: credential expiry TTL in seconds (default 3600)");
     println!();
     println!("EXAMPLES:");
     println!("    quic-peer --mode recv --listen 127.0.0.1:5701 --bytes 64 --json");
@@ -566,6 +725,12 @@ fn print_usage() {
     );
     println!(
         "    quic-peer --mode send --transport ice --signal connect:127.0.0.1:6000 --bytes 64 --json"
+    );
+    println!(
+        "    quic-peer --mode recv --transport relay --signal listen:6000 --turn 127.0.0.1:3478 --turn-secret s3cr3t --bytes 64 --json"
+    );
+    println!(
+        "    quic-peer --mode send --transport relay --signal connect:127.0.0.1:6000 --turn 127.0.0.1:3478 --turn-secret s3cr3t --bytes 64 --json"
     );
 }
 
@@ -982,6 +1147,7 @@ async fn ice_punch(
         pwd: credentials.pwd.clone(),
         candidates,
         cert_fp: own_cert_fp_hex,
+        relayed_addr: None,
     };
 
     let remote_msg = exchange_signal(signal, &local_msg)?;
@@ -1017,6 +1183,415 @@ async fn ice_punch(
         remote_addr,
         remote_cert_fp,
     })
+}
+
+// ── S19 leg 3: TURN relay (rtc_turn::client::Client -> custom quinn::AsyncUdpSocket adapter) ────
+
+/// Mints a coturn REST-API (`use-auth-secret`) long-term credential pair: `username =
+/// "<unix-expiry-timestamp>:<label>"`, `password = base64(HMAC-SHA1(secret, username))` — see
+/// coturn's own REST API spec and `docs/DESIGN.md` §A8 (`username = expiry:device_fp`). `label`
+/// stands in for §A8's `device_fp`; see `Config::turn_user_label`'s doc comment for why. Computed
+/// locally by each side from the same `--turn-secret` (this harness's stand-in for a production
+/// helper minting and handing out credentials per `root_fp` quota) rather than exchanged over
+/// `--signal` — coturn accepts any credential minted from its configured shared secret, so both
+/// sides minting their own is equivalent to one side minting and sharing.
+fn mint_turn_credentials(secret: &str, label: &str, ttl_secs: u64) -> Result<(String, String)> {
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("reading system clock for TURN credential expiry")?
+        .as_secs()
+        + ttl_secs;
+    let username = format!("{expiry}:{label}");
+    let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes())
+        .context("constructing HMAC-SHA1 for TURN credential")?;
+    mac.update(username.as_bytes());
+    let password = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    Ok((username, password))
+}
+
+/// Drives `client` (feeding it inbound datagrams from `socket`, sending whatever it emits) until
+/// `extract` returns `Some(_)` for one of its events, or `timeout` elapses. `extract` returns
+/// `Some(Ok(value))` on a matching success event, `Some(Err(_))` on a matching failure/timeout
+/// event, `None` to keep waiting (letting unrelated events — e.g. a background allocation-refresh
+/// response — pass through unhandled). Mirrors `drive_ice_agent`'s loop/select! idiom exactly:
+/// relative `sleep_for` computed from `poll_timeout()`, `std::time::Instant` throughout, no
+/// `tokio::time::Instant` conversion.
+async fn drive_turn_until<T>(
+    client: &mut TurnClient,
+    socket: &tokio::net::UdpSocket,
+    timeout: Duration,
+    mut extract: impl FnMut(&TurnEvent) -> Option<Result<T>>,
+) -> Result<T> {
+    let local_addr = socket.local_addr().context("reading TURN socket local addr")?;
+    let mut buf = vec![0u8; 2048];
+    let deadline = Instant::now() + timeout;
+    loop {
+        while let Some(transmit) = client.poll_write() {
+            socket
+                .send_to(&transmit.message[..], transmit.transport.peer_addr)
+                .await
+                .context("sending TURN packet")?;
+        }
+        while let Some(event) = client.poll_event() {
+            if let Some(result) = extract(&event) {
+                return result;
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "TURN operation timed out after {:.1}s with no matching response",
+                timeout.as_secs_f64()
+            ));
+        }
+        let wake_at = client
+            .poll_timeout()
+            .unwrap_or_else(|| Instant::now() + Duration::from_millis(100));
+        let sleep_for = wake_at.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_for) => {
+                client.handle_timeout(Instant::now()).context("TURN client timeout handling failed")?;
+            }
+            res = socket.recv_from(&mut buf) => {
+                let (n, peer_addr) = res.context("receiving TURN packet")?;
+                client.handle_read(TaggedBytesMut {
+                    now: Instant::now(),
+                    transport: TransportContext {
+                        local_addr,
+                        peer_addr,
+                        transport_protocol: TransportProtocol::UDP,
+                        ecn: None,
+                    },
+                    message: BytesMut::from(&buf[..n]),
+                }).with_context(|| format!("TURN client rejected inbound packet from {peer_addr}"))?;
+            }
+        }
+    }
+}
+
+/// Result of a successful TURN relay setup: the raw socket talking to the TURN server (to be
+/// wrapped by `TurnRelaySocket`, NOT handed to quinn directly — see the module doc comment for why
+/// leg 2's raw-socket handoff doesn't apply here), the driven `rtc_turn::client::Client` (already
+/// holding the live allocation and the peer's permission), this side's own relayed address, the
+/// peer's relayed address (what quinn will `connect`/`accept` as the "remote"), and — `--mode
+/// send` only — the peer's cert fingerprint learned over `--signal`.
+struct TurnRelayResult {
+    socket: tokio::net::UdpSocket,
+    client: TurnClient,
+    own_relayed_addr: SocketAddr,
+    peer_relayed_addr: SocketAddr,
+    remote_cert_fp: Option<[u8; 32]>,
+}
+
+/// Allocates a relayed address on `turn_addr`, exchanges it with the peer over `signal`, and
+/// creates a permission for the peer's relayed address. ICE-lite (see the module doc comment): no
+/// connectivity checks, dial the relayed address directly. Role mapping mirrors `ice_punch`:
+/// `--signal listen:` (recv side) reads-then-writes; `--signal connect:` (send side)
+/// writes-then-reads.
+async fn turn_relay_setup(
+    signal: Signal,
+    own_cert_fp_hex: Option<String>,
+    turn_addr: SocketAddr,
+    username: String,
+    password: String,
+    bind_ip: std::net::IpAddr,
+    timeout: Duration,
+) -> Result<TurnRelayResult> {
+    // Same "bind a concrete interface, not the wildcard address" reasoning as `ice_punch` — the
+    // TURN server needs a routable local_addr to reply to (relevant for the container NAT-punch
+    // harness's per-namespace bridge IPs; harmless to be specific on loopback too).
+    let udp = tokio::net::UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+        .await
+        .context("binding TURN client UDP socket")?;
+    let local_addr = udp
+        .local_addr()
+        .context("reading TURN client UDP socket local addr")?;
+
+    let mut client = TurnClient::new(TurnClientConfig {
+        stun_serv_addr: String::new(),
+        turn_serv_addr: turn_addr.to_string(),
+        local_addr,
+        transport_protocol: TransportProtocol::UDP,
+        username,
+        password,
+        // Left empty: the client learns the server's realm automatically from the first
+        // (anonymous) Allocate's 401-equivalent challenge and retries with credentials attached —
+        // see the module doc comment's "Long-term credentials" paragraph.
+        realm: String::new(),
+        software: "spindle-s19-quic-peer".to_string(),
+        rto_in_ms: 0,
+    })
+    .context("constructing rtc_turn::client::Client")?;
+
+    let alloc_tid = client.allocate().context("sending TURN Allocate")?;
+    let own_relayed_addr = drive_turn_until(&mut client, &udp, timeout, |event| match event {
+        TurnEvent::AllocateResponse(tid, addr) if *tid == alloc_tid => Some(Ok(*addr)),
+        TurnEvent::AllocateError(tid, e) if *tid == alloc_tid => {
+            Some(Err(anyhow!("TURN Allocate failed: {e}")))
+        }
+        TurnEvent::TransactionTimeout(tid) if *tid == alloc_tid => {
+            Some(Err(anyhow!("TURN Allocate timed out (no response from {turn_addr})")))
+        }
+        _ => None,
+    })
+    .await
+    .context("TURN allocate (relay setup)")?;
+    eprintln!("quic-peer: relay: allocated {own_relayed_addr} on TURN server {turn_addr}");
+
+    let local_msg = SignalMessage {
+        ufrag: String::new(),
+        pwd: String::new(),
+        candidates: Vec::new(),
+        cert_fp: own_cert_fp_hex,
+        relayed_addr: Some(own_relayed_addr.to_string()),
+    };
+    let remote_msg = exchange_signal(signal, &local_msg)?;
+    let peer_relayed_addr: SocketAddr = remote_msg
+        .relayed_addr
+        .as_deref()
+        .ok_or_else(|| anyhow!("peer's --signal message carried no relayed_addr"))?
+        .parse()
+        .context("parsing peer's signaled relayed_addr")?;
+    eprintln!("quic-peer: relay: peer's relayed address is {peer_relayed_addr}");
+
+    let perm_tid = client
+        .relay(own_relayed_addr)
+        .context("borrowing own relay allocation")?
+        .create_permission(peer_relayed_addr)
+        .context("sending TURN CreatePermission")?;
+    if let Some(perm_tid) = perm_tid {
+        drive_turn_until(&mut client, &udp, timeout, |event| match event {
+            TurnEvent::CreatePermissionResponse(tid, addr) if *tid == perm_tid => {
+                debug_assert_eq!(*addr, peer_relayed_addr);
+                Some(Ok(()))
+            }
+            TurnEvent::CreatePermissionError(tid, e) if *tid == perm_tid => {
+                Some(Err(anyhow!("TURN CreatePermission failed: {e}")))
+            }
+            TurnEvent::TransactionTimeout(tid) if *tid == perm_tid => Some(Err(anyhow!(
+                "TURN CreatePermission timed out (no response from {turn_addr})"
+            ))),
+            _ => None,
+        })
+        .await
+        .context("TURN create-permission (relay setup)")?;
+    }
+    eprintln!("quic-peer: relay: permission granted for peer {peer_relayed_addr}");
+
+    let remote_cert_fp = remote_msg
+        .cert_fp
+        .as_deref()
+        .map(parse_fingerprint)
+        .transpose()
+        .context("parsing peer's signaled cert-fp")?;
+
+    Ok(TurnRelayResult {
+        socket: udp,
+        client,
+        own_relayed_addr,
+        peer_relayed_addr,
+        remote_cert_fp,
+    })
+}
+
+/// State shared between `TurnRelaySocket`'s trait methods, behind a `Mutex` since
+/// `quinn::runtime::AsyncUdpSocket` requires `Send + Sync` but exposes only `&self` methods.
+///
+/// Known spike-grade limitation: nothing calls `TurnClient::handle_timeout` once quinn owns this
+/// socket (only `turn_relay_setup`'s `drive_turn_until` calls it, during allocate/create-
+/// permission). This means the allocation-refresh and permission-refresh timers
+/// (`RelayState`/`Relay::handle_timeout` in `rtc-turn`) never fire post-handoff — fine for this
+/// spike's short transfers (well under coturn's default allocation lifetime), but a real
+/// long-lived connection over this adapter would eventually lose its relay when the allocation
+/// expires unrefreshed. A production implementation would need `poll_recv`/`try_send` (or a
+/// separate ticker) to also periodically call `handle_timeout` and flush the resulting refresh
+/// transmits, the same way `drive_turn_until` does during setup.
+struct TurnInner {
+    client: TurnClient,
+    own_relayed_addr: SocketAddr,
+    /// Wire-facing packets (TURN Send-indication / ChannelData framing, addressed to the real TURN
+    /// server) that hit `WouldBlock` on the real socket and are waiting for
+    /// `UdpPoller::poll_writable` to retry them, in the order they were produced.
+    retry_wire: std::collections::VecDeque<TaggedBytesMut>,
+    /// Decoded application datagrams already pulled off `Client`'s event queue
+    /// (`Event::DataIndicationOrChannelData`), waiting for quinn's next `poll_recv`.
+    recv_queue: std::collections::VecDeque<(SocketAddr, BytesMut)>,
+}
+
+/// Custom `quinn::runtime::AsyncUdpSocket` bridging the sans-I/O `rtc_turn::client::Client` to
+/// quinn — see the module doc comment's "The TURN↔quinn adapter (leg 3)" section for why this is
+/// needed (leg 2's raw-socket handoff cannot work here: relay traffic is encapsulated in TURN
+/// framing that must be actively encoded/decoded). Spike-grade: single remote (the peer's relayed
+/// address, fixed at construction), no GSO/GRO/ECN (`max_transmit_segments`/
+/// `max_receive_segments`/`may_fragment` all left at their trait defaults).
+struct TurnRelaySocket {
+    /// The real UDP socket talking to the TURN server — NOT the peer.
+    socket: tokio::net::UdpSocket,
+    local_addr: SocketAddr,
+    inner: Mutex<TurnInner>,
+}
+
+impl std::fmt::Debug for TurnRelaySocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnRelaySocket")
+            .field("local_addr", &self.local_addr)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TurnRelaySocket {
+    /// Drains `inner.retry_wire` (oldest first) then `inner.client.poll_write()` onto the real
+    /// socket, via non-blocking `try_send_to`. On `WouldBlock`, buffers whatever is left (in
+    /// order) into `retry_wire` and returns `Err(WouldBlock)` — the caller (either `try_send`,
+    /// which ignores this, or the `UdpPoller`, which propagates it) decides what that means.
+    fn drain_wire(&self, inner: &mut TurnInner) -> io::Result<()> {
+        while let Some(transmit) = inner.retry_wire.pop_front() {
+            match self.socket.try_send_to(&transmit.message, transmit.transport.peer_addr) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    inner.retry_wire.push_front(transmit);
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        while let Some(transmit) = inner.client.poll_write() {
+            match self.socket.try_send_to(&transmit.message, transmit.transport.peer_addr) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    inner.retry_wire.push_back(transmit);
+                    while let Some(t) = inner.client.poll_write() {
+                        inner.retry_wire.push_back(t);
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AsyncUdpSocket for TurnRelaySocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        Box::pin(TurnUdpPoller { socket: self })
+    }
+
+    /// Encodes `transmit.contents` into TURN framing (`Relay::send_to`, which internally chooses
+    /// Send-indication vs. ChannelData) and flushes what it can onto the real socket. Always
+    /// returns `Ok(())` on the happy path: a wire-level `WouldBlock` against the TURN server is
+    /// buffered in `retry_wire` rather than bubbled up, since the QUIC transmit itself was already
+    /// accepted into the TURN client's internal queue — see `drain_wire`'s doc comment. Only a
+    /// genuine relay-protocol error (no permission, allocation gone) is surfaced as an `io::Error`.
+    fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let own_relayed_addr = inner.own_relayed_addr;
+        inner
+            .client
+            .relay(own_relayed_addr)
+            .and_then(|mut relay| relay.send_to(transmit.contents, transmit.destination))
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        match self.drain_wire(&mut inner) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut TaskContext<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            if let Some((from, data)) = inner.recv_queue.pop_front() {
+                let n = data.len().min(bufs[0].len());
+                bufs[0][..n].copy_from_slice(&data[..n]);
+                meta[0] = RecvMeta {
+                    addr: from,
+                    len: n,
+                    stride: n,
+                    ecn: None,
+                    dst_ip: None,
+                };
+                return Poll::Ready(Ok(1));
+            }
+            match self.socket.poll_recv_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+            let mut raw = [0u8; 2048];
+            match self.socket.try_recv_from(&mut raw) {
+                Ok((n, from)) => {
+                    if let Err(e) = inner.client.handle_read(TaggedBytesMut {
+                        now: Instant::now(),
+                        transport: TransportContext {
+                            local_addr: self.local_addr,
+                            peer_addr: from,
+                            transport_protocol: TransportProtocol::UDP,
+                            ecn: None,
+                        },
+                        message: BytesMut::from(&raw[..n]),
+                    }) {
+                        eprintln!("quic-peer: relay: dropping malformed packet from {from}: {e}");
+                        continue;
+                    }
+                    while let Some(event) = inner.client.poll_event() {
+                        // Other events here (allocation/permission refresh responses,
+                        // transaction timeouts on background refreshes) are logged-and-ignored:
+                        // `turn_relay_setup` already consumed the ones it cared about before
+                        // handing this socket to quinn.
+                        if let TurnEvent::DataIndicationOrChannelData(_chan, peer_addr, data) =
+                            event
+                        {
+                            inner.recv_queue.push_back((peer_addr, data));
+                        }
+                    }
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+}
+
+/// The `UdpPoller` for `TurnRelaySocket`: registers for the real socket's write-readiness and
+/// re-drains `retry_wire` when it fires. Mirrors quinn's own `UdpPollHelper` shape (see
+/// `quinn::runtime`'s source) but hand-written since it needs access to `TurnRelaySocket`'s
+/// `drain_wire`, not just a bare "retry the send" closure.
+struct TurnUdpPoller {
+    socket: Arc<TurnRelaySocket>,
+}
+
+impl std::fmt::Debug for TurnUdpPoller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnUdpPoller").finish_non_exhaustive()
+    }
+}
+
+impl UdpPoller for TurnUdpPoller {
+    fn poll_writable(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let mut inner = self.socket.inner.lock().unwrap();
+        if inner.retry_wire.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        match self.socket.socket.poll_send_ready(cx) {
+            Poll::Ready(Ok(())) => match self.socket.drain_wire(&mut inner) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+                Err(e) => Poll::Ready(Err(e)),
+            },
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 // ── recv (quinn server) ─────────────────────────────────────────────────────────────────────
@@ -1075,6 +1650,51 @@ async fn run_recv(cfg: &Config) -> Result<(u64, f64)> {
             )
             .context("constructing quinn endpoint over the ICE-punched socket")?
         }
+        Transport::Relay => {
+            let signal = cfg.signal.expect("validated by Config::from_args");
+            let turn_addr = cfg.turn.expect("validated by Config::from_args");
+            let turn_secret = cfg
+                .turn_secret
+                .as_deref()
+                .expect("validated by Config::from_args");
+            let (username, password) =
+                mint_turn_credentials(turn_secret, &cfg.turn_user_label, cfg.turn_ttl_secs)
+                    .context("minting TURN credentials (recv side)")?;
+            let relay = turn_relay_setup(
+                signal,
+                Some(format!("sha256:{}", hex_encode(&fingerprint))),
+                turn_addr,
+                username,
+                password,
+                cfg.ice_bind_ip,
+                Duration::from_secs(15),
+            )
+            .await
+            .context("TURN relay setup (recv side)")?;
+            let turn_local_addr = relay
+                .socket
+                .local_addr()
+                .context("reading TURN relay socket local addr")?;
+            let own_relayed_addr = relay.own_relayed_addr;
+            let turn_socket = Arc::new(TurnRelaySocket {
+                socket: relay.socket,
+                local_addr: turn_local_addr,
+                inner: Mutex::new(TurnInner {
+                    client: relay.client,
+                    own_relayed_addr,
+                    retry_wire: std::collections::VecDeque::new(),
+                    recv_queue: std::collections::VecDeque::new(),
+                }),
+            });
+            eprintln!("quic-peer: relay: quinn endpoint bound over relayed address {own_relayed_addr}");
+            Endpoint::new_with_abstract_socket(
+                EndpointConfig::default(),
+                Some(server_config),
+                turn_socket,
+                quinn::default_runtime().ok_or_else(|| anyhow!("no quinn async runtime found"))?,
+            )
+            .context("constructing quinn endpoint over the TURN relay socket")?
+        }
     };
     eprintln!(
         "quic-peer: listening on {} (cc={}, window={} MiB, transport={})",
@@ -1084,6 +1704,7 @@ async fn run_recv(cfg: &Config) -> Result<(u64, f64)> {
         match cfg.transport {
             Transport::Direct => "direct",
             Transport::Ice => "ice",
+            Transport::Relay => "relay",
         },
     );
 
@@ -1239,6 +1860,63 @@ async fn run_send(cfg: &Config) -> Result<(u64, f64)> {
             .context("constructing quinn endpoint over the ICE-punched socket")?;
             endpoint.set_default_client_config(client_config);
             (endpoint, punch.remote_addr)
+        }
+        Transport::Relay => {
+            let signal = cfg.signal.expect("validated by Config::from_args");
+            let turn_addr = cfg.turn.expect("validated by Config::from_args");
+            let turn_secret = cfg
+                .turn_secret
+                .as_deref()
+                .expect("validated by Config::from_args");
+            let (username, password) =
+                mint_turn_credentials(turn_secret, &cfg.turn_user_label, cfg.turn_ttl_secs)
+                    .context("minting TURN credentials (send side)")?;
+            let relay = turn_relay_setup(
+                signal,
+                None, // send side never has a cert of its own to offer
+                turn_addr,
+                username,
+                password,
+                cfg.ice_bind_ip,
+                Duration::from_secs(15),
+            )
+            .await
+            .context("TURN relay setup (send side)")?;
+            // --cert-fp, if given under --transport relay, OVERRIDES the signaled fingerprint —
+            // same override hook as --transport ice (see Config::cert_fp's doc comment).
+            let expected_fp = cfg.cert_fp.or(relay.remote_cert_fp).ok_or_else(|| {
+                anyhow!(
+                    "peer's --signal message carried no cert-fp and no --cert-fp override was given"
+                )
+            })?;
+            let client_config = build_client_config(cfg, expected_fp)?;
+
+            let turn_local_addr = relay
+                .socket
+                .local_addr()
+                .context("reading TURN relay socket local addr")?;
+            let own_relayed_addr = relay.own_relayed_addr;
+            let peer_relayed_addr = relay.peer_relayed_addr;
+            let turn_socket = Arc::new(TurnRelaySocket {
+                socket: relay.socket,
+                local_addr: turn_local_addr,
+                inner: Mutex::new(TurnInner {
+                    client: relay.client,
+                    own_relayed_addr,
+                    retry_wire: std::collections::VecDeque::new(),
+                    recv_queue: std::collections::VecDeque::new(),
+                }),
+            });
+            eprintln!("quic-peer: relay: quinn endpoint bound over relayed address {own_relayed_addr}");
+            let mut endpoint = Endpoint::new_with_abstract_socket(
+                EndpointConfig::default(),
+                None,
+                turn_socket,
+                quinn::default_runtime().ok_or_else(|| anyhow!("no quinn async runtime found"))?,
+            )
+            .context("constructing quinn endpoint over the TURN relay socket")?;
+            endpoint.set_default_client_config(client_config);
+            (endpoint, peer_relayed_addr)
         }
     };
 
