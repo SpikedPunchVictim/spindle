@@ -63,10 +63,29 @@ if [ "${1:-}" = "--in-container" ]; then
   #                            per-cell axis — here the axis is congestion controller, not
   #                            direction)
   #   BYTES_MIB=32          -> fixed transfer size for every RTT instead of bytes_for_rtt()
+  #   WINDOW_MIB=2           -> --window value passed to both sides (see below for why 2, not
+  #                            quic-peer's own 16 MiB CLI default)
   #   PER_RUN_TIMEOUT_S=60  -> override the per-cell watchdog below
   #   OVERALL_TIMEOUT_S=... -> override the outer `timeout` wrapper (see bottom of this file)
   RTTS="${RTTS:-0 20 50 100}"
   CCS="${CELLS:-cubic bbr}"
+
+  # --window override (2026-08-25, first real matrix run): quic-peer's own CLI default (16 MiB,
+  # chosen "generous vs BDP so flow control never masks congestion control" — see quic-peer.rs's
+  # module doc comment) reproducibly crashed EVERY shaped-RTT cell (20/50/100 ms, both cc) with
+  # quinn-proto's internal "too many gaps in stream buffer" error (quinn-proto 0.11.17
+  # connection/assembler.rs's MAX_CHUNKS=1024 anti-DoS cap on distinct buffered spans per stream).
+  # `tc -s qdisc show dev lo` showed ZERO drops on every failing cell, ruling out netem
+  # queue-overflow loss; a manual bisection (2/4 MiB) found 4 MiB still crashes, 2 MiB does not, at
+  # both 50 ms and 100 ms, on both cc — see RESULTS.md's dated leg-1 findings paragraph for the
+  # full diagnosis (best-supported theory: this container's netem `delay`-only qdisc reorders
+  # packets under the burst a 16 MiB window permits, which a real WAN path's own jitter would not
+  # reproduce identically, but which this container environment does reproducibly). 2 MiB does not
+  # measurably cost LAN-class (0 ms) throughput (571 vs. 605 MB/s at 16 MiB) and clears the ≥ 15
+  # MB/s @ 50 ms bar with margin, so it's the default for THIS script — quic-peer's own flag
+  # default is intentionally left at 16 MiB (unchanged) since a real link's netem-free/jitter-full
+  # behavior may not hit this artifact at all; override with WINDOW_MIB to test other values.
+  WINDOW_MIB="${WINDOW_MIB:-2}"
 
   # Per-cell watchdog: generous but bounded. Wraps BOTH the recv process (background) and the send
   # process (foreground) independently — a stalled connect/transfer must not hang the whole matrix.
@@ -117,7 +136,7 @@ if [ "${1:-}" = "--in-container" ]; then
 
       set +e
       timeout "${PER_RUN_TIMEOUT_S}s" "$BIN" \
-        --mode recv --listen "$addr" --bytes "$bytes" --cc "$cc" --json \
+        --mode recv --listen "$addr" --bytes "$bytes" --cc "$cc" --window "$WINDOW_MIB" --json \
         --stats-interval-ms 500 --stats-out "$stats_out" \
         >"$recv_out" 2>"$recv_err" &
       recv_pid=$!
@@ -146,7 +165,8 @@ if [ "${1:-}" = "--in-container" ]; then
       send_rc=1
       if [ "$listening" -eq 1 ]; then
         timeout "${PER_RUN_TIMEOUT_S}s" "$BIN" \
-          --mode send --connect "$addr" --cert-fp "$fp" --bytes "$bytes" --cc "$cc" --json \
+          --mode send --connect "$addr" --cert-fp "$fp" --bytes "$bytes" --cc "$cc" \
+          --window "$WINDOW_MIB" --json \
           >"$send_out" 2>"$send_err"
         send_rc=$?
       else
@@ -166,8 +186,8 @@ if [ "${1:-}" = "--in-container" ]; then
       if [ "$recv_rc" -eq 0 ] && [ "$send_rc" -eq 0 ] && [ -s "$recv_out" ]; then
         raw="$(cat "$recv_out")"
         mb_per_s="$(printf '%s' "$raw" | sed -n 's/.*"mb_per_s":\([0-9.]*\).*/\1/p')"
-        printf '| %s | %s | %s | %s | %s | bytes=%sMiB chunk=64KiB window=16MiB; recv=%s; send_raw=%s |\n' \
-          "$DATE_STR" "$ENV_LABEL" "$rtt" "$cc" "$mb_per_s" "$bytes" "$raw" "$(cat "$send_out")" \
+        printf '| %s | %s | %s | %s | %s | bytes=%sMiB chunk=64KiB window=%sMiB; recv=%s; send_raw=%s |\n' \
+          "$DATE_STR" "$ENV_LABEL" "$rtt" "$cc" "$mb_per_s" "$bytes" "$WINDOW_MIB" "$raw" "$(cat "$send_out")" \
           >>"$RESULTS_TMP"
       else
         reason="recv_exit=${recv_rc} send_exit=${send_rc}"
@@ -214,6 +234,7 @@ exec docker run --rm \
   -e CELLS \
   -e RTTS \
   -e BYTES_MIB \
+  -e WINDOW_MIB \
   -e PER_RUN_TIMEOUT_S \
   -e OVERALL_TIMEOUT_S \
   -v "$REPO_ROOT:/workspace" \
