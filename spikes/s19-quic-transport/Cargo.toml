@@ -1,0 +1,42 @@
+[package]
+name = "spike-s19-quic-transport"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# Enabled to run S19 leg 1 (docs/SPIKES.md §S19 / docs/DESIGN.md §A13): quinn QUIC throughput
+# between two native processes at 0/20/50/100 ms RTT, cubic vs. bbr, per-session self-signed cert
+# pinned by fingerprint (A10.32). See src/bin/quic-peer.rs's module doc comment for why ICE
+# punching (leg 2) is deliberately NOT a dependency here yet.
+[[bin]]
+name = "quic-peer"
+path = "src/bin/quic-peer.rs"
+
+[dependencies]
+tokio = { workspace = true } # workspace already declares features = ["full"]
+anyhow = { workspace = true }
+sha2 = { workspace = true } # cert fingerprint (SHA-256 of the DER, A10.32)
+
+# quinn 0.11: default features pull in `platform-verifier` (irrelevant — this harness always uses
+# a custom fingerprint-pinning verifier, never the platform trust store) and, transitively via
+# rustls's own defaults, the `aws-lc-rs` crypto provider (aws-lc-sys, a cmake+C-toolchain build —
+# see spikes/s3-throughput/Cargo.toml's `datachannel` dependency comment for the exact pain that
+# caused on this same macOS host). `default-features = false` + explicit `rustls-ring` keeps this
+# scaffold's dep tree to the pure-Rust `ring` provider only — no cmake, no C compiler required to
+# `cargo check`/`cargo build` this crate.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+
+# Matches quinn's `rustls-ring` selection above: `default-features = false` + `["ring", "std"]`
+# avoids pulling in rustls's own default `aws-lc-rs` provider alongside `ring` (both would
+# otherwise build, doubling the crypto-backend compile cost for no reason — this harness only ever
+# uses one provider, constructed explicitly via `rustls::crypto::ring::default_provider()` in
+# quic-peer.rs). `client::danger::ServerCertVerifier` (the custom fingerprint-pinning verifier;
+# A10.32) is available on the base `rustls::client::danger` module in 0.23 with no separate cargo
+# feature gate — the pre-0.21 `dangerous_configuration` feature this task brief anticipated no
+# longer exists as of rustls 0.21+; verified empirically (`cargo check`) before writing this
+# comment, not assumed.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+# Self-signed per-session QUIC certificate (A10.32) — fresh cert+key generated once per `--mode
+# recv` run. Not a workspace dependency (single-consumer, spike-local).
+rcgen = "0.13"

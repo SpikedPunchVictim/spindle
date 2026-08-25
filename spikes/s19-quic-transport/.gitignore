@@ -1,0 +1,8 @@
+# Raw per-cell artifacts and scratch tables written by s19-rtt-run.sh — RESULTS.md is the
+# curated, committed record; these are the underlying evidence the tables above were built from,
+# kept locally for follow-up debugging but not meant to be committed wholesale (large, regenerable,
+# per-machine). Same convention as spikes/s3-throughput/.gitignore.
+.s19-raw/
+.s19-rtt-results.tmp
+.s19-rtt-qdisc.tmp
+*.tmp
