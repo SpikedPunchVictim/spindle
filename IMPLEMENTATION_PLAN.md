@@ -16,18 +16,29 @@
 **Goal**: Answer the two highest-risk open questions before any production transport or VFS code
 is written: DataChannel throughput under realistic RTT, and `cap-std`-based path confinement
 against every known escape/collision class.
-**Success Criteria**: S3 meets the A9 throughput bar (≥ 50 MB/s LAN, ≥ 15 MB/s @ 50 ms RTT) with
-SCTP tuning knobs documented; S11's negative-test suite (`..`, symlink escape, hardlinks,
+**Success Criteria**: S3 is **complete** — resolved via decisions A10.31/A10.32 (transport split:
+QUIC for native↔native, WebRTC only for browser peers) rather than by `webrtc-rs`/`datachannel-rs`
+clearing the original ≥ 50 MB/s LAN / ≥ 15 MB/s @ 50 ms bar, which the full evidence chain in
+`spikes/s3-throughput/RESULTS.md` proved unreachable for WebRTC data channels as shipped, against
+any measured peer. That throughput bar now applies to the QUIC native↔native path, verified by
+spike S19 (Stage 5), not by S3. S11's negative-test suite (`..`, symlink escape, hardlinks,
 overlapping roots, case/Unicode collisions, exclusion bypass, upload scoping, Windows device
-names/8.3/ADS/`\\?\` paths, rename races) passes on macOS, Windows, and Linux.
-**Tests**: `spikes/s3-throughput` benchmark harness at 0/20/50/100 ms RTT; `spikes/s11-vfs-confinement`
+names/8.3/ADS/`\\?\` paths, rename races) still needs to pass on macOS, Windows, and Linux.
+**Tests**: `spikes/s3-throughput` benchmark harness at 0/20/50/100 ms RTT (done); `spikes/s11-vfs-confinement`
 automated negative-test suite (all three OSes in CI).
 **Status**: In Progress
-**Note**: S11 macOS complete (12/12; Linux/Windows runs pending). S3: webrtc-rs fails the 50 ms
-RTT bar (2.2 vs ≥15 MB/s, loopback 125+ MB/s passes); evaluating datachannel-rs per DESIGN §A8
-before ADR-005 can be Accepted. S3 follow-up complete: env exonerated (TCP 60 MB/s), parallel
-assoc. ceiling ~7.7 MB/s @ N=8; A10.29: deeper investigation (Chrome peer + cwnd profiling) runs
-alongside Stages 2–4.
+**Note**: S3 is **done** (2026-08-24): `webrtc-rs` and `datachannel-rs` both fail the 50 ms bar;
+containerized matrix vs. real headless Chromium 151 shows a `webrtc-rs` sender collapse (0.885
+MB/s @ 50 ms) and a frozen-cwnd Chrome-dcSCTP→webrtc-rs freeze (0.083 MB/s @ 50 ms, diagnosed via
+`rtc_sctp` tracing); the decisive Chromium↔Chromium control (dcSCTP both ends, no Rust code)
+plateaus at 0.845 MB/s @ 50 ms too — proving the shortfall is a property of WebRTC data channels
+as shipped, not a Rust-crate defect (TCP does 60.7 MB/s on the identical shaped path). Full data:
+`spikes/s3-throughput/RESULTS.md`. Resolved by decisions A10.31/A10.32: native↔native moves to
+QUIC (`quinn` + standalone ICE); browser peers keep WebRTC with a stated ~1–2 MB/s @ 50 ms
+ceiling. ADR-005's Accepted gate moves from S3 to the new spike **S19**
+(quinn-over-punched-ICE native↔native), tracked under Stage 5. Stage 1 itself is **In Progress on
+S11 alone now** — S11 macOS complete (12/12; Linux/Windows runs pending) is the only remaining
+work item for this stage; S3 is fully closed out and no longer blocks Stage 1's own completion.
 
 ## Stage 2: spindle-proto + @spindle/proto + golden vectors
 **Goal**: Define the wire contract once — canonical CBOR (RFC 8949 §4.2.1) types and the A7b
@@ -92,14 +103,19 @@ dev stack up, S1 suite re-run against it: 18/18 applicable checks passed (1 skip
 `bridging_callout_account_cannot_reach_app_subjects` needs the spike's own standalone responder
 process, not the containerized one); Postgres store + coturn pending.
 
-## Stage 5: spindle-net WebRTC signaling E2E
+## Stage 5: spindle-net WebRTC + QUIC transport signaling E2E
 **Goal**: Implement NATS-mediated WebRTC signaling (offer/answer/trickle ICE) and presence in
-`spindle-net`, connecting a real Rust host to a real Rust client end to end.
+`spindle-net`, connecting a real Rust host to a real Rust client end to end. Per ADR-005's
+2026-08-24 transport-split amendment (A10.31/A10.32), also implement the native↔native QUIC path:
+`quinn` running over a `webrtc-rs`-`ice`-punched UDP socket, with a per-session self-signed cert
+pinned via the connect envelope (mirrors the DTLS fingerprint rule) and transport negotiated
+inside that envelope (`quic` when both peers are native, WebRTC otherwise).
 **Success Criteria**: S2 (median connect < 2 s LAN, < 5 s across NATs) met; S5 (presence ≤ 5 s
 clean / ≤ 60 s dead) met; S9 (revoke→kick→reject < 5 s) met; S14 (revoke while host offline;
 callout refuses before host returns) met; S18 (cap lifecycle: expiry→connect-only→re-issue;
-device bootstrap; no lockout in any path) met.
-**Tests**: S2/S5/S9/S14/S18 automated suites graduated into CI.
+device bootstrap; no lockout in any path) met; S19 (quinn-over-punched-ICE native↔native: ≥ 15
+MB/s @ 50 ms, NAT-combination punch/relay success) met for the QUIC path.
+**Tests**: S2/S5/S9/S14/S18/S19 automated suites graduated into CI.
 **Status**: Not Started
 
 ## Stage 6: spindle-vfs + host-core

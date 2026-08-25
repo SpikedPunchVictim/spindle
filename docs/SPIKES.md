@@ -13,9 +13,11 @@ every VFS escape, whether a non-technical person can use the permission model un
 small, throwaway programs that answer one such question each, with a **measured pass/fail
 criterion**, before the ADR or implementation stage that depends on the answer is accepted.
 
-- **Order**: the eighteen spikes below are listed in `docs/DESIGN.md` §A13's risk order — highest
-  risk first (S3, S7), then the next tier (S1, S11), then the rest. Run them in this order unless
-  a dependency forces otherwise.
+- **Order**: the spikes below are listed in `docs/DESIGN.md` §A13's risk order — highest risk
+  first (S3, S7), then the next tier (S1, S11), then the rest. Run them in this order unless a
+  dependency forces otherwise. **S19 (added 2026-08-24)** inherits S3's risk tier: it is the
+  spike that now gates ADR-005's Accepted status (S3 itself is done — see below), so treat it as
+  high-priority alongside S7, not as a low-priority tail item just because it's listed last.
 - **Gates**: each spike's "Gates" line cross-references the `IMPLEMENTATION_PLAN.md` stage(s) that
   cannot start (or cannot be marked Complete) until the spike passes, and the ADR(s) whose design
   claims the spike validates. Per DESIGN.md's Part B verification note: *"S3 before any transport
@@ -28,9 +30,12 @@ criterion**, before the ADR or implementation stage that depends on the answer i
   suites are required to graduate into the permanent CI matrix (3-OS) per `docs/DESIGN.md` §A9b:
   *"CI matrix: 3 OSes; S1/S11/S16/S18 negative suites graduate into permanent CI."* Passing the
   spike once is necessary but not sufficient; the suite has to keep passing on every future commit.
-- **Status**: all spikes are **Not run** as of this writing, except **S3** and **S11**, which have
-  runnable (but empty-result) skeletons under `spikes/` — see `spikes/s3-throughput/` and
-  `spikes/s11-vfs-confinement/`. A skeleton existing does not mean the spike has been run.
+- **Status**: **S3 is COMPLETE** (2026-08-24) — full evidence chain and verdict in
+  `spikes/s3-throughput/RESULTS.md`, leading to decisions A10.31/A10.32 (transport split: QUIC for
+  native↔native, WebRTC only for browser peers). **S11** has a runnable skeleton under
+  `spikes/s11-vfs-confinement/` (macOS run complete, Linux/Windows pending — a skeleton existing
+  does not mean the spike has fully run). All other spikes, including the newly added **S19**, are
+  **Not run** as of this writing.
 
 ---
 
@@ -73,6 +78,31 @@ passes (125+ MB/s); datachannel-rs evaluation in progress per §A8 fallback.
 - **Decision A10.29 (2026-08-23)**: investigate deeper first — measure against a real Chrome peer
   (dcSCTP) and profile webrtc-rs cwnd before revising the A9 bar or reopening the transport choice;
   ADR-005 stays Proposed; Stages 2–4 proceed meanwhile.
+- **Completion (2026-08-24) — S3 is DONE; superseded by decisions A10.31/A10.32.** The A10.29
+  deeper investigation is finished. `webrtc-rs` and `datachannel-rs` both still fail the 50 ms bar.
+  Against a real headless Chromium 151 in a containerized RTT matrix, the `webrtc-rs` sender
+  collapses to 0.885 MB/s @ 50 ms (9.776/2.076/0.885/0.484 MB/s at 0/20/50/100 ms); the reverse
+  direction — Chrome's dcSCTP sending into a `webrtc-rs` receiver — freezes at 0.083 MB/s @ 50 ms,
+  diagnosed via `rtc_sctp` tracing to a stuck RFC 4960 initial congestion window (receiver SACKs
+  are clean, 1 per RTT, ~4.2 MB healthy `a_rwnd`, `dupTsn=[]` across all 1,494 SACKs — the freeze
+  is dcSCTP-internal growth gating, not a network or receiver defect). The decisive control run —
+  Chromium↔Chromium, dcSCTP both ends, **no Rust code involved** — still plateaus at 0.845 MB/s @
+  50 ms (1.892 MB/s @ 20 ms), a flat ~38–41.5 KB RTT-independent window: proof the 50 ms shortfall
+  is a property of WebRTC data channels as shipped, not a `webrtc-rs`/`datachannel-rs` defect. TCP
+  does 60.7 MB/s on the identical shaped path, so the environment is not the bottleneck. Full data,
+  method, and both container/two-container configurations: `spikes/s3-throughput/RESULTS.md`
+  (commits 7f76c70, 9d248b5). Caveat: this matrix is netem-on-loopback in one container;
+  real-two-host validation is folded into new spike **S19** (below), since it also needs to answer
+  the native↔native QUIC question. **Resolution — decisions A10.31/A10.32 (2026-08-24, user)**:
+  native↔native transfers move to **QUIC** (`quinn`, standalone ICE reusing `webrtc-rs`'s `ice`
+  crate for hole-punching, per-session self-signed cert pinned via the A7-verified envelope,
+  mirroring the DTLS `a=fingerprint` rule); WebRTC data channels are kept, unchanged, for any
+  session with a browser peer, now carrying a stated WAN ceiling (~1–2 MB/s @ 50 ms) instead of the
+  ≥ 15 MB/s bar; `iroh` was evaluated and rejected (large dependency; its own relay network beside
+  coturn; its own identity layer to reconcile with ADR-003). DESIGN.md §A9's "S3 sets the v1
+  numbers" UX bar is now split accordingly: the ≥ 15 MB/s @ 50 ms goal applies to the QUIC
+  native↔native path (S19 verifies), and the browser path's ceiling is stated on its own terms.
+  ADR-005 stays Proposed; the Accepted gate moves from S3 (done) to S19.
 
 ---
 
@@ -563,5 +593,60 @@ unaided."*
 success criteria require this bar met alongside S2/S5/S9/S14. Validates **ADR-003** (identity,
 capabilities, enrollment — §A4 cap lifecycle, §A10.3). Per §A9b, this suite graduates into
 permanent CI.
+
+**Status**: Not run.
+
+---
+
+## S19 — quinn-over-punched-ICE native↔native transport
+
+**Question** (A13): quinn-over-punched-ICE-socket native↔native: punch rate across NATs,
+throughput at 0/20/50/100 ms, TURN-relay fallback, real-two-host validation of the netem numbers.
+
+**Why this spike, and why it's high-priority**: S3 closed out the WebRTC-data-channel question —
+the full chain (`webrtc-rs`↔`webrtc-rs`, `webrtc-rs`↔real Chrome, and a Chromium↔Chromium control
+with zero Rust code) proved the ≥ 15 MB/s @ 50 ms shortfall is a property of WebRTC data channels
+as shipped, not a fixable Rust-crate bug (`spikes/s3-throughput/RESULTS.md`). Decisions A10.31/
+A10.32 respond by moving native↔native transfers to QUIC (`quinn`) over a standalone-ICE-punched
+UDP socket, with TURN relay as fallback and a per-session self-signed cert pinned via the
+A7-verified envelope (the DTLS `a=fingerprint` rule, restated for this transport). None of that is
+yet measured: quinn's default (TCP-class) congestion control is expected to clear the bar — S3's
+own TCP baseline did 60.7 MB/s on the identical shaped path — but "expected" is exactly the kind
+of claim this file exists to convert into a measured number before code is built against it. S19
+inherits S3's risk tier and is the sole remaining gate on ADR-005's Accepted status, so it should
+be run at the same priority as S7, not deferred because of its position at the end of this list.
+
+**Method sketch**:
+- Reuse S3's shaping/measurement machinery where possible rather than building a parallel harness:
+  `spikes/s3-throughput/browser-rtt-run.sh`'s `tc netem` container setup covers the shaped
+  (0/20/50/100 ms) legs; adapt it to drive two `quinn` endpoints instead of a `webrtc-rs`
+  DataChannel pair, punched via `webrtc-rs`'s `ice` crate rather than negotiated through SDP.
+  Vary send/receive buffer sizes at each RTT point as S3 did, and record MB/s per (RTT,
+  buffer-config) cell in this spike's own `RESULTS.md`, matching S3's table format.
+- Punch rate across NAT combinations: drive the ICE-punch step through a matrix of NAT types (full
+  cone, restricted cone, port-restricted, symmetric — paired both ways) using a NAT simulator or
+  multiple real network segments; record punch success/failure and time-to-punch per combination.
+- TURN-relay fallback: for NAT combinations where punching fails (symmetric↔symmetric is the
+  expected failure case), confirm the connection falls back to the existing coturn relay cleanly
+  (TURN relays UDP, and QUIC is UDP, so no new relay-side work is expected — this spike is what
+  confirms that expectation) and measure throughput over the relayed path too.
+- **Real-two-host leg**: S3's whole matrix ran netem-on-loopback in one container — a stated
+  external-validity caveat. S19 closes that gap with an actual two-host run (e.g. two cloud
+  instances or two physical machines across a real WAN link, or at minimum two separate
+  containers/VMs on different hosts) reproducing the 0/20/50/100 ms cells, to confirm the netem
+  numbers hold on a real link and not just a shaped loopback.
+- Record all of the above — throughput matrix, NAT-punch matrix, relay-fallback results, real-link
+  confirmation — in `spikes/s19-quic-transport/RESULTS.md`.
+
+**Pass criterion (verbatim, A13)**: *"≥ 15 MB/s @ 50 ms; punch or relay success on all tested NAT
+combos; netem ceiling confirmed on a real link."*
+
+**Gates**: `IMPLEMENTATION_PLAN.md` Stage 5 (`spindle-net` WebRTC + QUIC transport signaling E2E)
+— S19 is one of Stage 5's success criteria for the QUIC path (alongside S2/S5/S9/S14/S18). Per
+ADR-005's 2026-08-24 transport-split amendment (A10.31/A10.32), **ADR-005** (transport, VFS RPC,
+file safety) cannot move to Accepted until S19 passes — this supersedes S3 as ADR-005's gate now
+that S3 is done (see S3's 2026-08-24 completion note above). Also validates the native↔native row
+of DESIGN.md §A9's UX bar ("native↔native ≥ 50 MB/s LAN and ≥ 15 MB/s at 50 ms RTT (QUIC, S19
+verifies)").
 
 **Status**: Not run.

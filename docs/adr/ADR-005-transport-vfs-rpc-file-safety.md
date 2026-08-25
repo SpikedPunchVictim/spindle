@@ -7,13 +7,55 @@ Proposed
 This ADR stays **Proposed** until spike **S3** (DataChannel throughput at 0/20/50/100 ms RTT; SCTP tuning) sets the
 v1 throughput numbers. DESIGN.md's verification rule is explicit: *"S3 before any transport ADR is Accepted"*
 (DESIGN.md Part B, Verification). Do not move this ADR to Accepted before S3 has run and its pass criterion (≥ 50
-MB/s LAN; ≥ 15 MB/s @ 50 ms; knobs documented) has been met and recorded in ../SPIKES.md.
+MB/s LAN; ≥ 15 MB/s @ 50 ms; knobs documented) has been met and recorded in ../SPIKES.md. **S3 is now complete**
+(see the 2026-08-24 update below); the gate for Accepted has moved to spike **S19** (below).
 
 **2026-08-23 update**: TCP through the same netem path does 60 MB/s @ 50 ms with zero drops, exonerating the test
 environment; single-association SCTP still fails the 50 ms bar in both Rust stacks (~1–2 MB/s), and parallel SCTP
 associations scale sub-linearly, plateauing around ~7.7 MB/s at N=8 — short of the ≥ 15 MB/s bar. Per decision
 A10.29, this stays **Proposed** pending deeper investigation (a real browser-peer/dcSCTP throughput measurement plus
 webrtc-rs cwnd profiling) before the A9 bar is revised or the transport choice is reopened.
+
+**2026-08-24 update — S3 chain complete; transport split decided (A10.31, A10.32)**: The deeper investigation
+A10.29 called for is done (`spikes/s3-throughput/RESULTS.md`, commits 7f76c70, 9d248b5), and **S3 is marked
+complete**. Full chain, all on identical `tc netem`-shaped paths, zero loss, TCP baseline 60.7 MB/s @ 50 ms:
+
+| Pairing | 0 ms | 20 ms | 50 ms | 100 ms |
+|---|---|---|---|---|
+| webrtc-rs ↔ webrtc-rs / datachannel-rs (earlier host matrix) | — | — | ~1–2 MB/s | — |
+| webrtc-rs sender (containerized) → real headless Chromium 151 | 9.776 | 2.076 | 0.885 | 0.484 |
+| Chrome dcSCTP sender → webrtc-rs receiver | 90.360 | 0.179 | 0.083 | 0.044 |
+| Chromium ↔ Chromium control (dcSCTP both ends, no Rust) | 73.219 | 1.892 | 0.845 | — |
+
+The Chrome→webrtc-rs collapse (90.360 → 0.179 MB/s at 20 ms) was traced via `rtc_sctp` tracing to a frozen RFC 4960
+initial congestion window (~4380 B): receiver SACKs are clean (1 per RTT, ~4.2 MB healthy `a_rwnd`, `dupTsn=[]`
+across all 1,494 SACKs), so the freeze is dcSCTP-internal growth gating, not a network or receiver-side defect. The
+Chromium↔Chromium control run — no Rust stack on either end — still shows a flat ~38–41.5 KB RTT-independent window
+and fails the ≥ 15 MB/s @ 50 ms bar. **Conclusion**: WebRTC data channels as shipped cannot meet the bar against any
+measured peer, Rust-stack or browser-native; the Rust stacks are additionally worse than the browser baseline.
+Caveat: this matrix is netem-on-loopback in one container — real-WAN validation is folded into new spike **S19**
+(below). The findings (webrtc-rs sender-side collapse; the dcSCTP interop freeze) are to be filed upstream against
+`webrtc-rs`.
+
+**Decisions (user, 2026-08-24)**:
+- **A10.31 — transport split**: native↔native transfers use **QUIC**; WebRTC data channels are used only where a
+  browser peer is involved. The browser WAN ceiling (~1–2 MB/s @ 50 ms, per the matrix above) is stated explicitly
+  in DESIGN.md §A9 and surfaced in the UI, rather than presented as a general throughput bar.
+- **A10.32 — QUIC stack**: `quinn`, paired with a **standalone ICE** implementation — reusing `webrtc-rs`'s `ice`
+  crate for hole-punching — which hands the punched UDP socket to `quinn`. coturn/TURN and NATS signaling are
+  **unchanged** (TURN relays UDP, and QUIC is UDP, so the existing relay covers it). Identity binding mirrors the
+  DTLS rule: a per-session self-signed QUIC certificate, its fingerprint carried in the A7-verified envelope, and
+  the TLS handshake verified against that pin. `iroh` was evaluated and **rejected**: a large dependency, its own
+  relay network duplicating coturn, and its own identity layer that would need reconciling with ADR-003 (DESIGN.md
+  §A4).
+
+This amendment **supersedes the transport-selection paragraph above** (the ADR's original "webrtc-rs and channel
+layout" section, which specified `webrtc-rs` as the single Rust transport for every peer) — see the Decision
+section's new **Transport split** subsection below for the resulting design.
+
+This ADR remains **Proposed**. Acceptance is now gated on spike **S19** (quinn-over-punched-ICE native↔native: ≥ 15
+MB/s @ 50 ms, punch/relay success across the NAT-combination matrix, and real-two-host confirmation of the netem
+numbers above) rather than S3, which is complete.
 
 ## Context
 
@@ -43,6 +85,44 @@ All channels share a single SCTP association and congestion window, so adding mo
 throughput — this was evaluated and rejected (see Alternatives). Transfers use 64 KiB chunks, backpressure via
 `bufferedAmountLow`, and are resumable via a manifest of offsets and per-chunk hashes. The UI shows direct/relayed
 status and speed (DESIGN.md A8).
+
+### Transport split: QUIC for native↔native, WebRTC only with a browser peer [amendment 2026-08-24, A10.31, A10.32]
+
+**This subsection supersedes the transport-selection paragraph above** (the "webrtc-rs and channel layout" section,
+which specified `webrtc-rs` as the Rust transport for every peer pairing). It does not change the VFS RPC surface,
+chunk/manifest/resume format, or received-file policy below — those remain transport-agnostic, unchanged by this
+amendment.
+
+Per the evidence in the Status section above (S3 chain, `spikes/s3-throughput/RESULTS.md`, commits 7f76c70,
+9d248b5), WebRTC data channels as shipped cannot meet the ≥ 15 MB/s @ 50 ms bar (DESIGN.md §A9) against any measured
+peer. Decision A10.31 splits the transport by peer type:
+
+- **Native↔native transfers use QUIC.** `spindle-net` gains a QUIC transport path (`quinn`), used whenever both
+  peers are native (Tauri host/client). ICE is standalone: `webrtc-rs`'s `ice` crate performs hole-punching (reusing
+  the existing NATS-mediated trickle-ICE signaling and coturn TURN fallback from ADR-002), and the resulting punched
+  UDP socket is handed to `quinn` to run the QUIC handshake and streams over it. coturn/TURN and NATS signaling are
+  otherwise **unchanged** — TURN relays UDP, and QUIC is UDP, so no new relay component is needed (A10.32).
+- **Identity binding mirrors the DTLS rule (ADR-004).** Each QUIC session uses a per-session self-signed
+  certificate; its fingerprint is carried inside the A7-verified connect envelope (the same place the DTLS
+  `a=fingerprint` travels today), and the TLS handshake is verified against that pin. No CA, no TOFU — the envelope
+  is the trust anchor, exactly as for the DataChannel/DTLS path.
+- **Transport is negotiated inside the verified connect envelope**: peers advertise their transport capability and
+  agree on `quic` when both are native, falling back to the existing WebRTC/DataChannel path whenever a browser peer
+  is involved (browsers have no QUIC-transport API equivalent to DataChannels).
+- **Browser path is unchanged**: one reliable-ordered control channel + one unordered-reliable data channel, 64 KiB
+  chunks, `bufferedAmountLow` backpressure — the same layout as the "webrtc-rs and channel layout" section above —
+  but now carries the **stated WAN ceiling** (~1–2 MB/s @ 50 ms) rather than the ≥ 15 MB/s bar, per A10.31. Parallel
+  SCTP associations (~7.7 MB/s @ N=8, A10.29's mitigation) remain the recorded mitigation ceiling for this path, not
+  a fix.
+- **`iroh` was evaluated and rejected** (A10.32): a large dependency; it brings its own relay network alongside
+  coturn (duplicated infrastructure, not a replacement); and its own identity layer would need reconciling with the
+  root/device-cert model in ADR-003 (DESIGN.md §A4) — reconciliation the self-signed-cert-plus-envelope-pin approach
+  avoids entirely.
+- **Upstream**: the webrtc-rs sender-side collapse and the dcSCTP interop freeze (Status section above) are to be
+  filed as upstream issues against `webrtc-rs`; that is tracking work, not a blocker for this ADR.
+
+VFS RPC, the chunk/manifest/resume format, and received-file policy (below) are transport-agnostic and unaffected by
+this split — they run unchanged over either the QUIC stream pair or the WebRTC channel pair.
 
 ### VFS RPC surface
 
@@ -129,6 +209,11 @@ accepted/expired/already-used (DESIGN.md A8).
 | Access lost | Revoked/expired member sees an honest state ("host offline — or your access changed"), never an eternal spinner |
 | Registry down | Distinct "registry degraded" indicator; existing transfers continue (P2P), new connections queue |
 
+**[amended 2026-08-24, A10.31]** The ≥ 15 MB/s @ 50 ms bar in the Transfer row above now applies to the
+native↔native QUIC path (spike **S19** sets the pass bar, superseding S3 for this purpose). The browser row's
+ceiling is stated separately, and explicitly, as ~1–2 MB/s @ 50 ms; parallel SCTP associations (~7.7 MB/s @ N=8,
+A10.29) remain the recorded mitigation ceiling for that path, not a pass condition.
+
 ## Consequences
 
 ### Positive
@@ -166,7 +251,12 @@ accepted/expired/already-used (DESIGN.md A8).
 
 From DESIGN.md §A11:
 - **iroh / QUIC instead of WebRTC** — Rejected for v1; a browser client is required, and WebRTC has the mature
-  browser-native DataChannel story that QUIC-based alternatives lack.
+  browser-native DataChannel story that QUIC-based alternatives lack. **[amended 2026-08-24, A10.31/A10.32]**
+  Partially superseded: QUIC (via `quinn` + a standalone `ice` implementation, not `iroh`) is now adopted for
+  native↔native transfers — see the Decision section's "Transport split" subsection. `iroh` itself remains rejected
+  (large dependency; its own relay network duplicating coturn; its own identity layer to reconcile with ADR-003).
+  WebRTC remains mandatory wherever a browser peer is involved, since no browser ships a QUIC-transport API
+  equivalent to DataChannels.
 - **JetStream (durability / KV presence)** — Rejected for v1; not needed for transport, and KV permissions would
   break the per-host subject scoping used elsewhere in the system.
 - **N data channels for throughput** — Rejected (v0.6); all channels share one SCTP association and congestion
@@ -188,13 +278,14 @@ DESIGN.md marks the following as unresolved; they are recorded here, not decided
 ## References
 
 - ../DESIGN.md §A2 (threat model, asset 5, adversaries A1/A5), §A3 (architecture overview, TURN component), §A8
-  (transport, VFS RPC, file safety), §A9 (UX requirements table), §A10 rows 6–8, §A11 (alternatives), §A12 (red-team
-  traceability, rows #8, #18, #21, #28), §A13 (spikes S3, S4, S7)
+  (transport, VFS RPC, file safety), §A9 (UX requirements table), §A10 rows 6–8, 31–32, §A11 (alternatives), §A12
+  (red-team traceability, rows #8, #18, #21, #28), §A13 (spikes S3, S4, S7, S19)
 - [ADR-001: Threat Model](./ADR-001-threat-model.md) — adversaries A1/A5, §A12 rows #8, #18, #21, #28
 - [ADR-002: NATS Signaling](./ADR-002-nats-signaling.md) — session establishment that precedes the DataChannel
 - [ADR-004: End-to-End Signaling Envelope](./ADR-004-e2e-signaling-envelope.md) — device-key manifest signing,
   canonical CBOR used by the VFS RPC
 - [ADR-006: Host Authorization](./ADR-006-host-authorization-members-shares-entitlements.md) — per-request
   permission checks that gate every VFS RPC call
-- ../SPIKES.md S3 (throughput — gates this ADR's Accepted status), S4 (NAT traversal / TURN cost), S7 (browser
+- ../SPIKES.md S3 (throughput — **complete**, see the 2026-08-24 update above), S19 (quinn-over-punched-ICE
+  native↔native throughput — gates this ADR's Accepted status), S4 (NAT traversal / TURN cost), S7 (browser
   large-file sink)

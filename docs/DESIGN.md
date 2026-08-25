@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.5) + Execution Plan
+# Spindle — System Design Document (draft v0.9.6) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -10,7 +10,8 @@
 > bootstrap, signed-artifact profile (A7b), helper consistency model, transfer manager, operations (A14), delivery
 > (A15), hardened browser delivery, LAN non-goal, abuse posture (user decisions 2026-08-23). v0.9: repository
 > layout & toolchain codified (A9c) — React UIs, host = single Tauri tray app, `just` + pnpm + cargo front door
-> (user decisions 2026-08-23).
+> (user decisions 2026-08-23). v0.9.6: transport split decided — QUIC (via `quinn`) for native↔native file
+> transfers, WebRTC data channels retained only where a browser peer is involved (user decisions 2026-08-24).
 > Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and the **[DEFAULT]**-flagged rows in A10.
 
 ---
@@ -37,7 +38,8 @@
    shares, member names, groups, or entitlements; it does observe, as connection metadata, which devices hold
    capabilities for which hosts (stated honestly in A2).
 3. Connection setup feels instant; presence is accurate; failures are explained, not silent; transfers are fast enough
-   that users don't reach for a USB stick; permissions are predictable and explainable in one sentence.
+   that users don't reach for a USB stick — native↔native transfers run at full speed over QUIC, browser transfers
+   carry a stated WAN ceiling (A8/A9); permissions are predictable and explainable in one sentence.
 4. Custom infrastructure is **small**: NATS for signaling, WebRTC for transport, one small replicated broker-helper
    service (callout verifier, presence, TURN credentials, kick relay, durable store of host-signed revocations) that
    holds **no membership data**.
@@ -117,7 +119,7 @@ separately), legal compulsion of connection metadata.
         │ - signs capabilities│ │   device key         │
         │ - VFS (cap-std)     │ │ - pinned host keys   │
         └──────────┬──────────┘ └──────────┬───────────┘
-                   └─ WebRTC DataChannel (DTLS/SCTP), E2E: VFS RPC ─┘
+                   └─ native↔native: QUIC · browser: WebRTC DataChannel — E2E: VFS RPC ─┘
 ```
 
 **Components**
@@ -413,6 +415,11 @@ Client                          NATS                            Host
 ```
 - `connect` timeout covers the answer only (5 s, one retry); ICE streams independently; losses tolerated/retried.
 - ICE servers + TURN creds per session from the broker helper; `iceTransportPolicy: relay` privacy option.
+- For native↔native QUIC sessions, the same envelopes carry ICE candidates and the peer's QUIC certificate
+  fingerprint; the TLS handshake is verified against that pinned fingerprint (same rule as the DTLS case above,
+  different transport — A8/A10.32).
+- **Transport negotiation**: a native↔native pair negotiates `transport: quic` during `connect` (inside the
+  verified envelope); browser peers always use WebRTC.
 
 ## A7. End-to-end signaling envelope (→ ADR-004)
 
@@ -469,20 +476,34 @@ discovered divergence between op-key-signed caps and the root-derived `host_fp` 
 
 ## A8. Transport, VFS RPC, and file safety (→ ADR-005)
 
-- Rust: `webrtc-rs` (≥ 0.20, sans-I/O core); evaluate `datachannel-rs` if S3 fails. **Throughput is RTT-bound by SCTP
-  windows** — window/buffer tuning is a required S3 outcome.
-- **S3 result (2026-08:)** loopback/LAN passes; single-association SCTP fails the 50 ms bar in both Rust stacks
-  (~1–2 MB/s) while TCP on the same path does 60 MB/s; parallel associations reach ~7.7 MB/s at N=8. Decision
-  A10.29: investigate deeper (Chrome dcSCTP peer measurement + cwnd profiling) before revising the A9 bar or
-  reopening the transport alternative; ADR-005 remains Proposed.
-- Channels: one reliable-ordered control channel (VFS RPC) + **one** unordered-reliable data channel (all channels
-  share one SCTP association/cwnd; more channels don't add throughput); 64 KiB chunks; backpressure via
-  `bufferedAmountLow`; resumable transfers (manifest + offsets + per-chunk hashes); UI shows direct/relayed and speed.
-- **VFS RPC** (control channel, CBOR): `list(path, cursor) → entries[{name, kind, size, mtime, perms_here}]`,
-  `stat(path)`, `read(path, offset, len) → chunk stream on data channel`, `upload(path, size, hash) → resumable
-  session`, `mkdir(path)`, `delete(path)`, `whoami → {member_display, effective_paths}`. All paths virtual; every
-  call permission-checked (A4b); unauthorized == not found. RPC carries a protocol version; peers negotiate the
-  highest common version with no downgrade below each side's minimum.
+- **Native↔native transport (primary): QUIC via quinn.** Standalone ICE (webrtc-rs's `ice` crate, reused rather
+  than duplicated) punches the NAT; the resulting punched UDP socket is handed to `quinn`, which owns the QUIC
+  connection from there — TURN fallback is unchanged (relay carries UDP, QUIC included). Per-session self-signed
+  QUIC certificate, fingerprint pinned via the A7-verified envelope (the DTLS rule, restated for this transport —
+  A6). quinn's default congestion control is TCP-class, which is exactly what the S3 evidence shows the path
+  supports (plain TCP does 60.7 MB/s on the identical shaped path). One control stream (VFS RPC) + data streams;
+  64 KiB chunks; resumable transfers/manifests unchanged (below).
+- **Browser transport: WebRTC data channel.** Rust: `webrtc-rs` (≥ 0.20, sans-I/O core), used only when a browser
+  peer is on the other end. Channels: one reliable-ordered control channel (VFS RPC) + **one** unordered-reliable
+  data channel (all channels share one SCTP association/cwnd; more channels don't add throughput); 64 KiB chunks;
+  backpressure via `bufferedAmountLow`; resumable transfers (manifest + offsets + per-chunk hashes); UI shows
+  direct/relayed and speed.
+- **S3 result — closed (2026-08-24), decisions A10.31/32.** Full evidence chain: a containerized host-RTT matrix
+  (both Rust stacks fail the 50 ms bar, ~1–2 MB/s, vs. 60.7 MB/s for TCP on the identical path), a container matrix
+  measured against real Chrome, an `rtc_sctp` trace diagnosis (Chrome dcSCTP → webrtc-rs frozen at its initial
+  cwnd, 0.083 MB/s; webrtc-rs → webrtc-rs sender collapse, 0.885 MB/s), and the decisive Chromium↔Chromium control
+  (dcSCTP both ends, zero Rust code) plateauing at ~0.845 MB/s @ 50 ms / 1.892 MB/s @ 20 ms (a flat ~40 KB
+  RTT-independent window) — proof the shortfall is a property of WebRTC data channels as shipped, not the Rust
+  stack. Full data: `spikes/s3-throughput/RESULTS.md`. Native↔native moves to QUIC (A10.31) over quinn +
+  standalone ICE (A10.32); browser peers keep WebRTC with a stated WAN ceiling of ~1–2 MB/s @ 50 ms (dcSCTP limit);
+  parallel associations (~7.7 MB/s @ N=8) remain the recorded browser-side mitigation ceiling, with upstream
+  findings to be filed against webrtc-rs. External-validity caveat: netem-on-loopback in one container; real-WAN
+  validation is outstanding (S19).
+- **VFS RPC** (control channel/stream, CBOR): `list(path, cursor) → entries[{name, kind, size, mtime, perms_here}]`,
+  `stat(path)`, `read(path, offset, len) → chunk stream on the data channel/stream`, `upload(path, size, hash) →
+  resumable session`, `mkdir(path)`, `delete(path)`, `whoami → {member_display, effective_paths}`. All paths
+  virtual; every call permission-checked (A4b); unauthorized == not found. RPC carries a protocol version; peers
+  negotiate the highest common version with no downgrade below each side's minimum.
 - File integrity: per-chunk hash + whole-file hash in a manifest signed by the sender's device key.
 - **Received-file policy**: attacker-supplied names → flat sanitized basename; reject separators/`..`/reserved names;
   land under the granted upload subpath (or per-member quarantine dir for owner-received files); no overwrite
@@ -511,7 +532,7 @@ discovered divergence between op-key-signed caps and the root-derived `host_fp` 
 | Open app | Host list with online/offline/unresponsive ≤ 5 s after clean disconnect, ≤ 60 s after dead socket |
 | Click a host | Offline → instant, specific message; online → connected < 2 s LAN, < 5 s WAN (STUN); tree appears immediately |
 | Browse | Only what you may see; actions you can't do aren't there (upload targets discoverable) |
-| Transfer | Progress, speed, direct/relayed; goals ≥ 50 MB/s LAN native and ≥ 15 MB/s at 50 ms RTT (**S3 sets the v1 numbers**); survives blips; resumes |
+| Transfer | Progress, speed, direct/relayed; native↔native ≥ 50 MB/s LAN and ≥ 15 MB/s at 50 ms RTT (QUIC, S19 verifies); browser paths: stated ceiling (~1–2 MB/s @ 50 ms, dcSCTP limit — S3); survives blips; resumes |
 | Invite someone | "Invite Alex to Family" → QR/link; Alex redeems; sees Family tree at once; owner sees Alex + devices |
 | Share a folder | Add folder → name → choose groups/perms in one grid; "Preview as Alex" |
 | New device | Scan QR from the **primary** device (or enter recovery phrase) → every host accepts it; owners notified, no action |
@@ -583,8 +604,8 @@ spindle/
 │   ├── spindle-proto/          #   wire types, canonical CBOR (RFC 8949 §4.2.1), A7b artifact tags;
 │   │                           #   `gen-vectors` bin writes /vectors
 │   ├── spindle-core/           #   identity (roots, device certs), caps, envelope (A7), signed artifacts (A7b)
-│   ├── spindle-net/            #   NATS client + callout presentation, WebRTC (webrtc ≥0.20), trickle ICE,
-│   │                           #   transfer manager (A8)
+│   ├── spindle-net/            #   NATS client + callout presentation, WebRTC (browser peers) + QUIC via quinn
+│   │                           #   (native↔native), trickle ICE, transfer manager (A8)
 │   ├── spindle-vfs/            #   shares/groups/entitlements engine, cap-std confinement, audit chain (A4b); SQLite
 │   ├── spindle-host-core/      #   host library: members, invites, revocation, VFS RPC server, live-ops
 │   ├── spindle-client-core/    #   client library: sessions, pinning store, transfer queue, key custody
@@ -640,7 +661,7 @@ spindle/
 |---------|------|------------|
 | Runtime | tokio, tracing, thiserror (libs) / anyhow (bins) | Node 22 LTS (CLI/admin), evergreen browsers per A7 |
 | NATS | async-nats | nats.ws |
-| WebRTC | webrtc ≥0.20 (datachannel-rs = S3 fallback) | browser RTCPeerConnection |
+| WebRTC | webrtc ≥0.20 (browser peers; ice reused standalone for QUIC punching) + quinn (native↔native QUIC) | browser RTCPeerConnection |
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
 | Encoding | hand-rolled zero-dep canonical codec in spindle-proto (strict non-canonical rejection; minicbor rejected — decoder abstracts the raw bytes) | own canonical encoder in @spindle/proto |
 | Storage | rusqlite (bundled) host-side; sqlx/Postgres helper-side | IndexedDB (caps, resume manifests) |
@@ -696,8 +717,10 @@ Docker is explicitly not the primary dev environment.
 | 26 | Host app shape | **DECIDED 2026-08-23:** one Tauri 2 tray app — daemon in-process, admin window on demand, IPC-only admin surface (no localhost port); headless/NAS mode deferred |
 | 27 | Monorepo tooling | **DECIDED 2026-08-23:** cargo workspace + pnpm workspaces with a top-level `justfile` as the single build/test/dev entry point; CI runs the same `just` targets |
 | 28 | Developer environment | **DECIDED 2026-08-23:** hybrid — mise (`mise.toml`) as the native front door on all 3 OSes; single `Dockerfile.toolchain` consumed by devcontainer, Linux CI, and the helper image; devcontainer = Linux slice only; `just bootstrap` wrapper (ADR-010) |
-| 29 | S3 throughput shortfall | **DECIDED 2026-08-23:** investigate deeper first — browser-peer (dcSCTP) measurement + webrtc-rs cwnd profiling before revising the A9 WAN bar or reopening the transport choice; Stages 2–4 proceed; parallel associations (~7.7 MB/s @ N=8) recorded as the current mitigation ceiling |
+| 29 | S3 throughput shortfall | **DECIDED 2026-08-23:** investigate deeper first — browser-peer (dcSCTP) measurement + webrtc-rs cwnd profiling before revising the A9 WAN bar or reopening the transport choice; Stages 2–4 proceed; parallel associations (~7.7 MB/s @ N=8) recorded as the current mitigation ceiling; resolved by A10.31/32 after the full matrix + Chromium↔Chromium control (see A8) |
 | 30 | Capability signer model | **DECIDED 2026-08-24:** cap embeds host_root_pk + root-signed op-key cert, signed by the op key; host_fp always root-derived (S1 finding; keeps root cold) |
+| 31 | Transport split | **DECIDED 2026-08-24:** QUIC (quinn) for native↔native; WebRTC data channels only for browser peers; browser WAN ceiling stated in A9/UI |
+| 32 | QUIC NAT traversal & stack | **DECIDED 2026-08-24:** quinn + standalone ICE (reuse webrtc-rs ice + coturn); per-session self-signed QUIC cert pinned via A7 envelope; iroh rejected |
 
 ## A11. Alternatives considered
 
@@ -709,7 +732,7 @@ Docker is explicitly not the primary dev environment.
 | Per-device members, no chain | Rejected | Poor multi-device UX; re-invite everywhere on recovery |
 | Deny rules in entitlements | Deferred | Predictability; exclusions on shares cover the common case |
 | Host-local passwords for members | Rejected | Breaks E2E key model and one-identity-many-hosts UX |
-| iroh / QUIC instead of WebRTC | Rejected for v1 | Browser client required |
+| iroh / QUIC instead of WebRTC | Superseded (v0.9.6) | browser client still requires WebRTC, but S3 proved dcSCTP can't meet the WAN bar — QUIC adopted for native↔native (A10.31/32); iroh itself still rejected (own relay net + identity layer) |
 | JetStream (durability / KV presence) | Rejected for v1 | Not needed; KV perms break scoping |
 | WASM Rust core for browser crypto | Rejected | WebCrypto + `@noble/curves` suffices |
 | String-sanitization path confinement | Rejected | `cap-std` capability confinement by construction (+ Spindle-side folding/identity checks) |
@@ -727,7 +750,7 @@ Docker is explicitly not the primary dev environment.
 
 | # | Attack (adversary) | Closed by |
 |---|--------------------|-----------|
-| 1 | Broker MITMs DTLS via SDP tamper (A2) | A7 signature + fingerprint check |
+| 1 | Broker MITMs DTLS via SDP tamper (A2) | A7 signature + fingerprint check (DTLS a=fingerprint / QUIC cert fp) |
 | 2 | Read/spoof others' replies via `_INBOX.>` (A1) | A5 private inbox; A7 encryption |
 | 3 | Browser can't use client certs; token theft (A4) | A4 two-key split; `allowed_connection_types` |
 | 4 | Flood/enumerate hosts (A1/A5) | A5 cap-scoped perms; no-cap connections refused; host pre-crypto checks + rate limits |
@@ -776,7 +799,7 @@ Docker is explicitly not the primary dev environment.
 
 | Spike | Question | Pass criterion |
 |-------|----------|----------------|
-| **S3** | DataChannel throughput at 0/20/50/100 ms RTT; SCTP tuning | ≥ 50 MB/s LAN; ≥ 15 MB/s @ 50 ms; knobs documented |
+| **S3** | DataChannel throughput at 0/20/50/100 ms RTT; SCTP tuning | **DONE** — evidence in spikes/s3-throughput/RESULTS.md; led to A10.31/32 |
 | **S7** | Browser large-file sink; tab throttling; sleep/resume | 5 GB receive in Chromium; fallback ceiling measured; resume works |
 | S1 | Callout verifying self-signed caps; per-device inbox; scoped perms; no-cap refusal | Automated negative tests: other inbox unreadable; un-capped host unreachable; other client's session unreachable; reply-prefix bypass rejected; fresh key with no cap refused |
 | **S11** | VFS confinement (`cap-std`): `..`, symlink escape, hardlinks, overlapping roots, case/Unicode collisions, exclusion bypass, upload scoping, Windows device names / 8.3 / ADS / `\\?\` paths, rename races | Automated negative tests all pass on macOS/Windows/Linux |
@@ -794,6 +817,7 @@ Docker is explicitly not the primary dev environment.
 | S16 | Control plane: admit (token + pre-reg), evict, mode switch; negative tests (reused token, forged command, evicted host reconnect, admin without mTLS) | All negative tests fail closed; admit→first-connect < 10 s |
 | S17 | Hardened web delivery: reproducible build → signed manifest → verification extension detects a tampered bundle | Tampered bundle flagged in all 3 browsers; honest bundle passes |
 | S18 | Cap lifecycle: expiry while offline → connect-only → E2E re-issue; device bootstrap QR state bundle; refetch on second device | No lockout in any path; second device reaches all hosts unaided |
+| **S19** | quinn-over-punched-ICE-socket native↔native: punch rate across NATs, throughput at 0/20/50/100 ms, TURN-relay fallback, real-two-host validation of the netem numbers | ≥ 15 MB/s @ 50 ms; punch or relay success on all tested NAT combos; netem ceiling confirmed on a real link |
 
 ---
 
@@ -891,6 +915,11 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.6 (2026-08-24)** — S3 investigation closed: containerized RTT matrix vs Chrome, rtc_sctp trace diagnosis
+  (dcSCTP frozen initial cwnd vs webrtc-rs; webrtc-rs sender collapse), and a Chromium↔Chromium control proving
+  dcSCTP itself plateaus (~0.85 MB/s @ 50 ms) — WebRTC data channels cannot meet the A9 WAN bar. Transport split
+  decided (A10.31: QUIC native↔native via quinn, A10.32: standalone-ICE punching + envelope-pinned certs);
+  §A1/A3/A6/A8/A9/A9c/A11/A12/A13 amended; S19 added.
 - **v0.9.5 (2026-08-24)** — A10.30: capability signer model decided after S1 flagged root-vs-op host_fp divergence —
   caps carry the chain (host_root_pk + embedded HostOpKeyCert, op-key signature); §A4 layout, §A7b row, cap size
   updated. S1 spike PASSED 19/19 against live NATS 2.10 (helper two-connection bridging confirmed by account
