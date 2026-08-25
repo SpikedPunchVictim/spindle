@@ -229,6 +229,34 @@ const BUFFERED_LOW_WATER = 1 * 1024 * 1024;
 // the DOM that often would make the page itself the bottleneck under measurement.
 const PROGRESS_UPDATE_MS = 200;
 
+// ── Relay mode (A10.29 Chromium↔Chromium control cell) ──────────────────────────────────────
+// URL query params, read once at load. Absent (`relayRole === null`, the default when this page
+// is opened plain) preserves this page's original behavior byte-for-byte: auto-connect, then
+// passively wait for an "offer" message from the Rust `browser-peer` binary (the send/recv modes'
+// existing flow) — nothing below changes that path.
+//
+// `?role=send&bytes=<MiB>` makes this page itself the SDP offerer/data-channel creator (playing
+// the role the Rust binary normally plays) against another browser-peer.html instance loaded with
+// `?role=recv`. Both pages' WebSocket connections are paired and blindly forwarded to each other
+// by `browser-peer --mode relay` (no Rust WebRTC peer at all in that mode — see that file's
+// module doc comment). `?role=recv` needs no other params: it goes through the exact same
+// answerer code path (handleOffer/setupDataChannel/dc.onmessage) as today's non-relay flow — the
+// only difference is that its offer arrives from a browser page instead of from Rust.
+const relayParams = new URLSearchParams(location.search);
+const relayRole = relayParams.get("role"); // "send" | "recv" | null
+const relayBytesMiB = Number(relayParams.get("bytes")) || 512; // only meaningful for role=send
+
+// ── Telemetry (coordinator directive, A10.29 50ms-crawl diagnosis) ─────────────────────────────
+// Fine-grained, timestamped instrumentation so a stalled/crawling cell is visible as a rate curve
+// and a Chrome-native getStats() view instead of a silent timeout. Applies uniformly to BOTH the
+// relay flow (two browser-peer.html pages) and the original Rust-peer flow (send/recv modes) —
+// it's the same dc.onopen/setupDataChannel code path either way, just role-gated by `iAmSender`,
+// so no separate instrumentation is needed for the existing matrix. The Rust side either logs and
+// tracks these messages (relay mode — see browser-peer.rs's relay_pump) or harmlessly ignores them
+// (send/recv mode — recv_typed() already skips unrecognized signaling message types).
+const pageLoadT0 = performance.now();
+const TELEMETRY_INTERVAL_MS = 1000;
+
 // ── DOM handles ──────────────────────────────────────────────────────────────
 const el = {
   port: document.getElementById("port"),
@@ -274,11 +302,93 @@ let ws = null;
 let pc = null;
 let dc = null;
 let targetBytes = 0;
-let mode = null; // "send" | "recv" — Rust's mode; this page's role is the opposite direction
+let mode = null; // "send" | "recv" — the offer's declared role (Rust's --mode in the non-relay
+                  // flow, or this page's own declared role when it IS the relay offerer below).
+                  // This page's actual behavior is driven by `iAmSender`, not by comparing `mode`
+                  // directly — see handleOffer() and startRelaySend().
+let iAmSender = false; // computed once mode/role is known: true if THIS page pushes payload bytes.
 let transferredBytes = 0;
 let t0 = null;
 let progressTimer = null;
+let telemetryTimer = null;
+let firstByteMilestoneSent = false;
 let finished = false;
+
+// ── Telemetry helpers ────────────────────────────────────────────────────────
+// Best-effort role label for telemetry messages: the URL param when this page is a relay
+// participant, otherwise derived from `mode`/`iAmSender` once an offer has been seen, otherwise
+// "unknown" (e.g. the brief window between ws-open and the offer arriving).
+function currentRoleLabel() {
+  if (relayRole) return relayRole;
+  if (mode !== null) return iAmSender ? "send" : "recv";
+  return "unknown";
+}
+
+function sendMilestone(name, extra) {
+  try {
+    sendSignal(Object.assign(
+      { type: "milestone", role: currentRoleLabel(), name, t_ms: performance.now() - pageLoadT0 },
+      extra || {}
+    ));
+  } catch (e) {
+    // Best-effort — telemetry must never be why a transfer fails.
+  }
+}
+
+// Progress heartbeat (design point 2) + Chrome's own getStats() view (point 3), both on the same
+// 1s cadence, both role-gated by nothing (harmless/informational for the receiving side too — a
+// receiver's own `pc.getStats()` is just as revealing as a sender's for diagnosing which side is
+// backed up). Converts a silent timeout into a rate curve + Chrome's transport-level view of
+// whether dcSCTP is pacing, backed up, or idle (the same numbers chrome://webrtc-internals shows).
+async function sendTelemetry() {
+  if (finished || !dc) return;
+  const tMs = performance.now() - pageLoadT0;
+  const role = currentRoleLabel();
+
+  sendSignal({
+    type: "progress",
+    role,
+    t_ms: tMs,
+    bytes: transferredBytes,
+    buffered_amount: dc.bufferedAmount,
+  });
+
+  if (!pc) return;
+  try {
+    const report = await pc.getStats();
+    let transportStats = null;
+    let dcStats = null;
+    let pairStats = null;
+    report.forEach((stat) => {
+      if (stat.type === "transport") transportStats = stat;
+      else if (stat.type === "data-channel") dcStats = stat;
+    });
+    if (transportStats && transportStats.selectedCandidatePairId) {
+      pairStats = report.get(transportStats.selectedCandidatePairId) || null;
+    }
+    if (!pairStats) {
+      report.forEach((stat) => {
+        if (stat.type === "candidate-pair" && stat.nominated) pairStats = stat;
+      });
+    }
+    sendSignal({
+      type: "stats",
+      role,
+      t_ms: tMs,
+      current_round_trip_time: pairStats ? pairStats.currentRoundTripTime ?? null : null,
+      available_outgoing_bitrate: pairStats ? pairStats.availableOutgoingBitrate ?? null : null,
+      pair_bytes_sent: pairStats ? pairStats.bytesSent ?? null : null,
+      pair_bytes_received: pairStats ? pairStats.bytesReceived ?? null : null,
+      pair_packets_sent: pairStats ? pairStats.packetsSent ?? null : null,
+      pair_packets_received: pairStats ? pairStats.packetsReceived ?? null : null,
+      dc_bytes_sent: dcStats ? dcStats.bytesSent ?? null : null,
+      dc_bytes_received: dcStats ? dcStats.bytesReceived ?? null : null,
+      dc_buffered_amount: dc.bufferedAmount,
+    });
+  } catch (e) {
+    log(`getStats failed: ${e}`, "err");
+  }
+}
 
 // ── Signaling ──────────────────────────────────────────────────────────────
 function connect() {
@@ -293,6 +403,13 @@ function connect() {
   ws.onopen = () => {
     setStatus(`Connected — waiting for offer`, "connected");
     log("signaling WebSocket open", "ok");
+    sendMilestone("ws-open");
+    if (relayRole === "send") {
+      startRelaySend().catch((e) => {
+        log(`error starting relay send: ${e}`, "err");
+        reportError(String(e));
+      });
+    }
   };
 
   ws.onclose = () => {
@@ -341,6 +458,33 @@ async function handleSignal(msg) {
     case "offer":
       await handleOffer(msg);
       break;
+    case "answer":
+      // Only reachable when THIS page is the relay offerer (?role=send) — the non-relay flow
+      // never sends an offer itself, so it never expects an answer back. See startRelaySend().
+      await handleAnswer(msg);
+      break;
+    case "result":
+      // Only reachable in relay mode: browser-peer --mode relay forwards each page's own
+      // "result" message to the OTHER page too (see that binary's run_relay doc comment) — this
+      // page has no use for the peer's self-report beyond the log.
+      log(
+        `peer result: role=${msg.role} bytes=${msg.bytes} ` +
+          `elapsed_secs=${Number(msg.elapsed_secs).toFixed(3)} mb_per_s=${Number(msg.mb_per_s).toFixed(3)}`
+      );
+      break;
+    case "milestone":
+      // The peer's own milestone, forwarded here in relay mode only (browser-peer --mode relay
+      // blind-forwards every message — see that file's relay_pump doc comment). Logged for
+      // convenience; the authoritative record is the Rust side's stderr + sidecar file.
+      log(`peer milestone: role=${msg.role} name=${msg.name} t_ms=${Number(msg.t_ms).toFixed(1)}`);
+      break;
+    case "progress":
+    case "stats":
+      // The peer's high-frequency telemetry, forwarded in relay mode only. Deliberately NOT
+      // logged to this page's own #log element — at 1 Hz over a long transfer that would flood
+      // the DOM and risk making the page itself part of the bottleneck under measurement. The
+      // authoritative record is the Rust relay's stderr + sidecar file.
+      break;
     case "ice":
       // Non-trickle signaling on both ends (see src/bin/browser-peer.rs's module doc comment) —
       // this page waits for its own ICE gathering to complete before sending the answer, so a
@@ -355,8 +499,12 @@ async function handleSignal(msg) {
 
 async function handleOffer(msg) {
   mode = msg.mode;
+  iAmSender = mode === "recv"; // the offerer's role is "recv" => the offerer receives => this
+                                // page (the answerer) sends. Unchanged from this page's original
+                                // (pre-relay) logic, just factored into a named variable.
   targetBytes = msg.bytes;
   log(`offer received: mode=${mode} bytes=${targetBytes} chunk=${msg.chunk}`);
+  sendMilestone("config-parsed", { mode, bytes: targetBytes });
 
   el.configPanel.hidden = false;
   el.cfgMode.textContent = mode;
@@ -365,9 +513,8 @@ async function handleOffer(msg) {
     mode === "send" ? "receive-and-count (download)" : "send (upload)";
 
   pc = new RTCPeerConnection({}); // host-only ICE — no STUN/TURN needed on loopback
-
-  pc.oniceconnectionstatechange = () => log(`ICE connection state: ${pc.iceConnectionState}`);
-  pc.onconnectionstatechange = () => log(`peer connection state: ${pc.connectionState}`);
+  sendMilestone("pc-created");
+  wireConnectionStateLogging(pc);
 
   pc.ondatachannel = (event) => {
     dc = event.channel;
@@ -383,6 +530,75 @@ async function handleOffer(msg) {
 
   log("sending answer", "ok");
   sendSignal({ type: "answer", sdp: pc.localDescription.sdp });
+  sendMilestone("answer-sent");
+}
+
+async function handleAnswer(msg) {
+  log("answer received (relay)", "ok");
+  sendMilestone("answer-received");
+  await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+  sendMilestone("answer-applied");
+}
+
+// Shared by handleOffer() and startRelaySend() — logs to the page AND emits a "milestone" for
+// every ICE/peer-connection state transition (design point 1: "each iceconnectionstate +
+// connectionstate change"). A stalled connection at 50ms RTT shows up here as a state that's
+// reached but never progresses further, or as unusually slow gaps between state timestamps.
+function wireConnectionStateLogging(pc) {
+  pc.oniceconnectionstatechange = () => {
+    log(`ICE connection state: ${pc.iceConnectionState}`);
+    sendMilestone(`ice-connection-${pc.iceConnectionState}`);
+  };
+  pc.onconnectionstatechange = () => {
+    log(`peer connection state: ${pc.connectionState}`);
+    sendMilestone(`connection-${pc.connectionState}`);
+  };
+}
+
+// Relay mode only (?role=send): plays the role src/bin/browser-peer.rs normally plays —
+// SDP offerer, data-channel creator — against another browser-peer.html instance (?role=recv),
+// paired by `browser-peer --mode relay`'s blind signaling forward. Reuses setupDataChannel() /
+// pumpSend() / dc.onmessage / finishTransfer() unchanged (all driven by `iAmSender`, set to
+// `true` unconditionally here since this page's role is explicit from the URL, not derived from
+// an incoming offer).
+async function startRelaySend() {
+  mode = "send"; // matches what this page puts in its own outgoing offer below
+  iAmSender = true;
+  targetBytes = relayBytesMiB * 1024 * 1024;
+  log(`relay role=send: bytes=${targetBytes} (${relayBytesMiB} MiB) — creating offer`);
+  sendMilestone("config-parsed", { mode, bytes: targetBytes });
+
+  el.configPanel.hidden = false;
+  el.cfgMode.textContent = "send (relay)";
+  el.cfgBytes.textContent = `${fmtMB(targetBytes)} MB`;
+  el.cfgRole.textContent = "send (relay, offerer)";
+
+  pc = new RTCPeerConnection({}); // host-only ICE — no STUN/TURN needed on loopback
+  sendMilestone("pc-created");
+  wireConnectionStateLogging(pc);
+
+  // Unlike the answerer path (pc.ondatachannel below), this page creates the channel itself —
+  // same config as src/bin/browser-peer.rs's create_data_channel (unordered-reliable).
+  dc = pc.createDataChannel("throughput", { ordered: false });
+  dc.binaryType = "arraybuffer";
+  setupDataChannel();
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  sendMilestone("offer-created");
+  await waitForIceGatheringComplete(pc);
+
+  log("sending offer (relay)", "ok");
+  sendSignal({
+    type: "offer",
+    sdp: pc.localDescription.sdp,
+    mode: "send", // describes THIS (offerer) page's role, same field the Rust binary sends —
+                   // the answerer's existing handleOffer() interprets mode==="send" as "the
+                   // offerer sends, I receive", which is exactly correct here.
+    bytes: targetBytes,
+    chunk: SEND_CHUNK_BYTES,
+  });
+  sendMilestone("offer-sent");
 }
 
 function waitForIceGatheringComplete(pc) {
@@ -404,22 +620,30 @@ function setupDataChannel() {
 
   dc.onopen = () => {
     log("data channel open", "ok");
+    sendMilestone("dc-open");
     t0 = performance.now();
     transferredBytes = 0;
+    firstByteMilestoneSent = false;
     el.progressPanel.hidden = false;
     progressTimer = setInterval(updateProgressUI, PROGRESS_UPDATE_MS);
+    telemetryTimer = setInterval(sendTelemetry, TELEMETRY_INTERVAL_MS);
 
-    if (mode === "recv") {
-      // Rust is receiving; this page sends.
+    if (iAmSender) {
+      // Peer (Rust in send/recv mode, or the other page in relay mode) is receiving; this page
+      // sends.
       dc.bufferedAmountLowThreshold = BUFFERED_LOW_WATER;
       dc.onbufferedamountlow = pumpSend;
       pumpSend();
     }
-    // mode === "send": Rust is sending; this page just waits on dc.onmessage below.
+    // !iAmSender: peer is sending; this page just waits on dc.onmessage below.
   };
 
   dc.onmessage = (event) => {
-    if (mode !== "send" || finished) return;
+    if (iAmSender || finished) return;
+    if (!firstByteMilestoneSent) {
+      firstByteMilestoneSent = true;
+      sendMilestone("first-byte-received");
+    }
     const len = event.data.byteLength;
     transferredBytes += len;
     if (transferredBytes >= targetBytes) {
@@ -451,6 +675,10 @@ function pumpSend() {
       reportError(`send() failed: ${e}`);
       return;
     }
+    if (!firstByteMilestoneSent) {
+      firstByteMilestoneSent = true;
+      sendMilestone("first-byte-sent");
+    }
     transferredBytes += chunk.byteLength;
   }
   if (transferredBytes >= targetBytes) {
@@ -475,10 +703,16 @@ function finishTransfer() {
     clearInterval(progressTimer);
     progressTimer = null;
   }
+  if (telemetryTimer) {
+    clearInterval(telemetryTimer);
+    telemetryTimer = null;
+  }
   updateProgressUI();
 
   const elapsedSecs = (performance.now() - t0) / 1000;
   const mbPerS = elapsedSecs > 0 ? (transferredBytes / 1_000_000) / elapsedSecs : 0;
+
+  sendMilestone("done", { bytes: transferredBytes, elapsed_secs: elapsedSecs, mb_per_s: mbPerS });
 
   el.resultPanel.hidden = false;
   el.resultRate.innerHTML = `${mbPerS.toFixed(3)} <span class="unit">MB/s</span>`;
@@ -493,6 +727,11 @@ function finishTransfer() {
 
   sendSignal({
     type: "result",
+    // `role` is new: ignored by src/bin/browser-peer.rs's ResultMsg (send/recv mode — unknown
+    // fields are ignored by serde by default) but required by RelayResultMsg in relay mode, where
+    // it's how run_relay() tells the two pages' results apart (see that file's module doc
+    // comment's "Relay mode" section).
+    role: iAmSender ? "send" : "recv",
     bytes: transferredBytes,
     elapsed_secs: elapsedSecs,
     mb_per_s: mbPerS,
@@ -500,6 +739,13 @@ function finishTransfer() {
 }
 
 el.connectBtn.addEventListener("click", connect);
+
+if (relayRole) {
+  log(
+    `relay mode: role=${relayRole}` +
+      (relayRole === "send" ? ` bytes=${relayBytesMiB}MiB` : "")
+  );
+}
 
 // Auto-connect on load using the default port field value — the common case is "start the Rust
 // binary, then open this page", so requiring a manual click every time would just be friction.

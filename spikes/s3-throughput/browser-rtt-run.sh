@@ -94,7 +94,12 @@ if [ "${1:-}" = "--in-container" ]; then
   PER_RUN_TIMEOUT_S="${PER_RUN_TIMEOUT_S:-300}"
 
   # Diagnostic overrides (all optional, default to the full matrix's original behavior):
-  #   CELLS=recv            -> only run the given direction(s) instead of "send recv"
+  #   CELLS=recv            -> only run the given direction(s) instead of "send recv". A third
+  #                            direction, "chrome", is also recognized (e.g. CELLS=chrome): the
+  #                            A10.29 Chromium<->Chromium control cell — `browser-peer --mode
+  #                            relay` (no Rust WebRTC peer) pairs TWO headless Chromium instances
+  #                            (?role=recv and ?role=send&bytes=N) so they transfer directly
+  #                            against each other's dcSCTP. See the "chrome" branch below.
   #   RTTS="20 50 100"      -> only run the given RTT list instead of "0 20 50 100"
   #   BYTES_MIB=16          -> fixed transfer size for every RTT instead of bytes_for_rtt()
   #   PER_RUN_TIMEOUT_S=120 -> override the per-cell watchdog below
@@ -122,6 +127,21 @@ if [ "${1:-}" = "--in-container" ]; then
     esac
   }
 
+  # Bytes for the "chrome" (Chromium<->Chromium relay) cell — a separate, larger 0 ms default
+  # than bytes_for_rtt above: this cell is expected to run much faster (that's the point — it's
+  # the "is dcSCTP itself healthy here" control), so a bigger 0 ms transfer gives a more stable
+  # measurement at very high throughput. Also overridden entirely by BYTES_MIB when set.
+  bytes_for_chrome_rtt() {
+    if [ -n "${BYTES_MIB:-}" ]; then
+      echo "$BYTES_MIB"
+      return
+    fi
+    case "$1" in
+      0) echo 256 ;;
+      *) echo 64 ;;
+    esac
+  }
+
   # Kills chromium (and any child renderer/GPU processes) launched with a given --user-data-dir,
   # by matching that flag in the process's cmdline — more robust than tracking a single PID, since
   # `chromium --headless=new` forks helper processes that don't share the launcher's PID group in
@@ -141,9 +161,45 @@ if [ "${1:-}" = "--in-container" ]; then
     } >>"$QDISC_FILE"
   }
 
+  # Coordinator directive (A10.29 50ms-crawl diagnosis): sample `tc -s qdisc show dev lo` every 5s
+  # WHILE a cell runs, not just once before/after — a single before/after snapshot can't tell
+  # "netem's queue stayed empty the whole time" (payload never showed up) apart from "netem's queue
+  # was full the whole time" (payload backed up on the shaping queue itself); a time series can.
+  # Runs as a detached background loop; start_qdisc_sampler echoes its PID so the caller can stop it
+  # with stop_qdisc_sampler once the cell's wait completes.
+  #
+  # CRITICAL: this function is always invoked as `x="$(start_qdisc_sampler ...)"` — a command
+  # substitution. A command substitution's `$(...)` does not return until EVERY process holding the
+  # write end of its output pipe has closed it — including any background job that merely
+  # *inherited* that fd without writing to it. The very first version of this function backgrounded
+  # `( while true; ... ) &` with no redirection, so the infinite loop held that inherited stdout fd
+  # open forever, wedging `start_qdisc_sampler`'s own `$(...)` before it ever returned a PID — the
+  # whole script hung immediately, before building or launching anything. `</dev/null >/dev/null
+  # 2>&1` on the backgrounded subshell detaches it from the caller's fds so `echo $!` below is the
+  # command substitution's LAST write, and the pipe closes (EOF) as soon as this function returns.
+  start_qdisc_sampler() {
+    local sample_cell="$1"
+    (
+      while true; do
+        sleep 5
+        {
+          echo "== ${sample_cell} qdisc sample t=$(date +%s) =="
+          tc -s qdisc show dev lo
+          echo
+        } >>"$QDISC_FILE"
+      done
+    ) </dev/null >/dev/null 2>&1 &
+    disown
+    echo $!
+  }
+
+  stop_qdisc_sampler() {
+    kill "$1" >/dev/null 2>&1 || true
+    wait "$1" >/dev/null 2>&1 || true
+  }
+
   for rtt in $RTTS; do
     half=$((rtt / 2))
-    bytes="$(bytes_for_rtt "$rtt")"
 
     tc qdisc del dev lo root >/dev/null 2>&1 || true
     if [ "$half" -gt 0 ]; then
@@ -156,6 +212,148 @@ if [ "${1:-}" = "--in-container" ]; then
 
     for dir in $DIRECTIONS; do
       cell="rtt${rtt}_${dir}"
+
+      if [ "$dir" = "chrome" ]; then
+        # ── A10.29 Chromium<->Chromium control cell: no Rust WebRTC peer at all. `browser-peer
+        # --mode relay` just pairs the first two signaling connections and blind-forwards their
+        # messages; TWO headless Chromium instances (separate --user-data-dir each, so they don't
+        # share a profile/lock) open browser-peer.html with ?role=recv / ?role=send&bytes=N and
+        # transfer directly against each other's dcSCTP. Isolates whether dcSCTP itself is
+        # RTT-healthy here when NOT paired with webrtc-rs. ──
+        bytes="$(bytes_for_chrome_rtt "$rtt")"
+        echo "== RTT=${rtt}ms dir=${dir} bytes=${bytes}MiB (Chromium<->Chromium relay) ==" >&2
+
+        out_json="$RAW_DIR/${cell}.json"
+        err_log="$RAW_DIR/${cell}.err"
+        chrome_log_a="$RAW_DIR/${cell}-chrome-a.log"
+        chrome_log_b="$RAW_DIR/${cell}-chrome-b.log"
+        # Sidecar the two browser pages' own milestone/progress/stats telemetry gets appended to
+        # (see browser-peer.rs's relay_pump / module doc comment "Relay mode" section) — the
+        # coordinator's 50ms-crawl diagnosis instrumentation.
+        events_out="$RAW_DIR/${cell}-browser-events.jsonl"
+        udd_a="/tmp/chrome-${cell}-a"
+        udd_b="/tmp/chrome-${cell}-b"
+        : >"$out_json"
+        : >"$err_log"
+        : >"$chrome_log_a"
+        : >"$chrome_log_b"
+        : >"$events_out"
+        rm -rf "$udd_a" "$udd_b"
+        mkdir -p "$udd_a" "$udd_b"
+
+        capture_udp_stats "before rtt=${rtt} dir=${dir}"
+        qdisc_sampler_pid="$(start_qdisc_sampler "$cell")"
+
+        # --relay-watchdog-secs: browser-peer.rs's run_relay() used to wait on a fixed 60s internal
+        # watchdog for the receiver's result message — far too short for a slow-but-progressing
+        # shaped-RTT cell (the 50ms cell's telemetry showed steady ~0.85 MB/s the whole time, yet
+        # got mislabeled FAILED at 60s). Passing PER_RUN_TIMEOUT_S through here aligns the relay's
+        # own internal watchdog with this script's outer `timeout` wrapper, so a cell is only ever
+        # cut short once — by whichever fires first — instead of being cut short twice, the first
+        # time at an unrelated, much shorter fixed value.
+        set +e
+        timeout "${PER_RUN_TIMEOUT_S}s" "$BIN" \
+          --mode relay --json --stats-out "$events_out" \
+          --relay-watchdog-secs "$PER_RUN_TIMEOUT_S" \
+          >"$out_json" 2>"$err_log" &
+        rust_pid=$!
+
+        # Same listening-poll convention as the send/recv cells below.
+        listening=0
+        for _ in $(seq 1 50); do
+          if grep -q "listening on" "$err_log" 2>/dev/null; then
+            listening=1
+            break
+          fi
+          if ! kill -0 "$rust_pid" 2>/dev/null; then
+            break
+          fi
+          sleep 0.2
+        done
+
+        chrome_pid_a=""
+        chrome_pid_b=""
+        if [ "$listening" -eq 1 ]; then
+          chrome_extra_args=()
+          if [ "${DCSCTP_LOG:-0}" = "1" ]; then
+            chrome_extra_args+=(--enable-logging=stderr --vmodule=*dcsctp*=9 --v=0)
+          fi
+          # Launch the receiver page first, give it a head start to load and open its WS/answer
+          # path before the sender page (which actively creates the offer on load — see
+          # browser-peer.html's startRelaySend()) connects and sends its offer through the relay.
+          timeout "${PER_RUN_TIMEOUT_S}s" chromium \
+            --headless=new --no-sandbox --disable-gpu \
+            --allow-file-access-from-files \
+            --autoplay-policy=no-user-gesture-required \
+            --user-data-dir="$udd_a" \
+            "${chrome_extra_args[@]}" \
+            "file:///workspace/$SPIKE_DIR/browser-peer.html?role=recv" \
+            >"$chrome_log_a" 2>&1 &
+          chrome_pid_a=$!
+
+          sleep 0.5
+
+          timeout "${PER_RUN_TIMEOUT_S}s" chromium \
+            --headless=new --no-sandbox --disable-gpu \
+            --allow-file-access-from-files \
+            --autoplay-policy=no-user-gesture-required \
+            --user-data-dir="$udd_b" \
+            "${chrome_extra_args[@]}" \
+            "file:///workspace/$SPIKE_DIR/browser-peer.html?role=send&bytes=${bytes}" \
+            >"$chrome_log_b" 2>&1 &
+          chrome_pid_b=$!
+        else
+          echo "browser-rtt-run: Rust side never reported 'listening' — not launching Chromium for $cell" >&2
+        fi
+
+        wait "$rust_pid"
+        rust_rc=$?
+        set -e
+        stop_qdisc_sampler "$qdisc_sampler_pid"
+
+        for chrome_pid in "$chrome_pid_a" "$chrome_pid_b"; do
+          if [ -n "$chrome_pid" ]; then
+            kill "$chrome_pid" >/dev/null 2>&1 || true
+            wait "$chrome_pid" >/dev/null 2>&1 || true
+          fi
+        done
+        kill_chromium "$udd_a"
+        kill_chromium "$udd_b"
+
+        if [ -n "${RUST_LOG:-}" ]; then
+          cp "$err_log" "$RAW_DIR/${cell}-rust-trace.log"
+        fi
+
+        capture_udp_stats "after rtt=${rtt} dir=${dir}"
+
+        {
+          echo "== RTT=${rtt}ms dir=${dir}, after cell =="
+          tc -s qdisc show dev lo
+          echo
+        } >>"$QDISC_FILE"
+
+        if [ "$rust_rc" -eq 0 ] && [ -s "$out_json" ]; then
+          raw="$(cat "$out_json")"
+          mb_per_s="$(printf '%s' "$raw" | sed -n 's/.*"mb_per_s":\([0-9.]*\).*/\1/p')"
+          printf '| %s | %s | %s | %s | %s | bytes=%sMiB chunk=64KiB; Chrome dcSCTP <-> Chrome dcSCTP (relay, no Rust WebRTC peer); raw=%s |\n' \
+            "$DATE_STR" "$ENV_LABEL" "$rtt" "$dir" "$mb_per_s" "$bytes" "$raw" \
+            >>"$RESULTS_TMP"
+        else
+          reason="rust_exit=${rust_rc}"
+          if [ "$rust_rc" -eq 124 ]; then
+            reason="TIMEOUT after ${PER_RUN_TIMEOUT_S}s"
+          fi
+          tail_err="$(tail -c 400 "$err_log" 2>/dev/null | tr '\n' ' ')"
+          printf '| %s | %s | %s | %s | FAILED | %s; bytes=%sMiB; Chrome dcSCTP <-> Chrome dcSCTP (relay, no Rust WebRTC peer); stderr_tail=%s |\n' \
+            "$DATE_STR" "$ENV_LABEL" "$rtt" "$dir" "$reason" "$bytes" "$tail_err" \
+            >>"$RESULTS_TMP"
+          echo "browser-rtt-run: CELL FAILED rtt=${rtt} dir=${dir} ($reason)" >&2
+        fi
+
+        continue
+      fi
+
+      bytes="$(bytes_for_rtt "$rtt")"
       echo "== RTT=${rtt}ms dir=${dir} bytes=${bytes}MiB ==" >&2
 
       out_json="$RAW_DIR/${cell}.json"
@@ -171,6 +369,7 @@ if [ "${1:-}" = "--in-container" ]; then
       mkdir -p "$udd"
 
       capture_udp_stats "before rtt=${rtt} dir=${dir}"
+      qdisc_sampler_pid="$(start_qdisc_sampler "$cell")"
 
       set +e
       timeout "${PER_RUN_TIMEOUT_S}s" "$BIN" \
@@ -223,6 +422,7 @@ if [ "${1:-}" = "--in-container" ]; then
       wait "$rust_pid"
       rust_rc=$?
       set -e
+      stop_qdisc_sampler "$qdisc_sampler_pid"
 
       if [ -n "$chrome_pid" ]; then
         kill "$chrome_pid" >/dev/null 2>&1 || true
@@ -284,6 +484,17 @@ fi
 # -e VAR (no value) forwards the host's current value of VAR into the container, so the
 # diagnostic overrides (CELLS/RTTS/BYTES_MIB/PER_RUN_TIMEOUT_S/DCSCTP_LOG) set on the host actually
 # reach the --in-container invocation above instead of silently falling back to matrix defaults.
+#
+# Belt-and-braces overall watchdog (coordinator directive, post-mortem on a real wedge: an earlier
+# version of start_qdisc_sampler() above hung the WHOLE script silently for 2+ hours — see that
+# function's comment — in a span PER_RUN_TIMEOUT_S never covered, since it wedged before even
+# reaching the timeout-wrapped Rust/Chromium processes). `timeout` (GNU coreutils, present in this
+# Linux image, unlike the macOS host) wraps the ENTIRE --in-container run so ANY future hang
+# anywhere in it — a stuck `apt-get`/`cargo build`, another shell scripting mistake, whatever —
+# still produces a bounded, non-silent failure instead of an indefinitely wedged container.
+# Overridable via OVERALL_TIMEOUT_S; default (3600s) comfortably covers the full default matrix
+# (RTTS="0 20 50 100" x DIRECTIONS="send recv" = 8 cells x up to 300s default PER_RUN_TIMEOUT_S,
+# plus build/apt-get overhead) with headroom.
 exec docker run --rm \
   --cap-add NET_ADMIN \
   --user root \
@@ -291,9 +502,10 @@ exec docker run --rm \
   -e RTTS \
   -e BYTES_MIB \
   -e PER_RUN_TIMEOUT_S \
+  -e OVERALL_TIMEOUT_S \
   -e DCSCTP_LOG \
   -e RUST_LOG \
   -v "$REPO_ROOT:/workspace" \
   -w /workspace \
   spindle-toolchain:local \
-  bash "/workspace/$SPIKE_DIR/browser-rtt-run.sh" --in-container
+  timeout "${OVERALL_TIMEOUT_S:-3600}s" bash "/workspace/$SPIKE_DIR/browser-rtt-run.sh" --in-container

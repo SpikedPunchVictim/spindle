@@ -721,18 +721,26 @@ and not a hard protocol ceiling. This does not decide ADR-005; it narrows the op
 
 1. **Upstream `webrtc-rs`/`rtc-sctp` congestion-control work** — file the evidence in this section
    against the crate, focusing on the sender-side collapse (directly reachable/fixable) and the
-   `recv`-direction interop freeze (would need dcSCTP-side collaboration or a debug Chromium build
-   to pin down further).
+   `recv`-direction interop freeze. Still valid after the control cell below: the sender-side
+   collapse and the outright interop-freeze severity (~4.3 KB window, never past initial cwnd) are
+   `webrtc-rs`-specific and worse than Chrome's own ~40 KB plateau — but per the addendum, fixing
+   them tops out at Chrome↔Chrome's own ~0.85–1.9 MB/s ceiling in this environment, not the 15 MB/s
+   bar, so file this as "narrows the gap," not "closes it."
 2. **Switch the Rust SCTP stack.** Already tried once as S3's designated fallback —
    `datachannel-rs`/libdatachannel (`usrsctp`) shows the *same* RTT-bound collapse and is measurably
    *worse* than `webrtc-rs` at 50/100 ms (see "datachannel-rs backend" above) — so this option's
    track record in this codebase so far is poor, not a clean escape hatch.
 3. **A Chromium↔Chromium control cell** (two headless Chrome peers, no Rust SCTP stack on either
    end) — would isolate whether dcSCTP itself is RTT-bound in this environment independent of
-   `webrtc-rs`, or whether the freeze is specific to pairing with `webrtc-rs`. Not run in this
-   session.
+   `webrtc-rs`, or whether the freeze is specific to pairing with `webrtc-rs`. **RUN — see
+   "Addendum — Chromium↔Chromium control (dcSCTP both ends)" below.** Verdict: dcSCTP itself is
+   *not* RTT-healthy here either (~0.85 MB/s @ 50 ms), so the WAN shortfall is not a `webrtc-rs`-
+   specific defect.
 4. **Revise the A9 ≥ 15 MB/s @ 50 ms WAN bar** — if none of the above close the gap in a reasonable
-   timeframe.
+   timeframe. Strengthened by the addendum: every peer pairing measured so far (including
+   dcSCTP↔dcSCTP with no Rust stack involved) fails the bar on this shaped path while TCP clears it
+   4×+ over, so this is looking less like an implementation gap and more like a property of
+   WebRTC data channels as currently shipped.
 
 #### Reproduction
 
@@ -760,3 +768,148 @@ CELLS=recv RTTS="50" BYTES_MIB=8 PER_RUN_TIMEOUT_S=90 RUST_LOG=rtc_sctp=trace ./
 Raw per-cell artifacts (`.jsonl` stats, `.err`/`-rust-trace.log`, `-chrome.log`, qdisc/UDP-error
 snapshots) live under `.browser-rtt-raw/` and `.browser-rtt-qdisc.tmp` — not committed (see
 `.gitignore`), regenerable by the reproduction commands above.
+
+### Addendum — Chromium↔Chromium control (dcSCTP both ends)
+
+**Purpose**: option 3 from the verdict above, user-directed as a follow-up to the previous
+section — isolate whether Chrome's `dcSCTP` is RTT-healthy in this environment **with no
+`webrtc-rs` on either end**, since the previous section's diagnosis positively exonerated the
+`webrtc-rs` receiver on wire-level evidence but couldn't rule out that the freeze is somehow
+specific to being *paired with* `webrtc-rs` rather than intrinsic to `dcSCTP` itself under this
+shaping.
+
+**Harness**: `src/bin/browser-peer.rs` gained a fourth mode, `--mode relay` — no Rust WebRTC peer
+at all; it's a pure WebSocket signaling forwarder that pairs the first two connections and blindly
+relays their messages. `browser-peer.html` gained `?role=send&bytes=<MiB>` / `?role=recv` URL
+params so it can play either side of an offer/answer/ICE handshake against *another instance of
+itself* instead of against the Rust binary. `browser-rtt-run.sh` gained a `CELLS=chrome` cell type:
+per RTT, start `browser-peer --mode relay`, launch two headless Chromium instances (separate
+`--user-data-dir` each) with `?role=recv` then `?role=send&bytes=N`, and let them transfer directly
+against each other's `dcSCTP` — same `tc netem`-on-`lo` shaping, same container, same network
+namespace as every other cell in this file.
+
+Diagnosing the first 50 ms run required a second instrumentation pass: `browser-peer.html` now
+emits timestamped page milestones (`ws-open`, `config-parsed`, `pc-created`, `offer-created/sent`,
+`answer-received/applied`, every ICE/connection state transition, `dc-open`,
+`first-byte-sent`/`first-byte-received`, `done`) plus a 1 Hz heartbeat of transfer progress and
+Chrome's own `pc.getStats()` view (`currentRoundTripTime`, `availableOutgoingBitrate`, candidate-
+pair/data-channel byte and packet counters, `bufferedAmount`) — all sent as JSON over the same
+signaling WebSocket. `relay_pump()` in `browser-peer.rs` stamps every forwarded message to stderr
+with a monotonic timestamp and type (milestone/progress/stats logged in full; SDP/ICE bodies
+logged as type-only, never dumped), and appends the milestone/progress/stats stream to a per-cell
+sidecar, `.browser-rtt-raw/<cell>-browser-events.jsonl`. `browser-rtt-run.sh` also now samples
+`tc -s qdisc show dev lo` every 5 s during each cell (not just before/after) into the qdisc tmp
+file, so a stalled-looking cell shows whether netem's queue is idle or backed up over time instead
+of just at two snapshots.
+
+#### Results
+
+| Date | Environment | RTT (ms) | Direction | MB/s | Notes |
+|------|-------------|----------|-----------|------|-------|
+| 2026-08-24 | Linux container (aarch64), Chromium 151.0.7922.173, tc netem on lo, spindle-toolchain:local | 0 | relay (Chrome dcSCTP ↔ Chrome dcSCTP) | 73.219 | bytes=256MiB chunk=64KiB; completed, 3.666 s |
+| 2026-08-24 | Linux container (aarch64), Chromium 151.0.7922.173, tc netem on lo, spindle-toolchain:local | 20 | relay (Chrome dcSCTP ↔ Chrome dcSCTP) | 1.892 | bytes=64MiB chunk=64KiB; completed, 35.5 s (sender self-report 2.119 MB/s, 31.666 s) |
+| 2026-08-24 | Linux container (aarch64), Chromium 151.0.7922.173, tc netem on lo, spindle-toolchain:local | 50 | relay (Chrome dcSCTP ↔ Chrome dcSCTP) | 0.845 | bytes=64MiB chunk=64KiB; **transfer was NOT stalled** — 50.46 of 67.1 MB delivered, steady 0.83–0.85 MB/s from t≈5 s, when the relay's *then*-hardcoded 60 s internal result-wait watchdog cut it off and reported FAILED; see "Watchdog fix" below — the rate is real, the FAILED label was a harness artifact |
+
+Both directions clear the ≥ 50 MB/s LAN bar at 0 ms (73.219 MB/s — in the same range as the
+0 ms `send`/`recv` numbers against `webrtc-rs` above, confirming the relay harness itself adds no
+material overhead). **Both shaped RTTs miss the ≥ 15 MB/s @ 50 ms bar by a wide margin** — 1.892
+MB/s at 20 ms (~87% short), ~0.845 MB/s at 50 ms (~94% short) — with no Rust SCTP stack anywhere on
+the path.
+
+#### Evidence
+
+- **Connection setup is fast and healthy, not the bottleneck.** Milestone timestamps for the 50 ms
+  cell: `ws-open` ~150 ms → offer/answer/ICE/DTLS complete by ~620 ms → `dc-open` at 727 ms →
+  `first-byte-received` at 892 ms. The crawl is entirely in post-connect steady-state throughput,
+  not connection establishment.
+- **Chrome's own `getStats()` confirms the shaping and rules out one hypothesis.**
+  `currentRoundTripTime` tracked the configured delay throughout (≈0.021–0.032 s at 20 ms RTT,
+  ≈0.052–0.063 s at 50 ms RTT) — a direct sanity check that `tc netem` is applying what it claims.
+  `availableOutgoingBitrate` was `null` for the whole run on both cells — Chrome's bandwidth
+  estimator appears not to run (or not to be exposed via `getStats()`) for a datachannel-only
+  `RTCPeerConnection` with no RTP media, so this field is noted as **unusable** for this harness,
+  not broken.
+- **The sender's own buffer was never the bottleneck.** `dc.bufferedAmount` on the sending page
+  sawtoothed cleanly between the page's own high/low watermarks (1.08 MB – 8.44 MB) the entire
+  run — the application layer kept trying to push more data in than the connection could drain,
+  the textbook signature of a *send-side* limit downstream of the JS layer (i.e. inside `dcSCTP`
+  itself), not application-level pacing.
+- **The path itself stayed clean and uncongested.** `tc -s qdisc show dev lo` sampled every 5 s
+  during the 50 ms cell shows the netem queue backlog oscillating in the tens-of-kilobytes range,
+  never approaching its 10000-packet `limit`, and **zero drops** throughout — corroborated by
+  **zero** `UdpInErrors`/`UdpRcvbufErrors` deltas beyond expected background noise. The bottleneck
+  is not queueing or loss.
+- **Implied send window is small and essentially RTT-independent.** Back-computing
+  `window ≈ rate × RTT` from the steady-state numbers: **≈38 KB at 20 ms**, **≈41.5 KB at 50 ms** —
+  nearly identical across a 2.5× RTT change, and flat for the full observed duration of each cell
+  (tens of seconds, zero loss) rather than climbing. That is the signature of a window that plateaus
+  early and stops growing, not one that's merely rate-limited by RTT×bandwidth in a healthy,
+  still-scaling congestion-control sense.
+
+#### Interpretation
+
+This is the **same class** of problem diagnosed in the previous section — a stuck congestion/send
+window that stops growing well short of what the shaped path can carry — but roughly **10× larger**
+in absolute terms (**~40 KB here vs. ~4.3 KB** in the `webrtc-rs`-receiver freeze above). One
+plausible contributor (**hypothesis, not established by this harness**): Chrome's own receiver
+appears to SACK closer to once per RTT in both diagnoses, but small cadence or ack-coalescing
+differences between Chrome's `dcSCTP` and `rtc-sctp`'s SACK generation could let Chrome's window
+climb a little further before whatever gating mechanism plateaus it — this harness has no direct
+visibility into `dcSCTP`'s internal cwnd/pacing state (release Chromium's verbose dcSCTP logging is
+compiled out, as already noted above) to confirm or refute this.
+
+**Critical conclusion**: `dcSCTP` talking to `dcSCTP` — zero Rust code, zero `webrtc-rs`, zero
+`rtc-sctp` anywhere on the path — is **not RTT-healthy in this environment either** (~0.85 MB/s
+measured vs. the 15 MB/s @ 50 ms bar). The WAN shortfall documented throughout this file is
+therefore **not uniquely a Rust-stack defect**: WebRTC data channels, as implemented by today's
+Chrome, fail the bar in this shaped environment against every peer this file has measured them
+against — while plain TCP on the identical path does 60.685 MB/s (see "Follow-up: environment
+baseline" above), over 70× this addendum's 50 ms number. The Rust stacks measured in this file
+remain meaningfully *worse* than Chrome↔Chrome (a ~4.3 KB frozen window and an outright sender-side
+collapse, vs. Chrome's ~40 KB plateau) — so upstream/stack-switch work (options 1–2 above) is not
+pointless — but even a full fix there would, at best, land the Rust side at Chrome↔Chrome's own
+~0.85–1.9 MB/s ceiling in this environment, not at the 15 MB/s bar.
+
+#### Watchdog fix
+
+The 50 ms cell's initial FAILED result was a harness artifact, not a data point: `run_relay()` in
+`browser-peer.rs` waited on a fixed, hardcoded 60 s internal timeout for the receiver's result
+message — unrelated to `browser-rtt-run.sh`'s own `PER_RUN_TIMEOUT_S` — so a cell that is merely
+*slow* (steadily delivering data, as confirmed by the telemetry above) got the same "stalled"
+label as a cell that has genuinely wedged. Fixed: `--relay-watchdog-secs <N>` (default 300s) makes
+this configurable; `browser-rtt-run.sh` now passes `--relay-watchdog-secs "$PER_RUN_TIMEOUT_S"` for
+`chrome` cells so the internal and outer timeouts agree. The 50 ms row above is still the telemetry
+-derived number (captured independently via the browser-events sidecar regardless of the Rust
+binary's own exit status) rather than a post-fix completed run — re-running with the fix would
+produce a completed row instead of a FAILED one, but would not be expected to change the measured
+rate, since the rate curve was already flat well before the old 60 s cutoff.
+
+#### Caveat — external validity
+
+This entire file's shaped-RTT evidence, this addendum included, comes from `tc netem` delay on a
+single container's loopback interface (`lo`) — headless Chromium, aarch64, one Linux kernel network
+stack for both "ends" of every connection. It rules out netem-queue drops, UDP-socket errors, and
+(via this addendum) `webrtc-rs`-specific defects as the cause, but it cannot rule out something
+specific to loopback-with-netem itself (e.g. how the kernel schedules/paces packets crossing the
+same interface twice) that a real two-host path — or even two containers on a real virtual network
+— would not reproduce. Before treating ~0.85 MB/s as *the* dcSCTP ceiling rather than *this
+environment's* ceiling, a real-WAN or two-host validation is the remaining external-validity check.
+
+#### Reproduction
+
+```
+export PATH="$HOME/.local/share/mise/shims:$PATH"
+cd spikes/s3-throughput
+
+# Chromium<->Chromium control cell at 0/20/50 ms, 64 MiB per shaped cell:
+CELLS=chrome RTTS="0 20 50" BYTES_MIB=64 ./browser-rtt-run.sh
+
+# Add --relay-watchdog-secs headroom explicitly if driving a longer PER_RUN_TIMEOUT_S than the
+# default 300s (browser-rtt-run.sh already does this automatically for CELLS=chrome).
+```
+
+Per-cell artifacts land under `.browser-rtt-raw/`: `<cell>.json`/`.err` (Rust relay
+stdout/stderr), `<cell>-chrome-a.log`/`-chrome-b.log` (the recv/send Chromium instances'
+own stderr), and `<cell>-browser-events.jsonl` (the milestone/progress/stats sidecar this
+addendum's evidence was drawn from) — none committed (see `.gitignore`), all regenerable by the
+command above.
