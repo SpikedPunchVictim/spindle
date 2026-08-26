@@ -90,19 +90,28 @@ mod tests {
 
     #[test]
     fn same_fields_encode_identically() {
-        assert_eq!(encode_entry(&entry("a", "b")), encode_entry(&entry("a", "b")));
+        assert_eq!(
+            encode_entry(&entry("a", "b")),
+            encode_entry(&entry("a", "b"))
+        );
     }
 
     #[test]
     fn different_fields_encode_differently() {
-        assert_ne!(encode_entry(&entry("a", "b")), encode_entry(&entry("x", "b")));
+        assert_ne!(
+            encode_entry(&entry("a", "b")),
+            encode_entry(&entry("x", "b"))
+        );
     }
 
     #[test]
     fn length_prefixes_prevent_field_boundary_ambiguity() {
         // "ab" + "cd" must not collide with "a" + "bcd" despite the concatenation
         // ("abcd") being identical without length prefixes.
-        assert_ne!(encode_entry(&entry("ab", "cd")), encode_entry(&entry("a", "bcd")));
+        assert_ne!(
+            encode_entry(&entry("ab", "cd")),
+            encode_entry(&entry("a", "bcd"))
+        );
     }
 
     #[test]

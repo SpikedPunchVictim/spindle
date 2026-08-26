@@ -66,19 +66,22 @@ impl From<crate::canonical::CborError> for ProtoError {
 }
 
 /// Read-side helper over a decoded `CborValue::Map`: field lookup plus the closed-schema check
-/// (every key must be in the caller's declared allow-list).
-struct MapReader<'a> {
+/// (every key must be in the caller's declared allow-list). `pub(crate)` (rather than private to
+/// this module) so [`crate::vfs_rpc`] can reuse the identical field-extraction discipline for the
+/// VFS RPC wire types instead of re-implementing it — same crate, same closed-schema/strict-type
+/// conventions documented in `lib.rs`.
+pub(crate) struct MapReader<'a> {
     entries: &'a [(CborValue, CborValue)],
 }
 
 impl<'a> MapReader<'a> {
-    fn new(v: &'a CborValue) -> Result<Self, ProtoError> {
+    pub(crate) fn new(v: &'a CborValue) -> Result<Self, ProtoError> {
         let entries = v.as_map().ok_or(ProtoError::NotAMap)?;
         Ok(Self { entries })
     }
 
     /// Rejects the map if it contains any key not in `allowed`.
-    fn deny_unknown_fields(&self, allowed: &[&str]) -> Result<(), ProtoError> {
+    pub(crate) fn deny_unknown_fields(&self, allowed: &[&str]) -> Result<(), ProtoError> {
         for (k, _) in self.entries {
             let key = k.as_text().ok_or(ProtoError::KeyNotText)?;
             if !allowed.contains(&key) {
@@ -88,48 +91,60 @@ impl<'a> MapReader<'a> {
         Ok(())
     }
 
-    fn get(&self, key: &str) -> Option<&CborValue> {
+    pub(crate) fn get(&self, key: &str) -> Option<&CborValue> {
         self.entries
             .iter()
             .find(|(k, _)| k.as_text() == Some(key))
             .map(|(_, v)| v)
     }
 
-    fn require(&self, key: &'static str) -> Result<&CborValue, ProtoError> {
+    pub(crate) fn require(&self, key: &'static str) -> Result<&CborValue, ProtoError> {
         self.get(key).ok_or(ProtoError::MissingField(key))
     }
 
-    fn bytes(&self, key: &'static str) -> Result<Vec<u8>, ProtoError> {
+    pub(crate) fn bytes(&self, key: &'static str) -> Result<Vec<u8>, ProtoError> {
         self.require(key)?
             .as_bytes()
             .map(|b| b.to_vec())
             .ok_or(ProtoError::WrongType(key))
     }
 
-    fn text(&self, key: &'static str) -> Result<String, ProtoError> {
+    pub(crate) fn text(&self, key: &'static str) -> Result<String, ProtoError> {
         self.require(key)?
             .as_text()
             .map(|s| s.to_string())
             .ok_or(ProtoError::WrongType(key))
     }
 
-    fn u64(&self, key: &'static str) -> Result<u64, ProtoError> {
+    pub(crate) fn u64(&self, key: &'static str) -> Result<u64, ProtoError> {
         self.require(key)?
             .as_uint()
             .ok_or(ProtoError::WrongType(key))
     }
 
-    fn u8(&self, key: &'static str) -> Result<u8, ProtoError> {
+    pub(crate) fn u8(&self, key: &'static str) -> Result<u8, ProtoError> {
         let v = self.u64(key)?;
         u8::try_from(v).map_err(|_| ProtoError::IntOutOfRange(key))
     }
 
-    fn u16(&self, key: &'static str) -> Result<u16, ProtoError> {
+    pub(crate) fn u16(&self, key: &'static str) -> Result<u16, ProtoError> {
         let v = self.u64(key)?;
         u16::try_from(v).map_err(|_| ProtoError::IntOutOfRange(key))
     }
 
-    fn bytes_array(&self, key: &'static str) -> Result<Vec<Vec<u8>>, ProtoError> {
+    pub(crate) fn u32(&self, key: &'static str) -> Result<u32, ProtoError> {
+        let v = self.u64(key)?;
+        u32::try_from(v).map_err(|_| ProtoError::IntOutOfRange(key))
+    }
+
+    pub(crate) fn bool(&self, key: &'static str) -> Result<bool, ProtoError> {
+        match self.require(key)? {
+            CborValue::Bool(b) => Ok(*b),
+            _ => Err(ProtoError::WrongType(key)),
+        }
+    }
+
+    pub(crate) fn bytes_array(&self, key: &'static str) -> Result<Vec<Vec<u8>>, ProtoError> {
         let arr = self
             .require(key)?
             .as_array()
@@ -143,13 +158,25 @@ impl<'a> MapReader<'a> {
             .collect()
     }
 
-    fn optional_bytes(&self, key: &'static str) -> Result<Option<Vec<u8>>, ProtoError> {
+    pub(crate) fn optional_bytes(&self, key: &'static str) -> Result<Option<Vec<u8>>, ProtoError> {
         match self.get(key) {
             None => Ok(None),
             Some(v) => v
                 .as_bytes()
                 .map(|b| Some(b.to_vec()))
                 .ok_or(ProtoError::WrongType(key)),
+        }
+    }
+
+    pub(crate) fn optional_u32(&self, key: &'static str) -> Result<Option<u32>, ProtoError> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(v) => {
+                let n = v.as_uint().ok_or(ProtoError::WrongType(key))?;
+                Ok(Some(
+                    u32::try_from(n).map_err(|_| ProtoError::IntOutOfRange(key))?,
+                ))
+            }
         }
     }
 }

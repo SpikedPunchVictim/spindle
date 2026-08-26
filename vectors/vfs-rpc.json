@@ -1,0 +1,912 @@
+{
+  "description": "VFS RPC wire types (DESIGN.md §A8), Stage 6 slice 3: request/reply CBOR shapes for list/stat/read/mkdir/delete/whoami and the typed error-code model. Not A7b signed artifacts — no domain tag, no signing input.",
+  "requests": [
+    {
+      "name": "list_root_no_cursor",
+      "description": "`list` at the share-root-relative virtual path \"Photos\", first page (no cursor, server-default limit).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 0
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "path"
+            },
+            "value": {
+              "type": "text",
+              "value": "Photos"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a3617601626f700064706174686650686f746f73"
+    },
+    {
+      "name": "list_with_cursor_and_limit",
+      "description": "`list` continuing from an opaque cursor, with an explicit page-size limit.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 0
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "path"
+            },
+            "value": {
+              "type": "text",
+              "value": "Photos"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cursor"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "01010101"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "limit"
+            },
+            "value": {
+              "type": "uint",
+              "value": 50
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a5617601626f700064706174686650686f746f73656c696d6974183266637572736f724401010101"
+    },
+    {
+      "name": "stat",
+      "description": "`stat` a single virtual path.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "path"
+            },
+            "value": {
+              "type": "text",
+              "value": "Photos/Vacation/img.jpg"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a3617601626f700164706174687750686f746f732f5661636174696f6e2f696d672e6a7067"
+    },
+    {
+      "name": "read_one_chunk",
+      "description": "`read` one 64 KiB chunk starting at offset 65536 (DESIGN.md §A8 max chunk size).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 2
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "path"
+            },
+            "value": {
+              "type": "text",
+              "value": "Photos/Vacation/img.jpg"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "offset"
+            },
+            "value": {
+              "type": "uint",
+              "value": 65536
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "len"
+            },
+            "value": {
+              "type": "uint",
+              "value": 65536
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a5617601626f7002636c656e1a0001000064706174687750686f746f732f5661636174696f6e2f696d672e6a7067666f66667365741a00010000"
+    },
+    {
+      "name": "mkdir",
+      "description": "`mkdir` a new virtual directory.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 3
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "path"
+            },
+            "value": {
+              "type": "text",
+              "value": "Photos/NewAlbum"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a3617601626f700364706174686f50686f746f732f4e6577416c62756d"
+    },
+    {
+      "name": "delete",
+      "description": "`delete` a virtual path.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 4
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "path"
+            },
+            "value": {
+              "type": "text",
+              "value": "Photos/old.jpg"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a3617601626f700464706174686e50686f746f732f6f6c642e6a7067"
+    },
+    {
+      "name": "whoami",
+      "description": "`whoami` — no fields beyond the shared `v`/`op` envelope.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 5
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2617601626f7005"
+    }
+  ],
+  "replies": [
+    {
+      "name": "list_reply_one_entry_more_pages",
+      "description": "`list` reply with one directory entry and a continuation cursor.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 0
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "entries"
+            },
+            "value": {
+              "type": "array",
+              "value": [
+                {
+                  "type": "map",
+                  "value": [
+                    {
+                      "key": {
+                        "type": "text",
+                        "value": "name"
+                      },
+                      "value": {
+                        "type": "text",
+                        "value": "Vacation"
+                      }
+                    },
+                    {
+                      "key": {
+                        "type": "text",
+                        "value": "kind"
+                      },
+                      "value": {
+                        "type": "uint",
+                        "value": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "type": "text",
+                        "value": "size"
+                      },
+                      "value": {
+                        "type": "uint",
+                        "value": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "type": "text",
+                        "value": "mtime"
+                      },
+                      "value": {
+                        "type": "uint",
+                        "value": 1755907200
+                      }
+                    },
+                    {
+                      "key": {
+                        "type": "text",
+                        "value": "perms_here"
+                      },
+                      "value": {
+                        "type": "uint",
+                        "value": 1
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "next_cursor"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "02020202"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a3626f700067656e747269657381a5646b696e6401646e616d65685661636174696f6e6473697a6500656d74696d651a68a904806a7065726d735f68657265016b6e6578745f637572736f724402020202"
+    },
+    {
+      "name": "list_reply_empty_last_page",
+      "description": "`list` reply with zero entries and no continuation cursor (end of listing) — also exercises the empty-array canonical encoding edge case for this schema.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 0
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "entries"
+            },
+            "value": {
+              "type": "array",
+              "value": []
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2626f700067656e747269657380"
+    },
+    {
+      "name": "stat_reply_file",
+      "description": "`stat` reply for a regular file with browse+download granted here.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "kind"
+            },
+            "value": {
+              "type": "uint",
+              "value": 0
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "size"
+            },
+            "value": {
+              "type": "uint",
+              "value": 4194304
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "mtime"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1755907200
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "perms_here"
+            },
+            "value": {
+              "type": "uint",
+              "value": 3
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a5626f7001646b696e64006473697a651a00400000656d74696d651a68a904806a7065726d735f6865726503"
+    },
+    {
+      "name": "read_reply_partial_chunk",
+      "description": "`read` reply carrying one chunk of file data, more remaining (`eof: false`).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 2
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "data"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "eof"
+            },
+            "value": {
+              "type": "bool",
+              "value": false
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a3626f700263656f66f464646174615880abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+    },
+    {
+      "name": "read_reply_final_chunk",
+      "description": "`read` reply carrying the last chunk of a file (`eof: true`), including the zero-length-at-exact-boundary case.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 2
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "data"
+            },
+            "value": {
+              "type": "bytes",
+              "value": ""
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "eof"
+            },
+            "value": {
+              "type": "bool",
+              "value": true
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a3626f700263656f66f5646461746140"
+    },
+    {
+      "name": "mkdir_reply",
+      "description": "`mkdir` success acknowledgement.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 3
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a1626f7003"
+    },
+    {
+      "name": "delete_reply",
+      "description": "`delete` success acknowledgement.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 4
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a1626f7004"
+    },
+    {
+      "name": "whoami_reply",
+      "description": "`whoami` reply — trimmed per DESIGN.md §A4b/A12 #32: display name and effective paths only, no group names.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 5
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "member_display"
+            },
+            "value": {
+              "type": "text",
+              "value": "Alex"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "effective_paths"
+            },
+            "value": {
+              "type": "array",
+              "value": [
+                {
+                  "type": "text",
+                  "value": "Photos/Vacation"
+                },
+                {
+                  "type": "text",
+                  "value": "Drop"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a3626f70056e6d656d6265725f646973706c617964416c65786f6566666563746976655f7061746873826f50686f746f732f5661636174696f6e6444726f70"
+    },
+    {
+      "name": "error_reply",
+      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 6
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "code"
+            },
+            "value": {
+              "type": "uint",
+              "value": 0
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2626f700664636f646500"
+    },
+    {
+      "name": "error_reply",
+      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 6
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "code"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2626f700664636f646501"
+    },
+    {
+      "name": "error_reply",
+      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 6
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "code"
+            },
+            "value": {
+              "type": "uint",
+              "value": 2
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2626f700664636f646502"
+    },
+    {
+      "name": "error_reply",
+      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 6
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "code"
+            },
+            "value": {
+              "type": "uint",
+              "value": 3
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2626f700664636f646503"
+    },
+    {
+      "name": "error_reply",
+      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 6
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "code"
+            },
+            "value": {
+              "type": "uint",
+              "value": 4
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2626f700664636f646504"
+    },
+    {
+      "name": "error_reply",
+      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 6
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "code"
+            },
+            "value": {
+              "type": "uint",
+              "value": 5
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2626f700664636f646505"
+    },
+    {
+      "name": "error_reply",
+      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 6
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "code"
+            },
+            "value": {
+              "type": "uint",
+              "value": 6
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2626f700664636f646506"
+    },
+    {
+      "name": "error_reply",
+      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 6
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "code"
+            },
+            "value": {
+              "type": "uint",
+              "value": 7
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2626f700664636f646507"
+    }
+  ]
+}

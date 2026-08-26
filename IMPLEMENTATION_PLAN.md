@@ -198,6 +198,51 @@ spindle-helper — Cargo rejects two crate versions that both `links = "sqlite3"
 graph.) Pending: the VFS RPC server, `spindle-host-core` wiring, and the mount-path resolution
 gap noted above.
 
+**Slice 3** — the VFS RPC server: `spindle-host-core` goes from an empty stub to the per-request
+enforcement pipeline, plus the wire types it speaks (`spindle-proto::vfs_rpc`, new). Scope
+(deliberately bounded, per this slice's task brief): **in** — `list` (cursor-paged, max page 500),
+`stat`, `read` (chunked, offset/len, 64 KiB max per DESIGN.md §A8), `mkdir`, `delete`, `whoami`
+(`{member_display, effective_paths}`, trimmed per §A4b/A12 #32), and protocol-version negotiation
+(`v` on every request, `MIN_PROTOCOL_VERSION` rejection); **out** (slice 4) — `upload`'s resumable
+sessions (staging names, TTL GC, manifest verification), rate limiting/quotas, and binding to any
+real transport (`spindle-net`). `spindle-proto::vfs_rpc` defines request/reply enums for the six
+ops plus DESIGN.md §A8's seven named error codes (`not_found, quota_exceeded, grants_changed,
+resume_expired, upload_rejected, storage_full, throttled`) and one addition of this crate's own,
+`UnsupportedVersion` (no named code fits a version-negotiation failure) — same canonical-CBOR/
+closed-schema discipline as the seven A7b artifacts, but explicitly *not* an eighth signed
+artifact (no domain tag, no `sig`: VFS RPC travels inside an already-authenticated session).
+Golden vectors added (`vectors/vfs-rpc.json`) via the existing `gen-vectors` flow; **the TS twin
+(`@spindle/proto`) does not implement this schema yet — required follow-up before the CI vector
+cross-check job can cover it.**
+
+`spindle-host-core`'s pipeline, per request, cheapest first: decode + version check → member
+active? (§A4b: unauthorized == `not_found`, enforced with a typed error since §A5's uniform
+silent-drop rule is pre-auth only) → resolve the virtual path via a new mount-path trie (closing
+the slice-1 gap: longest-prefix match from an incoming path to `(share, subpath)`, with
+`Store::add_share` gaining a `MountPathCollision` check alongside its existing real-root-overlap
+check, and its own tests) → effective perms from `algebra` (a host-wide shares/entitlements
+snapshot cached and invalidated by `grants_version`/`cap_epoch`; a member's own status/groups are
+*always* fetched fresh, every request, specifically because `revoke_member` does not bump either
+counter — caching that row would silently reopen the revocation-liveness hole) → `confine/` for
+the actual I/O (fresh `Dir` every request; a new `confine::listing` module adds the
+list/mkdir/delete primitives slice 1/2 never needed; a per-member last-observed-file-identity
+cache carries the stat→read TOCTOU rule across separate RPC calls, since there is no wire-level
+identity token) → audit append for every outcome, including every denial. Virtual-root/
+intermediate-directory listings (e.g. a share mounted at `"Family/Photos"` synthesizes a listable
+`"Family"` directory) are filtered the same browse-implies-traversal way a real directory's
+listing is. 33 new tests (20 unit incl. per-op happy/denied paths and cache-invalidation tests, 13
+S11-style negative integration tests: traversal/`..`/absolute-path, symlink escape,
+unauthorized-vs-nonexistent wire-byte comparison, revoked-member-mid-session with an explicit
+assertion that neither counter moved, sub-minimum protocol version, paging boundaries including a
+deletion between pages, virtual-root/intermediate listing filtering, and whoami trimming/no-leak).
+`cargo test -p spindle-host-core -p spindle-proto -p spindle-vfs`: 145 tests passing (33 + 33 +
+79, 4 Windows-only still compile-gated); `cargo check --workspace` and `cargo clippy --workspace
+--all-targets -- -D warnings` both exit 0. `spindle-host-core` gained its first real dependencies
+(`spindle-vfs`, `spindle-proto`, `spindle-core`, `cap-std`, `thiserror`) — deliberately **not**
+`spindle-net` for this slice (the slice-1 stub's module doc comment had prematurely claimed that
+dependency; corrected here). Pending: slice 4 (`upload`'s resumable-session machinery, rate
+limiting/quotas, real transport binding via `spindle-net`).
+
 ## Stage 7: client-core + Tauri apps init + engine-api/engine-tauri/ui
 **Goal**: Implement `spindle-client-core`; initialize `apps/host` and `apps/client` as real Tauri
 2 apps (`pnpm create tauri-app`); implement `@spindle/engine-api`, `@spindle/engine-tauri`, and

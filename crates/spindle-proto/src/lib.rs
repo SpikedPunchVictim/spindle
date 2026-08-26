@@ -12,6 +12,10 @@
 //! - [`artifacts`] — the seven A7b wire structures ([`Envelope`], [`Capability`],
 //!   [`AdmissionToken`], [`DeviceCertificate`], [`RevocationRecord`], [`AdminCommand`],
 //!   [`HostOpKeyCert`]).
+//! - [`vfs_rpc`] — the VFS RPC wire types (DESIGN.md §A8), Stage 6 slice 3: request/reply types
+//!   for `list`/`stat`/`read`/`mkdir`/`delete`/`whoami` and the typed VFS error-code model. Not
+//!   one of the seven A7b signed artifacts (no domain tag, no `sig`) — see that module's doc
+//!   comment for why.
 //!
 //! # Schema choices
 //!
@@ -50,12 +54,17 @@
 pub mod artifacts;
 pub mod canonical;
 pub mod tags;
+pub mod vfs_rpc;
 
 pub use artifacts::{
     AdminCommand, AdmissionToken, CapKind, Capability, DeviceCertificate, Envelope, HostOpKeyCert,
     ProtoError, RevocationRecord,
 };
 pub use canonical::{canonical_decode, canonical_encode, CborError, CborValue};
+pub use vfs_rpc::{
+    DirEntry, EntryKind, VfsErrorCode, VfsPerms, VfsReply, VfsRequest, VfsRequestEnvelope,
+    CURRENT_PROTOCOL_VERSION, MAX_LIST_PAGE, MAX_READ_CHUNK, MIN_PROTOCOL_VERSION,
+};
 
 #[cfg(test)]
 mod tests {

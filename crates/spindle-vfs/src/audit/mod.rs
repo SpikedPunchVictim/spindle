@@ -353,12 +353,10 @@ impl<'a> Audit<'a> {
     /// Returns the genesis [`ChainHead`] (`seq: 0`, `head_hash: GENESIS_PREV_HASH`) for an empty
     /// chain.
     pub fn verify_chain(&self) -> Result<ChainHead, AuditError> {
-        Ok(self
-            .walk_chain(None)?
-            .unwrap_or(ChainHead {
-                seq: 0,
-                head_hash: GENESIS_PREV_HASH,
-            }))
+        Ok(self.walk_chain(None)?.unwrap_or(ChainHead {
+            seq: 0,
+            head_hash: GENESIS_PREV_HASH,
+        }))
     }
 
     /// Signs the current chain head with `signer`, storing `{seq, head_hash, ts, sig}`.
@@ -374,7 +372,12 @@ impl<'a> Audit<'a> {
         let sig = signer.sign(&digest);
         self.conn.execute(
             "INSERT INTO signed_heads (seq, head_hash, ts, sig) VALUES (?1, ?2, ?3, ?4)",
-            params![head.seq as i64, head.head_hash.to_vec(), ts as i64, sig.clone()],
+            params![
+                head.seq as i64,
+                head.head_hash.to_vec(),
+                ts as i64,
+                sig.clone()
+            ],
         )?;
         Ok(SignedHead {
             seq: head.seq,
@@ -615,7 +618,13 @@ mod tests {
     fn empty_chain_verifies_to_genesis() {
         let store = Store::open_in_memory().expect("open");
         let head = store.audit().verify_chain().expect("verify empty chain");
-        assert_eq!(head, ChainHead { seq: 0, head_hash: GENESIS_PREV_HASH });
+        assert_eq!(
+            head,
+            ChainHead {
+                seq: 0,
+                head_hash: GENESIS_PREV_HASH
+            }
+        );
     }
 
     #[test]
@@ -642,7 +651,13 @@ mod tests {
         assert_eq!(c.prev_hash, b.hash);
 
         let head = audit.verify_chain().expect("verify");
-        assert_eq!(head, ChainHead { seq: 3, head_hash: c.hash });
+        assert_eq!(
+            head,
+            ChainHead {
+                seq: 3,
+                head_hash: c.hash
+            }
+        );
     }
 
     #[test]
@@ -681,16 +696,28 @@ mod tests {
         }
 
         let page1 = audit.list(None, 2).expect("page1");
-        assert_eq!(page1.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            page1.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         assert_eq!(page1.next_cursor, Some(2));
 
         let page2 = audit.list(page1.next_cursor, 2).expect("page2");
-        assert_eq!(page2.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(
+            page2.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
         assert_eq!(page2.next_cursor, Some(4));
 
         let page3 = audit.list(page2.next_cursor, 2).expect("page3");
-        assert_eq!(page3.records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![5]);
-        assert_eq!(page3.next_cursor, None, "landing exactly on the last row must not claim more");
+        assert_eq!(
+            page3.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![5]
+        );
+        assert_eq!(
+            page3.next_cursor, None,
+            "landing exactly on the last row must not claim more"
+        );
 
         // `page3.next_cursor` is correctly `None` (nothing more to fetch) — querying again with
         // that would restart from the beginning (`None` means "first page"), not test "past the
@@ -714,7 +741,9 @@ mod tests {
         for i in 0..3 {
             audit.append(entry(&format!("op-{i}"))).expect("append");
         }
-        let page = audit.list(None, MAX_AUDIT_PAGE_SIZE + 1000).expect("clamped page");
+        let page = audit
+            .list(None, MAX_AUDIT_PAGE_SIZE + 1000)
+            .expect("clamped page");
         assert_eq!(page.records.len(), 3);
         assert_eq!(page.next_cursor, None);
     }
@@ -753,7 +782,13 @@ mod tests {
             .expect("delete mid-chain");
 
         let err = audit.verify_chain().unwrap_err();
-        assert!(matches!(err, AuditError::SeqGap { expected: 2, found: 3 }));
+        assert!(matches!(
+            err,
+            AuditError::SeqGap {
+                expected: 2,
+                found: 3
+            }
+        ));
     }
 
     #[test]
@@ -771,12 +806,19 @@ mod tests {
             .expect("truncate tail");
 
         // The now-shorter chain is internally consistent on its own...
-        let head = audit.verify_chain().expect("shortened chain still verifies alone");
+        let head = audit
+            .verify_chain()
+            .expect("shortened chain still verifies alone");
         assert_eq!(head.seq, 2);
 
         // ...but the earlier-signed head at seq 3 can no longer be reached.
-        let err = audit.verify_head(signed.seq, &signer.public_key()).unwrap_err();
-        assert!(matches!(err, AuditError::TruncatedBeforeSignedHead { seq: 3 }));
+        let err = audit
+            .verify_head(signed.seq, &signer.public_key())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuditError::TruncatedBeforeSignedHead { seq: 3 }
+        ));
     }
 
     #[test]
@@ -815,7 +857,9 @@ mod tests {
             )
             .expect("forge signature to a value that can't even parse as one length-wise");
 
-        let err = audit.verify_head(signed.seq, &signer.public_key()).unwrap_err();
+        let err = audit
+            .verify_head(signed.seq, &signer.public_key())
+            .unwrap_err();
         assert!(matches!(err, AuditError::BadHeadSignature { seq: 1, .. }));
     }
 
@@ -836,7 +880,9 @@ mod tests {
             )
             .expect("flip a byte of the real signature");
 
-        let err = audit.verify_head(signed.seq, &signer.public_key()).unwrap_err();
+        let err = audit
+            .verify_head(signed.seq, &signer.public_key())
+            .unwrap_err();
         assert!(matches!(err, AuditError::BadHeadSignature { seq: 1, .. }));
     }
 

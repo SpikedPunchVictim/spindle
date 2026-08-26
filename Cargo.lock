@@ -3261,6 +3261,14 @@ dependencies = [
 [[package]]
 name = "spindle-host-core"
 version = "0.1.0"
+dependencies = [
+ "cap-std",
+ "spindle-core",
+ "spindle-proto",
+ "spindle-vfs",
+ "tempfile",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "spindle-net"

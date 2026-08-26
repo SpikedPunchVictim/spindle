@@ -163,6 +163,30 @@ pub enum StoreError {
         existing: ShareId,
     },
 
+    /// **Stage 6 slice 3 addition, reported per the task brief rather than silently added**: the
+    /// slice-1/2 store rejected overlapping *real* roots (`real_root`, via
+    /// `crate::confine::overlap_check`) but had no equivalent check for overlapping **virtual**
+    /// `mount_path`s. DESIGN.md §A4b states shares are "mounted into one virtual tree per host"
+    /// but does not spell out a mount-path collision rule the way it does for real roots. Left
+    /// unchecked, two shares could claim the same (or an ancestor/descendant) `mount_path` — e.g.
+    /// `"Photos"` and `"Photos/Vacation"` — which the slice-3 VFS RPC server's longest-prefix-match
+    /// mount resolution (`spindle-host-core`) would then resolve ambiguously: a virtual path under
+    /// the shorter mount could be silently shadowed by the longer one, permanently hiding part of
+    /// the first share's tree with no error at share-creation time. This check closes that gap: a
+    /// new `mount_path` must be neither equal to, an ancestor of, nor a descendant of any existing
+    /// share's `mount_path` (component-wise, case/Unicode-fold-key compared, matching every other
+    /// virtual-path comparison in this codebase — see
+    /// [`crate::model::VirtualPath::descends_from_or_eq`]).
+    #[error(
+        "mount path {new_mount_path:?} collides with existing share {existing:?}'s mount path \
+         (equal to, an ancestor of, or a descendant of it) — DESIGN.md §A4b shares mount into one \
+         virtual tree per host; overlapping mount paths would resolve ambiguously"
+    )]
+    MountPathCollision {
+        new_mount_path: String,
+        existing: ShareId,
+    },
+
     /// DESIGN.md §A4b: "... re-checked at host start" — this store's persisted shares now overlap
     /// on disk (e.g. an external mount or symlink change since the last run); each pair is listed
     /// rather than silently proceeding with a stale confinement guarantee.
@@ -269,10 +293,8 @@ impl Store {
     /// The **only** method in this crate that increments `cap_epoch` — see the module doc
     /// comment's "Two counters, two rules" section. Returns the new value.
     pub fn bump_cap_epoch(&self) -> Result<u64, StoreError> {
-        self.conn.execute(
-            "UPDATE meta SET cap_epoch = cap_epoch + 1 WHERE id = 0",
-            [],
-        )?;
+        self.conn
+            .execute("UPDATE meta SET cap_epoch = cap_epoch + 1 WHERE id = 0", [])?;
         self.cap_epoch()
     }
 
@@ -365,9 +387,9 @@ impl Store {
     }
 
     fn devices_for_member(&self, member_id: MemberId) -> Result<Vec<Device>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT device_fp, label, added, revoked FROM devices WHERE member_id = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT device_fp, label, added, revoked FROM devices WHERE member_id = ?1")?;
         let rows = stmt.query_map(params![member_id.0 as i64], |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
@@ -604,9 +626,9 @@ impl Store {
         excludes: &[String],
         created: u64,
     ) -> Result<ShareId, StoreError> {
-        let existing_count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))?;
+        let existing_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))?;
         if existing_count as usize >= self.limits.max_shares {
             return Err(StoreError::TooManyShares {
                 limit: self.limits.max_shares,
@@ -621,10 +643,23 @@ impl Store {
             });
         }
 
+        // Reject an invalid mount_path outright (same component rules as any other virtual path
+        // — see `VirtualPath::parse`), then check it against every existing share's mount_path
+        // for a collision (equal, ancestor, or descendant — see `StoreError::MountPathCollision`
+        // and `mount_paths_collide`'s doc comment).
+        let new_mount_path = VirtualPath::parse(mount_path)?;
         for existing in self.list_shares()? {
             if overlap_check(real_root, &existing.real_root)? {
                 return Err(StoreError::OverlappingShareRoot {
                     new_root: real_root.to_path_buf(),
+                    existing: existing.share_id,
+                });
+            }
+            let existing_mount_path = VirtualPath::parse(&existing.mount_path)
+                .expect("mount_path persisted by this store is always a valid VirtualPath");
+            if mount_paths_collide(&new_mount_path, &existing_mount_path) {
+                return Err(StoreError::MountPathCollision {
+                    new_mount_path: mount_path.to_string(),
                     existing: existing.share_id,
                 });
             }
@@ -955,6 +990,17 @@ fn parse_group_kind(s: &str) -> GroupKind {
     }
 }
 
+/// `true` if `a` and `b` are the same virtual path, or one is a proper ancestor of the other
+/// (component-wise, case/Unicode fold-key compared — see
+/// [`VirtualPath::descends_from_or_eq`]). Two shares whose `mount_path`s collide this way would
+/// resolve ambiguously under the slice-3 VFS RPC server's longest-prefix-match mount resolution —
+/// see [`StoreError::MountPathCollision`]'s doc comment. Sibling mount paths (neither a prefix of
+/// the other — e.g. `"Photos"` and `"Documents"`, or `"Photos"` and `"PhotosArchive"`, which share
+/// no common path component) do not collide.
+fn mount_paths_collide(a: &VirtualPath, b: &VirtualPath) -> bool {
+    a.descends_from_or_eq(b) || b.descends_from_or_eq(a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -970,7 +1016,10 @@ mod tests {
     #[test]
     fn builtin_groups_seeded_and_protected() {
         let store = Store::open_in_memory().expect("open");
-        let owner = store.get_group(OWNER_GROUP_ID).expect("get").expect("exists");
+        let owner = store
+            .get_group(OWNER_GROUP_ID)
+            .expect("get")
+            .expect("exists");
         assert_eq!(owner.kind, GroupKind::Owner);
         let members = store
             .get_group(MEMBERS_GROUP_ID)
@@ -979,7 +1028,10 @@ mod tests {
         assert_eq!(members.kind, GroupKind::Members);
 
         let err = store.rename_group(OWNER_GROUP_ID, "Nope").unwrap_err();
-        assert!(matches!(err, StoreError::BuiltinGroupNotEditable(OWNER_GROUP_ID)));
+        assert!(matches!(
+            err,
+            StoreError::BuiltinGroupNotEditable(OWNER_GROUP_ID)
+        ));
         let err = store.rename_group(MEMBERS_GROUP_ID, "Nope").unwrap_err();
         assert!(matches!(
             err,
@@ -1011,7 +1063,12 @@ mod tests {
             )
             .expect("add_share");
         let err = store
-            .add_entitlement(OWNER_GROUP_ID, share_id, &VirtualPath::root(), Perms::BROWSE)
+            .add_entitlement(
+                OWNER_GROUP_ID,
+                share_id,
+                &VirtualPath::root(),
+                Perms::BROWSE,
+            )
             .unwrap_err();
         assert!(matches!(err, StoreError::OwnerNotGrantable));
     }
@@ -1023,7 +1080,14 @@ mod tests {
         let store = Store::open_in_memory().expect("open");
         let dir = tempdir().expect("tempdir");
         let share_id = store
-            .add_share("Photos", "Photos", dir.path(), ShareFlags::default(), &[], 0)
+            .add_share(
+                "Photos",
+                "Photos",
+                dir.path(),
+                ShareFlags::default(),
+                &[],
+                0,
+            )
             .expect("add_share");
         let share = store.get_share(share_id).expect("get").expect("exists");
 
@@ -1061,17 +1125,29 @@ mod tests {
         let e0 = store.cap_epoch().expect("e0");
 
         let share_id = store
-            .add_share("Photos", "Photos", dir.path(), ShareFlags::default(), &[], 0)
+            .add_share(
+                "Photos",
+                "Photos",
+                dir.path(),
+                ShareFlags::default(),
+                &[],
+                0,
+            )
             .expect("add_share bumps");
         let v1 = store.grants_version().expect("v1");
         assert!(v1 > v0, "add_share must bump grants_version");
 
-        let group_id = store.create_custom_group("Family").expect("create_custom_group");
+        let group_id = store
+            .create_custom_group("Family")
+            .expect("create_custom_group");
         let member_id = store
             .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
             .expect("add_member bumps (Members group assignment)");
         let v2 = store.grants_version().expect("v2");
-        assert!(v2 > v1, "add_member's group assignment must bump grants_version");
+        assert!(
+            v2 > v1,
+            "add_member's group assignment must bump grants_version"
+        );
 
         store
             .add_member_to_group(member_id, group_id)
@@ -1200,6 +1276,64 @@ mod tests {
             .expect("sibling share ok");
     }
 
+    // ---- Mount-path collision (Stage 6 slice 3 addition) ----
+
+    #[test]
+    fn add_share_rejects_exact_mount_path_collision() {
+        let store = Store::open_in_memory().expect("open");
+        let sandbox = tempdir().expect("tempdir");
+        let a = sandbox.path().join("a");
+        let b = sandbox.path().join("b");
+        std::fs::create_dir_all(&a).expect("mkdir a");
+        std::fs::create_dir_all(&b).expect("mkdir b");
+
+        store
+            .add_share("A", "Photos", &a, ShareFlags::default(), &[], 0)
+            .expect("first share ok");
+        let err = store
+            .add_share("B", "Photos", &b, ShareFlags::default(), &[], 0)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::MountPathCollision { .. }));
+    }
+
+    #[test]
+    fn add_share_rejects_ancestor_and_descendant_mount_path_collisions() {
+        let store = Store::open_in_memory().expect("open");
+        let sandbox = tempdir().expect("tempdir");
+        let a = sandbox.path().join("a");
+        let b = sandbox.path().join("b");
+        std::fs::create_dir_all(&a).expect("mkdir a");
+        std::fs::create_dir_all(&b).expect("mkdir b");
+
+        store
+            .add_share("A", "Photos", &a, ShareFlags::default(), &[], 0)
+            .expect("first share ok");
+
+        // Descendant of an existing mount path.
+        let err = store
+            .add_share("B", "Photos/Vacation", &b, ShareFlags::default(), &[], 0)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::MountPathCollision { .. }));
+    }
+
+    #[test]
+    fn add_share_allows_sibling_mount_paths() {
+        let store = Store::open_in_memory().expect("open");
+        let sandbox = tempdir().expect("tempdir");
+        let a = sandbox.path().join("a");
+        let b = sandbox.path().join("b");
+        std::fs::create_dir_all(&a).expect("mkdir a");
+        std::fs::create_dir_all(&b).expect("mkdir b");
+
+        store
+            .add_share("A", "Photos", &a, ShareFlags::default(), &[], 0)
+            .expect("first share ok");
+        // "PhotosArchive" shares no path component with "Photos" — not a prefix either way.
+        store
+            .add_share("B", "PhotosArchive", &b, ShareFlags::default(), &[], 0)
+            .expect("sibling mount path ok");
+    }
+
     #[test]
     fn open_rechecks_persisted_overlap_and_reports_offenders() {
         let sandbox = tempdir().expect("tempdir");
@@ -1284,7 +1418,10 @@ mod tests {
                 0,
             )
             .unwrap_err();
-        assert!(matches!(err, StoreError::TooManyExcludeGlobs { limit: 1, .. }));
+        assert!(matches!(
+            err,
+            StoreError::TooManyExcludeGlobs { limit: 1, .. }
+        ));
     }
 
     #[test]
@@ -1296,13 +1433,23 @@ mod tests {
         .expect("open");
         let dir = tempdir().expect("tempdir");
         let share_id = store
-            .add_share("Photos", "Photos", dir.path(), ShareFlags::default(), &[], 0)
+            .add_share(
+                "Photos",
+                "Photos",
+                dir.path(),
+                ShareFlags::default(),
+                &[],
+                0,
+            )
             .expect("add_share");
         store
             .add_share_exclude(share_id, "one")
             .expect("first exclude within limit");
         let err = store.add_share_exclude(share_id, "two").unwrap_err();
-        assert!(matches!(err, StoreError::TooManyExcludeGlobs { limit: 1, .. }));
+        assert!(matches!(
+            err,
+            StoreError::TooManyExcludeGlobs { limit: 1, .. }
+        ));
     }
 
     // ---- Invite nonce idempotent CAS ----
@@ -1327,7 +1474,10 @@ mod tests {
         let replay = store
             .burn_invite_nonce(&nonce, member_id, b"a-different-freshly-minted-cap", 9999)
             .expect("replay burn");
-        assert_eq!(replay, first, "replay must return the original stored record");
+        assert_eq!(
+            replay, first,
+            "replay must return the original stored record"
+        );
     }
 
     #[test]
@@ -1405,7 +1555,10 @@ mod tests {
             grants.resolve_access(&share, &vp("Vacation/img.jpg"))
         };
 
-        assert_eq!(before, after, "effective perms must be identical across a restart");
+        assert_eq!(
+            before, after,
+            "effective perms must be identical across a restart"
+        );
         assert_eq!(
             after,
             crate::algebra::AccessDecision::Granted(Perms::BROWSE | Perms::DOWNLOAD)
