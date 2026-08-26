@@ -328,7 +328,21 @@ responsibility; NAT traversal is exercised end-to-end in Stage 5). Validates **A
 success criteria require this bar met. Validates **ADR-002** (§A6 signaling flows) and the "Open
 app" / host-list row of the DESIGN.md §A9 UX bar.
 
-**Status**: Not run.
+**Status**: **PASS — run 2026-08-25/26.** 15/15 automated checks green against the composed
+`deploy/docker-compose.yml` stack (`nats-server:2.10-alpine` v2.10.29 + Postgres + the graduated
+`spindle-helper`, ac9bb98's presence pipeline). Clean-disconnect detection: **0.01 s** (bar ≤ 5 s).
+Dead-socket detection (`SIGSTOP` on a separate fake-host process, `ping_interval: "20s"` /
+`ping_max: 2` per §A6): **42.36 s** (bar ≤ 60 s). Overlap semantics (two live connections for one
+host, drop-one, reconnect-before-stale-disconnect) all hold. The A12 #46 cross-session
+`helper.presence.get.<nfp>` publish-denial negative test passed. Two genuine bugs found and fixed
+live (not caught by the 114 pre-existing pure-logic unit tests, now covered by 6 new ones using
+real captured payloads): (1) the callout connection lived in the `AUTH` account, not `SYS` —
+`$SYS.ACCOUNT.*.CONNECT|DISCONNECT` are ordinary SYS-account broadcasts, not the specially-routed
+request/reply subjects `$SYS.REQ.USER.AUTH`/`PING.CONNZ` are, so those subscriptions silently
+received nothing until a dedicated genuine-SYS-account connection was added; (2) CONNZ's identity
+field is `"authorized_user"` (only present when the request body is `{"auth": true}`), not
+`"user"` as originally assumed from documentation alone. Full method, measurements, root causes,
+and captured real `$SYS`/CONNZ payload samples in `spikes/s5-presence/RESULTS.md`.
 
 ---
 

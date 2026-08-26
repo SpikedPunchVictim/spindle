@@ -1,0 +1,37 @@
+[package]
+name = "spike-s5-presence"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# S5 (docs/SPIKES.md / docs/DESIGN.md §A13): presence via `$SYS` events + `CONNZ`; ping tuning.
+# Live validation against the composed reference deployment (deploy/docker-compose.yml) —
+# unlike S1 (which stood up its own throwaway nats-server + responder), this spike talks to the
+# *actual* helper binary/image running in that stack, over the same NATS port an app or a host
+# daemon would use. See RESULTS.md for the full method and measured numbers.
+#
+# Reuses spike-s1-callout's identity/capability/admission-token fixtures (`fixtures.rs`) as a
+# path dependency rather than re-deriving the hand-rolled CBOR `auth_token` envelope a second
+# time — that envelope shape is spike-local by design (see fixtures.rs's own module doc), and
+# S1's encoder/decoder pair is exactly what the compose stack's helper (spindle_helper::auth_token)
+# already expects on the wire.
+[dependencies]
+spike-s1-callout = { path = "../s1-callout" }
+spindle-core = { path = "../../crates/spindle-core" }
+spindle-proto = { path = "../../crates/spindle-proto" }
+
+tokio = { workspace = true }
+async-nats = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+
+nkeys = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = { workspace = true }
+futures-util = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

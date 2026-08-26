@@ -31,16 +31,19 @@
 //!
 //! # Presence (DESIGN.md §A3/§A6, subject parametrized in v0.9.8 the same way `helper.turn.get`
 //! was in v0.9.7)
-//! The `callout_client` (system account) additionally subscribes to `$SYS.ACCOUNT.*.CONNECT` and
-//! `$SYS.ACCOUNT.*.DISCONNECT` and, once at startup, requests `$SYS.REQ.SERVER.PING.CONNZ` to seed
-//! [`spindle_helper::presence::ConnectionMap`] with whatever connections predate this process
-//! (see `seed_presence_map`'s doc comment for the exact fold logic and its one flagged gap). Every
-//! DISCONNECT additionally triggers [`HelperView::delete_session_record`] for that connection's
-//! `nats_fp`, host or device alike (DESIGN.md §A5's "cleaned up on DISCONNECT/expiry"). See
-//! `spindle_helper::presence`'s own module doc for the wire schema, the `$SYS` payload shapes
-//! assumed here (no local ground truth exists for them — see that doc's evidence note), and the
-//! explicit list of what's still out of scope (kick relay, split-brain, multi-server `CONNZ`,
-//! leader-only publishing).
+//! A dedicated `sys_client` (genuine SYS-account connection — see `sys_conn_seed`'s doc comment
+//! below for why `callout_client`'s AUTH-account membership is not sufficient) subscribes to
+//! `$SYS.ACCOUNT.*.CONNECT` and `$SYS.ACCOUNT.*.DISCONNECT` and, once at startup, requests
+//! `$SYS.REQ.SERVER.PING.CONNZ` to seed [`spindle_helper::presence::ConnectionMap`] with whatever
+//! connections predate this process (see `seed_presence_map`'s doc comment for the exact fold
+//! logic and its one flagged gap). Every DISCONNECT additionally triggers
+//! [`HelperView::delete_session_record`] for that connection's `nats_fp`, host or device alike
+//! (DESIGN.md §A5's "cleaned up on DISCONNECT/expiry"). See `spindle_helper::presence`'s own
+//! module doc for the wire schema, and this file's `seed_presence_map`/`user_from_sys_event` doc
+//! comments and their `#[cfg(test)] mod tests` for the real, live-verified `$SYS`/CONNZ payload
+//! shapes (spikes/s5-presence, docs/SPIKES.md §S5 — two shapes were wrong on the first pass, see
+//! that spike's RESULTS.md), and the explicit list of what's still out of scope (kick relay,
+//! split-brain, multi-server `CONNZ`, leader-only publishing).
 //!
 //! # `verify_nkey_sig` (DESIGN.md §A4 step 1: "signing the server nonce with its session nkey")
 //! Satisfied the same way S1 proved it: the authorization request's `connect_opts.sig` is the
@@ -94,6 +97,15 @@ struct Config {
     /// nkey seed for the helper's own application-account connection. Optional in this slice
     /// (nothing here uses it yet); see this file's module docs.
     app_conn_seed: Option<String>,
+    /// nkey seed for a dedicated, genuine-SYS-account connection. Required to actually *receive*
+    /// `$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT` presence events — spikes/s5-presence (docs/
+    /// SPIKES.md §S5) found live that these are ordinary pub/sub broadcasts published on the SYS
+    /// account, unlike `$SYS.REQ.USER.AUTH`/`$SYS.REQ.SERVER.PING.CONNZ` (special-cased request/
+    /// reply subjects nats-server answers to any `auth_callout.auth_users` connection regardless
+    /// of its own account). Unset → those subscriptions are opened on `callout_client` as before
+    /// and will silently never fire outside a SYS-account connection; loud warning, not fatal
+    /// (mirrors `app_conn_seed`'s optionality — dev flexibility over hard-failing).
+    sys_conn_seed: Option<String>,
     /// Operator admission-key seed, for verifying presented admission tokens. Falls back to a
     /// fixed dev-only key (matching the S1 spike) if unset — loud warning, never for production.
     operator_seed: Option<String>,
@@ -139,6 +151,10 @@ Every flag has an env-var equivalent (flags override the env var if both are set
     --app-account-seed <seed>   APP_ACCOUNT_SEED     (required)
     --account-name <name>       ACCOUNT_NAME         (default: APP)
     --app-conn-seed <seed>      APP_CONN_SEED        (optional; application-account connection)
+    --sys-conn-seed <seed>      SYS_CONN_SEED        (optional; genuine SYS-account connection for
+                                                       $SYS.ACCOUNT.*.CONNECT|DISCONNECT — falls
+                                                       back to the callout connection, which won't
+                                                       receive them, if unset)
     --operator-seed <seed>      OPERATOR_SEED        (optional; dev-only fallback key if unset)
     --admission-mode <mode>     ADMISSION_MODE       (open|invite|closed; default: open)
     --database-url <url>        DATABASE_URL         (optional; Postgres — unset uses the in-memory store)
@@ -156,6 +172,7 @@ impl Config {
         let mut app_account_seed = env::var("APP_ACCOUNT_SEED").ok();
         let mut account_name = env::var("ACCOUNT_NAME").ok();
         let mut app_conn_seed = env::var("APP_CONN_SEED").ok();
+        let mut sys_conn_seed = env::var("SYS_CONN_SEED").ok();
         let mut operator_seed = env::var("OPERATOR_SEED").ok();
         let mut admission_mode = env::var("ADMISSION_MODE").ok();
         let mut database_url = env::var("DATABASE_URL").ok();
@@ -196,6 +213,11 @@ impl Config {
                 "--app-conn-seed" => {
                     app_conn_seed = Some(args.next().ok_or_else(|| {
                         ConfigError::FlagMissingValue("app-conn-seed".to_string())
+                    })?)
+                }
+                "--sys-conn-seed" => {
+                    sys_conn_seed = Some(args.next().ok_or_else(|| {
+                        ConfigError::FlagMissingValue("sys-conn-seed".to_string())
                     })?)
                 }
                 "--operator-seed" => {
@@ -283,6 +305,7 @@ impl Config {
                 .ok_or(ConfigError::Missing("APP_ACCOUNT_SEED", "app-account-seed"))?,
             account_name: account_name.unwrap_or_else(|| "APP".to_string()),
             app_conn_seed,
+            sys_conn_seed,
             operator_seed,
             admission_mode,
             database_url,
@@ -557,14 +580,37 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     let mut sub = callout_client.subscribe("$SYS.REQ.USER.AUTH").await?;
 
-    // Presence (DESIGN.md §A3/§A6 — see this file's module docs). Both `$SYS.ACCOUNT.*.CONNECT`
-    // and `.DISCONNECT` are subscribed on the system/callout connection, matching where `$SYS.REQ.
-    // USER.AUTH` itself lives — `$SYS.>` is system-account subject space, unreachable from the
-    // application-account `app_client` connection (see the module docs' "two connections" note).
+    // Presence (DESIGN.md §A3/§A6 — see this file's module docs). `$SYS.ACCOUNT.*.CONNECT` and
+    // `.DISCONNECT` are ordinary pub/sub broadcasts published *on* the SYS account (unlike
+    // `$SYS.REQ.USER.AUTH`/`$SYS.REQ.SERVER.PING.CONNZ`, which nats-server answers to any
+    // `auth_callout.auth_users` connection regardless of its own account) — spikes/s5-presence
+    // (docs/SPIKES.md §S5) found live that subscribing for them on `callout_client` (an AUTH-
+    // account connection) silently receives nothing. `sys_client` is a dedicated connection with
+    // genuine SYS-account membership; falls back to `callout_client` (with a loud warning) if
+    // `SYS_CONN_SEED` is unset, matching that pre-S5 (broken) behavior rather than hard-failing.
+    let sys_client = match &config.sys_conn_seed {
+        Some(seed) => {
+            let client = async_nats::ConnectOptions::with_nkey(seed.clone())
+                .connect(&config.nats_url)
+                .await?;
+            tracing::info!("SYS-account connection established");
+            Some(client)
+        }
+        None => {
+            tracing::warn!(
+                "SYS_CONN_SEED not set — subscribing to $SYS.ACCOUNT.*.CONNECT|DISCONNECT on the \
+                 callout connection instead, which is not a SYS-account member and will silently \
+                 never receive them (see spikes/s5-presence/RESULTS.md's root-cause writeup)"
+            );
+            None
+        }
+    };
+    let sys_ref = sys_client.as_ref().unwrap_or(&callout_client);
+
     let mut connect_sub: Option<async_nats::Subscriber> =
-        Some(callout_client.subscribe("$SYS.ACCOUNT.*.CONNECT").await?);
+        Some(sys_ref.subscribe("$SYS.ACCOUNT.*.CONNECT").await?);
     let mut disconnect_sub: Option<async_nats::Subscriber> =
-        Some(callout_client.subscribe("$SYS.ACCOUNT.*.DISCONNECT").await?);
+        Some(sys_ref.subscribe("$SYS.ACCOUNT.*.DISCONNECT").await?);
 
     // `helper.presence.get.*` — same subject-parametrization shape as `helper.turn.get.*` above
     // (DESIGN.md v0.9.8, pending doc amendment — see `spindle_helper::presence`'s module doc).
@@ -573,7 +619,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         None => None,
     };
 
-    let mut presence_map = seed_presence_map(&callout_client, &mut store, now_secs()).await;
+    let mut presence_map = seed_presence_map(sys_ref, &mut store, now_secs()).await;
 
     // Periodic best-effort cleanup of expired session records (DESIGN.md §A9b: "a cleanup path
     // for expired rows (on-read filter + periodic delete — keep simple)"). The on-read `exp`
@@ -663,6 +709,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     connect_sub = None;
                     continue;
                 };
+                // Raw-sample capture for spikes/s5-presence's RESULTS.md (docs/SPIKES.md §S5,
+                // task g): the exact shape of a real $SYS.ACCOUNT.*.CONNECT event, ground truth
+                // for user_from_sys_event's doc comment's assumption. Debug-level only.
+                tracing::debug!(
+                    subject = %msg.subject,
+                    payload = %String::from_utf8_lossy(&msg.payload),
+                    "raw $SYS.ACCOUNT.*.CONNECT event"
+                );
                 let Some(user_pk) = user_from_sys_event(&msg.payload) else {
                     tracing::warn!(
                         payload = %String::from_utf8_lossy(&msg.payload),
@@ -680,6 +734,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     disconnect_sub = None;
                     continue;
                 };
+                tracing::debug!(
+                    subject = %msg.subject,
+                    payload = %String::from_utf8_lossy(&msg.payload),
+                    "raw $SYS.ACCOUNT.*.DISCONNECT event"
+                );
                 let Some(user_pk) = user_from_sys_event(&msg.payload) else {
                     tracing::warn!(
                         payload = %String::from_utf8_lossy(&msg.payload),
@@ -718,11 +777,13 @@ async fn run(config: Config) -> anyhow::Result<()> {
 /// `handle_one`'s own style for external wire shapes) rather than a typed struct: the `async-nats`
 /// crate this binary depends on does not model `$SYS` event payloads at all (confirmed by
 /// grepping its source for `ConnectEvent`/`DisconnectEvent`/`client_info` — zero matches; these
-/// events only ever reach a subscriber as raw JSON), and no local capture of a real event exists
-/// in this repo to verify the exact shape against (`spikes/s1-callout` only ever captured its own
-/// callout's `client_info`, not `$SYS.ACCOUNT.*` events). The `{"client": {"user": "<pubkey>",
-/// ...}}` shape assumed here follows nats-server's documented system-event schema from general
-/// knowledge, not a local capture — flagged here explicitly per the task's evidence requirement.
+/// events only ever reach a subscriber as raw JSON). Verified live by spikes/s5-presence (docs/
+/// SPIKES.md §S5, RESULTS.md's captured samples): a real event is `{"type":"io.nats.server.
+/// advisory.v1.client_connect"` (or `.client_disconnect`), ..., "client": {"user": "<pubkey>",
+/// "acc": "APP", "start": ..., "id": <cid>, ...}}` — the assumed `{"client": {"user": "<pubkey>",
+/// ...}}` shape this function relies on matched exactly, no parsing change needed. A disconnect's
+/// `client.reason` was observed as `"Client Closed"` for a clean close and `"Stale Connection"`
+/// for the SIGSTOP dead-socket scenario (unused by this function, noted for future reference).
 /// Any other shape (or a missing/non-string `user`) is treated as "ignore this event," not a
 /// fatal error — an unrecognized or malformed system event should never take the responder down.
 fn user_from_sys_event(payload: &[u8]) -> Option<String> {
@@ -774,10 +835,17 @@ async fn publish_presence_delta(
 /// (DESIGN.md §A6/S8) — this takes only the first reply, matching a single-helper-instance
 /// deployment.
 ///
-/// Payload shape assumed (same caveat as [`user_from_sys_event`]: no local capture exists, this
-/// follows nats-server's documented monitoring/CONNZ schema from general knowledge): the reply is
-/// `{"server": {...}, "data": {"connections": [{"user": "<pubkey>", ...}, ...], ...}, ...}`; a
-/// bare top-level `connections` array is also tolerated in case of a differently-wrapped reply.
+/// Payload shape verified live by spikes/s5-presence (docs/SPIKES.md §S5 — see RESULTS.md for
+/// the captured samples, before and after both fixes below): the reply is `{"server": {...},
+/// "data": {"connections": [{"authorized_user": "<pubkey>", "account": "<account name>", "cid":
+/// ..., "ip": ..., ...}, ...], ...}, ...}`; a bare top-level `connections` array is also
+/// tolerated in case of a differently-wrapped reply. Two live-only gotchas, both found by S5's
+/// restart-reseed scenario failing and both required together to fix it:
+/// 1. The request body must be `{"auth": true}` (nats-server's `ConnzOptions.Username`, JSON key
+///    `"auth"`) — an empty request body gets a reply with no identity field on any connection at
+///    all.
+/// 2. Even with `auth: true`, the identity field is named `"authorized_user"`, not `"user"` as
+///    first assumed (`"user"` is kept as a tolerant fallback below, never observed in practice).
 ///
 /// # Host-user resolution gap (flagged ambiguity, not silently resolved)
 /// [`presence::ConnectionMap::register_host_user`] is normally populated live, at the moment a
@@ -795,15 +863,26 @@ async fn publish_presence_delta(
 /// indistinguishable from a device or the helper's own connection, and presence for it simply
 /// reads "offline/unknown" until its own next CONNECT/DISCONNECT cycle re-establishes it live.
 async fn seed_presence_map(
-    callout_client: &async_nats::Client,
+    sys_client: &async_nats::Client,
     store: &mut Store,
     now: u64,
 ) -> presence::ConnectionMap {
     let mut map = presence::ConnectionMap::new();
 
+    // `{"auth": true}` is nats-server's `ConnzOptions.Username` field (JSON key "auth") — spikes/
+    // s5-presence (docs/SPIKES.md §S5) found live that an empty request body gets back a CONNZ
+    // reply whose `connections[]` entries have NO `"user"` field at all (cid/ip/port/etc. only),
+    // silently defeating every seed below. Requesting `auth` info is what makes the server
+    // include it (see that spike's RESULTS.md for the captured before/after payload samples).
+    let request_payload = serde_json::json!({ "auth": true });
     let reply = match tokio::time::timeout(
         Duration::from_secs(5),
-        callout_client.request("$SYS.REQ.SERVER.PING.CONNZ", Vec::new().into()),
+        sys_client.request(
+            "$SYS.REQ.SERVER.PING.CONNZ",
+            serde_json::to_vec(&request_payload)
+                .expect("static json! value always serializes")
+                .into(),
+        ),
     )
     .await
     {
@@ -829,6 +908,11 @@ async fn seed_presence_map(
         }
     };
 
+    // Raw-sample capture for spikes/s5-presence's RESULTS.md (docs/SPIKES.md §S5, task g): the
+    // exact shape of a real $SYS.REQ.SERVER.PING.CONNZ reply, ground truth for this function's
+    // doc comment's assumption. Debug-level only.
+    tracing::debug!(reply = %value, "raw $SYS.REQ.SERVER.PING.CONNZ reply");
+
     let connections = value
         .get("data")
         .and_then(|d| d.get("connections"))
@@ -843,7 +927,7 @@ async fn seed_presence_map(
     };
 
     for conn in connections {
-        let Some(user_pk) = conn.get("user").and_then(|u| u.as_str()) else {
+        let Some(user_pk) = connz_row_user_pk(conn) else {
             continue;
         };
         let Ok(nats_fp) = auth_token::nats_fp_of_nkey(user_pk) else {
@@ -863,6 +947,18 @@ async fn seed_presence_map(
     }
 
     map
+}
+
+/// Extracts a CONNZ connection row's authorized-user nkey pubkey. Split out of
+/// [`seed_presence_map`]'s loop so the field-name lookup — the exact thing spikes/s5-presence
+/// (docs/SPIKES.md §S5) got wrong on the first pass — is independently unit-testable against the
+/// real captured shape (see the tests below), without needing a live NATS server. Real nats-
+/// server rows (with `{"auth": true}` requested) name this field `"authorized_user"`; `"user"` is
+/// a tolerant fallback that has never actually been observed.
+fn connz_row_user_pk(conn: &serde_json::Value) -> Option<&str> {
+    conn.get("authorized_user")
+        .or_else(|| conn.get("user"))
+        .and_then(|u| u.as_str())
 }
 
 fn verifying_key_from_raw(raw: &[u8]) -> anyhow::Result<spindle_core::VerifyingKey> {
@@ -1099,5 +1195,120 @@ fn handle_one(
                 }
             }
         }
+    }
+}
+
+// ================================================================================================
+// Tests — real captured $SYS/CONNZ payload shapes (spikes/s5-presence, docs/SPIKES.md §S5).
+//
+// These are narrow, pure-function tests of the two parsing boundaries whose assumed shapes were
+// (partly) wrong until validated live against a real nats-server:2.10.29: `connz_row_user_pk`
+// (CONNZ's `"authorized_user"` vs. the originally-assumed `"user"`) and `user_from_sys_event`
+// (the `$SYS.ACCOUNT.*.CONNECT|DISCONNECT` `client.user` shape, which turned out to already match
+// what was assumed). Both fixtures below are trimmed real replies captured via this binary's own
+// `tracing::debug!` instrumentation during an S5 run (see spikes/s5-presence/RESULTS.md for the
+// untrimmed originals) — not hand-invented JSON.
+// ================================================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One row of a real `$SYS.REQ.SERVER.PING.CONNZ` reply, captured with `{"auth": true}` in
+    /// the request (spikes/s5-presence's fix — an empty request body's rows have no identity
+    /// field at all, see `connz_row_no_auth_requested_has_no_identity_field` below).
+    const REAL_CONNZ_ROW_WITH_AUTH: &str = r#"{
+        "account":"APP","authorized_user":"UAOUJCRS3HXWQ2GKAA2PZA7QA5WQN3QTPTBSFX2KYC2XTY7P67U2252X",
+        "cid":20,"idle":"0s","in_bytes":0,"in_msgs":0,"ip":"172.26.0.4","issuer_key":"APP",
+        "kind":"Client","lang":"rust","last_activity":"2026-08-26T04:40:26.092235Z",
+        "out_bytes":0,"out_msgs":0,"pending_bytes":0,"port":34748,"rtt":"384µs",
+        "start":"2026-08-26T04:40:26.061902097Z","subscriptions":2,"type":"nats","uptime":"0s",
+        "version":"0.35.1"
+    }"#;
+
+    /// One row of a real `$SYS.REQ.SERVER.PING.CONNZ` reply captured *before* the `{"auth":
+    /// true}` fix — no `"user"` or `"authorized_user"` field at all. This is what
+    /// `seed_presence_map` silently skipped every row as, live, before spikes/s5-presence found
+    /// the fix (docs/SPIKES.md §S5's restart-reseed scenario failed until both this and the
+    /// field-name fix landed).
+    const REAL_CONNZ_ROW_NO_AUTH_REQUESTED: &str = r#"{
+        "cid":19,"idle":"0s","in_bytes":0,"in_msgs":0,"ip":"172.26.0.4","kind":"Client",
+        "lang":"rust","last_activity":"2026-08-26T04:34:36.267987921Z","out_bytes":0,
+        "out_msgs":0,"pending_bytes":0,"port":34544,"rtt":"5.156167ms",
+        "start":"2026-08-26T04:34:36.219214254Z","subscriptions":1,"type":"nats","uptime":"0s",
+        "version":"0.35.1"
+    }"#;
+
+    /// A real `$SYS.ACCOUNT.APP.CONNECT` event payload, captured live.
+    const REAL_CONNECT_EVENT: &str = r#"{
+        "type":"io.nats.server.advisory.v1.client_connect","id":"HoUqrLYsWsMsv9m8ZFLQUF",
+        "timestamp":"2026-08-26T04:33:42.221103549Z",
+        "server":{"name":"ND4QZW2IXGFJBFLOVVIDZ4LDNLA3QEBLUXXODP2OAKO2GRCT26GSIJNK",
+            "host":"0.0.0.0","id":"ND4QZW2IXGFJBFLOVVIDZ4LDNLA3QEBLUXXODP2OAKO2GRCT26GSIJNK",
+            "ver":"2.10.29","jetstream":false,"flags":0,"seq":22,
+            "time":"2026-08-26T04:33:42.221243091Z"},
+        "client":{"start":"2026-08-26T04:33:42.202549549Z","host":"151.101.42.132","id":10,
+            "acc":"APP","user":"UCCDYXIJL3ARVUAHY6QMJWI34OI7QL525CQKOOJSPVKW3NZMEKC2VTE3",
+            "lang":"rust","ver":"0.35.1","issuer_key":"APP","kind":"Client","client_type":"nats"}
+    }"#;
+
+    /// A real `$SYS.ACCOUNT.APP.DISCONNECT` event payload from the SIGSTOP dead-socket scenario —
+    /// note `"reason":"Stale Connection"`, distinct from a clean close's `"Client Closed"`.
+    const REAL_DISCONNECT_EVENT_STALE: &str = r#"{
+        "type":"io.nats.server.advisory.v1.client_disconnect","id":"HoUqrLYsWsMsv9m8ZFLR1N",
+        "timestamp":"2026-08-26T04:34:24.677784847Z",
+        "server":{"name":"ND4QZW2IXGFJBFLOVVIDZ4LDNLA3QEBLUXXODP2OAKO2GRCT26GSIJNK",
+            "host":"0.0.0.0","id":"ND4QZW2IXGFJBFLOVVIDZ4LDNLA3QEBLUXXODP2OAKO2GRCT26GSIJNK",
+            "ver":"2.10.29","jetstream":false,"flags":0,"seq":43,
+            "time":"2026-08-26T04:34:24.678288347Z"},
+        "client":{"start":"2026-08-26T04:33:42.521603508Z","host":"151.101.42.132","id":13,
+            "acc":"APP","user":"UB5AUMGSNEAINIEWVEYRRSDD4PX6LUWDNO7OLOFCAJCT7IZLLARZWP6N",
+            "lang":"rust","ver":"0.35.1","rtt":801000,"stop":"2026-08-26T04:34:24.677784847Z",
+            "issuer_key":"APP","kind":"Client","client_type":"nats"},
+        "sent":{"msgs":0,"bytes":0},"received":{"msgs":0,"bytes":0},"reason":"Stale Connection"
+    }"#;
+
+    #[test]
+    fn connz_row_with_auth_requested_yields_authorized_user() {
+        let row: serde_json::Value = serde_json::from_str(REAL_CONNZ_ROW_WITH_AUTH).unwrap();
+        assert_eq!(
+            connz_row_user_pk(&row),
+            Some("UAOUJCRS3HXWQ2GKAA2PZA7QA5WQN3QTPTBSFX2KYC2XTY7P67U2252X")
+        );
+    }
+
+    #[test]
+    fn connz_row_no_auth_requested_has_no_identity_field() {
+        let row: serde_json::Value =
+            serde_json::from_str(REAL_CONNZ_ROW_NO_AUTH_REQUESTED).unwrap();
+        assert_eq!(connz_row_user_pk(&row), None);
+    }
+
+    #[test]
+    fn connz_row_falls_back_to_user_field_when_present() {
+        let row = serde_json::json!({ "user": "UABC123" });
+        assert_eq!(connz_row_user_pk(&row), Some("UABC123"));
+    }
+
+    #[test]
+    fn connz_row_prefers_authorized_user_over_user_if_both_present() {
+        let row = serde_json::json!({ "authorized_user": "UAAA", "user": "UBBB" });
+        assert_eq!(connz_row_user_pk(&row), Some("UAAA"));
+    }
+
+    #[test]
+    fn real_connect_event_yields_client_user() {
+        assert_eq!(
+            user_from_sys_event(REAL_CONNECT_EVENT.as_bytes()),
+            Some("UCCDYXIJL3ARVUAHY6QMJWI34OI7QL525CQKOOJSPVKW3NZMEKC2VTE3".to_string())
+        );
+    }
+
+    #[test]
+    fn real_stale_disconnect_event_yields_client_user() {
+        assert_eq!(
+            user_from_sys_event(REAL_DISCONNECT_EVENT_STALE.as_bytes()),
+            Some("UB5AUMGSNEAINIEWVEYRRSDD4PX6LUWDNO7OLOFCAJCT7IZLLARZWP6N".to_string())
+        );
     }
 }

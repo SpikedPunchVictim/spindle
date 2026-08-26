@@ -20,16 +20,21 @@ spikes (`spikes/`) run against.
   `TURN_SECRET` (must match the helper's own `TURN_SECRET` env var below — coturn validates
   credentials the helper mints using the same shared secret, DESIGN.md §A8). Relay port range is
   kept small for dev (`49160-49200`); widen it for real NAT-traversal testing.
-- `helper` — `crates/spindle-helper`'s graduated Auth Callout responder + TURN credential minter
-  (`src/bin/helper.rs`), built via `deploy/Dockerfile`. Runs in **`open` admission mode**
-  (docs/DESIGN.md §A3b) against `spindle_helper::pg_store::PgStore` — the durable, `sqlx`-backed
-  `HelperView` (embedded migrations run automatically at startup; the container fails fast with a
-  descriptive error if Postgres is unreachable or a migration fails). Holds the two NATS
-  connections DESIGN.md §A5 / ADR-002 describe (callout/system + application); the application
-  connection now actively answers `helper.turn.get.<nfp>` (TURN credential minting, quota-limited
-  per `root_fp` via `TURN_MONTHLY_QUOTA`; `<nfp>` is the caller's session-nkey fingerprint, taken
-  from the subject the callout granted rather than the request body — DESIGN.md §A5 v0.9.7,
-  A12 #45).
+- `helper` — `crates/spindle-helper`'s graduated Auth Callout responder + TURN credential minter +
+  presence service (`src/bin/helper.rs`), built via `deploy/Dockerfile`. Runs in **`open`
+  admission mode** (docs/DESIGN.md §A3b) against `spindle_helper::pg_store::PgStore` — the
+  durable, `sqlx`-backed `HelperView` (embedded migrations run automatically at startup; the
+  container fails fast with a descriptive error if Postgres is unreachable or a migration fails).
+  Holds the two NATS connections DESIGN.md §A5 / ADR-002 describe (callout/system + application);
+  the application connection actively answers `helper.turn.get.<nfp>` (TURN credential minting,
+  quota-limited per `root_fp` via `TURN_MONTHLY_QUOTA`; `<nfp>` is the caller's session-nkey
+  fingerprint, taken from the subject the callout granted rather than the request body —
+  DESIGN.md §A5 v0.9.7, A12 #45) and `helper.presence.get.<nfp>` the same way (v0.9.8). The
+  system/callout connection additionally subscribes to `$SYS.ACCOUNT.*.CONNECT|DISCONNECT` and
+  seeds a live connection map from `$SYS.REQ.SERVER.PING.CONNZ` at startup, pushing
+  `host.<hfp>.presence` deltas on the application connection (DESIGN.md §A3/§A6) — validated live
+  against this exact stack by `spikes/s5-presence` (docs/SPIKES.md §S5; `nats-server.conf`'s
+  `ping_interval`/`ping_max` tuning exists for that spike's dead-socket bar).
 
 **No-postgres dev flow**: unset `DATABASE_URL` in the `helper` service's environment block (or run
 `spindle-helper` directly, outside compose, without `DATABASE_URL`) to fall back to
@@ -43,8 +48,9 @@ logs a loud warning on startup either way, naming which store it picked.
   **with a local CA**"; only the `open`-admission half is real today. `nats-server.conf`'s
   listeners are plaintext TCP/WebSocket, dev/local only, matching the S1 spike's own config (see
   that file's dev-only notes). No dev-CA generation script exists yet.
-- **Presence, admin-command verifier** — not implemented (`crates/spindle-helper`'s own module
-  docs list what's still out of scope).
+- **Admin-command verifier** — not implemented (`crates/spindle-helper`'s own module docs list
+  what's still out of scope). Presence landed and is live in this stack (see the `helper` bullet
+  above) — it was the last item on this list.
 - **Calendar-month TURN quota windows** — `TURN_MONTHLY_QUOTA` is enforced over a fixed 30-day
   rolling bucket, not a calendar month (see `HelperView::record_turn_issuance`'s doc comment for
   why — no calendar/date dependency in this crate's A9c manifest).

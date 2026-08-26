@@ -1,0 +1,8 @@
+# run.sh's helper.rs debug-log dump — the raw evidence RESULTS.md's payload-shape excerpts were
+# taken from, kept locally for follow-up debugging but not meant to be committed wholesale
+# (large, regenerable, per-run). Same convention as spikes/s1-callout/RESULTS.md's
+# `mktemp`-based responder log and spikes/s3-throughput/s19-quic-transport's `.gitignore`d
+# `.tmp`/raw-artifact files.
+.s5-helper.log
+.s5-run.log
+*.tmp

@@ -117,6 +117,13 @@ device bootstrap; no lockout in any path) met; S19 (quinn-over-punched-ICE nativ
 MB/s @ 50 ms, NAT-combination punch/relay success) met for the QUIC path.
 **Tests**: S2/S5/S9/S14/S18/S19 automated suites graduated into CI.
 **Status**: Not Started
+**Note**: S5 spike: **PASS** (2026-08-25/26, 15/15 automated checks against the composed
+`deploy/docker-compose.yml` stack; `spikes/s5-presence/RESULTS.md`) — presence's bar met live
+(0.01 s clean / 42.36 s dead vs. the 5 s/60 s bar); two live-only bugs found and fixed (SYS-account
+connection wiring for `$SYS.ACCOUNT.*.CONNECT|DISCONNECT`, CONNZ's real `authorized_user` field
+name). This validates only the presence slice of this stage's success criteria — S2/S9/S14/S18/S19
+and the WebRTC/QUIC signaling work itself remain not started, so this stage's own Status is
+unchanged.
 
 ## Stage 6: spindle-vfs + host-core
 **Goal**: Implement the shares/groups/entitlements engine and the VFS RPC server in

@@ -6,10 +6,13 @@
 # 19/19, spikes/s1-callout/RESULTS.md), running in `open` admission mode with the durable
 # Postgres-backed store (spindle_helper::pg_store::PgStore) now that DATABASE_URL is set below.
 # helper.turn.get.<nfp> (TURN credential minting) is wired against the coturn service via
-# TURN_SECRET.
+# TURN_SECRET. Presence (helper.presence.get.<nfp>, host.<hfp>.presence deltas, CONNZ/$SYS
+# bridging — DESIGN.md §A3/§A6) landed in ac9bb98 and was validated live against this stack by
+# spikes/s5-presence (docs/SPIKES.md §S5) — nats-server.conf's ping_interval/ping_max tuning
+# exists for it.
 # See deploy/README.md for the no-postgres dev flow (unset DATABASE_URL/helper's env block below
 # to fall back to the in-memory store) and for what's still deliberately deferred (TLS/local CA,
-# presence, the admin-command verifier).
+# the admin-command verifier).
 
 services:
   nats:
@@ -83,6 +86,12 @@ services:
       CALLOUT_USER_SEED: "SUAP32HDCRWO6KRJBIRSNCD5NZGDP33A6RKOG2KZNZBQDC7MHQL5KWLDOM"
       APP_ACCOUNT_SEED: "SAAODS72DAQRLQ2OKCAR4AHZPNKOR6YNYRPVBHXQA7T3GBUURXFECWCMXU"
       APP_CONN_SEED: "SUAFWWQRCTGQTS6DKVAJKMMFMIJKFZ3MRFGFQ4WCRZ5RVZ5WFRB4CXPYBY"
+      # Dedicated genuine-SYS-account connection for `$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT`
+      # presence event subscriptions — spikes/s5-presence (docs/SPIKES.md §S5) found that
+      # CALLOUT_USER's AUTH-account membership is NOT sufficient to receive these (only
+      # $SYS.REQ.USER.AUTH / $SYS.REQ.SERVER.PING.CONNZ request/reply are special-cased across
+      # accounts by nats-server); see nats-server.conf's account-topology comment.
+      SYS_CONN_SEED: "SUAJNND3A4EBPOPMXASJCSIAPEFJROE7JFVDDZMLN2WEP3OPTNQSLMBO6A"
       ACCOUNT_NAME: "APP"
       # `open` admission per docs/DESIGN.md §A9b: "dev mode runs helper in `open` admission with a
       # local CA". The local-CA half of that sentence isn't wired up yet (no TLS in this stack at
