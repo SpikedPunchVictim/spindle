@@ -29,3 +29,19 @@ export {
   HostOpKeyCert,
 } from "./artifacts.js";
 export type { ProtoErrorKind } from "./artifacts.js";
+
+export {
+  MIN_PROTOCOL_VERSION,
+  CURRENT_PROTOCOL_VERSION,
+  MAX_LIST_PAGE,
+  MAX_READ_CHUNK,
+  EntryKind,
+  VfsPerms,
+  vfsPermsUnion,
+  vfsPermsContains,
+  VfsErrorCode,
+  DirEntry,
+  VfsRequestEnvelope,
+  VfsReply,
+} from "./vfsRpc.js";
+export type { VfsRequest } from "./vfsRpc.js";

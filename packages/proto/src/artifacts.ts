@@ -87,8 +87,12 @@ export class ProtoError extends Error {
 }
 
 /** Read-side helper over a decoded `{kind: "map"}` value: field lookup plus the closed-schema
- * check (every key must be in the caller's declared allow-list). */
-class MapReader {
+ * check (every key must be in the caller's declared allow-list). Exported (mirroring Rust's
+ * `pub(crate) struct MapReader` in `artifacts.rs`) so `vfsRpc.ts` can reuse the identical
+ * field-extraction discipline for the VFS RPC wire types instead of re-implementing it — same
+ * package, same closed-schema/strict-type conventions. Not re-exported from `index.ts`: like the
+ * Rust type, it is package-internal, not part of `@spindle/proto`'s public API. */
+export class MapReader {
   private readonly entries: ReadonlyArray<[CborValue, CborValue]>;
 
   constructor(v: CborValue) {
@@ -147,6 +151,18 @@ class MapReader {
     return Number(v);
   }
 
+  u32(key: string): number {
+    const v = this.u64(key);
+    if (v > 0xffffffffn) throw ProtoError.intOutOfRange(key);
+    return Number(v);
+  }
+
+  bool(key: string): boolean {
+    const v = this.require(key);
+    if (v.kind !== "bool") throw ProtoError.wrongType(key);
+    return v.value;
+  }
+
   bytesArray(key: string): Uint8Array[] {
     const v = this.require(key);
     if (v.kind !== "array") throw ProtoError.wrongType(key);
@@ -162,6 +178,14 @@ class MapReader {
     if (v.kind !== "bytes") throw ProtoError.wrongType(key);
     return v.value;
   }
+
+  optionalU32(key: string): number | undefined {
+    const v = this.get(key);
+    if (v === undefined) return undefined;
+    if (v.kind !== "uint") throw ProtoError.wrongType(key);
+    if (v.value > 0xffffffffn) throw ProtoError.intOutOfRange(key);
+    return Number(v.value);
+  }
 }
 
 function bytesArrayValue(items: readonly Uint8Array[]): CborValue {
@@ -170,8 +194,9 @@ function bytesArrayValue(items: readonly Uint8Array[]): CborValue {
 
 /** Decodes exactly one canonical CBOR item, converting a `CborError` into the equivalent
  * `ProtoError.Cbor` (mirrors Rust's `From<CborError> for ProtoError` firing through the `?`
- * operator in `from_canonical_bytes`). */
-function decodeCanonicalOrThrow(bytes: Uint8Array): CborValue {
+ * operator in `from_canonical_bytes`). Exported for `vfsRpc.ts`'s reuse (package-internal, not
+ * re-exported from `index.ts`) — same rationale as `MapReader` above. */
+export function decodeCanonicalOrThrow(bytes: Uint8Array): CborValue {
   try {
     return canonicalDecode(bytes);
   } catch (e) {
