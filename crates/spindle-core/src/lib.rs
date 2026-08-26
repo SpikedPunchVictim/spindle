@@ -26,6 +26,12 @@
 //! - **Session-key `from_fp`/`to_fp` are session roles, not per-message envelope fields**: see
 //!   the [`envelope`] module docs for the interpretation this crate follows (DESIGN.md §A7 does
 //!   not spell this out explicitly).
+//! - **[`identity::sign_bytes`]/[`identity::verify_bytes`]** (Stage 6 slice 2 addition): generic
+//!   raw-Ed25519-signature helpers over already domain-separated bytes, added so a crate that
+//!   depends only on `spindle-core` (not directly on `ed25519-dalek`, per A9c boundary rule 3) can
+//!   still produce/verify ad hoc signatures without needing to name `ed25519_dalek::Signature`
+//!   itself. First consumer: `spindle-vfs`'s audit-chain `HeadSigner` trait (DESIGN.md §A4b
+//!   "Audit log"), which must not gain a direct crypto dependency of its own.
 
 pub mod artifacts;
 pub mod envelope;
@@ -40,8 +46,8 @@ pub use envelope::{
 };
 pub use fingerprint::{Fingerprint, FingerprintError, FINGERPRINT_LEN};
 pub use identity::{
-    device_fp_of, generate_next_root, root_fp_of, sign_root_rotation, verify_root_rotation,
-    DeviceKey, IdentityError, NextRoot, RootKey, ALG_ID_V1,
+    device_fp_of, generate_next_root, root_fp_of, sign_bytes, sign_root_rotation, verify_bytes,
+    verify_root_rotation, DeviceKey, IdentityError, NextRoot, RootKey, ALG_ID_V1,
 };
 
 /// Re-exported so downstream crates (e.g. `spindle-helper`) can name these types without taking

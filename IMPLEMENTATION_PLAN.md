@@ -153,6 +153,51 @@ chain, `spindle-host-core`, and the mount-path-to-share virtual-tree resolution 
 an open ambiguity — §A4b does not specify how a raw client-facing virtual path resolves to
 `(share_id, subpath)` across multiple mounted shares).
 
+**Slice 2** — SQLite persistence (`store`) and the tamper-evident audit chain (`audit`), both
+wired to slice 1's `model`/`algebra`/`confine`/`glob` unmodified in semantics (two small additive
+extensions to `model` support storage round-tripping: `VirtualPath::to_path_string` and
+`Perms::bits`/`from_bits`; neither changes existing behavior or breaks a slice-1 test). `store`
+embeds schema migrations via `PRAGMA user_version` (one numbered SQL constant per version:
+v1 members/devices/groups/member_groups/shares/share_excludes/entitlements/invite_nonces/meta,
+v2 audit_log/signed_heads); `Store` wraps a single `rusqlite::Connection` with typed methods
+mapping directly to the slice-1 model structs. Enforced in the store, each with tests: the
+`cap_epoch`/`grants_version` two-counter rule (`grants_version` bumps on every entitlement/
+group-membership/share mutation; `cap_epoch` bumps only via an explicit `bump_cap_epoch()` —
+`revoke_member`/`revoke_device` deliberately do not auto-bump it, leaving that security-event
+decision to the caller, i.e. `spindle-host-core` in a later slice); built-in `Owner`/`Members`
+groups seeded at init, mutation-protected, with `Owner` excluded from the grantable-groups list;
+secure-by-default (new share/member → zero grants, asserted via `algebra::EffectiveGrants` against
+real persisted rows); overlapping-share-root rejection at add-time *and* re-checked at `open()`
+(a persisted-but-now-overlapping-on-disk DB surfaces a typed `PersistedSharesOverlap` error listing
+every offending pair); `invited → active → revoked` status transitions with revoked terminal;
+configurable `StoreLimits` (shares-per-host default 256, excludes-per-share default 128, §A4b
+"caps on shares per host, globs per share"); and the DESIGN.md §A4 idempotent invite-nonce CAS
+(`burn_invite_nonce`, mirroring spindle-helper's `pg_store` admission-nonce
+`INSERT ... ON CONFLICT DO NOTHING` + read-back pattern exactly — `issued_cap` is stored as opaque
+bytes, since minting a capability needs `spindle-core`'s op-key signing machinery and a live host
+signing key, which belongs to `spindle-host-core`, not this storage crate). One integration test
+persists members/groups/entitlements, reopens the DB fresh, and recomputes effective perms via
+`algebra`, asserting equality with the pre-restart computation. `audit` hash-chains every entry
+(`hash = SHA-256("spindle-audit-v1" || prev_hash || deterministic_encoding(entry))`, computed via
+`spindle_core::Fingerprint::of_parts` rather than a direct `sha2` dependency; deterministic
+encoding is a hand-rolled fixed-order length-prefixed format, not spindle-proto's canonical CBOR
+— see `audit`'s module doc comment for why), supports periodic signed heads via a `HeadSigner`
+trait (`spindle-core`'s Ed25519 machinery, via two small generic helpers — `sign_bytes`/
+`verify_bytes` — added to `spindle-core` for this, since `spindle-vfs` cannot name
+`ed25519_dalek::Signature` without a direct crypto dependency it must not take), and
+`verify_chain`/`verify_head`/`list` (cursor-paged, max page 500). Six dedicated tamper tests (bit-
+flip, row deletion, tail truncation caught only via a signed head, reordering, two forged-signature
+variants) plus append/verify round-trip across reopen, paging boundaries, and empty-chain verify.
+`cargo test -p spindle-vfs`: 73 tests passing (up from 36), 4 Windows-only cases still compile-gated
+(77 total); `cargo check --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`
+both exit 0. `spindle-vfs` gained exactly one new dependency, `rusqlite` (bundled) — still no
+tokio/async anywhere in its dependency tree. (One workspace-wide side effect: the pinned
+`rusqlite` version in the root `Cargo.toml` moved from 0.31 to 0.29 so its `libsqlite3-sys`
+requirement unifies with the version `sqlx-sqlite` already resolves to transitively via
+spindle-helper — Cargo rejects two crate versions that both `links = "sqlite3"` in one build
+graph.) Pending: the VFS RPC server, `spindle-host-core` wiring, and the mount-path resolution
+gap noted above.
+
 ## Stage 7: client-core + Tauri apps init + engine-api/engine-tauri/ui
 **Goal**: Implement `spindle-client-core`; initialize `apps/host` and `apps/client` as real Tauri
 2 apps (`pnpm create tauri-app`); implement `@spindle/engine-api`, `@spindle/engine-tauri`, and

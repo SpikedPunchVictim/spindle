@@ -89,6 +89,15 @@ impl VirtualPath {
         &self.0
     }
 
+    /// The inverse of [`VirtualPath::parse`]: renders back to a `/`-joined string (the root path
+    /// renders as `""`). Additive helper for Stage 6 slice 2 (`crate::store`), which persists
+    /// `subpath` as `TEXT` and must round-trip it losslessly; does not change any slice-1
+    /// behavior — [`VirtualPath::parse`] of this output is guaranteed to reconstruct an equal
+    /// value since components are already validated non-empty/non-`.`/non-`..`.
+    pub fn to_path_string(&self) -> String {
+        self.0.join("/")
+    }
+
     pub fn is_root(&self) -> bool {
         self.0.is_empty()
     }
@@ -240,6 +249,20 @@ impl Perms {
 
     pub fn is_empty(self) -> bool {
         self.0 == 0
+    }
+
+    /// The raw bitset byte. Additive helper for Stage 6 slice 2 (`crate::store`), which persists
+    /// perms as a SQLite `INTEGER` column; does not change any slice-1 behavior.
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Inverse of [`Perms::bits`] — wraps any byte value as-is (the bitset has no invalid bit
+    /// patterns to reject: every combination of the four defined bits, and even unused high bits,
+    /// is representable and simply behaves as "no permission" for any bit not one of the four
+    /// named constants).
+    pub fn from_bits(bits: u8) -> Self {
+        Perms(bits)
     }
 }
 

@@ -30,6 +30,13 @@ pub enum IdentityError {
     BadRotationSignature,
     #[error("new root public key does not match the pre-committed hash")]
     RotationHashMismatch,
+    /// [`verify_bytes`]: the signature slice wasn't exactly 64 bytes, so it cannot even be parsed
+    /// as an Ed25519 signature.
+    #[error("signature must be exactly 64 bytes, got {0}")]
+    BadSignatureLength(usize),
+    /// [`verify_bytes`]: the signature was well-formed but did not verify under the given key.
+    #[error("signature verification failed")]
+    BadSignature,
 }
 
 // ================================================================================================
@@ -222,9 +229,80 @@ pub fn device_fp_of(alg_id: u8, sign_pk: &VerifyingKey, agree_pk: &X25519PublicK
     ])
 }
 
+// ================================================================================================
+// Raw Ed25519 sign/verify helpers
+// ================================================================================================
+//
+// `spindle-vfs`'s audit chain (Stage 6 slice 2, DESIGN.md §A4b "Audit log") needs a `HeadSigner`
+// trait so periodic signed-head custody stays out of that crate, using "spindle-core types" per
+// its own design brief — but per A9c's crate-layering law `spindle-vfs` must not gain a direct
+// `ed25519-dalek` dependency (it depends on `spindle-core` only). `SigningKey`/`VerifyingKey` are
+// already re-exported (see `lib.rs`), so a caller can hold and construct those; what's missing is
+// a way to sign/verify arbitrary already-domain-separated bytes without naming
+// `ed25519_dalek::Signature` itself (not re-exported, and constructing one from raw bytes needs
+// that type's own associated function, which requires a direct dependency to name). These two
+// functions close that gap generically, rather than adding a one-off audit-chain-specific API
+// here — any future crate-local signing need with the same crate-layering constraint can reuse
+// them instead of re-deriving the same workaround.
+
+/// Signs already domain-separated bytes (the caller is responsible for its own domain tag —
+/// mirroring the discipline in [`sign_root_rotation`]), returning the raw 64-byte Ed25519
+/// signature.
+pub fn sign_bytes(signing_key: &SigningKey, msg: &[u8]) -> Vec<u8> {
+    signing_key.sign(msg).to_bytes().to_vec()
+}
+
+/// Verifies a raw Ed25519 signature (as produced by [`sign_bytes`]) over `msg` under
+/// `verifying_key`.
+pub fn verify_bytes(
+    verifying_key: &VerifyingKey,
+    msg: &[u8],
+    sig: &[u8],
+) -> Result<(), IdentityError> {
+    let arr: [u8; 64] = sig
+        .try_into()
+        .map_err(|_| IdentityError::BadSignatureLength(sig.len()))?;
+    let signature = Signature::from_bytes(&arr);
+    verifying_key
+        .verify(msg, &signature)
+        .map_err(|_| IdentityError::BadSignature)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sign_bytes_verify_bytes_round_trip() {
+        let signer = SigningKey::from_bytes(&[0x40; 32]);
+        let sig = sign_bytes(&signer, b"spindle-audit-head-v1 payload");
+        verify_bytes(&signer.verifying_key(), b"spindle-audit-head-v1 payload", &sig)
+            .expect("valid signature must verify");
+    }
+
+    #[test]
+    fn verify_bytes_rejects_wrong_message() {
+        let signer = SigningKey::from_bytes(&[0x41; 32]);
+        let sig = sign_bytes(&signer, b"original");
+        let err = verify_bytes(&signer.verifying_key(), b"tampered", &sig).unwrap_err();
+        assert_eq!(err, IdentityError::BadSignature);
+    }
+
+    #[test]
+    fn verify_bytes_rejects_wrong_key() {
+        let signer = SigningKey::from_bytes(&[0x42; 32]);
+        let impostor = SigningKey::from_bytes(&[0x43; 32]);
+        let sig = sign_bytes(&signer, b"payload");
+        let err = verify_bytes(&impostor.verifying_key(), b"payload", &sig).unwrap_err();
+        assert_eq!(err, IdentityError::BadSignature);
+    }
+
+    #[test]
+    fn verify_bytes_rejects_wrong_length() {
+        let signer = SigningKey::from_bytes(&[0x44; 32]);
+        let err = verify_bytes(&signer.verifying_key(), b"payload", &[0u8; 10]).unwrap_err();
+        assert_eq!(err, IdentityError::BadSignatureLength(10));
+    }
 
     #[test]
     fn root_key_fp_matches_root_fp_of() {

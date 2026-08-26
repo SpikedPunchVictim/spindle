@@ -52,7 +52,17 @@ zeroize = "1"
 minicbor = "0.24"
 
 # Storage
-rusqlite = { version = "0.31", features = ["bundled"] }
+# rusqlite pinned to 0.29 (not the newest release) so its `libsqlite3-sys` requirement (^0.26.0)
+# unifies with the version `sqlx-sqlite` already resolves to elsewhere in this workspace's
+# dependency graph (pulled in transitively via spindle-helper -> sqlx, even though spindle-helper
+# only enables sqlx's "postgres" driver — sqlx's own Cargo.toml resolves all driver crates
+# unconditionally). Cargo refuses two different versions of a crate that both declare `links =
+# "sqlite3"` (rusqlite's and sqlx-sqlite's shared `libsqlite3-sys`) in the same build graph; 0.29
+# is the newest rusqlite release whose requirement range exactly matches sqlx-sqlite 0.7.4's
+# `^0.26.0`. Feature unification means sqlx-sqlite also ends up compiled against the bundled
+# (vendored) SQLite amalgamation as a side effect — harmless, since spindle-helper never enables
+# sqlx's sqlite driver at runtime.
+rusqlite = { version = "0.29", features = ["bundled"] }
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio"] }
 
 # Confinement
