@@ -52,18 +52,23 @@ zeroize = "1"
 minicbor = "0.24"
 
 # Storage
-# rusqlite pinned to 0.29 (not the newest release) so its `libsqlite3-sys` requirement (^0.26.0)
-# unifies with the version `sqlx-sqlite` already resolves to elsewhere in this workspace's
-# dependency graph (pulled in transitively via spindle-helper -> sqlx, even though spindle-helper
-# only enables sqlx's "postgres" driver — sqlx's own Cargo.toml resolves all driver crates
-# unconditionally). Cargo refuses two different versions of a crate that both declare `links =
-# "sqlite3"` (rusqlite's and sqlx-sqlite's shared `libsqlite3-sys`) in the same build graph; 0.29
-# is the newest rusqlite release whose requirement range exactly matches sqlx-sqlite 0.7.4's
-# `^0.26.0`. Feature unification means sqlx-sqlite also ends up compiled against the bundled
-# (vendored) SQLite amalgamation as a side effect — harmless, since spindle-helper never enables
-# sqlx's sqlite driver at runtime.
-rusqlite = { version = "0.29", features = ["bundled"] }
-sqlx = { version = "0.7", features = ["postgres", "runtime-tokio"] }
+# rusqlite pinned to 0.32 (not the newest release, currently 0.40) so its `libsqlite3-sys`
+# requirement (^0.30.1) unifies with what `sqlx-sqlite` requires elsewhere in this workspace's
+# dependency graph. `sqlx`'s own Cargo.toml lists `sqlx-sqlite` (and `sqlx-mysql`) as optional
+# dependencies unconditionally, and even though nothing in this workspace enables sqlx's "sqlite"
+# feature (so `sqlx-sqlite` is never actually compiled — confirmed via `cargo tree -i
+# libsqlite3-sys`, which shows only rusqlite depending on it), Cargo's `links = "sqlite3"`
+# uniqueness check still runs against the full manifest-declared graph when resolving the
+# workspace-wide Cargo.lock (the spikes/ crates pull in spindle-helper -> sqlx too, which is what
+# brings `sqlx-sqlite` into that full-graph resolution). Verified empirically, not from memory:
+# bumping rusqlite to 0.40 (`libsqlite3-sys ^0.38.0`) makes `cargo check --workspace` fail with
+# "failed to select a version for `libsqlite3-sys`" citing exactly this `links` conflict against
+# `sqlx-sqlite`; 0.32 is the newest rusqlite release whose requirement range still overlaps
+# sqlx-sqlite 0.8.x's `^0.30.1` (rusqlite 0.33 bumps to `^0.31.0`, which no longer overlaps).
+# Re-check this pin (`cargo tree -i libsqlite3-sys` after bumping) whenever sqlx or rusqlite is
+# next upgraded, or if any workspace member ever enables sqlx's "sqlite" feature for real.
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
 
 # Confinement
 cap-std = ">=3.4.1"
