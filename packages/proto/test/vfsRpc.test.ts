@@ -1,14 +1,19 @@
 // Golden-vector conformance for the VFS RPC wire types (vectors/vfs-rpc.json) — the TS twin of
-// `crates/spindle-proto/src/vfs_rpc.rs`. Unlike the seven A7b artifact vector files (see
-// vectors.test.ts), vfs-rpc.json's `decoded` field is the same generic `{type, value}` CBOR-tree
-// mirror canonical-cbor.json uses (see vectors/README.md's "vfs-rpc.json's shape" note) rather
-// than a bespoke per-op JSON shape, since the six ops carry different field sets. So each case is
+// `crates/spindle-proto/src/vfs_rpc.rs`. Covers both Stage 6 slice 3 (list/stat/read/mkdir/
+// delete/whoami, eight error codes) and slice 4 (upload_open/upload_chunk/upload_commit/
+// upload_abort, plus the `already_exists`/`file_changed` error codes added by the DESIGN.md
+// v0.9.10 amendment). Unlike the seven A7b artifact vector files (see vectors.test.ts),
+// vfs-rpc.json's `decoded` field is the same generic `{type, value}` CBOR-tree mirror
+// canonical-cbor.json uses (see vectors/README.md's "vfs-rpc.json's shape" note) rather than a
+// bespoke per-op JSON shape, since the ten ops carry different field sets. So each case is
 // cross-checked three ways: (1) the generic tree round-trips to canonical_cbor_hex independent of
 // this package's typed layer entirely (same check canonical.test.ts does), (2) the typed decoder
 // (`VfsRequestEnvelope.fromCbor` / `VfsReply.fromCbor`) accepts that same generic tree and
 // re-encodes it byte-identically, and (3) decoding canonical_cbor_hex directly through the typed
 // layer reproduces the same typed value and re-encodes byte-identically. (2) and (3) together are
-// the "decodes, re-encodes byte-identically, matches expected structure" check.
+// the "decodes, re-encodes byte-identically, matches expected structure" check. The suite iterates
+// every case in `doc.requests`/`doc.replies` (not a fixed count), so it automatically covers
+// whatever `vectors/vfs-rpc.json` currently contains.
 //
 // Plus negative tests per the established convention (vectors.test.ts's "mutation rejection"
 // block): swapped key order, a lengthened (non-shortest-form) integer field, and an unrecognized
@@ -28,7 +33,9 @@ import {
   EntryKind,
   MAX_LIST_PAGE,
   MAX_READ_CHUNK,
+  MAX_UPLOAD_CHUNK,
   MIN_PROTOCOL_VERSION,
+  UPLOAD_SESSION_TTL_SECS,
   VfsErrorCode,
   VfsPerms,
   VfsReply,
@@ -222,6 +229,33 @@ describe("round-trips every request/reply variant (vfs_rpc.rs parity)", () => {
     rtReq({ v: 1, request: { op: "mkdir", path: "Photos/NewAlbum" } });
     rtReq({ v: 1, request: { op: "delete", path: "Photos/old.jpg" } });
     rtReq({ v: 1, request: { op: "whoami" } });
+    rtReq({
+      v: 1,
+      request: {
+        op: "upload_open",
+        path: "Drop/incoming.bin",
+        size: 1048576n,
+        hash: new Uint8Array(32).fill(0xaa),
+        manifest_sig: new Uint8Array(64).fill(0xbb),
+      },
+    });
+    rtReq({
+      v: 1,
+      request: {
+        op: "upload_chunk",
+        session_id: new Uint8Array(16).fill(0x03),
+        offset: 65536n,
+        data: new Uint8Array(128).fill(0xcc),
+      },
+    });
+    rtReq({
+      v: 1,
+      request: { op: "upload_commit", session_id: new Uint8Array(16).fill(0x03) },
+    });
+    rtReq({
+      v: 1,
+      request: { op: "upload_abort", session_id: new Uint8Array(16).fill(0x03) },
+    });
   });
 
   it("every reply variant", () => {
@@ -254,6 +288,19 @@ describe("round-trips every request/reply variant (vfs_rpc.rs parity)", () => {
       member_display: "Alex",
       effective_paths: ["Photos/Vacation", "Drop"],
     });
+    rtReply({
+      op: "upload_open",
+      session_id: new Uint8Array(16).fill(0x03),
+      offset: 0n,
+    });
+    rtReply({
+      op: "upload_open",
+      session_id: new Uint8Array(16).fill(0x03),
+      offset: 65536n,
+    });
+    rtReply({ op: "upload_chunk", offset: 131072n });
+    rtReply({ op: "upload_commit" });
+    rtReply({ op: "upload_abort" });
     for (const code of [
       VfsErrorCode.NotFound,
       VfsErrorCode.QuotaExceeded,
@@ -263,6 +310,8 @@ describe("round-trips every request/reply variant (vfs_rpc.rs parity)", () => {
       VfsErrorCode.StorageFull,
       VfsErrorCode.Throttled,
       VfsErrorCode.UnsupportedVersion,
+      VfsErrorCode.AlreadyExists,
+      VfsErrorCode.FileChanged,
     ]) {
       rtReply({ op: "error", code });
     }
@@ -303,7 +352,7 @@ describe("rejection parity with vfs_rpc.rs's inline unit tests", () => {
     expect(opErr.enumValue).toBe(99n);
 
     const badCode = CborValue.map([
-      ["op", CborValue.uint(6)],
+      ["op", CborValue.uint(10)],
       ["code", CborValue.uint(99)],
     ]);
     const codeErr = expectThrows(ProtoError, () =>
@@ -328,20 +377,54 @@ describe("rejection parity with vfs_rpc.rs's inline unit tests", () => {
     expect(err.kind).toBe("IntOutOfRange");
     expect(err.field).toBe("perms_here");
   });
+
+  it("rejects an unknown field on an upload op (slice 4 parity)", () => {
+    const cbor = VfsRequestEnvelope.toCbor({
+      v: 1,
+      request: { op: "upload_commit", session_id: Uint8Array.from([1]) },
+    });
+    if (cbor.kind !== "map") throw new Error("expected map");
+    cbor.value.push([CborValue.text("bogus"), CborValue.uint(1)]);
+    const bytes = canonicalEncode(cbor);
+    const err = expectThrows(ProtoError, () => VfsRequestEnvelope.fromCanonicalBytes(bytes));
+    expect(err.kind).toBe("UnknownField");
+    expect(err.field).toBe("bogus");
+  });
+
+  it("rejects a missing required field on upload_open (slice 4 parity)", () => {
+    const cbor = VfsRequestEnvelope.toCbor({
+      v: 1,
+      request: {
+        op: "upload_open",
+        path: "x",
+        size: 1n,
+        hash: Uint8Array.from([1]),
+        manifest_sig: Uint8Array.from([2]),
+      },
+    });
+    if (cbor.kind !== "map") throw new Error("expected map");
+    cbor.value = cbor.value.filter(([k]) => !(k.kind === "text" && k.value === "hash"));
+    const bytes = canonicalEncode(cbor);
+    const err = expectThrows(ProtoError, () => VfsRequestEnvelope.fromCanonicalBytes(bytes));
+    expect(err.kind).toBe("MissingField");
+    expect(err.field).toBe("hash");
+  });
 });
 
 describe("constants and bitset helpers (vfs_rpc.rs parity)", () => {
-  it("MAX_READ_CHUNK is 64 KiB", () => {
+  it("MAX_READ_CHUNK and MAX_UPLOAD_CHUNK are both 64 KiB", () => {
     expect(MAX_READ_CHUNK).toBe(65536);
+    expect(MAX_UPLOAD_CHUNK).toBe(65536);
   });
 
-  it("MAX_LIST_PAGE and protocol version constants match the Rust twin", () => {
+  it("MAX_LIST_PAGE, protocol version, and upload session TTL constants match the Rust twin", () => {
     expect(MAX_LIST_PAGE).toBe(500);
     expect(MIN_PROTOCOL_VERSION).toBe(1);
     expect(CURRENT_PROTOCOL_VERSION).toBe(1);
+    expect(UPLOAD_SESSION_TTL_SECS).toBe(48 * 60 * 60);
   });
 
-  it("all error codes are distinct and round-trip their u64 discriminant", () => {
+  it("all ten error codes are distinct and round-trip their u64 discriminant", () => {
     const codes = [
       VfsErrorCode.NotFound,
       VfsErrorCode.QuotaExceeded,
@@ -351,6 +434,8 @@ describe("constants and bitset helpers (vfs_rpc.rs parity)", () => {
       VfsErrorCode.StorageFull,
       VfsErrorCode.Throttled,
       VfsErrorCode.UnsupportedVersion,
+      VfsErrorCode.AlreadyExists,
+      VfsErrorCode.FileChanged,
     ];
     codes.forEach((c, i) => expect(c).toBe(i));
   });

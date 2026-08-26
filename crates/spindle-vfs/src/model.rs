@@ -194,12 +194,26 @@ pub struct Group {
 }
 
 /// A member's device: `{device_fp, label, added, revoked?}` (§A4b).
+///
+/// **Stage 6 slice 4 addition, flagged per the task brief rather than resolved silently**:
+/// `sign_pk` — the device's Ed25519 signing public key — is new as of slice 4. DESIGN.md §A4's
+/// device certificates already carry this key (`spindle_proto::artifacts::DeviceCertificate`),
+/// and the host pins it at enrollment, but no slice before this one had a reason to persist it
+/// here: slices 1-2 only needed `device_fp` (a fingerprint) to identify a device for grants/
+/// revocation bookkeeping. Slice 4 needs the actual public key because DESIGN.md §A8's transfer
+/// manager requires verifying an upload's manifest signature — signed by the *sending device's*
+/// key — before the staged file is moved into place, and there is nowhere else in this crate's
+/// durable state that key is recorded. `None` for a device added before this field existed, or in
+/// a test that never supplied one; an upload manifest signed by such a device fails closed
+/// (`spindle-host-core` cannot verify without a key, and does not treat a missing key as "skip
+/// verification").
 #[derive(Clone, Debug)]
 pub struct Device {
     pub device_fp: Fingerprint,
     pub label: String,
     pub added: u64,
     pub revoked: bool,
+    pub sign_pk: Option<Vec<u8>>,
 }
 
 /// `invited | active | revoked` (§A4b).

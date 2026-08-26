@@ -11,7 +11,7 @@
 //! this module only knows how to talk to the real filesystem safely through the capability.
 
 use super::identity::stat_through_dir;
-use super::upload::upload_target_path;
+use super::upload::{is_staging_name, upload_target_path};
 use super::ConfineError;
 use cap_std::fs::Dir;
 use std::path::{Path, PathBuf};
@@ -49,6 +49,10 @@ fn unix_seconds(meta: &std::fs::Metadata) -> u64 {
 /// *why* — consistent with this crate's no-existence-leak posture (the caller,
 /// `EffectiveGrants::filter_listing`, independently decides visibility; a skipped entry here is
 /// just absent from what it gets to filter, exactly like an entry the member isn't entitled to).
+/// An entry matching [`super::upload::is_staging_name`] is likewise skipped unconditionally
+/// (DESIGN.md §A8 transfer manager: an in-progress upload's hidden staging file is "never
+/// listed") — this is independent of the share's `show_hidden` flag, which governs real dotfiles
+/// a member placed, not host-internal bookkeeping files.
 pub fn list_dir(dir: &Dir, relative: &str) -> Result<Vec<RealDirEntry>, ConfineError> {
     let read_dir = if relative.is_empty() {
         dir.entries()
@@ -66,6 +70,9 @@ pub fn list_dir(dir: &Dir, relative: &str) -> Result<Vec<RealDirEntry>, ConfineE
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
+        if is_staging_name(&name) {
+            continue;
+        }
         let child_relative = if relative.is_empty() {
             name.clone()
         } else {
@@ -94,7 +101,7 @@ pub fn list_dir(dir: &Dir, relative: &str) -> Result<Vec<RealDirEntry>, ConfineE
 /// [`remove_confined`] so both can check the *parent* directory's entries for a fold-key
 /// collision on the target's own name (DESIGN.md §A4b overwrite/collision rules), not `dir`'s own
 /// root entries when the target is nested.
-fn split_parent_and_name(target: &Path) -> (PathBuf, String) {
+pub(super) fn split_parent_and_name(target: &Path) -> (PathBuf, String) {
     let name = target
         .file_name()
         .expect("upload_target_path guarantees at least one component")
@@ -192,6 +199,22 @@ mod tests {
         assert_eq!(nested.len(), 1);
         assert_eq!(nested[0].name, "b.txt");
         assert_eq!(nested[0].size, 2);
+    }
+
+    #[test]
+    fn list_dir_never_shows_staging_files() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("mkdir root");
+        std::fs::write(root.join("a.txt"), b"a").expect("write a");
+        let staging = super::super::upload::staging_name(&[0x01, 0x02, 0x03]);
+        std::fs::write(root.join(&staging), b"partial-upload-bytes").expect("write staging file");
+
+        let dir = open_share_root(&root).expect("open");
+        let entries = list_dir(&dir, "").expect("list root");
+
+        assert_eq!(entries.len(), 1, "the staging file must never be listed");
+        assert_eq!(entries[0].name, "a.txt");
     }
 
     #[test]

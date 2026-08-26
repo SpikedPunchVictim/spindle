@@ -931,6 +931,58 @@ fn vfs_rpc_vectors() -> Json {
             }
             .to_cbor(),
         ),
+        vfs_rpc_case(
+            "upload_open",
+            "`upload_open` — begin (or resume) a resumable upload session (DESIGN.md §A8 \
+             transfer manager), carrying the whole-file declared size/hash and a signature over \
+             that manifest by the sending device's key.",
+            VfsRequestEnvelope {
+                v: 1,
+                request: VfsRequest::UploadOpen {
+                    path: "Drop/incoming.bin".to_string(),
+                    size: 1_048_576,
+                    hash: rep(0xaa, 32),
+                    manifest_sig: rep(0xbb, 64),
+                },
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "upload_chunk",
+            "`upload_chunk` — append one chunk at the session's next-expected-offset (DESIGN.md \
+             §A8 max chunk size, same 64 KiB bound as `read`).",
+            VfsRequestEnvelope {
+                v: 1,
+                request: VfsRequest::UploadChunk {
+                    session_id: rep(0x03, 16),
+                    offset: 65536,
+                    data: rep(0xcc, 128),
+                },
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "upload_commit",
+            "`upload_commit` — finalize a completed upload session.",
+            VfsRequestEnvelope {
+                v: 1,
+                request: VfsRequest::UploadCommit {
+                    session_id: rep(0x03, 16),
+                },
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "upload_abort",
+            "`upload_abort` — discard an in-progress upload session and its staged bytes.",
+            VfsRequestEnvelope {
+                v: 1,
+                request: VfsRequest::UploadAbort {
+                    session_id: rep(0x03, 16),
+                },
+            }
+            .to_cbor(),
+        ),
     ];
 
     let mut replies = vec![
@@ -1009,6 +1061,40 @@ fn vfs_rpc_vectors() -> Json {
             }
             .to_cbor(),
         ),
+        vfs_rpc_case(
+            "upload_open_reply_new_session",
+            "`upload_open` reply for a brand-new session (offset 0).",
+            VfsReply::UploadOpen {
+                session_id: rep(0x03, 16),
+                offset: 0,
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "upload_open_reply_resumed_session",
+            "`upload_open` reply for a resumed session — same `(path, size, hash)` as a still-live \
+             session, returning its current next-expected-offset instead of starting over.",
+            VfsReply::UploadOpen {
+                session_id: rep(0x03, 16),
+                offset: 65536,
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "upload_chunk_reply",
+            "`upload_chunk` reply — the session's next-expected-offset after appending this chunk.",
+            VfsReply::UploadChunk { offset: 131072 }.to_cbor(),
+        ),
+        vfs_rpc_case(
+            "upload_commit_reply",
+            "`upload_commit` success acknowledgement.",
+            VfsReply::UploadCommit.to_cbor(),
+        ),
+        vfs_rpc_case(
+            "upload_abort_reply",
+            "`upload_abort` success acknowledgement.",
+            VfsReply::UploadAbort.to_cbor(),
+        ),
     ];
 
     for code in [
@@ -1020,11 +1106,14 @@ fn vfs_rpc_vectors() -> Json {
         VfsErrorCode::StorageFull,
         VfsErrorCode::Throttled,
         VfsErrorCode::UnsupportedVersion,
+        VfsErrorCode::AlreadyExists,
+        VfsErrorCode::FileChanged,
     ] {
         replies.push(vfs_rpc_case(
             "error_reply",
-            "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's \
-             UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+            "One of the ten typed VFS error codes (DESIGN.md §A8's seven, this crate's \
+             UnsupportedVersion addition, and the v0.9.10 amendment's already_exists/file_changed \
+             — see `spindle_proto::vfs_rpc`'s schema-choices table and module doc comment).",
             VfsReply::Error { code }.to_cbor(),
         ));
     }
@@ -1033,9 +1122,10 @@ fn vfs_rpc_vectors() -> Json {
         (
             "description",
             Json::Str(
-                "VFS RPC wire types (DESIGN.md §A8), Stage 6 slice 3: request/reply CBOR shapes \
-                 for list/stat/read/mkdir/delete/whoami and the typed error-code model. Not A7b \
-                 signed artifacts — no domain tag, no signing input."
+                "VFS RPC wire types (DESIGN.md §A8), Stage 6 slices 3-4: request/reply CBOR \
+                 shapes for list/stat/read/mkdir/delete/whoami, the four upload-session ops \
+                 (upload_open/upload_chunk/upload_commit/upload_abort), and the ten-code typed \
+                 error model. Not A7b signed artifacts — no domain tag, no signing input."
                     .to_string(),
             ),
         ),

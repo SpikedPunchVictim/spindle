@@ -35,6 +35,8 @@ export {
   CURRENT_PROTOCOL_VERSION,
   MAX_LIST_PAGE,
   MAX_READ_CHUNK,
+  MAX_UPLOAD_CHUNK,
+  UPLOAD_SESSION_TTL_SECS,
   EntryKind,
   VfsPerms,
   vfsPermsUnion,

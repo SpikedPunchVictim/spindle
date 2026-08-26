@@ -243,6 +243,117 @@ deletion between pages, virtual-root/intermediate listing filtering, and whoami 
 dependency; corrected here). Pending: slice 4 (`upload`'s resumable-session machinery, rate
 limiting/quotas, real transport binding via `spindle-net`).
 
+**Slice 4** — upload sessions, quotas, and rate limits: `spindle-host-core` gains the four
+`upload_*` RPCs (`upload_open`/`upload_chunk`/`upload_commit`/`upload_abort`) DESIGN.md §A8's
+"transfer manager" describes, completing the §A4b/§A8 write path slice 3 deliberately deferred.
+**Scope note (divergence from slice 3's own forward-reference)**: slice 3's pending note above
+bundled "real transport binding via `spindle-net`" into "slice 4"; this slice's actual task brief
+scoped that out explicitly (`spindle-net` untouched, no dependency added) — `VfsRpcServer` remains
+the same transport-agnostic, synchronous, bytes-in/bytes-out pipeline slice 3 built, now just with
+four more request types. Real transport binding is still pending, deferred to whichever future
+slice actually wires `spindle-net`; flagged here rather than silently marked done.
+
+`spindle-proto::vfs_rpc` gains the wire types: `UploadOpen{path,size,hash,manifest_sig} →
+{session_id,offset}`, `UploadChunk{session_id,offset,data} → {offset}`, `UploadCommit{session_id}`,
+`UploadAbort{session_id}`, appended as ops 6–9 on both the request and reply discriminant (an
+additive-only but wire-breaking renumbering for any slice-3-only peer, since `Error` moved from 6
+to 10 — acceptable pre-1.0, flagged per this crate's convention) — plus two new error codes,
+`AlreadyExists`/`FileChanged` (codes 8/9), completing DESIGN.md §A8's ten-code error model.
+Golden vectors regenerated (`vectors/vfs-rpc.json` only); **the TS twin still does not implement
+this schema — an existing, now-larger, gap for the CI vector cross-check job.** Two slice-3
+stopgaps are remapped to the new codes exactly per the v0.9.10 DESIGN.md/ADR-005 amendment:
+`mkdir`-over-an-existing-name now reports `already_exists` (was `upload_rejected`), and a
+stat→read TOCTOU identity mismatch now reports `file_changed` (was `not_found`) — both remaps
+covered by dedicated byte-level regression tests.
+
+**Schema gap found and fixed**: DESIGN.md §A8 requires the upload manifest to be verified against
+"the sending device's key" before every chunk is accepted and again immediately before
+move-into-place, but `spindle_vfs::model::Device`/the v2 schema never persisted a device's Ed25519
+signing public key anywhere — there was no key to verify against. Fixed via a new `store` migration,
+`SCHEMA_V3` (`ALTER TABLE devices ADD COLUMN sign_pk BLOB`, plus two new counter tables — see
+below), `Device::sign_pk: Option<Vec<u8>>`, `Store::add_device` gaining a `sign_pk` parameter, and
+`Store::device_sign_pk`. Verification itself needed no new dependency: `spindle-host-core` already
+depends on `spindle-core`, whose `verify_bytes`/`VerifyingKey` (already re-exported for exactly
+this generic-signature-checking use case, per slice 2) are used directly against the manifest's
+signing input, `spindle-host-core::upload::manifest_signing_bytes` (a length-prefixed
+`path||size||hash` encoding — this crate's own choice, DESIGN.md specifies the fields but not a
+byte-for-byte layout).
+
+`crate::upload::UploadSessions` is the in-memory (not persisted — a documented, deliberate choice:
+DESIGN.md does not require sessions to survive a host restart, only committed files) session table
+holding DESIGN.md's exact `{id, member, path, size, hash, offset, expires}` shape plus this crate's
+bookkeeping (`share_id`+share-relative `subpath` in place of a raw `path` string, the signer's
+`device_fp`, and the `grants_version`/`cap_epoch` observed at open time). `open_or_resume` resumes
+a still-live session for an identical `(member, share, subpath, size, hash)` at its
+next-expected-offset; `gc_expired(now)` is a plain callable method (no background thread, per the
+task brief) wired to `VfsRpcServer::gc_expired_upload_sessions`, which also discards each reaped
+session's staged bytes. Every `upload_chunk`/`upload_commit` call re-checks `grants_version`/
+`cap_epoch` against the values captured at open time and aborts-and-GCs the session on any
+movement (DESIGN.md §A8: "an entitlement change mid-transfer aborts the session") — conservative
+by construction: any host-wide entitlement/share mutation aborts every live session, not just ones
+whose specific grant changed, since re-deriving "did *this* grant specifically change" is not
+something the cache layer tracks. Staging bytes live under a hidden filename
+(`crate::confine::upload::staging_name`, `.spindle-upload-<hex session id>`) directly in the
+share's real root; `confine::listing::list_dir` now unconditionally skips any such name (DESIGN.md
+§A8: "never listed"), independent of a share's `show_hidden` flag. `confine::upload::finalize_upload`
+performs the final overwrite-requires-`delete` collision check (reusing the same fold-key machinery
+mkdir/upload already share) and atomic same-filesystem rename into place.
+
+Quotas are two store-backed running byte counters, `member_upload_bytes`/`share_upload_bytes`
+(new tables in `SCHEMA_V3`), incremented on a successful `upload_commit` and decremented on
+`delete` — **documented limitation**: `share_upload_bytes` stays exactly accurate for every delete
+(a delete always knows the real size of what it removes, file deletes only — a recursive directory
+delete does not walk and decrement, an explicitly flagged simplification), but
+`member_upload_bytes` is not symmetrically decremented when a *different* member deletes the
+content, since no ownership ledger maps a real file back to its uploader; acceptable for generous,
+host-configured default limits (50 GiB/member, 500 GiB/share), not a full accounting system.
+Checked at both `upload_open` (fail fast) and `upload_commit` (re-checked, since usage may have
+grown from other sessions committing concurrently) — `quota_exceeded`.
+
+The free-space floor (DESIGN.md §A8 "Owner live operations": pause uploads before the disk fills)
+is implemented as an injectable `crate::limits::FreeSpaceProbe` trait, checked before every
+`upload_chunk` is accepted, driving `storage_full`. **Flagged dependency gap, not silently
+resolved** (per this repo's standing "ask before adding a dependency" instruction): querying real
+OS free space needs `statvfs`/`GetDiskFreeSpaceExW`, available via no crate already in this
+workspace's graph. The default probe (`UnlimitedFreeSpace`) always reports effectively unlimited
+space, so this slice regresses nothing; production wiring is a one-line
+`VfsRpcServer::with_limits(...)` call once a probe is chosen from three options (documented in
+`crate::limits`'s module doc comment): `libc` (zero extra dependency weight, hand-rolled unsafe
+FFI, two platforms to maintain), `fs4` (small, focused, cross-platform, one new dependency), or
+`sysinfo` (correct but far heavier than this one need justifies). Tests inject a fake
+always-full probe to exercise `storage_full` end to end without needing the real decision made.
+
+Rate limiting is a per-caller (device fingerprint, or a `member_id`-derived key when the transport
+supplied no device) token-bucket (`crate::ratelimit`), checked first in `VfsRpcServer::handle` —
+before even the protocol-version gate — on every RPC, not just uploads (DESIGN.md §A5 describes
+this mechanism for the pre-auth NATS-connect limiter specifically; this slice's task brief scoped a
+distinct post-auth, per-session VFS-RPC-entry-point instance of the same mechanism, flagged as an
+adaptation rather than the literal §A5 limiter). Generous, documented defaults (200-request burst,
+50/sec refill); time is the caller-supplied deterministic `ts: u64`, never a wall clock, matching
+every other timestamp in this pipeline.
+
+43 new tests (+3 in `spindle-proto::vfs_rpc`, 33->36, for the new wire types/error codes; +7 in
+`spindle-vfs`, 79->86, for `sign_pk`/quota-counter store methods and the hidden-staging-file
+listing/finalize-upload confinement helpers; +33 in `spindle-host-core`, 33->66, split across
+`upload`/`ratelimit`/`limits` unit tests and the `server` module's upload-RPC handler tests
+including the two v0.9.10 remap byte-level regressions) covering: the full happy path end to
+end with quota-counter assertions, resume-after-reopen at the correct offset, wrong-offset
+(`file_changed`), oversize-vs-declared and hash-mismatch-at-commit (`upload_rejected`), an unsigned
+manifest, no-`upload`-perm, overwrite blocked without `delete` (session survives to retry) and
+allowed with `delete`, a case-fold collision at commit treated as overwrite, hidden-staging-file
+invisibility in `list`, TTL GC actually removing stale staged bytes, entitlement-change-mid-upload
+(`grants_changed`, staged bytes discarded immediately), `quota_exceeded` for both the member and
+share counters, `storage_full` via the fake probe, `throttled` via a tiny rate-limit config and
+recovery after simulated refill, and upload-implies-resolve-without-listing (drop-box: an
+`upload`-only grant can open a session against a path it cannot `list`). `cargo test -p
+spindle-host-core -p spindle-proto -p spindle-vfs`: 188 tests passing (66 + 36 + 86, up from 145 in
+slice 3; 4 Windows-only cases still compile-gated), `0 failed`; `cargo check --workspace` and
+`cargo clippy --workspace --all-targets -- -D warnings` both exit 0. No new dependency was added to
+any crate. **Status: Complete** for this slice's own scope (upload sessions, quotas, rate limits,
+the ten-code error model); Stage 6 as a whole stays **In Progress** — real transport binding via
+`spindle-net` (mentioned in slice 3's pending note above) was never in this slice's task brief and
+remains unaddressed.
+
 ## Stage 7: client-core + Tauri apps init + engine-api/engine-tauri/ui
 **Goal**: Implement `spindle-client-core`; initialize `apps/host` and `apps/client` as real Tauri
 2 apps (`pnpm create tauri-app`); implement `@spindle/engine-api`, `@spindle/engine-tauri`, and

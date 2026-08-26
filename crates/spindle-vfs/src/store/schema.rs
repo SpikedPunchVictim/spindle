@@ -126,9 +126,38 @@ CREATE TABLE signed_heads (
 );
 "#;
 
+/// Version 3 — Stage 6 slice 4 additions (DESIGN.md §A8 "transfer manager" / "received-file
+/// policy"), flagged per the task brief as a real schema gap rather than resolved silently:
+///
+/// - `devices.sign_pk`: the device's Ed25519 signing public key, nullable (`ALTER TABLE ... ADD
+///   COLUMN` requires a default for `NOT NULL`, and there is no sensible default for a key; a
+///   `NULL` here means "no key on file", handled explicitly by `spindle-host-core` as "cannot
+///   verify a manifest signed by this device", never as "skip verification"). See
+///   `crate::model::Device::sign_pk`'s doc comment for why this was missing through slice 3 and
+///   why slice 4 needs it (manifest-signature verification before an upload is moved into place).
+/// - `member_upload_bytes` / `share_upload_bytes`: running byte counters backing DESIGN.md §A4b's
+///   "quotas per member and per share". Deliberately scoped to bytes that moved through *this
+///   crate's* upload path (an `upload_commit`), not a full recursive walk of on-disk usage — see
+///   `crate::store::Store::adjust_member_upload_bytes`'s doc comment for the accounting model and
+///   its documented limitation (a delete does not retroactively restore a *different* member's
+///   counter, since no ownership ledger maps a real file back to whichever member uploaded it).
+const SCHEMA_V3: &str = r#"
+ALTER TABLE devices ADD COLUMN sign_pk BLOB;
+
+CREATE TABLE member_upload_bytes (
+    member_id INTEGER PRIMARY KEY REFERENCES members(member_id),
+    bytes INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE share_upload_bytes (
+    share_id INTEGER PRIMARY KEY REFERENCES shares(share_id),
+    bytes INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
 /// Every schema version in order, oldest first. Appending a new `(N, SQL)` pair is the only way
 /// to evolve the schema — existing entries are never edited once shipped.
-const MIGRATIONS: &[(i64, &str)] = &[(1, SCHEMA_V1), (2, SCHEMA_V2)];
+const MIGRATIONS: &[(i64, &str)] = &[(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)];
 
 /// Applies every migration strictly newer than the connection's current `user_version`, each in
 /// its own transaction, advancing `user_version` as it goes. Safe to call on every [`super::Store`]
