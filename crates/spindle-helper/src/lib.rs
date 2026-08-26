@@ -44,11 +44,12 @@
 //!   whether `DATABASE_URL` is set. See that module's own doc comment for the SQL semantics and
 //!   for why its `HelperView` methods bridge to async I/O via `block_in_place` rather than making
 //!   the trait itself async.
-//! - [`turn`] — [`turn::handle_turn_get`] (Stage 4 slice 3): TURN credential minting for
-//!   `helper.turn.get`, authorized via the session record a successful callout now persists (see
-//!   [`authz::HelperView::put_session_record`]) and quota-limited per `root_fp` via
-//!   [`authz::HelperView::record_turn_issuance`]. See that module's own doc comment for the
-//!   request/reply wire-schema gap this slice had to resolve without a spec to point to.
+//! - [`turn`] — [`turn::handle_turn_get`] (Stage 4 slice 3, subject parametrized in v0.9.7 —
+//!   DESIGN.md §A5, A12 #45): TURN credential minting for `helper.turn.get.<nfp>`, where identity
+//!   comes from the subject token, not the payload. Authorized via the session record a
+//!   successful callout now persists (see [`authz::HelperView::put_session_record`]) and
+//!   quota-limited per `root_fp` via [`authz::HelperView::record_turn_issuance`]. See that
+//!   module's own doc comment for the wire-schema detail.
 //!
 //! **Still out of scope** (later slices): presence (`$SYS` event bridging into
 //! `host.<hfp>.presence`) and the admin-command verifier (`registry.admin.>`).

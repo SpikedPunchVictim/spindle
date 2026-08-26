@@ -98,12 +98,22 @@ pub fn host_permissions(own_host_fp: Fingerprint) -> SubjectPermissions {
 /// Full member-cap client permissions for the given `own_device_fp`, one `host_fp` at a time
 /// (DESIGN.md §A5): per host `h`, `pub host.<h>.connect`, `pub host.<h>.sess.<own>.*.c2h`, `sub
 /// host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus, once for the whole connection (not
-/// per host): `sub _INBOX_<own>.>`, `pub helper.presence.get`, `pub helper.turn.get`.
+/// per host): `sub _INBOX_<own>.>`, `pub helper.presence.get`, `pub helper.turn.get.<own_nats_fp>`.
+///
+/// `own_nats_fp` is the connection's session-nkey fingerprint (the callout-verified identity
+/// behind this NATS connection — see [`crate::session::SessionRecord`]), **not** `own_device_fp`.
+/// DESIGN.md §A5 v0.9.7 (A12 #45) parametrizes `helper.turn.get` by the caller's subject token
+/// specifically so the helper's authorization comes from what NATS itself proved about the
+/// publisher, not from a self-declared payload field — the same scoping pattern `registry.
+/// revoke.<hfp>` already uses for hosts. That means this grant must name the one subject token
+/// this connection is actually allowed to publish on, i.e. its own `nats_fp`, the same identity
+/// `session_record(nats_fp, ...)` is keyed by in `turn.rs`.
 ///
 /// `hosts` must be non-empty — a connection with no fully-verified member host has no business
 /// calling this (see [`client_connect_only_permissions`] instead).
 pub fn client_member_permissions(
     own_device_fp: Fingerprint,
+    own_nats_fp: Fingerprint,
     hosts: &[Fingerprint],
 ) -> SubjectPermissions {
     let mut publish_allow = Vec::with_capacity(hosts.len() * 2 + 2);
@@ -116,7 +126,7 @@ pub fn client_member_permissions(
         subscribe_allow.push(format!("host.{h}.presence"));
     }
     publish_allow.push("helper.presence.get".to_string());
-    publish_allow.push("helper.turn.get".to_string());
+    publish_allow.push(format!("helper.turn.get.{own_nats_fp}"));
     SubjectPermissions {
         publish_allow,
         subscribe_allow,
@@ -127,8 +137,9 @@ pub fn client_member_permissions(
 
 /// Connect-only permissions for an invite cap or a stale-but-signature-valid member cap
 /// (DESIGN.md §A5: "Invite-only and stale-cap connections get just `pub host.<h>.connect` +
-/// inbox"). No `helper.presence.get`/`helper.turn.get`, no session subjects, no presence sub —
-/// those are reserved for connections with at least one fully-verified member host.
+/// inbox"). No `helper.presence.get`/`helper.turn.get.<nfp>` of any shape, no session subjects,
+/// no presence sub — those are reserved for connections with at least one fully-verified member
+/// host.
 pub fn client_connect_only_permissions(
     own_device_fp: Fingerprint,
     hosts: &[Fingerprint],
@@ -236,15 +247,16 @@ mod tests {
     #[test]
     fn client_member_permissions_are_byte_exact_for_one_host() {
         let own = fp(b"device-under-test");
+        let nats_fp = fp(b"nats-under-test");
         let h = fp(b"host-a");
-        let perms = client_member_permissions(own, &[h]);
+        let perms = client_member_permissions(own, nats_fp, &[h]);
         assert_eq!(
             perms.publish_allow,
             vec![
                 format!("host.{h}.connect"),
                 format!("host.{h}.sess.{own}.*.c2h"),
                 "helper.presence.get".to_string(),
-                "helper.turn.get".to_string(),
+                format!("helper.turn.get.{nats_fp}"),
             ]
         );
         assert_eq!(
@@ -260,11 +272,29 @@ mod tests {
     }
 
     #[test]
+    fn client_member_permissions_turn_get_is_scoped_to_nats_fp_not_device_fp() {
+        // The device_fp and nats_fp are deliberately distinct here so a regression that scopes
+        // helper.turn.get by the wrong fingerprint (e.g. reusing own_device_fp) is caught.
+        let own_device_fp = fp(b"device-distinct");
+        let own_nats_fp = fp(b"nats-distinct");
+        assert_ne!(own_device_fp, own_nats_fp);
+        let h = fp(b"host-c");
+        let perms = client_member_permissions(own_device_fp, own_nats_fp, &[h]);
+        assert!(perms
+            .publish_allow
+            .contains(&format!("helper.turn.get.{own_nats_fp}")));
+        assert!(!perms
+            .publish_allow
+            .contains(&format!("helper.turn.get.{own_device_fp}")));
+    }
+
+    #[test]
     fn client_member_permissions_scale_per_host() {
         let own = fp(b"device-multi");
+        let nats_fp = fp(b"nats-multi");
         let h1 = fp(b"host-1");
         let h2 = fp(b"host-2");
-        let perms = client_member_permissions(own, &[h1, h2]);
+        let perms = client_member_permissions(own, nats_fp, &[h1, h2]);
         // One shared inbox sub + 2 subs per host (sess.h2c, presence).
         assert_eq!(perms.subscribe_allow.len(), 1 + 2 * 2);
         // 2 pubs per host (connect, sess.c2h) + the 2 fixed helper.* pubs.
@@ -282,7 +312,7 @@ mod tests {
         assert_eq!(perms.allow_responses, None);
         assert!(
             !perms.publish_allow.iter().any(|s| s.contains("helper.")),
-            "connect-only connections never get helper.presence.get/helper.turn.get"
+            "connect-only connections never get helper.presence.get/helper.turn.get.<nfp> of any shape"
         );
         assert!(
             !perms.subscribe_allow.iter().any(|s| s.contains("presence")),
@@ -293,9 +323,10 @@ mod tests {
     #[test]
     fn merge_concatenates_and_prefers_first_allow_responses() {
         let own = fp(b"device-mixed");
+        let own_nats_fp = fp(b"nats-mixed");
         let full_h = fp(b"host-full");
         let connect_h = fp(b"host-connect-only");
-        let merged = client_member_permissions(own, &[full_h])
+        let merged = client_member_permissions(own, own_nats_fp, &[full_h])
             .merge(client_connect_only_permissions(own, &[connect_h]));
         assert!(merged
             .publish_allow

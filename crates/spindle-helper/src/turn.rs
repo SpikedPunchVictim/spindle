@@ -1,50 +1,43 @@
-//! TURN credential minting (`helper.turn.get`, DESIGN.md §A5 "request/reply TURN credentials
-//! (helper authorizes via the session record...)", §A8 "coturn `use-auth-secret`, `username =
-//! expiry:device_fp`; quota enforced by the helper per `root_fp`").
+//! TURN credential minting (`helper.turn.get.<nfp>`, DESIGN.md §A5 subject table + "Permissions
+//! issued by callout", v0.9.7/A12 #45).
 //!
-//! # Wire-schema gap, documented rather than silently resolved
-//! DESIGN.md defines *that* `helper.turn.get` is a request/reply subject and *how* the helper
-//! authorizes it ("via the session record"), but — like the `auth_token` CONNECT envelope
-//! ([`crate::auth_token`]'s own module docs) and the session-record ambiguities
-//! ([`crate::session`]'s doc comment) — it defines no field-level shape for the request or reply
-//! payload. This module invents one, following the same base64url-CBOR-free, plain-JSON style
-//! already used for the NATS-JWT claims this crate builds elsewhere (`natsjwt.rs`):
+//! # Identity source: the subject token, not the payload [v0.9.7]
+//! Prior to v0.9.7, this subject was the bare `helper.turn.get`, and the caller declared its own
+//! `nats_fp` inside the JSON request body — a quota-griefing gap (DESIGN.md §A12 #45): core NATS
+//! pub/sub gives a subscriber no notion of which authenticated connection published a message, so
+//! nothing stopped an authenticated device from asserting someone *else's* `nats_fp` and burning
+//! that victim's TURN quota. DESIGN.md §A5 closes this the same way it already scopes
+//! `registry.revoke.<hfp>`: parametrize the subject itself as `helper.turn.get.<nfp>`, where
+//! `<nfp>` is the caller's session-nkey fingerprint. The callout only ever grants a connection
+//! `pub helper.turn.get.<own_nats_fp>` for its *own* `nats_fp` (see
+//! `permissions::client_member_permissions`), so NATS's own permission system — not this
+//! payload — proves the caller's identity: by the time a message reaches this handler, the
+//! subject it arrived on is the one fact about the caller's identity that cannot have been
+//! forged. [`handle_turn_get`] therefore takes the subject as a parameter and parses `<nfp>` out
+//! of it; the request body carries no identity field at all.
 //!
+//! Wire schema (v0.9.7):
 //! ```text
-//! request:  { "nats_fp": "<32 bytes, base64url no-pad>" }
-//! reply ok: { "username": "<exp>:<root_fp base32>", "credential": "<base64>", "ttl": <secs>,
-//!             "uris": ["turn:host:3478?transport=udp", ...] }
+//! subject:   helper.turn.get.<nfp>            (nfp = base32(session nkey fingerprint), same
+//!                                               Display encoding as every other <...fp> subject
+//!                                               token — see permissions.rs's module doc)
+//! request:   {}  (or an empty body — no fields are read; unknown fields are ignored)
+//! reply ok:  { "username": "<exp>:<root_fp base32>", "credential": "<base64>", "ttl": <secs>,
+//!              "uris": ["turn:host:3478?transport=udp", ...] }
 //! reply err: { "error": "<human-readable reason>" }
 //! ```
+//! `src/bin/helper.rs` subscribes `helper.turn.get.*` and passes both the received `msg.subject`
+//! and `msg.payload` into [`handle_turn_get`]; this module stays NATS-free (no `async-nats` type
+//! appears in its signature) so it can be unit-tested without a broker.
 //!
-//! **Two more gaps this shape papers over, flagged for the coordinator**:
-//! 1. **No cryptographic binding between the request payload and the connection that sent it.**
-//!    Core NATS pub/sub gives a subscriber no notion of which authenticated connection published
-//!    a message — unlike `host.<hfp>.connect`, which carries the caller's `from_fp` inside an
-//!    A7-verified, signed envelope, DESIGN.md's subject table shows `helper.turn.get` with no
-//!    envelope and no per-caller subject suffix (contrast `host.<h>.sess.<own_device_fp>.*.c2h`,
-//!    where the *subject itself*, not the payload, is what NATS permissions bind to the caller's
-//!    own fingerprint). Absent either of those two existing patterns, a caller can only *assert*
-//!    which `nats_fp` it is in the payload; the helper cannot verify the assertion. The
-//!    consequence is bounded, not a confidentiality break: an authenticated device presenting a
-//!    fabricated `nats_fp` can only cause the *named* session's TURN-quota counter to be
-//!    consumed (an availability/quota-griefing surface, not credential theft — a reply is
-//!    delivered to whatever `reply` subject the *attacker's own request* carried, but it is
-//!    minted under the *victim's* session's `root_fp`, so the attacker only harms the victim's
-//!    quota, not itself gain anything address). This is a genuine residual gap worth a real fix
-//!    (e.g. parametrizing the subject as `helper.turn.get.<own_device_fp>` the same way
-//!    `host.<h>.sess.<own>.*.c2h` is, so NATS's own permission system — not this payload — proves
-//!    the caller's identity) — deliberately not made here since it would change
-//!    `permissions.rs`'s byte-exact, DESIGN.md-table-matching subject strings, which is exactly
-//!    the kind of design question this task brief asks to report rather than unilaterally
-//!    resolve.
-//! 2. **`username = expiry:device_fp` cannot be honored literally.** [`crate::session::
-//!    SessionRecord`] (as `authz.rs`/`session.rs` define it) carries `root_fp`, not `device_fp`,
-//!    for client connections (see that module's own doc comment on why). This module mints
-//!    `username = expiry:root_fp` instead — consistent with the per-`root_fp` quota model DESIGN.md
-//!    §A8 itself uses ("device keys are free to mint" — the quota that matters is per-root, not
-//!    per-device) and harmless to coturn (which treats the whole username as an opaque HMAC
-//!    input, never decoding it), but it is a real divergence from the literal spec text.
+//! **`username = expiry:root_fp` [amended v0.9.7]**: [`crate::session::SessionRecord`] (as
+//! `authz.rs`/`session.rs` define it) carries `root_fp`, not `device_fp`, for client connections
+//! (see that module's own doc comment on why). DESIGN.md §A8 now states the username as
+//! `expiry:root_fp` directly — this is no longer a divergence this module has to paper over, it
+//! is the session record's caller identity, and it matches the per-`root_fp` quota model DESIGN.md
+//! §A8 itself uses ("device keys are free to mint" — the quota that matters is per-root, not
+//! per-device). coturn treats the whole username as an opaque HMAC input and never decodes it, so
+//! this was always harmless; it is now also spec-correct.
 
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -69,10 +62,17 @@ pub struct TurnConfig {
     pub monthly_quota: u64,
 }
 
+/// The `helper.turn.get.` subject prefix; `<nfp>` follows it as the final subject token.
+const SUBJECT_PREFIX: &str = "helper.turn.get.";
+
+/// The (now-empty) request body. No fields are read — caller identity comes from the subject
+/// (see the module doc) — but the type still exists so `{}` / unknown-fields tolerance is a
+/// documented, tested contract rather than an accident of `serde_json::from_slice::<Value>`.
+/// Deliberately *not* `#[serde(deny_unknown_fields)]`: an unrecognized field (e.g. a lingering
+/// client still sending the old `nats_fp`) must be ignored, not rejected — this is serde's
+/// default struct behavior, stated here explicitly rather than left implicit.
 #[derive(Debug, Deserialize)]
-struct TurnGetRequest {
-    nats_fp: String,
-}
+struct TurnGetRequest {}
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnGetReply {
@@ -124,21 +124,38 @@ pub fn mint_credentials(secret: &str, label: &str, expiry: u64) -> (String, Stri
     (username, credential)
 }
 
-/// Decodes and authorizes one `helper.turn.get` request, enforcing the per-`root_fp` quota and
-/// minting credentials on success. Pure with respect to NATS — takes the raw request payload
-/// bytes and returns the JSON reply payload bytes to publish back; `src/bin/helper.rs` is the only
-/// caller that touches an actual NATS connection.
+/// Parses the caller's `nats_fp` out of a `helper.turn.get.<nfp>` subject. Rejects anything that
+/// doesn't start with the exact `helper.turn.get.` prefix, has an empty token after it, or whose
+/// token doesn't decode as a [`Fingerprint`] under the same base32 `Display` encoding every other
+/// `<...fp>` subject token uses (DESIGN.md §A5; see `permissions.rs`'s module doc).
+fn parse_subject_nats_fp(subject: &str) -> Option<Fingerprint> {
+    let token = subject.strip_prefix(SUBJECT_PREFIX)?;
+    if token.is_empty() {
+        return None;
+    }
+    token.parse::<Fingerprint>().ok()
+}
+
+/// Decodes and authorizes one `helper.turn.get.<nfp>` request, enforcing the per-`root_fp` quota
+/// and minting credentials on success. Pure with respect to NATS — takes the subject the request
+/// arrived on and the raw request payload bytes, and returns the JSON reply payload bytes to
+/// publish back; `src/bin/helper.rs` is the only caller that touches an actual NATS connection.
+///
+/// Caller identity comes from `subject` alone (the callout-granted permission already proved this
+/// connection owns that `nats_fp` — see the module doc); `payload` carries no identity field.
 pub fn handle_turn_get(
+    subject: &str,
     payload: &[u8],
     config: Option<&TurnConfig>,
     view: &mut impl HelperView,
     now: u64,
 ) -> Vec<u8> {
-    let reply = handle_turn_get_inner(payload, config, view, now);
+    let reply = handle_turn_get_inner(subject, payload, config, view, now);
     serde_json::to_vec(&reply).expect("TurnGetReply always serializes")
 }
 
 fn handle_turn_get_inner(
+    subject: &str,
     payload: &[u8],
     config: Option<&TurnConfig>,
     view: &mut impl HelperView,
@@ -148,16 +165,16 @@ fn handle_turn_get_inner(
         return TurnGetReply::err("TURN not configured");
     };
 
-    let Ok(req) = serde_json::from_slice::<TurnGetRequest>(payload) else {
-        return TurnGetReply::err("malformed request");
+    let Some(nats_fp) = parse_subject_nats_fp(subject) else {
+        return TurnGetReply::err("malformed subject");
     };
-    let Ok(nats_fp_raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&req.nats_fp)
-    else {
+
+    // The body carries no identity and (as of v0.9.7) no other required field either — empty and
+    // `{}` are both valid. An unparseable *non-empty* body is still rejected, though: a caller
+    // sending garbage there is a bug worth surfacing loudly rather than silently ignoring.
+    if !payload.is_empty() && serde_json::from_slice::<TurnGetRequest>(payload).is_err() {
         return TurnGetReply::err("malformed request");
-    };
-    let Ok(nats_fp) = Fingerprint::from_slice(&nats_fp_raw) else {
-        return TurnGetReply::err("malformed request");
-    };
+    }
 
     let Some(session) = view.session_record(&nats_fp, now) else {
         return TurnGetReply::err("no active session");
@@ -194,9 +211,8 @@ mod tests {
         )
     }
 
-    fn request_payload(nats_fp: &Fingerprint) -> Vec<u8> {
-        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nats_fp.as_bytes());
-        serde_json::to_vec(&serde_json::json!({ "nats_fp": b64 })).unwrap()
+    fn subject_for(nats_fp: &Fingerprint) -> String {
+        format!("helper.turn.get.{nats_fp}")
     }
 
     // ---- mint_credentials: known vectors (independent oracle: `openssl dgst -sha1 -hmac`) -------
@@ -237,16 +253,113 @@ mod tests {
         assert_eq!(username, "1700000000:some-label");
     }
 
+    // ---- parse_subject_nats_fp -------------------------------------------------------------------
+
+    #[test]
+    fn parse_subject_round_trips_a_fingerprint() {
+        let nats_fp = fp(b"nats-subject-parse");
+        assert_eq!(
+            parse_subject_nats_fp(&subject_for(&nats_fp)),
+            Some(nats_fp)
+        );
+    }
+
+    #[test]
+    fn parse_subject_rejects_wrong_prefix() {
+        let nats_fp = fp(b"nats-wrong-prefix");
+        assert_eq!(
+            parse_subject_nats_fp(&format!("helper.turn.gett.{nats_fp}")),
+            None
+        );
+        assert_eq!(parse_subject_nats_fp("helper.turn.get"), None);
+        assert_eq!(
+            parse_subject_nats_fp(&format!("registry.revoke.{nats_fp}")),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_subject_rejects_empty_token() {
+        assert_eq!(parse_subject_nats_fp("helper.turn.get."), None);
+    }
+
+    #[test]
+    fn parse_subject_rejects_a_token_that_does_not_decode_as_a_fingerprint() {
+        assert_eq!(
+            parse_subject_nats_fp("helper.turn.get.not-a-fingerprint!!"),
+            None
+        );
+        // Valid base32 alphabet, but the wrong decoded length.
+        assert_eq!(parse_subject_nats_fp("helper.turn.get.my"), None);
+    }
+
     // ---- handle_turn_get: authorization / quota / config paths -----------------------------------
 
     #[test]
     fn unconfigured_turn_replies_with_a_clear_error() {
         let mut s = store();
         let nats_fp = fp(b"nats-a");
-        let reply_bytes = handle_turn_get(&request_payload(&nats_fp), None, &mut s, 1_000);
+        let reply_bytes = handle_turn_get(&subject_for(&nats_fp), b"", None, &mut s, 1_000);
         let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
         assert_eq!(reply.error.as_deref(), Some("TURN not configured"));
         assert!(reply.username.is_none());
+    }
+
+    #[test]
+    fn malformed_subject_is_refused_before_config_is_even_consulted() {
+        // Config is present (Some) here specifically to prove the subject check happens first
+        // and independently of TURN configuration state.
+        let mut s = store();
+        let config = TurnConfig {
+            secret: "s".to_string(),
+            uris: vec![],
+            ttl_secs: 60,
+            monthly_quota: 10,
+        };
+        let reply_bytes = handle_turn_get("helper.turn.get", b"", Some(&config), &mut s, 1_000);
+        let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
+        assert_eq!(reply.error.as_deref(), Some("malformed subject"));
+    }
+
+    #[test]
+    fn wrong_prefix_subject_is_refused_as_malformed() {
+        let mut s = store();
+        let config = TurnConfig {
+            secret: "s".to_string(),
+            uris: vec![],
+            ttl_secs: 60,
+            monthly_quota: 10,
+        };
+        let nats_fp = fp(b"nats-wrong-prefix-2");
+        let reply_bytes = handle_turn_get(
+            &format!("registry.revoke.{nats_fp}"),
+            b"",
+            Some(&config),
+            &mut s,
+            1_000,
+        );
+        let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
+        assert_eq!(reply.error.as_deref(), Some("malformed subject"));
+    }
+
+    #[test]
+    fn bad_fingerprint_token_in_subject_is_refused_as_malformed() {
+        let mut s = store();
+        let config = TurnConfig {
+            secret: "s".to_string(),
+            uris: vec![],
+            ttl_secs: 60,
+            monthly_quota: 10,
+        };
+        let reply_bytes = handle_turn_get(
+            "helper.turn.get.not-a-real-fingerprint",
+            b"",
+            Some(&config),
+            &mut s,
+            1_000,
+        );
+        let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
+        assert_eq!(reply.error.as_deref(), Some("malformed subject"));
     }
 
     #[test]
@@ -259,7 +372,37 @@ mod tests {
             monthly_quota: 10,
         };
         let nats_fp = fp(b"nats-no-session");
-        let reply_bytes = handle_turn_get(&request_payload(&nats_fp), Some(&config), &mut s, 1_000);
+        let reply_bytes = handle_turn_get(&subject_for(&nats_fp), b"", Some(&config), &mut s, 1_000);
+        let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
+        assert_eq!(reply.error.as_deref(), Some("no active session"));
+    }
+
+    #[test]
+    fn a_subject_fp_with_no_matching_session_record_is_refused_even_if_other_sessions_exist() {
+        // Proves lookup is keyed by the *subject's* fp, not merely "some session exists somewhere".
+        let mut s = store();
+        let unrelated_nats_fp = fp(b"nats-unrelated-session");
+        s.put_session_record(SessionRecord::new(
+            unrelated_nats_fp,
+            fp(b"root-unrelated"),
+            vec![],
+            "member".to_string(),
+            10_000,
+        ));
+        let config = TurnConfig {
+            secret: "s".to_string(),
+            uris: vec![],
+            ttl_secs: 60,
+            monthly_quota: 10,
+        };
+        let caller_nats_fp = fp(b"nats-caller-with-no-session");
+        let reply_bytes = handle_turn_get(
+            &subject_for(&caller_nats_fp),
+            b"",
+            Some(&config),
+            &mut s,
+            1_000,
+        );
         let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
         assert_eq!(reply.error.as_deref(), Some("no active session"));
     }
@@ -286,7 +429,7 @@ mod tests {
             monthly_quota: 10,
         };
         let now = 1_000;
-        let reply_bytes = handle_turn_get(&request_payload(&nats_fp), Some(&config), &mut s, now);
+        let reply_bytes = handle_turn_get(&subject_for(&nats_fp), b"", Some(&config), &mut s, now);
         let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
         assert!(reply.error.is_none());
         assert_eq!(reply.ttl, Some(1_800));
@@ -295,6 +438,90 @@ mod tests {
         assert_eq!(username, format!("{}:{}", now + 1_800, root_fp));
         let expected_credential = mint_credentials(&config.secret, &root_fp.to_string(), now + 1_800).1;
         assert_eq!(reply.credential, Some(expected_credential));
+    }
+
+    #[test]
+    fn empty_body_is_accepted() {
+        let mut s = store();
+        let nats_fp = fp(b"nats-empty-body");
+        let root_fp = fp(b"root-empty-body");
+        s.put_session_record(SessionRecord::new(
+            nats_fp,
+            root_fp,
+            vec![],
+            "member".to_string(),
+            10_000,
+        ));
+        let config = TurnConfig {
+            secret: "s".to_string(),
+            uris: vec![],
+            ttl_secs: 60,
+            monthly_quota: 10,
+        };
+        let reply_bytes = handle_turn_get(&subject_for(&nats_fp), b"", Some(&config), &mut s, 1_000);
+        let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
+        assert!(reply.error.is_none(), "empty body must be accepted: {reply:?}");
+    }
+
+    #[test]
+    fn empty_json_object_body_is_accepted() {
+        let mut s = store();
+        let nats_fp = fp(b"nats-empty-object-body");
+        let root_fp = fp(b"root-empty-object-body");
+        s.put_session_record(SessionRecord::new(
+            nats_fp,
+            root_fp,
+            vec![],
+            "member".to_string(),
+            10_000,
+        ));
+        let config = TurnConfig {
+            secret: "s".to_string(),
+            uris: vec![],
+            ttl_secs: 60,
+            monthly_quota: 10,
+        };
+        let reply_bytes =
+            handle_turn_get(&subject_for(&nats_fp), b"{}", Some(&config), &mut s, 1_000);
+        let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
+        assert!(reply.error.is_none(), "`{{}}` body must be accepted: {reply:?}");
+    }
+
+    #[test]
+    fn unknown_fields_in_body_are_ignored() {
+        let mut s = store();
+        let nats_fp = fp(b"nats-unknown-fields");
+        let root_fp = fp(b"root-unknown-fields");
+        s.put_session_record(SessionRecord::new(
+            nats_fp,
+            root_fp,
+            vec![],
+            "member".to_string(),
+            10_000,
+        ));
+        let config = TurnConfig {
+            secret: "s".to_string(),
+            uris: vec![],
+            ttl_secs: 60,
+            monthly_quota: 10,
+        };
+        // Also proves the payload's own (now-vestigial) "nats_fp" field, even naming a *different*
+        // fingerprint than the subject, is fully ignored: identity comes from the subject alone.
+        let attacker_claimed_fp = fp(b"attacker-claims-this-fp-in-body");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "nats_fp": attacker_claimed_fp.to_string(),
+            "something_else": 42,
+        }))
+        .unwrap();
+        let reply_bytes = handle_turn_get(&subject_for(&nats_fp), &body, Some(&config), &mut s, 1_000);
+        let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
+        assert!(reply.error.is_none(), "unknown fields must be ignored: {reply:?}");
+        let username = reply.username.expect("username present");
+        assert_eq!(
+            username,
+            format!("{}:{}", 1_000 + config.ttl_secs, root_fp),
+            "credential must be minted for the subject's session, never the body's claimed fp"
+        );
     }
 
     #[test]
@@ -315,12 +542,12 @@ mod tests {
             ttl_secs: 60,
             monthly_quota: 1,
         };
-        let payload = request_payload(&nats_fp);
-        let first = handle_turn_get(&payload, Some(&config), &mut s, 1_000);
+        let subject = subject_for(&nats_fp);
+        let first = handle_turn_get(&subject, b"", Some(&config), &mut s, 1_000);
         let first_reply: TurnGetReply = serde_json::from_slice(&first).unwrap();
         assert!(first_reply.error.is_none(), "first mint must be admitted");
 
-        let second = handle_turn_get(&payload, Some(&config), &mut s, 1_000);
+        let second = handle_turn_get(&subject, b"", Some(&config), &mut s, 1_000);
         let second_reply: TurnGetReply = serde_json::from_slice(&second).unwrap();
         assert_eq!(second_reply.error.as_deref(), Some("TURN quota exceeded"));
     }
@@ -342,13 +569,15 @@ mod tests {
             ttl_secs: 60,
             monthly_quota: 10,
         };
-        let reply_bytes = handle_turn_get(&request_payload(&nats_fp), Some(&config), &mut s, 1_000);
+        let reply_bytes = handle_turn_get(&subject_for(&nats_fp), b"", Some(&config), &mut s, 1_000);
         let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
         assert_eq!(reply.error.as_deref(), Some("no active session"));
     }
 
     #[test]
-    fn malformed_request_payload_is_refused() {
+    fn malformed_non_empty_request_payload_is_still_refused() {
+        // Empty / `{}` bodies are valid (identity lives in the subject now), but a non-empty body
+        // that isn't even parseable JSON is kept strict rather than silently ignored.
         let mut s = store();
         let config = TurnConfig {
             secret: "s".to_string(),
@@ -356,7 +585,14 @@ mod tests {
             ttl_secs: 60,
             monthly_quota: 10,
         };
-        let reply_bytes = handle_turn_get(b"not json", Some(&config), &mut s, 1_000);
+        let nats_fp = fp(b"nats-malformed-body");
+        let reply_bytes = handle_turn_get(
+            &subject_for(&nats_fp),
+            b"not json",
+            Some(&config),
+            &mut s,
+            1_000,
+        );
         let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
         assert_eq!(reply.error.as_deref(), Some("malformed request"));
     }

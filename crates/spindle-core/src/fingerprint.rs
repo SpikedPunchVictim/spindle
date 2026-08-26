@@ -7,6 +7,7 @@
 use crate::base32;
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::str::FromStr;
 use thiserror::Error;
 
 /// Every Spindle fingerprint is a SHA-256 digest: 32 bytes.
@@ -21,6 +22,11 @@ pub struct Fingerprint([u8; FINGERPRINT_LEN]);
 pub enum FingerprintError {
     #[error("fingerprint must be exactly {FINGERPRINT_LEN} bytes, got {0}")]
     WrongLength(usize),
+    /// The string wasn't valid lowercase RFC 4648 base32 (no padding) — see
+    /// [`Fingerprint::from_str`] / DESIGN.md §A5 `helper.turn.get.<nfp>` (v0.9.7, A12 #45), the
+    /// first place a fingerprint's string form must be parsed back rather than only displayed.
+    #[error("invalid base32 fingerprint encoding")]
+    InvalidEncoding,
 }
 
 impl Fingerprint {
@@ -74,6 +80,19 @@ impl fmt::Debug for Fingerprint {
     }
 }
 
+/// Parses the exact inverse of [`Display`](fmt::Display): lowercase, unpadded RFC 4648 base32.
+/// Used to recover a fingerprint from a NATS subject token (e.g. the `<nfp>` in
+/// `helper.turn.get.<nfp>`, DESIGN.md §A5 v0.9.7) — the one place this crate round-trips the
+/// display encoding instead of only producing it.
+impl FromStr for Fingerprint {
+    type Err = FingerprintError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = base32::decode_no_pad(s).map_err(|_| FingerprintError::InvalidEncoding)?;
+        Self::from_slice(&bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +106,31 @@ mod tests {
         assert_eq!(
             Fingerprint::from_slice(&[0u8; 33]).unwrap_err(),
             FingerprintError::WrongLength(33)
+        );
+    }
+
+    #[test]
+    fn display_then_parse_round_trips() {
+        let fp = Fingerprint::of_parts(&[b"subject-token-round-trip"]);
+        let s = fp.to_string();
+        let parsed: Fingerprint = s.parse().expect("parse");
+        assert_eq!(parsed, fp);
+    }
+
+    #[test]
+    fn from_str_rejects_invalid_base32() {
+        assert_eq!(
+            "not valid base32!!".parse::<Fingerprint>().unwrap_err(),
+            FingerprintError::InvalidEncoding
+        );
+    }
+
+    #[test]
+    fn from_str_rejects_wrong_decoded_length() {
+        // Valid base32 alphabet, but far too short to decode to 32 bytes.
+        assert_eq!(
+            "my".parse::<Fingerprint>().unwrap_err(),
+            FingerprintError::WrongLength(1)
         );
     }
 

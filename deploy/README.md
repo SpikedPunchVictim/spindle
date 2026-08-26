@@ -26,8 +26,10 @@ spikes (`spikes/`) run against.
   `HelperView` (embedded migrations run automatically at startup; the container fails fast with a
   descriptive error if Postgres is unreachable or a migration fails). Holds the two NATS
   connections DESIGN.md §A5 / ADR-002 describe (callout/system + application); the application
-  connection now actively answers `helper.turn.get` (TURN credential minting, quota-limited per
-  `root_fp` via `TURN_MONTHLY_QUOTA`).
+  connection now actively answers `helper.turn.get.<nfp>` (TURN credential minting, quota-limited
+  per `root_fp` via `TURN_MONTHLY_QUOTA`; `<nfp>` is the caller's session-nkey fingerprint, taken
+  from the subject the callout granted rather than the request body — DESIGN.md §A5 v0.9.7,
+  A12 #45).
 
 **No-postgres dev flow**: unset `DATABASE_URL` in the `helper` service's environment block (or run
 `spindle-helper` directly, outside compose, without `DATABASE_URL`) to fall back to

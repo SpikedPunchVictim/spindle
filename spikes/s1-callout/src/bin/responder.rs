@@ -39,24 +39,43 @@ use spindle_helper::authz::{
     HostConnectPresented,
 };
 use spindle_helper::permissions::SubjectPermissions;
+use spindle_helper::session::SessionRecord;
 use std::collections::HashMap;
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Bucket width for this store's TURN-usage counter — mirrors
+/// `spindle_helper::memory_store::InMemoryHelperView`'s fixed 30-day rolling window (see that
+/// module's `record_turn_issuance` doc comment); S1 doesn't exercise TURN at all, so this constant
+/// only needs to exist to make the trait method's arithmetic well-defined.
+const TURN_PERIOD_SECS: u64 = 30 * 86_400;
 
 /// All-permissive test double: no revocations, `open` admission (a host with no prior admission
 /// record is admitted on cert alone), one fixed operator key for admission-token verification.
 /// Good enough for S1 — the admission-mode state machine itself is S16's negative-test suite, not
 /// this one (docs/SPIKES.md §S1's pass criteria don't mention admission modes).
+///
+/// `sessions`/`turn_usage` (DESIGN.md §A5/§A9b, Stage 4 slice 3) were added after S1 originally
+/// PASSed 19/19 — `HelperView` grew `put_session_record`/`session_record`/
+/// `record_turn_issuance`/`record_revocation` for the graduated store
+/// (`spindle_helper::memory_store::InMemoryHelperView`) without this spike's own copy being
+/// updated to match, which left this binary failing to compile (E0046). Implemented here at
+/// spike-appropriate fidelity — plain `HashMap`s, same semantics as the graduated store — purely
+/// so the workspace builds again; S1's actual pass criteria (docs/SPIKES.md §S1) never exercised
+/// sessions, TURN quota, or revocation, so none of this is expected to see real traffic.
 struct InMemoryHelperView {
     operator_pk: ed25519_dalek::VerifyingKey,
     revoked: HashMap<(Fingerprint, Fingerprint), bool>,
+    epochs: HashMap<Fingerprint, u64>,
     admitted: HashMap<Fingerprint, AdmissionRecord>,
     burned_nonces: HashMap<(Fingerprint, Vec<u8>), AdmissionRecord>,
+    sessions: HashMap<Fingerprint, SessionRecord>,
+    turn_usage: HashMap<(Fingerprint, u64), u64>,
 }
 
 impl HelperView for InMemoryHelperView {
-    fn revocation_epoch(&mut self, _host_fp: &Fingerprint) -> u64 {
-        0
+    fn revocation_epoch(&mut self, host_fp: &Fingerprint) -> u64 {
+        self.epochs.get(host_fp).copied().unwrap_or(0)
     }
     fn is_revoked(&mut self, host_fp: &Fingerprint, subject: &Fingerprint) -> bool {
         self.revoked
@@ -98,6 +117,43 @@ impl HelperView for InMemoryHelperView {
         self.burned_nonces.insert(key, record.clone());
         self.admitted.insert(host_fp, record.clone());
         Some(record)
+    }
+
+    fn put_session_record(&mut self, record: SessionRecord) {
+        self.sessions.insert(record.nats_fp, record);
+    }
+
+    fn session_record(&mut self, nats_fp: &Fingerprint, now: u64) -> Option<SessionRecord> {
+        self.sessions.get(nats_fp).filter(|r| r.exp > now).cloned()
+    }
+
+    fn record_turn_issuance(
+        &mut self,
+        root_fp: &Fingerprint,
+        now: u64,
+        monthly_quota: u64,
+    ) -> Result<u64, u64> {
+        let period = now / TURN_PERIOD_SECS;
+        let count = self.turn_usage.entry((*root_fp, period)).or_insert(0);
+        if *count >= monthly_quota {
+            Err(*count)
+        } else {
+            *count += 1;
+            Ok(*count)
+        }
+    }
+
+    fn record_revocation(
+        &mut self,
+        host_fp: Fingerprint,
+        epoch: u64,
+        revoked_subjects: &[Fingerprint],
+    ) {
+        let entry = self.epochs.entry(host_fp).or_insert(0);
+        *entry = (*entry).max(epoch);
+        for subject in revoked_subjects {
+            self.revoked.insert((host_fp, *subject), true);
+        }
     }
 }
 
@@ -152,8 +208,11 @@ async fn main() -> anyhow::Result<()> {
     let mut view = InMemoryHelperView {
         operator_pk,
         revoked: HashMap::new(),
+        epochs: HashMap::new(),
         admitted: HashMap::new(),
         burned_nonces: HashMap::new(),
+        sessions: HashMap::new(),
+        turn_usage: HashMap::new(),
     };
 
     let client = async_nats::ConnectOptions::with_nkey(callout_seed)

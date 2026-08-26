@@ -88,10 +88,10 @@ struct Config {
     /// Postgres connection string (Stage 4 slice 3). Set → `PgStore` (durable, migrations run at
     /// startup, fail fast if unreachable). Unset → `InMemoryHelperView` (ephemeral, dev/demo).
     database_url: Option<String>,
-    /// coturn's `static-auth-secret` (DESIGN.md §A8). Unset → `helper.turn.get` replies with a
-    /// clear "TURN not configured" error instead of minting anything.
+    /// coturn's `static-auth-secret` (DESIGN.md §A8). Unset → `helper.turn.get.<nfp>` replies
+    /// with a clear "TURN not configured" error instead of minting anything.
     turn_secret: Option<String>,
-    /// Comma-separated ICE server URIs handed back verbatim in `helper.turn.get` replies.
+    /// Comma-separated ICE server URIs handed back verbatim in `helper.turn.get.<nfp>` replies.
     turn_uris: Vec<String>,
     turn_ttl_secs: u64,
     turn_monthly_quota: u64,
@@ -129,7 +129,7 @@ Every flag has an env-var equivalent (flags override the env var if both are set
     --operator-seed <seed>      OPERATOR_SEED        (optional; dev-only fallback key if unset)
     --admission-mode <mode>     ADMISSION_MODE       (open|invite|closed; default: open)
     --database-url <url>        DATABASE_URL         (optional; Postgres — unset uses the in-memory store)
-    --turn-secret <secret>      TURN_SECRET          (optional; unset refuses helper.turn.get requests)
+    --turn-secret <secret>      TURN_SECRET          (optional; unset refuses helper.turn.get.<nfp> requests)
     --turn-uris <a,b,...>       TURN_URIS            (comma-separated; default: empty)
     --turn-ttl-secs <n>         TURN_TTL_SECS         (default: 3600)
     --turn-monthly-quota <n>    TURN_MONTHLY_QUOTA    (default: 1000)
@@ -434,7 +434,7 @@ impl HelperView for Store {
 
 /// Waits on `sub` if present, otherwise never resolves — lets an optional `async_nats::Subscriber`
 /// sit as a `tokio::select!` branch that simply never fires when the application connection (and
-/// therefore `helper.turn.get`) isn't configured (`APP_CONN_SEED` unset).
+/// therefore `helper.turn.get.<nfp>`) isn't configured (`APP_CONN_SEED` unset).
 async fn next_or_pending(sub: &mut Option<async_nats::Subscriber>) -> Option<async_nats::Message> {
     match sub {
         Some(s) => s.next().await,
@@ -470,7 +470,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     // The application-account connection (DESIGN.md §A5's two-connection bridging — see this
     // file's module docs). Optional in this slice's callout wiring, but Stage 4 slice 3's
-    // `helper.turn.get` handling needs it — see the `turn_sub` subscription below.
+    // `helper.turn.get.<nfp>` handling needs it — see the `turn_sub` subscription below.
     let app_client = match &config.app_conn_seed {
         Some(seed) => {
             let client = async_nats::ConnectOptions::with_nkey(seed.clone())
@@ -481,15 +481,20 @@ async fn run(config: Config) -> anyhow::Result<()> {
         }
         None => {
             tracing::warn!(
-                "APP_CONN_SEED not set — running with the callout connection only; helper.turn.get \
+                "APP_CONN_SEED not set — running with the callout connection only; helper.turn.get.<nfp> \
                  and future presence/registry work will need it"
             );
             None
         }
     };
 
+    // `helper.turn.get.*` — DESIGN.md §A5 v0.9.7 (A12 #45): the subject is parametrized by the
+    // caller's own `nats_fp` (the callout only ever grants `pub helper.turn.get.<own_nats_fp>`,
+    // see `permissions::client_member_permissions`), so this subscription wildcards the final
+    // token and `handle_turn_get` recovers `<nfp>` from `msg.subject` itself, never from the
+    // payload.
     let mut turn_sub: Option<async_nats::Subscriber> = match &app_client {
-        Some(client) => Some(client.subscribe("helper.turn.get").await?),
+        Some(client) => Some(client.subscribe("helper.turn.get.*").await?),
         None => None,
     };
 
@@ -502,7 +507,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         }),
         None => {
             tracing::warn!(
-                "TURN_SECRET not set — helper.turn.get will refuse every request with \
+                "TURN_SECRET not set — helper.turn.get.<nfp> will refuse every request with \
                  'TURN not configured'"
             );
             None
@@ -571,17 +576,23 @@ async fn run(config: Config) -> anyhow::Result<()> {
             }
             msg = next_or_pending(&mut turn_sub) => {
                 let Some(msg) = msg else {
-                    tracing::warn!("helper.turn.get subscription ended unexpectedly");
+                    tracing::warn!("helper.turn.get.* subscription ended unexpectedly");
                     turn_sub = None;
                     continue;
                 };
                 let Some(reply) = msg.reply.clone() else {
                     continue;
                 };
-                let reply_payload = turn::handle_turn_get(&msg.payload, turn_config.as_ref(), &mut store, now_secs());
+                let reply_payload = turn::handle_turn_get(
+                    msg.subject.as_str(),
+                    &msg.payload,
+                    turn_config.as_ref(),
+                    &mut store,
+                    now_secs(),
+                );
                 if let Some(client) = &app_client {
                     if let Err(e) = client.publish(reply, reply_payload.into()).await {
-                        tracing::error!(error = %e, "failed to publish helper.turn.get response");
+                        tracing::error!(error = %e, "failed to publish helper.turn.get.<nfp> response");
                     }
                     let _ = client.flush().await;
                 }
@@ -786,7 +797,7 @@ fn handle_one(
                     // {root_fp, host_fps, quota_profile, exp} to the helper store" — Stage 4
                     // slice 2 computed this record but never persisted it (see
                     // HelperView::put_session_record's doc comment). Stage 4 slice 3's
-                    // helper.turn.get needs it to authorize non-callout requests.
+                    // helper.turn.get.<nfp> needs it to authorize non-callout requests.
                     view.put_session_record(auth.session_record);
                     Ok(respond_ok(auth.permissions, auth.limits, host_count))
                 }

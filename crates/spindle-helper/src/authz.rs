@@ -211,8 +211,8 @@ pub trait HelperView {
     // was also no store method to write a revocation epoch/subject at all (only the read side,
     // above, existed) despite DESIGN.md §A9b listing revocation epochs among the leader's writes.
     // This is not a redesign of the existing (read) methods above — it is filling in write/lookup
-    // methods the trait needed all along for `helper.turn.get` (this slice) and `registry.revoke.
-    // <hfp>` (a still-unwired later slice) to have anything to call.
+    // methods the trait needed all along for `helper.turn.get.<nfp>` (this slice) and `registry.
+    // revoke.<hfp>` (a still-unwired later slice) to have anything to call.
     // ============================================================================================
 
     /// Writes (or overwrites) the session record for `record.nats_fp` (DESIGN.md §A5). Upsert
@@ -409,13 +409,21 @@ pub fn decide_device_connect(
     }
 
     let permissions = match (full_hosts.is_empty(), connect_only_hosts.is_empty()) {
-        (false, true) => permissions::client_member_permissions(device_fp, &full_hosts),
+        (false, true) => {
+            permissions::client_member_permissions(device_fp, presented.nats_fp, &full_hosts)
+        }
         (true, false) => {
             permissions::client_connect_only_permissions(device_fp, &connect_only_hosts)
         }
-        (false, false) => permissions::client_member_permissions(device_fp, &full_hosts).merge(
-            permissions::client_connect_only_permissions(device_fp, &connect_only_hosts),
-        ),
+        (false, false) => permissions::client_member_permissions(
+            device_fp,
+            presented.nats_fp,
+            &full_hosts,
+        )
+        .merge(permissions::client_connect_only_permissions(
+            device_fp,
+            &connect_only_hosts,
+        )),
         (true, true) => unreachable!("checked above"),
     };
 
@@ -965,11 +973,12 @@ mod tests {
         let host = test_host([0x11; 32], [0x12; 32]);
         let host_fp = host.host_fp;
         let cap = member_cap(&host, root_fp, 0, 2_000_000);
+        let nats_fp = fp(b"nats-session");
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,
             caps: vec![cap],
-            nats_fp: fp(b"nats-session"),
+            nats_fp,
         };
         let mut view = MockView::default();
         let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 42);
@@ -978,7 +987,7 @@ mod tests {
         };
         assert_eq!(
             auth.permissions,
-            permissions::client_member_permissions(device_fp, &[host_fp])
+            permissions::client_member_permissions(device_fp, nats_fp, &[host_fp])
         );
         assert_eq!(
             auth.limits.max_subscriptions,
@@ -1001,20 +1010,23 @@ mod tests {
         let stale_host = host_b.host_fp;
         let full_cap = member_cap(&host_a, root_fp, 0, 2_000_000);
         let stale_cap = member_cap(&host_b, root_fp, 0, 1_000); // expired -> connect-only
+        let nats_fp = fp(b"nats-session");
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,
             caps: vec![full_cap, stale_cap],
-            nats_fp: fp(b"nats-session"),
+            nats_fp,
         };
         let mut view = MockView::default();
         let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
         let AuthzDecision::Authorized(auth) = decision else {
             panic!("expected authorization, got {decision:?}");
         };
-        let expected = permissions::client_member_permissions(device_fp, &[full_host]).merge(
-            permissions::client_connect_only_permissions(device_fp, &[stale_host]),
-        );
+        let expected = permissions::client_member_permissions(device_fp, nats_fp, &[full_host])
+            .merge(permissions::client_connect_only_permissions(
+                device_fp,
+                &[stale_host],
+            ));
         assert_eq!(auth.permissions, expected);
     }
 

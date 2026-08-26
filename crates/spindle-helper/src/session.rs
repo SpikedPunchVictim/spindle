@@ -1,6 +1,6 @@
 //! The callout's session record (DESIGN.md §A5): `nats_fp → {root_fp, host_fps, quota_profile,
 //! exp}`, written on every successful auth so the helper can authorize the non-callout requests
-//! (`helper.presence.get`, `helper.turn.get`) that a live connection makes later. This module
+//! (`helper.presence.get`, `helper.turn.get.<nfp>`) that a live connection makes later. This module
 //! defines only the plain data type and its constructor — durable storage (the keyed `nats_fp →
 //! ...` map itself) is a [`crate::authz::HelperView`] concern, wired to Postgres in a later
 //! slice.

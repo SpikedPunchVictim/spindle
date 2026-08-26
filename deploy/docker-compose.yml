@@ -5,7 +5,8 @@
 # decision core, wired to a live nats-server exactly as spikes/s1-callout proved — S1 PASS,
 # 19/19, spikes/s1-callout/RESULTS.md), running in `open` admission mode with the durable
 # Postgres-backed store (spindle_helper::pg_store::PgStore) now that DATABASE_URL is set below.
-# helper.turn.get (TURN credential minting) is wired against the coturn service via TURN_SECRET.
+# helper.turn.get.<nfp> (TURN credential minting) is wired against the coturn service via
+# TURN_SECRET.
 # See deploy/README.md for the no-postgres dev flow (unset DATABASE_URL/helper's env block below
 # to fall back to the in-memory store) and for what's still deliberately deferred (TLS/local CA,
 # presence, the admin-command verifier).
