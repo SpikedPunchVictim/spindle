@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.6) + Execution Plan
+# Spindle — System Design Document (draft v0.9.7) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -12,7 +12,9 @@
 > layout & toolchain codified (A9c) — React UIs, host = single Tauri tray app, `just` + pnpm + cargo front door
 > (user decisions 2026-08-23). v0.9.6: transport split decided — QUIC (via `quinn`) for native↔native file
 > transfers, WebRTC data channels retained only where a browser peer is involved (user decisions 2026-08-24).
-> Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and the **[DEFAULT]**-flagged rows in A10.
+> v0.9.7: TURN credential request hardened — subject parametrized to `helper.turn.get.<nfp>`; username =
+> `expiry:root_fp` (2026-08-25). Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and the
+> **[DEFAULT]**-flagged rows in A10.
 
 ---
 
@@ -358,7 +360,7 @@ Photos because they're in Family") derived directly from the union model.
 | `host.<hfp>.presence` | broker helper (from `$SYS` events) | devices holding a cap for `hfp` | push deltas `{host_fp, state, last_seen}` only |
 | `helper.presence.get` | devices | broker helper | request/reply snapshot for the caller's hosts (core NATS has no retained messages) |
 | `registry.revoke.<hfp>` | host `hfp` only | broker helper | host-signed revocation/epoch records (durable; helper asserts subject token == record `host_fp`; per-host token bucket) |
-| `helper.turn.get` | authenticated devices | broker helper | request/reply TURN credentials (helper authorizes via the session record, below) |
+| `helper.turn.get.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply TURN credentials; caller identity = the subject token (callout-granted), never the payload; helper authorizes via the session record for `nfp` (below) |
 | `registry.admin.>` | operator (mTLS + operator cert) | broker helper | signed admin commands (A3b); replies via `allow_responses` |
 | `_INBOX_<dfp>.>` | host via `allow_responses` after prefix check | owning device | private inbox prefix |
 
@@ -367,10 +369,11 @@ Photos because they're in Family") derived directly from the union model.
   `allow_responses {max:1, expires:"2m"}`; explicit deny of `_INBOX.>`, `$SYS.>`, `$JS.>`.
 - Client, for each host `h` in its verified caps: `pub host.<h>.connect`, `pub host.<h>.sess.<own>.*.c2h`,
   `sub host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus `sub _INBOX_<own>.>`, `pub helper.presence.get`,
-  `pub helper.turn.get`. Invite-only and stale-cap connections get just `pub host.<h>.connect` + inbox. Max 32 hosts
+  `pub helper.turn.get.<own nfp>`. Invite-only and stale-cap connections get just `pub host.<h>.connect` + inbox. Max 32 hosts
   per connection (A10.5). **Session record**: on each successful auth the callout writes
   `nats_fp → {root_fp, host_fps, quota_profile, exp}` to the helper store, so the helper can authorize non-callout
-  requests (`helper.presence.get`, `helper.turn.get`) — cleaned up on DISCONNECT/expiry.
+  requests (`helper.presence.get`, `helper.turn.get.<nfp>` — keyed by the subject token) — cleaned up on
+  DISCONNECT/expiry.
   **Account topology (A10.15)**: one application account + system account; every cross-boundary subject
   (`$SYS.REQ.USER.AUTH`, `$SYS` events, `helper.*`, `registry.*`) gets an explicit export/import row in ADR-002's
   topology table — no implicit sharing.
@@ -508,7 +511,8 @@ discovered divergence between op-key-signed caps and the root-derived `host_fp` 
 - **Received-file policy**: attacker-supplied names → flat sanitized basename; reject separators/`..`/reserved names;
   land under the granted upload subpath (or per-member quarantine dir for owner-received files); no overwrite
   without `delete`; size caps per transfer/member/share; OS quarantine attribute; never auto-open; audit log.
-- TURN: coturn `use-auth-secret`, `username = expiry:device_fp`; quota enforced by the helper per **`root_fp`**
+- TURN: coturn `use-auth-secret`, `username = expiry:root_fp` [amended v0.9.7 — the session record's caller
+  identity; coturn only verifies the HMAC]; quota enforced by the helper per **`root_fp`**
   (device keys are free to mint); short TTLs; allocation caps.
 - Browser receive path: File System Access API where available; streaming-download fallback with a stated ceiling
   (A10.6); background-tab/sleep → resume (S7).
@@ -794,6 +798,7 @@ Docker is explicitly not the primary dev environment.
 | 42 | Revocation rollback via replayed old record / restored backup (A1/A3) | A7b max-wins epochs; host fetches epoch high-water from helper at startup |
 | 43 | Cross-host forgery/flood on shared revoke subject (A1) | A5 `registry.revoke.<hfp>` scoping + per-host bucket |
 | 44 | Admin command replay / race / audit fork (A7) | A7b per-signer seq + idempotence; single-writer audit chain (A14) |
+| 45 | TURN quota griefing via self-declared identity in `turn.get` payload (A1) | A5 subject parametrization `helper.turn.get.<nfp>` — identity from the NATS permission, not the payload |
 
 ## A13. Spikes (evidence before code) — ordered by risk
 
@@ -915,6 +920,11 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.7 (2026-08-25)** — Stage-4 slice-3 findings resolved: `helper.turn.get` parametrized to
+  `helper.turn.get.<nfp>` (closes a quota-griefing gap — payload-declared identity replaced by the
+  callout-granted subject token; A12 #45); TURN `username = expiry:root_fp` (was `device_fp`) matching the
+  session record's caller identity and the per-`root_fp` quota model. Helper implementation follow-up flagged:
+  current code still serves the un-parametrized subject.
 - **v0.9.6 (2026-08-24)** — S3 investigation closed: containerized RTT matrix vs Chrome, rtc_sctp trace diagnosis
   (dcSCTP frozen initial cwnd vs webrtc-rs; webrtc-rs sender collapse), and a Chromium↔Chromium control proving
   dcSCTP itself plateaus (~0.85 MB/s @ 50 ms) — WebRTC data channels cannot meet the A9 WAN bar. Transport split
