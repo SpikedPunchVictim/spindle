@@ -34,3 +34,6 @@ Thumbs.db
 *.log
 npm-debug.log*
 pnpm-debug.log*
+
+# Agent worktrees (session-local, never committed)
+.claude/worktrees/
