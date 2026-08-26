@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.10) + Execution Plan
+# Spindle — System Design Document (draft v0.9.11) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -16,8 +16,10 @@
 > `expiry:root_fp` (2026-08-25). v0.9.8: `helper.presence.get` likewise parametrized to `helper.presence.get.<nfp>`
 > (2026-08-26). v0.9.9: helper account bridging corrected to a three-connection model on S5's live evidence
 > (2026-08-26). v0.9.10: §A8 VFS error codes extended (+`unsupported_version`, `already_exists`, `file_changed`) from
-> slice-3 implementation evidence (2026-08-26). Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and
-> the **[DEFAULT]**-flagged rows in A10.
+> slice-3 implementation evidence (2026-08-26). v0.9.11: FreeSpaceProbe backend decided — rustix (Unix) +
+> windows-sys (Windows), both already-transitive via cap-std, promoted to direct target-scoped deps of
+> spindle-host-core (user decision 2026-08-26; A9c manifest amended). Remaining **[USER DECISION]** items: A10.6–9,
+> A10.24 (license), and the **[DEFAULT]**-flagged rows in A10.
 
 ---
 
@@ -685,7 +687,7 @@ spindle/
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
 | Encoding | hand-rolled zero-dep canonical codec in spindle-proto (strict non-canonical rejection; minicbor rejected — decoder abstracts the raw bytes) | own canonical encoder in @spindle/proto |
 | Storage | rusqlite (bundled) host-side; sqlx/Postgres helper-side | IndexedDB (caps, resume manifests) |
-| Confinement | cap-std ≥3.4.1 | — (browser sandbox) |
+| Confinement | cap-std ≥3.4.1 + rustix (unix) / windows-sys (windows) free-space probe — already-transitive, promoted direct | — (browser sandbox) |
 | OS / shell | keyring, tauri 2 + plugins (tray, autostart, single-instance, updater), qrcode | @tauri-apps/api |
 | UI | — | React, Vite, @spindle/ui |
 | CLI | — | commander |
@@ -937,6 +939,10 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.11 (2026-08-26)** — FreeSpaceProbe backend decided (user, 2026-08-26): rustix statvfs (Unix) +
+  windows-sys GetDiskFreeSpaceExW (Windows), both already-transitive via cap-std, promoted to direct
+  target-scoped deps of spindle-host-core; probe failure fails closed (reports 0 → storage_full), preserving
+  §A4b's free-space floor. A9c manifest amended.
 - **v0.9.10 (2026-08-26)** — §A8 typed VFS error codes extended to ten on Stage-6-slice-3 evidence:
   `unsupported_version` (protocol-version gate, pre-dispatch), `already_exists` (overwrite-requires-delete name
   collision), `file_changed` (TOCTOU identity-check abort / resume conflict). Wire enum in spindle-proto/vfs_rpc.rs

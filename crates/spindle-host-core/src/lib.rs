@@ -30,9 +30,8 @@
 //!   upload-session table (DESIGN.md §A8 "transfer manager"): open/resume, per-chunk offset
 //!   tracking, and TTL GC.
 //! - [`limits`] (Stage 6 slice 4) — [`limits::UploadLimits`] (per-member/per-share quotas, the
-//!   free-space floor) and the [`limits::FreeSpaceProbe`] seam — see that module's doc comment for
-//!   a documented dependency gap (real OS free-disk-space querying needs a new crate dependency
-//!   this slice did not add unilaterally).
+//!   free-space floor), the [`limits::FreeSpaceProbe`] seam, and [`limits::OsFreeSpace`], the real
+//!   OS probe (`rustix`/`windows-sys`, user decision 2026-08-26 — see that module's doc comment).
 //! - [`ratelimit`] (crate-private, Stage 6 slice 4) — [`ratelimit::RateLimiter`], the per-caller
 //!   token-bucket limiter DESIGN.md §A5 describes for pre-auth connects, adapted here to the
 //!   post-auth VFS RPC entry point.
@@ -56,8 +55,7 @@
 //! transport-agnostic and pure/testable (bytes-in/bytes-out, or typed request/typed reply —
 //! [`server::VfsRpcServer`] offers both).
 //!
-//! **Out**: binding to any real transport (`spindle-net`), and a real OS free-disk-space probe
-//! (see [`limits`]'s module doc comment).
+//! **Out**: binding to any real transport (`spindle-net`).
 
 pub mod server;
 

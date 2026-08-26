@@ -2,33 +2,33 @@
 //! share"; §A8 "Owner live operations": "host-level free-space floor that pauses uploads before
 //! the disk fills").
 //!
-//! # Free-space floor: a documented dependency gap, not silently resolved
+//! # Free-space floor: real OS probe (user decision 2026-08-26)
 //!
 //! Checking *real* available disk space requires an OS-level call (`statvfs` on Unix,
-//! `GetDiskFreeSpaceExW` on Windows) that has no stable API in `std` and is not provided by any
-//! crate already in this workspace's dependency graph (`libc`, `fs4`/`fs2`, and `sysinfo` are the
-//! usual choices; none is currently a dependency of any crate here). Adding one is an
-//! architecture decision — a new third-party dependency — that this task brief did not authorize
-//! unilaterally (per this repo's own "be cognizant about adding dependencies, ask clarifying
-//! questions" standing instruction), so it is flagged here instead of silently added.
+//! `GetDiskFreeSpaceExW` on Windows) that has no stable API in `std`. Earlier slices flagged
+//! choosing a dependency for this as an architecture decision this task brief did not authorize
+//! unilaterally; the "whichever dependency is chosen" placeholder that used to sit here is now
+//! resolved — the user decided (2026-08-26, DESIGN.md A9c manifest amended) on `rustix`
+//! (`rustix::fs::statvfs` on Unix) and `windows-sys` (`GetDiskFreeSpaceExW` on Windows); see
+//! [`OsFreeSpace`]. Both were already *transitive* dependencies of this crate via
+//! `cap-std`/`cap-primitives` before this decision, so promoting them to direct, target-scoped
+//! dependencies here adds no new crate version to the workspace's dependency graph (verified via
+//! `cargo tree -i rustix` and `cargo tree --target all -i windows-sys`).
+//!
+//! [`OsFreeSpace`] **fails closed**: any probe error (nonexistent path, permission denied, a
+//! Windows path that isn't representable in UTF-16, ...) reports `0` bytes available, which trips
+//! `storage_full` rather than silently behaving as if space were unlimited. DESIGN.md §A4b's
+//! free-space floor exists specifically to pause uploads "before the disk fills" — a probe that
+//! fails *open* (reports plenty of space when it actually does not know) would defeat that
+//! guarantee at exactly the moment it matters most.
 //!
 //! What *is* implemented, fully and testably: the [`FreeSpaceProbe`] seam
 //! `crate::server::VfsRpcServer` calls before accepting every `upload_chunk` (task brief: "free
 //! space floor check before accepting chunks"), and the `storage_full` error path it drives. The
-//! default probe ([`UnlimitedFreeSpace`]) always reports "plenty of space", so this slice does not
-//! regress any existing behavior; a production host wires in a real probe (implementing
-//! [`FreeSpaceProbe`] over whichever dependency is chosen) via [`crate::server::VfsRpcServer::with_limits`]
-//! — a one-line change once that dependency decision is made. Tests in `crate::server` inject a
-//! fake probe that reports a full disk, to exercise the `storage_full` path end to end.
-//!
-//! Options for the real probe, for whoever makes that call:
-//! - `libc::statvfs`/`libc::GetDiskFreeSpaceExW` directly: zero extra dependency weight beyond
-//!   `libc` itself (already ubiquitous, but not currently a dependency here), full control, but
-//!   hand-rolled `unsafe` FFI and platform-specific code to maintain.
-//! - `fs4` (maintained fork of the unmaintained `fs2`): small, focused, cross-platform
-//!   `available_space(path)` function; adds one small dependency.
-//! - `sysinfo`: much heavier (whole-system inventory: CPU, memory, processes, disks) for what is
-//!   needed here; not recommended unless this workspace already wants that for other reasons.
+//! default probe ([`UnlimitedFreeSpace`]) always reports "plenty of space", so tests never depend
+//! on host-machine free space; a production host wires in [`OsFreeSpace`] via
+//! [`crate::server::VfsRpcServer::with_limits`]. Tests in `crate::server` inject a fake probe that
+//! reports a full disk, to exercise the `storage_full` path end to end.
 
 use std::path::Path;
 
@@ -78,6 +78,69 @@ impl FreeSpaceProbe for UnlimitedFreeSpace {
     }
 }
 
+/// The real OS probe (user decision 2026-08-26 — see the module doc comment). Queries the
+/// filesystem backing `real_root` directly: `rustix::fs::statvfs` on Unix, `GetDiskFreeSpaceExW`
+/// on Windows.
+///
+/// **Fails closed**: any probe error reports `0` bytes available (never `u64::MAX`, never the
+/// error propagated) so the free-space floor in `crate::server::VfsRpcServer` refuses uploads
+/// (`storage_full`) rather than silently letting the disk fill — see the module doc comment for
+/// why fail-open would defeat DESIGN.md §A4b's floor.
+pub struct OsFreeSpace;
+
+#[cfg(unix)]
+impl FreeSpaceProbe for OsFreeSpace {
+    fn available_bytes(&self, real_root: &Path) -> u64 {
+        // `f_bavail` (blocks available to an unprivileged user) times `f_frsize` (fragment/block
+        // size in bytes) is the standard statvfs "space I could actually use" computation —
+        // `f_bfree` includes blocks reserved for root, which would overstate what a normal upload
+        // path can claim. Saturating multiply: astronomically large disks should clamp to
+        // `u64::MAX` rather than wrap.
+        match rustix::fs::statvfs(real_root) {
+            Ok(stat) => stat.f_bavail.saturating_mul(stat.f_frsize),
+            Err(_) => 0,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl FreeSpaceProbe for OsFreeSpace {
+    fn available_bytes(&self, real_root: &Path) -> u64 {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        // GetDiskFreeSpaceExW wants a NUL-terminated, UTF-16 ("wide") path.
+        let mut wide: Vec<u16> = real_root.as_os_str().encode_wide().collect();
+        wide.push(0);
+
+        let mut free_bytes_available_to_caller: u64 = 0;
+        // SAFETY: `wide` is a valid, NUL-terminated UTF-16 buffer kept alive for the duration of
+        // this call. `free_bytes_available_to_caller` is a live, uniquely-owned local `u64`; we
+        // pass a valid pointer to it as the out-param this function actually reads. The other two
+        // out-params (total bytes, total free bytes) are not needed here — the Win32 API accepts
+        // `NULL` for any of the three pointer out-params, so passing null is well-defined per the
+        // documented contract, not a safety violation.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free_bytes_available_to_caller,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+
+        if ok == 0 {
+            // BOOL == 0 means the call failed (e.g. path does not exist) — fail closed.
+            0
+        } else {
+            // FreeBytesAvailableToCaller (not the raw total-free) is the caller-quota-aware value:
+            // it already accounts for any per-user disk quota, matching "available-to-unprivileged"
+            // in spirit with the Unix `f_bavail` branch above.
+            free_bytes_available_to_caller
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +149,24 @@ mod tests {
     fn unlimited_free_space_reports_max() {
         let probe = UnlimitedFreeSpace;
         assert_eq!(probe.available_bytes(Path::new("/anything")), u64::MAX);
+    }
+
+    #[test]
+    fn os_free_space_reports_a_real_bounded_value_for_a_real_directory() {
+        // A real filesystem has *some* space, and is never reported as literally infinite —
+        // distinguishes a working probe from a stub that just returns `u64::MAX`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe = OsFreeSpace;
+        let bytes = probe.available_bytes(dir.path());
+        assert!(bytes > 0);
+        assert!(bytes < u64::MAX);
+    }
+
+    #[test]
+    fn os_free_space_fails_closed_on_a_nonexistent_path() {
+        let probe = OsFreeSpace;
+        let missing = Path::new("/definitely/does/not/exist/spindle-limits-test");
+        assert_eq!(probe.available_bytes(missing), 0);
     }
 
     #[test]

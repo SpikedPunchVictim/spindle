@@ -24,6 +24,23 @@ spindle-vfs = { path = "../spindle-vfs" }
 cap-std = { workspace = true }
 thiserror = { workspace = true }
 
+# `rustix`/`windows-sys` back `limits::OsFreeSpace` (DESIGN.md §A4b free-space floor; user decision
+# 2026-08-26 — A9c manifest amended). Both are already-transitive dependencies of this crate via
+# `cap-std`/`cap-primitives` (verified via `cargo tree -i rustix` / `cargo tree --target all -i
+# windows-sys`) — this promotes them to direct, target-scoped deps rather than reaching through
+# `cap-std`'s private dependency graph. Crate-local (not workspace-level), matching the `tempfile`
+# precedent below: this pin is specific to this crate's OS probe, not shared workspace policy.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+# 0.60 already resolves to the locked 0.60.2 (the version cap-std's Windows path already pulls in
+# via cap-primitives/io-extras — confirmed with `cargo tree --target all -i windows-sys@0.60.2`).
+# `Win32_Storage_FileSystem` is the only feature needed: it gates the `FileSystem` module
+# (`GetDiskFreeSpaceExW`) and implies `Win32_Storage`; `BOOL`/`PCWSTR` live in the always-available
+# `windows_sys::core` module, so no `Win32_Foundation` feature is required.
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem"] }
+
 # tempfile is crate-local only (not a workspace dependency), matching the precedent set by
 # `spindle-vfs`'s own `Cargo.toml`: negative/integration tests need disposable real temp
 # directories to run confinement/RPC pipeline tests against; this never becomes a runtime

@@ -112,11 +112,16 @@ display state, or opaque handles across the Tauri IPC boundary — never a priva
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
 | Encoding | hand-rolled zero-dep canonical codec in spindle-proto (strict non-canonical rejection; minicbor rejected — decoder abstracts the raw bytes) **[amended v0.9.3]** | own canonical encoder in @spindle/proto |
 | Storage | rusqlite (bundled) host-side; sqlx/Postgres helper-side | IndexedDB (caps, resume manifests) |
-| Confinement | cap-std ≥3.4.1 | — (browser sandbox) |
+| Confinement | cap-std ≥3.4.1 + rustix (unix) / windows-sys (windows) free-space probe — already-transitive, promoted direct **[amended v0.9.11]** | — (browser sandbox) |
 | OS / shell | keyring, tauri 2 + plugins (tray, autostart, single-instance, updater), qrcode | @tauri-apps/api |
 | UI | — | React, Vite, @spindle/ui |
 | CLI | — | commander |
 | Test/lint | cargo test + clippy + rustfmt; S-suite negatives in CI | vitest, ESLint + Prettier, TS strict |
+
+**Amendment (2026-08-26, v0.9.11)**: FreeSpaceProbe backend decided (user, 2026-08-26): rustix statvfs (Unix) +
+windows-sys GetDiskFreeSpaceExW (Windows), both already-transitive via cap-std, promoted to direct target-scoped
+deps of spindle-host-core; probe failure fails closed (reports 0 → storage_full), preserving DESIGN.md §A4b's
+free-space floor. DESIGN.md A9c manifest amended (Confinement row above).
 
 ### Versioning & release (DESIGN.md §A9c)
 

@@ -3263,11 +3263,13 @@ name = "spindle-host-core"
 version = "0.1.0"
 dependencies = [
  "cap-std",
+ "rustix",
  "spindle-core",
  "spindle-proto",
  "spindle-vfs",
  "tempfile",
  "thiserror 1.0.69",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
