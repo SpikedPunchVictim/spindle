@@ -196,6 +196,74 @@ pub trait HelperView {
         quota_profile: String,
         admitted_at: u64,
     ) -> Option<AdmissionRecord>;
+
+    // ============================================================================================
+    // Extended in Stage 4 slice 3 (session records + TURN counters + revocation writes).
+    //
+    // **Discovered gap, reported rather than silently patched**: none of the four methods below
+    // existed anywhere in this trait before this slice, even though DESIGN.md §A5 explicitly
+    // describes writing a session record ("on each successful auth the callout writes `nats_fp →
+    // {root_fp, host_fps, quota_profile, exp}` to the helper store") and §A9b explicitly lists
+    // "session records, admission records, ... TURN counters" among the leader's durable writes.
+    // Slice 1/2 built [`SessionRecord`] as a plain data type and computed one on every
+    // [`AuthzDecision::Authorized`], but **never persisted it** — `src/bin/helper.rs`'s
+    // `handle_one` discarded `auth.session_record` after reading only its `host_fps.len()`. There
+    // was also no store method to write a revocation epoch/subject at all (only the read side,
+    // above, existed) despite DESIGN.md §A9b listing revocation epochs among the leader's writes.
+    // This is not a redesign of the existing (read) methods above — it is filling in write/lookup
+    // methods the trait needed all along for `helper.turn.get` (this slice) and `registry.revoke.
+    // <hfp>` (a still-unwired later slice) to have anything to call.
+    // ============================================================================================
+
+    /// Writes (or overwrites) the session record for `record.nats_fp` (DESIGN.md §A5). Upsert
+    /// semantics: a later write for the same `nats_fp` (e.g. a reconnect that reuses the same
+    /// session nkey, or a renewed `exp`) replaces the stored record rather than erroring or
+    /// requiring a separate update call.
+    fn put_session_record(&mut self, record: SessionRecord);
+
+    /// Looks up the session record for `nats_fp`. A record whose `exp` is at or before `now` is
+    /// treated as absent (DESIGN.md §A5 "cleaned up on DISCONNECT/expiry" — this trait enforces
+    /// only the expiry half via an on-read filter; eager DISCONNECT-triggered deletion is a
+    /// wiring-layer concern for whichever later slice bridges `$SYS.ACCOUNT.*.DISCONNECT` events,
+    /// out of scope for this trait boundary).
+    fn session_record(&mut self, nats_fp: &Fingerprint, now: u64) -> Option<SessionRecord>;
+
+    /// Atomically checks-and-increments `root_fp`'s TURN-credential-mint counter for the period
+    /// containing `now`, against `monthly_quota`. Returns `Ok(new_count)` (already incremented) if
+    /// the mint is admitted, or `Err(current_count)` (not incremented) if `root_fp` is already at
+    /// or over `monthly_quota` for this period (DESIGN.md §A8 "quota enforced by the helper per
+    /// `root_fp`"; §A9b lists "TURN counters" among the leader's writes).
+    ///
+    /// **Period definition — a documented deviation, not "monthly" in the calendar sense**: this
+    /// trait defines the window as a fixed 30-day rolling bucket (`now / (30 * 86400)`), not a
+    /// calendar month. Calendar-month bucketing needs a date/calendar dependency this crate's A9c
+    /// dependency manifest does not list for `spindle-helper` (proto + core only); a fixed-size
+    /// integer bucket needs no such dependency and is a reasonable, simple stand-in. Flagged for
+    /// the coordinator, not silently resolved as literally "monthly".
+    fn record_turn_issuance(
+        &mut self,
+        root_fp: &Fingerprint,
+        now: u64,
+        monthly_quota: u64,
+    ) -> Result<u64, u64>;
+
+    /// Records a revocation for `host_fp`: bumps the stored epoch to `max(existing, epoch)`
+    /// (DESIGN.md §A7b "max-wins, never decreases") and adds every fingerprint in
+    /// `revoked_subjects` to the durable revoked-subject set for `host_fp` (DESIGN.md §A9b
+    /// "revocation epochs ... revoked-subject sets alongside"). Not currently called by
+    /// `src/bin/helper.rs` — `registry.revoke.<hfp>` handling is still unwired (a later slice) —
+    /// but the store operation and its SQL semantics are this slice's deliverable regardless, so
+    /// the read side above (`revocation_epoch`/`is_revoked`) has something to prove itself against
+    /// in the store-contract tests.
+    fn record_revocation(&mut self, host_fp: Fingerprint, epoch: u64, revoked_subjects: &[Fingerprint]);
+
+    /// Best-effort cleanup of session records whose `exp` has already passed. No-op by default
+    /// (the on-read `exp` filter in [`session_record`](HelperView::session_record) already hides
+    /// expired rows from callers — this is purely about bounding storage growth for a
+    /// long-running process, not correctness). [`crate::pg_store::PgStore`] overrides this with a
+    /// real `DELETE`; [`crate::memory_store::InMemoryHelperView`] overrides it to bound its
+    /// `HashMap`'s growth too.
+    fn purge_expired_sessions(&mut self, _now: u64) {}
 }
 
 // ================================================================================================
@@ -510,6 +578,8 @@ mod tests {
         burned: HashMap<Vec<u8>, AdmissionRecord>,
         operator_pk: Option<VerifyingKey>,
         burn_calls: u32,
+        sessions: HashMap<Fingerprint, SessionRecord>,
+        turn_usage: HashMap<(Fingerprint, u64), u64>,
     }
 
     impl HelperView for MockView {
@@ -558,6 +628,44 @@ mod tests {
             self.burned.insert(nonce, record.clone());
             self.records.insert(host_fp, record.clone());
             Some(record)
+        }
+
+        fn put_session_record(&mut self, record: SessionRecord) {
+            self.sessions.insert(record.nats_fp, record);
+        }
+
+        fn session_record(&mut self, nats_fp: &Fingerprint, now: u64) -> Option<SessionRecord> {
+            self.sessions.get(nats_fp).filter(|r| r.exp > now).cloned()
+        }
+
+        fn record_turn_issuance(
+            &mut self,
+            root_fp: &Fingerprint,
+            now: u64,
+            monthly_quota: u64,
+        ) -> Result<u64, u64> {
+            let period = now / (30 * 86_400);
+            let key = (*root_fp, period);
+            let count = self.turn_usage.entry(key).or_insert(0);
+            if *count >= monthly_quota {
+                Err(*count)
+            } else {
+                *count += 1;
+                Ok(*count)
+            }
+        }
+
+        fn record_revocation(
+            &mut self,
+            host_fp: Fingerprint,
+            epoch: u64,
+            revoked_subjects: &[Fingerprint],
+        ) {
+            let entry = self.epochs.entry(host_fp).or_insert(0);
+            *entry = (*entry).max(epoch);
+            for subject in revoked_subjects {
+                self.revoked.insert((host_fp, *subject));
+            }
         }
     }
 

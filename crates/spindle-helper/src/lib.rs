@@ -11,11 +11,13 @@
 //!   external fact (current time, a caller-verified nkey signature, a store lookup) is a
 //!   parameter, never read implicitly. This is what makes [`authz::decide_device_connect`]/
 //!   [`authz::decide_host_connect`] exhaustively unit-testable without a running NATS server.
-//! - [`natsjwt`], [`memory_store`], and `src/bin/helper.rs` — **the NATS/runtime wiring layer**
-//!   (Stage 4 slice 2, graduated from `spikes/s1-callout` — S1 **PASS**, 19/19 automated checks
-//!   against a live `nats-server`, 2026-08-24; `spikes/s1-callout/RESULTS.md`). This is where
-//!   ADR-009's runtime-dependency allowance for this crate (`tokio`, `async-nats`, `nkeys`,
-//!   `tracing`, `serde`/`serde_json`) applies — the pure core above never gains any of these.
+//! - [`natsjwt`], [`memory_store`], [`pg_store`], [`turn`], and `src/bin/helper.rs` — **the
+//!   NATS/runtime wiring layer** (Stage 4 slices 2 and 3, graduated from `spikes/s1-callout` — S1
+//!   **PASS**, 19/19 automated checks against a live `nats-server`, 2026-08-24;
+//!   `spikes/s1-callout/RESULTS.md`). This is where ADR-009's runtime-dependency allowance for
+//!   this crate (`tokio`, `async-nats`, `nkeys`, `tracing`, `serde`/`serde_json`, and — as of
+//!   slice 3 — `sqlx`/`hmac`/`sha1` per A9c's "sqlx/Postgres helper-side" line) applies — the pure
+//!   core above never gains any of these.
 //!
 //! - [`authz`] — [`authz::decide_device_connect`]/[`authz::decide_host_connect`]: given a
 //!   presented auth payload, a caller-verified nkey-signature result, the current time, and a
@@ -32,15 +34,24 @@
 //!   cert + admission token), graduated (decode side only) from the S1 spike's `fixtures.rs`. See
 //!   its own module docs for the still-open wire-schema gap this envelope shape papers over.
 //! - [`memory_store`] — [`memory_store::InMemoryHelperView`], the dev-mode default
-//!   [`authz::HelperView`] implementation `src/bin/helper.rs` runs with. **Not durable** — every
-//!   revocation/admission/session fact it holds is lost on restart. Exists so the store is
-//!   swappable behind the same trait: a Postgres-backed `HelperView` (Stage 4 slice 3, `sqlx`)
-//!   drops in wherever `InMemoryHelperView` is constructed today, with no change to `authz.rs`,
-//!   `natsjwt.rs`, or the callout-handling logic in `src/bin/helper.rs`.
+//!   [`authz::HelperView`] implementation `src/bin/helper.rs` runs with when `DATABASE_URL` is
+//!   unset. **Not durable** — every revocation/admission/session/TURN-counter fact it holds is
+//!   lost on restart.
+//! - [`pg_store`] — [`pg_store::PgStore`] (Stage 4 slice 3): the durable, `sqlx`/Postgres-backed
+//!   [`authz::HelperView`], embedding its own migrations (`migrations/`). Drops in wherever
+//!   `InMemoryHelperView` is constructed, with no change to `authz.rs`, `natsjwt.rs`, or the
+//!   callout-handling logic — `src/bin/helper.rs` picks one or the other at startup based on
+//!   whether `DATABASE_URL` is set. See that module's own doc comment for the SQL semantics and
+//!   for why its `HelperView` methods bridge to async I/O via `block_in_place` rather than making
+//!   the trait itself async.
+//! - [`turn`] — [`turn::handle_turn_get`] (Stage 4 slice 3): TURN credential minting for
+//!   `helper.turn.get`, authorized via the session record a successful callout now persists (see
+//!   [`authz::HelperView::put_session_record`]) and quota-limited per `root_fp` via
+//!   [`authz::HelperView::record_turn_issuance`]. See that module's own doc comment for the
+//!   request/reply wire-schema gap this slice had to resolve without a spec to point to.
 //!
-//! **Still out of scope** (later slices): the durable Postgres-backed `HelperView`, presence
-//! (`$SYS` event bridging into `host.<hfp>.presence`), TURN credential minting, and the
-//! admin-command verifier (`registry.admin.>`).
+//! **Still out of scope** (later slices): presence (`$SYS` event bridging into
+//! `host.<hfp>.presence`) and the admin-command verifier (`registry.admin.>`).
 //!
 //! # Design notes and ambiguities (reported, not silently resolved)
 //!
@@ -60,7 +71,9 @@ pub mod authz;
 pub mod memory_store;
 pub mod natsjwt;
 pub mod permissions;
+pub mod pg_store;
 pub mod session;
+pub mod turn;
 
 #[cfg(test)]
 mod tests {

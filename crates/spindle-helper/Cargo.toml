@@ -53,6 +53,26 @@ futures-util = "0.3"
 # fulfill the task's "tracing instead of println" requirement for a real service binary.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# --- Stage 4 slice 3 additions (durable Postgres store + TURN credential minting) ---
+# sqlx: the durable HelperView (pg_store.rs), per A9c's dependency manifest ("sqlx/Postgres
+# helper-side"). `runtime-tokio-rustls` adds the rustls TLS backend to the workspace's own
+# `runtime-tokio`/`postgres` feature pins (additive, not a replacement — see root Cargo.toml);
+# `migrate` is `sqlx::migrate!`'s embedded-migration support. Deliberately the runtime `query`/
+# `query_as` API, never the compile-time `query!` macros — CI has no live Postgres to compile
+# against.
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "migrate"] }
+# hmac/sha1: TURN REST credential minting (`turn.rs`), mirroring
+# `spikes/s19-quic-transport/src/bin/quic-peer.rs`'s `mint_turn_credentials` (same crate choices
+# and versions — small, pure-Rust, no C-toolchain requirement).
+hmac = "0.12"
+sha1 = "0.10"
+
+[dev-dependencies]
+# Independent-oracle style HMAC-SHA1 vectors and the pg-gated contract-test harness both need a
+# tokio multi-thread test runtime (see pg_store.rs's module docs on why `PgStore`'s HelperView
+# impl needs `block_in_place`, which panics on the default current-thread `#[tokio::test]` flavor).
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
+
 [[bin]]
 name = "spindle-helper"
 path = "src/bin/helper.rs"

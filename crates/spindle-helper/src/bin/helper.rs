@@ -48,14 +48,18 @@ use futures_util::StreamExt;
 use nkeys::KeyPair;
 use spindle_helper::auth_token::{self, DecodedAuthToken};
 use spindle_helper::authz::{
-    self, AdmissionMode, AuthzDecision, DeviceConnectPresented, HostConnectPresented,
+    self, AdmissionMode, AdmissionRecord, AuthzDecision, DeviceConnectPresented, HelperView,
+    HostConnectPresented,
 };
 use spindle_helper::memory_store::InMemoryHelperView;
 use spindle_helper::natsjwt::{self, NatsJwtError};
 use spindle_helper::permissions::{Limits, SubjectPermissions};
+use spindle_helper::pg_store::PgStore;
+use spindle_helper::session::SessionRecord;
+use spindle_helper::turn::{self, TurnConfig};
 use std::env;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ================================================================================================
 // Config
@@ -81,6 +85,16 @@ struct Config {
     /// fixed dev-only key (matching the S1 spike) if unset — loud warning, never for production.
     operator_seed: Option<String>,
     admission_mode: AdmissionMode,
+    /// Postgres connection string (Stage 4 slice 3). Set → `PgStore` (durable, migrations run at
+    /// startup, fail fast if unreachable). Unset → `InMemoryHelperView` (ephemeral, dev/demo).
+    database_url: Option<String>,
+    /// coturn's `static-auth-secret` (DESIGN.md §A8). Unset → `helper.turn.get` replies with a
+    /// clear "TURN not configured" error instead of minting anything.
+    turn_secret: Option<String>,
+    /// Comma-separated ICE server URIs handed back verbatim in `helper.turn.get` replies.
+    turn_uris: Vec<String>,
+    turn_ttl_secs: u64,
+    turn_monthly_quota: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +107,12 @@ enum ConfigError {
     FlagMissingValue(String),
     #[error("unrecognized argument: {0}")]
     UnknownArg(String),
+    #[error("invalid value {given:?} for --{flag} / {env_var} (expected a non-negative integer)")]
+    BadInteger {
+        flag: &'static str,
+        env_var: &'static str,
+        given: String,
+    },
 }
 
 const HELP: &str = r#"spindle-helper — the NATS Auth Callout responder (DESIGN.md §A4/§A5)
@@ -108,6 +128,11 @@ Every flag has an env-var equivalent (flags override the env var if both are set
     --app-conn-seed <seed>      APP_CONN_SEED        (optional; application-account connection)
     --operator-seed <seed>      OPERATOR_SEED        (optional; dev-only fallback key if unset)
     --admission-mode <mode>     ADMISSION_MODE       (open|invite|closed; default: open)
+    --database-url <url>        DATABASE_URL         (optional; Postgres — unset uses the in-memory store)
+    --turn-secret <secret>      TURN_SECRET          (optional; unset refuses helper.turn.get requests)
+    --turn-uris <a,b,...>       TURN_URIS            (comma-separated; default: empty)
+    --turn-ttl-secs <n>         TURN_TTL_SECS         (default: 3600)
+    --turn-monthly-quota <n>    TURN_MONTHLY_QUOTA    (default: 1000)
     -h, --help                  show this message
 "#;
 
@@ -120,6 +145,11 @@ impl Config {
         let mut app_conn_seed = env::var("APP_CONN_SEED").ok();
         let mut operator_seed = env::var("OPERATOR_SEED").ok();
         let mut admission_mode = env::var("ADMISSION_MODE").ok();
+        let mut database_url = env::var("DATABASE_URL").ok();
+        let mut turn_secret = env::var("TURN_SECRET").ok();
+        let mut turn_uris = env::var("TURN_URIS").ok();
+        let mut turn_ttl_secs = env::var("TURN_TTL_SECS").ok();
+        let mut turn_monthly_quota = env::var("TURN_MONTHLY_QUOTA").ok();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -165,6 +195,32 @@ impl Config {
                         ConfigError::FlagMissingValue("admission-mode".to_string())
                     })?)
                 }
+                "--database-url" => {
+                    database_url = Some(args.next().ok_or_else(|| {
+                        ConfigError::FlagMissingValue("database-url".to_string())
+                    })?)
+                }
+                "--turn-secret" => {
+                    turn_secret = Some(args.next().ok_or_else(|| {
+                        ConfigError::FlagMissingValue("turn-secret".to_string())
+                    })?)
+                }
+                "--turn-uris" => {
+                    turn_uris = Some(
+                        args.next()
+                            .ok_or_else(|| ConfigError::FlagMissingValue("turn-uris".to_string()))?,
+                    )
+                }
+                "--turn-ttl-secs" => {
+                    turn_ttl_secs = Some(args.next().ok_or_else(|| {
+                        ConfigError::FlagMissingValue("turn-ttl-secs".to_string())
+                    })?)
+                }
+                "--turn-monthly-quota" => {
+                    turn_monthly_quota = Some(args.next().ok_or_else(|| {
+                        ConfigError::FlagMissingValue("turn-monthly-quota".to_string())
+                    })?)
+                }
                 other => return Err(ConfigError::UnknownArg(other.to_string())),
             }
         }
@@ -180,6 +236,32 @@ impl Config {
             }
         };
 
+        let turn_ttl_secs = match turn_ttl_secs {
+            Some(s) => s.parse::<u64>().map_err(|_| ConfigError::BadInteger {
+                flag: "turn-ttl-secs",
+                env_var: "TURN_TTL_SECS",
+                given: s,
+            })?,
+            None => 3_600,
+        };
+        let turn_monthly_quota = match turn_monthly_quota {
+            Some(s) => s.parse::<u64>().map_err(|_| ConfigError::BadInteger {
+                flag: "turn-monthly-quota",
+                env_var: "TURN_MONTHLY_QUOTA",
+                given: s,
+            })?,
+            None => 1_000,
+        };
+        let turn_uris = turn_uris
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Config {
             nats_url: nats_url.unwrap_or_else(|| "nats://127.0.0.1:4222".to_string()),
             callout_user_seed: callout_user_seed
@@ -190,6 +272,11 @@ impl Config {
             app_conn_seed,
             operator_seed,
             admission_mode,
+            database_url,
+            turn_secret,
+            turn_uris,
+            turn_ttl_secs,
+            turn_monthly_quota,
         })
     }
 }
@@ -221,6 +308,140 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ================================================================================================
+// Store selection (Stage 4 slice 3): `DATABASE_URL` set → durable `PgStore`; unset →
+// `InMemoryHelperView` (ephemeral, dev/demo — see that module's own doc comment).
+//
+// `authz::decide_device_connect`/`decide_host_connect` and `handle_one` below are generic over
+// `impl HelperView` (static dispatch), not `dyn HelperView` — `HelperView`'s methods take `&mut
+// impl HelperView` themselves in a couple of call sites' surrounding generic bounds, which are
+// `Sized` by default, so a bare trait object doesn't satisfy them without `?Sized` plumbing that
+// would ripple beyond this file. A small enum wrapper that delegates every method is the smallest
+// diff that lets one `run()` body construct either concrete store and hand it to the same generic
+// call sites.
+// ================================================================================================
+
+enum Store {
+    Memory(Box<InMemoryHelperView>),
+    Pg(PgStore),
+}
+
+impl HelperView for Store {
+    fn revocation_epoch(&mut self, host_fp: &spindle_core::Fingerprint) -> u64 {
+        match self {
+            Store::Memory(s) => s.revocation_epoch(host_fp),
+            Store::Pg(s) => s.revocation_epoch(host_fp),
+        }
+    }
+
+    fn is_revoked(
+        &mut self,
+        host_fp: &spindle_core::Fingerprint,
+        subject: &spindle_core::Fingerprint,
+    ) -> bool {
+        match self {
+            Store::Memory(s) => s.is_revoked(host_fp, subject),
+            Store::Pg(s) => s.is_revoked(host_fp, subject),
+        }
+    }
+
+    fn admission_mode(&mut self) -> AdmissionMode {
+        match self {
+            Store::Memory(s) => s.admission_mode(),
+            Store::Pg(s) => s.admission_mode(),
+        }
+    }
+
+    fn admission_record(&mut self, host_fp: &spindle_core::Fingerprint) -> Option<AdmissionRecord> {
+        match self {
+            Store::Memory(s) => s.admission_record(host_fp),
+            Store::Pg(s) => s.admission_record(host_fp),
+        }
+    }
+
+    fn operator_pk(&mut self) -> spindle_core::VerifyingKey {
+        match self {
+            Store::Memory(s) => s.operator_pk(),
+            Store::Pg(s) => s.operator_pk(),
+        }
+    }
+
+    fn burn_admission_token(
+        &mut self,
+        host_fp: spindle_core::Fingerprint,
+        nonce: Vec<u8>,
+        label: String,
+        quota_profile: String,
+        admitted_at: u64,
+    ) -> Option<AdmissionRecord> {
+        match self {
+            Store::Memory(s) => {
+                s.burn_admission_token(host_fp, nonce, label, quota_profile, admitted_at)
+            }
+            Store::Pg(s) => s.burn_admission_token(host_fp, nonce, label, quota_profile, admitted_at),
+        }
+    }
+
+    fn put_session_record(&mut self, record: SessionRecord) {
+        match self {
+            Store::Memory(s) => s.put_session_record(record),
+            Store::Pg(s) => s.put_session_record(record),
+        }
+    }
+
+    fn session_record(
+        &mut self,
+        nats_fp: &spindle_core::Fingerprint,
+        now: u64,
+    ) -> Option<SessionRecord> {
+        match self {
+            Store::Memory(s) => s.session_record(nats_fp, now),
+            Store::Pg(s) => s.session_record(nats_fp, now),
+        }
+    }
+
+    fn record_turn_issuance(
+        &mut self,
+        root_fp: &spindle_core::Fingerprint,
+        now: u64,
+        monthly_quota: u64,
+    ) -> Result<u64, u64> {
+        match self {
+            Store::Memory(s) => s.record_turn_issuance(root_fp, now, monthly_quota),
+            Store::Pg(s) => s.record_turn_issuance(root_fp, now, monthly_quota),
+        }
+    }
+
+    fn record_revocation(
+        &mut self,
+        host_fp: spindle_core::Fingerprint,
+        epoch: u64,
+        revoked_subjects: &[spindle_core::Fingerprint],
+    ) {
+        match self {
+            Store::Memory(s) => s.record_revocation(host_fp, epoch, revoked_subjects),
+            Store::Pg(s) => s.record_revocation(host_fp, epoch, revoked_subjects),
+        }
+    }
+
+    fn purge_expired_sessions(&mut self, now: u64) {
+        match self {
+            Store::Memory(s) => s.purge_expired_sessions(now),
+            Store::Pg(s) => s.purge_expired_sessions(now),
+        }
+    }
+}
+
+/// Waits on `sub` if present, otherwise never resolves — lets an optional `async_nats::Subscriber`
+/// sit as a `tokio::select!` branch that simply never fires when the application connection (and
+/// therefore `helper.turn.get`) isn't configured (`APP_CONN_SEED` unset).
+async fn next_or_pending(sub: &mut Option<async_nats::Subscriber>) -> Option<async_nats::Message> {
+    match sub {
+        Some(s) => s.next().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn run(config: Config) -> anyhow::Result<()> {
     let app_kp = KeyPair::from_seed(&config.app_account_seed)
         .map_err(|e| anyhow::anyhow!("bad APP_ACCOUNT_SEED: {e}"))?;
@@ -248,10 +469,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
     tracing::info!("callout/system connection established, subscribing to $SYS.REQ.USER.AUTH");
 
     // The application-account connection (DESIGN.md §A5's two-connection bridging — see this
-    // file's module docs). Optional in this slice; nothing below reads `_app_client` yet, but
-    // establishing it here is what makes Stage 4 slice 3's presence/TURN/registry work a
-    // same-file addition rather than a re-plumbing.
-    let _app_client = match &config.app_conn_seed {
+    // file's module docs). Optional in this slice's callout wiring, but Stage 4 slice 3's
+    // `helper.turn.get` handling needs it — see the `turn_sub` subscription below.
+    let app_client = match &config.app_conn_seed {
         Some(seed) => {
             let client = async_nats::ConnectOptions::with_nkey(seed.clone())
                 .connect(&config.nats_url)
@@ -261,15 +481,63 @@ async fn run(config: Config) -> anyhow::Result<()> {
         }
         None => {
             tracing::warn!(
-                "APP_CONN_SEED not set — running with the callout connection only; presence/TURN/\
-                 registry work (Stage 4 slice 3+) will need it"
+                "APP_CONN_SEED not set — running with the callout connection only; helper.turn.get \
+                 and future presence/registry work will need it"
             );
             None
         }
     };
 
+    let mut turn_sub: Option<async_nats::Subscriber> = match &app_client {
+        Some(client) => Some(client.subscribe("helper.turn.get").await?),
+        None => None,
+    };
+
+    let turn_config = match &config.turn_secret {
+        Some(secret) => Some(TurnConfig {
+            secret: secret.clone(),
+            uris: config.turn_uris.clone(),
+            ttl_secs: config.turn_ttl_secs,
+            monthly_quota: config.turn_monthly_quota,
+        }),
+        None => {
+            tracing::warn!(
+                "TURN_SECRET not set — helper.turn.get will refuse every request with \
+                 'TURN not configured'"
+            );
+            None
+        }
+    };
+
+    // Store selection (Stage 4 slice 3): DATABASE_URL set → durable PgStore (migrations run here,
+    // fail fast on any connection/migration error); unset → ephemeral InMemoryHelperView.
+    let mut store = match &config.database_url {
+        Some(url) => {
+            tracing::info!("DATABASE_URL set — connecting to Postgres and running migrations");
+            let pg = PgStore::connect(url, config.admission_mode, operator_pk)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to connect to Postgres / run migrations: {e}"))?;
+            tracing::info!("Postgres store ready");
+            Store::Pg(pg)
+        }
+        None => {
+            tracing::warn!(
+                "DATABASE_URL not set — running with the in-memory store; every revocation, \
+                 admission, session, and TURN-usage fact is lost on restart. Never use this in \
+                 production."
+            );
+            Store::Memory(Box::new(InMemoryHelperView::new(config.admission_mode, operator_pk)))
+        }
+    };
+
     let mut sub = callout_client.subscribe("$SYS.REQ.USER.AUTH").await?;
-    let mut view = InMemoryHelperView::new(config.admission_mode, operator_pk);
+
+    // Periodic best-effort cleanup of expired session records (DESIGN.md §A9b: "a cleanup path
+    // for expired rows (on-read filter + periodic delete — keep simple)"). The on-read `exp`
+    // filter in `HelperView::session_record` already makes this a non-correctness-affecting
+    // housekeeping task, not a latency-sensitive one, hence the generous interval.
+    let mut purge_interval = tokio::time::interval(Duration::from_secs(300));
+    purge_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     tracing::info!("responder ready");
     loop {
@@ -287,7 +555,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 let Some(reply) = msg.reply.clone() else {
                     continue;
                 };
-                let resp = match handle_one(&msg.payload, &config.account_name, &app_kp, &mut view) {
+                let resp = match handle_one(&msg.payload, &config.account_name, &app_kp, &mut store) {
                     Ok(resp) => resp,
                     Err(e) => {
                         tracing::error!(error = %e, "internal error building callout response");
@@ -300,6 +568,26 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     }
                     let _ = callout_client.flush().await;
                 }
+            }
+            msg = next_or_pending(&mut turn_sub) => {
+                let Some(msg) = msg else {
+                    tracing::warn!("helper.turn.get subscription ended unexpectedly");
+                    turn_sub = None;
+                    continue;
+                };
+                let Some(reply) = msg.reply.clone() else {
+                    continue;
+                };
+                let reply_payload = turn::handle_turn_get(&msg.payload, turn_config.as_ref(), &mut store, now_secs());
+                if let Some(client) = &app_client {
+                    if let Err(e) = client.publish(reply, reply_payload.into()).await {
+                        tracing::error!(error = %e, "failed to publish helper.turn.get response");
+                    }
+                    let _ = client.flush().await;
+                }
+            }
+            _ = purge_interval.tick() => {
+                store.purge_expired_sessions(now_secs());
             }
         }
     }
@@ -385,7 +673,7 @@ fn handle_one(
     request_payload: &[u8],
     account_name: &str,
     app_kp: &KeyPair,
-    view: &mut InMemoryHelperView,
+    view: &mut impl HelperView,
 ) -> Result<Option<String>, HandleError> {
     let req_str = std::str::from_utf8(request_payload).map_err(|_| HandleError::NonUtf8Payload)?;
     let claims = natsjwt::decode_claims_unverified(req_str)?;
@@ -494,6 +782,12 @@ fn handle_one(
             match decision {
                 AuthzDecision::Authorized(auth) => {
                     let host_count = auth.session_record.host_fps.len() as u32;
+                    // DESIGN.md §A5: "on each successful auth the callout writes nats_fp →
+                    // {root_fp, host_fps, quota_profile, exp} to the helper store" — Stage 4
+                    // slice 2 computed this record but never persisted it (see
+                    // HelperView::put_session_record's doc comment). Stage 4 slice 3's
+                    // helper.turn.get needs it to authorize non-callout requests.
+                    view.put_session_record(auth.session_record);
                     Ok(respond_ok(auth.permissions, auth.limits, host_count))
                 }
                 AuthzDecision::Refused(reason) => {
@@ -519,7 +813,10 @@ fn handle_one(
             let decision =
                 authz::decide_host_connect(&presented, verify_nkey_sig, now, view, jitter);
             match decision {
-                AuthzDecision::Authorized(auth) => Ok(respond_ok(auth.permissions, auth.limits, 1)),
+                AuthzDecision::Authorized(auth) => {
+                    view.put_session_record(auth.session_record);
+                    Ok(respond_ok(auth.permissions, auth.limits, 1))
+                }
                 AuthzDecision::Refused(reason) => {
                     tracing::debug!(%reason, "host connection refused");
                     Ok(respond_err(authz::UNIFORM_REFUSAL_MESSAGE))

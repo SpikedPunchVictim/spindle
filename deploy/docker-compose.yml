@@ -1,13 +1,14 @@
 # Reference deployment (docs/DESIGN.md §A9b): the dev/demo path and the spike substrate.
 #
-# Stage 4 slice 2 status: nats + helper are real, runnable services — the helper is
-# crates/spindle-helper's graduated Auth Callout responder (Stage 4 slice 1's pure decision core,
-# wired to a live nats-server exactly as spikes/s1-callout proved — S1 PASS, 19/19,
-# spikes/s1-callout/RESULTS.md), running in `open` admission mode with the in-memory store
-# (spindle_helper::memory_store::InMemoryHelperView — not durable; see deploy/README.md).
-# postgres and coturn are placeholder blocks (commented out, not running services) — Postgres
-# persistence lands in Stage 4 slice 3, coturn/TURN credential minting in a later slice. See
-# deploy/README.md before running anything.
+# Stage 4 slice 3 status: nats + helper + postgres + coturn are all real, runnable services.
+# The helper is crates/spindle-helper's graduated Auth Callout responder (Stage 4 slice 1's pure
+# decision core, wired to a live nats-server exactly as spikes/s1-callout proved — S1 PASS,
+# 19/19, spikes/s1-callout/RESULTS.md), running in `open` admission mode with the durable
+# Postgres-backed store (spindle_helper::pg_store::PgStore) now that DATABASE_URL is set below.
+# helper.turn.get (TURN credential minting) is wired against the coturn service via TURN_SECRET.
+# See deploy/README.md for the no-postgres dev flow (unset DATABASE_URL/helper's env block below
+# to fall back to the in-memory store) and for what's still deliberately deferred (TLS/local CA,
+# presence, the admin-command verifier).
 
 services:
   nats:
@@ -22,6 +23,52 @@ services:
         # box may already have 8080 bound; the container-internal port and nats-server.conf's
         # `websocket { port: 8080 }` are unchanged — only this host-side mapping moved.
       - "8222:8222" # HTTP monitor endpoint (/varz) — used by `just dev`'s readiness wait
+
+  # --- Postgres (Stage 4 slice 3) --------------------------------------------------------------
+  # Backs spindle_helper::pg_store::PgStore. Dev-only default password — override via the
+  # POSTGRES_PASSWORD env var (or a .env file, per deploy/README.md) for anything beyond a
+  # throwaway local stack.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-spindle}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spindle-dev-only}
+      POSTGRES_DB: ${POSTGRES_DB:-spindle}
+    volumes:
+      - spindle-postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432" # Host side published as 5434, not 5432 — dev boxes commonly already have a
+        # native or containerized Postgres bound to 5432 (this one did). The container-internal
+        # port and DATABASE_URL below (which addresses the "postgres" service by Docker DNS name,
+        # not this host mapping) are unaffected — only host-side tools (psql, TEST_DATABASE_URL)
+        # need the 5434 mapping.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-spindle} -d ${POSTGRES_DB:-spindle}"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # --- coturn (TURN credential minting, Stage 4 slice 3) ----------------------------------------
+  # `use-auth-secret` / `static-auth-secret` must match the helper's TURN_SECRET below (dual-secret
+  # rotation overlap per DESIGN.md §A9b is a production concern, not modeled in this dev stack).
+  # Relay port range kept small for dev (49160-49200) — widen for real NAT-traversal testing.
+  coturn:
+    image: coturn/coturn
+    command:
+      - "-n"
+      - "--listening-port=3478"
+      - "--realm=spindle.local"
+      - "--use-auth-secret"
+      - "--static-auth-secret=${TURN_SECRET:-spindle-turn-dev-only}"
+      - "--min-port=49160"
+      - "--max-port=49200"
+      - "--no-cli"
+      - "--no-tls"
+      - "--no-dtls"
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49160-49200:49160-49200/udp"
 
   helper:
     build:
@@ -41,43 +88,22 @@ services:
       # all — see nats-server.conf's dev-only note); `open` admission is what's real today.
       ADMISSION_MODE: "open"
       RUST_LOG: "info,spindle_helper=debug"
+      # Stage 4 slice 3: durable store + TURN credential minting. Unset DATABASE_URL to fall back
+      # to the ephemeral in-memory store (deploy/README.md's "no-postgres dev flow").
+      DATABASE_URL: "postgres://${POSTGRES_USER:-spindle}:${POSTGRES_PASSWORD:-spindle-dev-only}@postgres:5432/${POSTGRES_DB:-spindle}"
+      TURN_SECRET: "${TURN_SECRET:-spindle-turn-dev-only}"
+      TURN_URIS: "turn:127.0.0.1:3478?transport=udp,turn:127.0.0.1:3478?transport=tcp"
+      TURN_TTL_SECS: "3600"
+      TURN_MONTHLY_QUOTA: "1000"
     depends_on:
-      - nats
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
     # nats-server:2.10-alpine ships no wget/curl/nc for a compose healthcheck, and the helper's
     # own `async-nats` connect doesn't retry a still-starting server — restart on failure instead
     # of failing the stack outright while nats finishes coming up (a few seconds, in practice).
     restart: on-failure
 
-  # --- Postgres (Stage 4 slice 3) -------------------------------------------------------------
-  # spindle-helper still runs entirely on spindle_helper::memory_store::InMemoryHelperView (not
-  # durable — see crates/spindle-helper/src/memory_store.rs). This block is a placeholder for the
-  # sqlx-backed HelperView landing in Stage 4 slice 3; uncomment once the helper actually reads
-  # DATABASE_URL.
-  # postgres:
-  #   image: postgres:16-alpine
-  #   environment:
-  #     POSTGRES_USER: ${POSTGRES_USER:-spindle}
-  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spindle}
-  #     POSTGRES_DB: ${POSTGRES_DB:-spindle}
-  #   volumes:
-  #     - spindle-postgres-data:/var/lib/postgresql/data
-  #   ports:
-  #     - "5432:5432"
-
-  # --- coturn (TURN credential minting, a later Stage 4 slice) --------------------------------
-  # Nothing in spindle-helper mints TURN credentials yet (helper.turn.get isn't implemented — see
-  # crates/spindle-helper/src/bin/helper.rs's module docs on what's still Stage 4 slice 3+ work).
-  # Placeholder only; uncomment once that lands.
-  # coturn:
-  #   image: coturn/coturn
-  #   command:
-  #     - "-n"
-  #     - "--use-auth-secret"
-  #     - "--static-auth-secret=${TURN_SECRET:-changeme-dev-only}"
-  #   ports:
-  #     - "3478:3478/udp"
-  #     - "3478:3478/tcp"
-  #     - "5349:5349/tcp"
-
-# volumes:
-#   spindle-postgres-data:
+volumes:
+  spindle-postgres-data:

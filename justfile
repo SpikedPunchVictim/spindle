@@ -40,10 +40,10 @@ vectors:
     pnpm --filter @spindle/proto test
     pnpm --filter @spindle/crypto test
 
-# Run the reference dev stack: NATS + the graduated spindle-helper Auth Callout responder, in
-# `open` admission mode (deploy/README.md). Postgres/coturn are still commented placeholders in
-# deploy/docker-compose.yml (Stage 4 slice 3+) — the local-CA half of "open admission with a
-# local CA" (docs/DESIGN.md §A9b) isn't wired up yet either; see deploy/README.md's Status section.
+# Run the reference dev stack: NATS + Postgres + coturn + the graduated spindle-helper Auth
+# Callout responder / TURN credential minter, in `open` admission mode (deploy/README.md). The
+# local-CA half of "open admission with a local CA" (docs/DESIGN.md §A9b) isn't wired up yet; see
+# deploy/README.md's Status section.
 dev:
     docker compose -f deploy/docker-compose.yml up --build
 
