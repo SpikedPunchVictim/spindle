@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.7) + Execution Plan
+# Spindle — System Design Document (draft v0.9.8) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -13,8 +13,9 @@
 > (user decisions 2026-08-23). v0.9.6: transport split decided — QUIC (via `quinn`) for native↔native file
 > transfers, WebRTC data channels retained only where a browser peer is involved (user decisions 2026-08-24).
 > v0.9.7: TURN credential request hardened — subject parametrized to `helper.turn.get.<nfp>`; username =
-> `expiry:root_fp` (2026-08-25). Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and the
-> **[DEFAULT]**-flagged rows in A10.
+> `expiry:root_fp` (2026-08-25). v0.9.8: `helper.presence.get` likewise parametrized to
+> `helper.presence.get.<nfp>` (2026-08-26). Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and
+> the **[DEFAULT]**-flagged rows in A10.
 
 ---
 
@@ -131,7 +132,7 @@ separately), legal compulsion of connection metadata.
 - **Broker helper** (the whole "backend"): **small, replicated (≥2, queue group), holds no membership data**. Roles:
   callout responder verifying **host-signed capabilities**; presence service (live connection map rebuilt from
   `$SYS.REQ.SERVER.PING.CONNZ` on start + `$SYS.ACCOUNT.*.CONNECT|DISCONNECT` deltas; answers
-  `helper.presence.get`); kick relay (`device_fp → (server_id, cid)` from the same map); TURN credential minting with
+  `helper.presence.get.<nfp>`); kick relay (`device_fp → (server_id, cid)` from the same map); TURN credential minting with
   quotas per `root_fp`; **durable store of host-signed revocation/epoch records** (opaque, host-signed, keyed by
   `host_fp`) + TURN counters + connection-metadata retention (A10.7). NATS in front must set `max_control_line`
   (A10.10) and sit behind per-IP connection/rate limits (the callout is the DoS surface). HA + load test (S8, S12).
@@ -358,7 +359,7 @@ Photos because they're in Family") derived directly from the union model.
 | `host.<hfp>.sess.<cfp>.<sid>.c2h` | client `cfp` only | host | trickle ICE + session control |
 | `host.<hfp>.sess.<cfp>.<sid>.h2c` | host | client `cfp` only | trickle ICE + session control |
 | `host.<hfp>.presence` | broker helper (from `$SYS` events) | devices holding a cap for `hfp` | push deltas `{host_fp, state, last_seen}` only |
-| `helper.presence.get` | devices | broker helper | request/reply snapshot for the caller's hosts (core NATS has no retained messages) |
+| `helper.presence.get.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply snapshot for the caller's hosts (from the session record for `nfp` — identity = the callout-granted subject token, never the payload; core NATS has no retained messages) |
 | `registry.revoke.<hfp>` | host `hfp` only | broker helper | host-signed revocation/epoch records (durable; helper asserts subject token == record `host_fp`; per-host token bucket) |
 | `helper.turn.get.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply TURN credentials; caller identity = the subject token (callout-granted), never the payload; helper authorizes via the session record for `nfp` (below) |
 | `registry.admin.>` | operator (mTLS + operator cert) | broker helper | signed admin commands (A3b); replies via `allow_responses` |
@@ -368,11 +369,11 @@ Photos because they're in Family") derived directly from the union model.
 - Host: `sub host.<own>.>`, `pub host.<own>.sess.*.*.h2c`, `pub registry.revoke`,
   `allow_responses {max:1, expires:"2m"}`; explicit deny of `_INBOX.>`, `$SYS.>`, `$JS.>`.
 - Client, for each host `h` in its verified caps: `pub host.<h>.connect`, `pub host.<h>.sess.<own>.*.c2h`,
-  `sub host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus `sub _INBOX_<own>.>`, `pub helper.presence.get`,
+  `sub host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus `sub _INBOX_<own>.>`, `pub helper.presence.get.<own nfp>`,
   `pub helper.turn.get.<own nfp>`. Invite-only and stale-cap connections get just `pub host.<h>.connect` + inbox. Max 32 hosts
   per connection (A10.5). **Session record**: on each successful auth the callout writes
   `nats_fp → {root_fp, host_fps, quota_profile, exp}` to the helper store, so the helper can authorize non-callout
-  requests (`helper.presence.get`, `helper.turn.get.<nfp>` — keyed by the subject token) — cleaned up on
+  requests (`helper.presence.get.<nfp>`, `helper.turn.get.<nfp>` — keyed by the subject token) — cleaned up on
   DISCONNECT/expiry.
   **Account topology (A10.15)**: one application account + system account; every cross-boundary subject
   (`$SYS.REQ.USER.AUTH`, `$SYS` events, `helper.*`, `registry.*`) gets an explicit export/import row in ADR-002's
@@ -393,7 +394,7 @@ Photos because they're in Family") derived directly from the union model.
 ## A6. Signaling flows
 
 **Presence**: broker helper keeps a live connection map (CONNZ on start + `$SYS.ACCOUNT.<acct>.CONNECT|DISCONNECT`
-deltas), answers `helper.presence.get` on client start, and pushes deltas on `host.<hfp>.presence`;
+deltas), answers `helper.presence.get.<nfp>` on client start, and pushes deltas on `host.<hfp>.presence`;
 `ping_interval` ~20 s / `ping_max` 2 so a dead socket flips ≤ ~60 s; UI shows online / offline / unresponsive
 (last seen). **Multiple connections per identity are normal** (native app + browser tab): the connection map and
 kick relay are one-to-many per `device_fp`; presence is by connection count, not a boolean, and reconnect overlap
@@ -799,6 +800,7 @@ Docker is explicitly not the primary dev environment.
 | 43 | Cross-host forgery/flood on shared revoke subject (A1) | A5 `registry.revoke.<hfp>` scoping + per-host bucket |
 | 44 | Admin command replay / race / audit fork (A7) | A7b per-signer seq + idempotence; single-writer audit chain (A14) |
 | 45 | TURN quota griefing via self-declared identity in `turn.get` payload (A1) | A5 subject parametrization `helper.turn.get.<nfp>` — identity from the NATS permission, not the payload |
+| 46 | Cross-user host-list disclosure via self-declared identity in `presence.get` (A1) | A5 subject parametrization `helper.presence.get.<nfp>` — identity from the NATS permission, not the payload |
 
 ## A13. Spikes (evidence before code) — ordered by risk
 
@@ -920,6 +922,9 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.8 (2026-08-26)** — `helper.presence.get` parametrized to `helper.presence.get.<nfp>` as presence lands
+  in the helper (A12 #46): a bare subject would let any authenticated device query another session's fingerprint
+  and learn which hosts that user holds caps for — same fix shape as v0.9.7's `helper.turn.get.<nfp>`.
 - **v0.9.7 (2026-08-25)** — Stage-4 slice-3 findings resolved: `helper.turn.get` parametrized to
   `helper.turn.get.<nfp>` (closes a quota-griefing gap — payload-declared identity replaced by the
   callout-granted subject token; A12 #45); TURN `username = expiry:root_fp` (was `device_fp`) matching the
