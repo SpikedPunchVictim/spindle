@@ -223,10 +223,21 @@ pub trait HelperView {
 
     /// Looks up the session record for `nats_fp`. A record whose `exp` is at or before `now` is
     /// treated as absent (DESIGN.md §A5 "cleaned up on DISCONNECT/expiry" — this trait enforces
-    /// only the expiry half via an on-read filter; eager DISCONNECT-triggered deletion is a
-    /// wiring-layer concern for whichever later slice bridges `$SYS.ACCOUNT.*.DISCONNECT` events,
-    /// out of scope for this trait boundary).
+    /// only the expiry half via an on-read filter; eager DISCONNECT-triggered deletion is
+    /// [`Self::delete_session_record`], wired to `$SYS.ACCOUNT.*.DISCONNECT` events by
+    /// `src/bin/helper.rs`'s presence bridging (DESIGN.md §A3/§A6, `presence.rs`)).
     fn session_record(&mut self, nats_fp: &Fingerprint, now: u64) -> Option<SessionRecord>;
+
+    /// Eagerly deletes the session record for `nats_fp`, if any (DESIGN.md §A5: "cleaned up on
+    /// DISCONNECT/expiry" — the DISCONNECT half; [`Self::session_record`]'s `now`-filter already
+    /// covers the expiry half). Called by `src/bin/helper.rs` on every `$SYS.ACCOUNT.*.DISCONNECT`
+    /// event, for both device and host connections alike — a session record exists for either
+    /// kind (see [`crate::session::SessionRecord`]'s doc comment), and this is a general-purpose
+    /// cleanup, not a presence-specific one (the presence connection map's own bookkeeping,
+    /// [`crate::presence::ConnectionMap`], is a separate concern that only tracks *registered
+    /// host* users). A no-op if no record exists for `nats_fp` — callers don't need to check
+    /// first.
+    fn delete_session_record(&mut self, nats_fp: &Fingerprint);
 
     /// Atomically checks-and-increments `root_fp`'s TURN-credential-mint counter for the period
     /// containing `now`, against `monthly_quota`. Returns `Ok(new_count)` (already incremented) if
@@ -644,6 +655,10 @@ mod tests {
 
         fn session_record(&mut self, nats_fp: &Fingerprint, now: u64) -> Option<SessionRecord> {
             self.sessions.get(nats_fp).filter(|r| r.exp > now).cloned()
+        }
+
+        fn delete_session_record(&mut self, nats_fp: &Fingerprint) {
+            self.sessions.remove(nats_fp);
         }
 
         fn record_turn_issuance(

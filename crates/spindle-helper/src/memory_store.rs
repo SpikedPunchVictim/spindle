@@ -126,6 +126,10 @@ impl HelperView for InMemoryHelperView {
         self.sessions.get(nats_fp).filter(|r| r.exp > now).cloned()
     }
 
+    fn delete_session_record(&mut self, nats_fp: &Fingerprint) {
+        self.sessions.remove(nats_fp);
+    }
+
     fn record_turn_issuance(
         &mut self,
         root_fp: &Fingerprint,
@@ -266,6 +270,30 @@ mod tests {
             v.session_record(&nats_fp, 1_000).is_none(),
             "exp is exclusive: at/after exp the record must read as absent"
         );
+    }
+
+    #[test]
+    fn delete_session_record_removes_a_present_record() {
+        let mut v = view(AdmissionMode::Open);
+        let nats_fp = fp(b"nats-delete");
+        v.put_session_record(SessionRecord::new(
+            nats_fp,
+            fp(b"root-delete"),
+            vec![],
+            "member".to_string(),
+            2_000,
+        ));
+        assert!(v.session_record(&nats_fp, 1_000).is_some());
+        v.delete_session_record(&nats_fp);
+        assert!(v.session_record(&nats_fp, 1_000).is_none());
+    }
+
+    #[test]
+    fn delete_session_record_on_an_absent_record_is_a_harmless_no_op() {
+        let mut v = view(AdmissionMode::Open);
+        let nats_fp = fp(b"nats-never-existed");
+        v.delete_session_record(&nats_fp); // must not panic
+        assert!(v.session_record(&nats_fp, 1_000).is_none());
     }
 
     #[test]

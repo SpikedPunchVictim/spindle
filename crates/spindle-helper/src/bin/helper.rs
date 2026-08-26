@@ -22,13 +22,25 @@
 //!   nkey exempted from the callout itself via the server's `auth_callout.auth_users`).
 //!   Subscribes to `$SYS.REQ.USER.AUTH` and is the only connection this slice's responder loop
 //!   uses.
-//! - `_app_client` — on the application account, authenticated with `APP_CONN_SEED` (a second
+//! - `app_client` — on the application account, authenticated with `APP_CONN_SEED` (a second
 //!   exempted nkey, distinct from `APP_ACCOUNT_SEED`, which is the account's own *signing* key
-//!   used to sign User JWTs and is never used to open a connection). Established but otherwise
-//!   idle in this slice — presence (`host.<hfp>.presence` publishing from `$SYS` events) and
-//!   `registry.*`/`helper.*` request/reply are Stage 4 slice 3+ work. Optional: if
-//!   `APP_CONN_SEED` is unset, this binary logs a warning and runs with the callout connection
-//!   only, since nothing in this slice actually needs the application connection yet.
+//!   used to sign User JWTs and is never used to open a connection). Answers `helper.turn.get.
+//!   <nfp>` and `helper.presence.get.<nfp>` and publishes `host.<hfp>.presence` deltas.
+//!   `registry.*` request/reply remains later work. Optional: if `APP_CONN_SEED` is unset, this
+//!   binary logs a warning per degraded feature and runs with the callout connection only.
+//!
+//! # Presence (DESIGN.md §A3/§A6, subject parametrized in v0.9.8 the same way `helper.turn.get`
+//! was in v0.9.7)
+//! The `callout_client` (system account) additionally subscribes to `$SYS.ACCOUNT.*.CONNECT` and
+//! `$SYS.ACCOUNT.*.DISCONNECT` and, once at startup, requests `$SYS.REQ.SERVER.PING.CONNZ` to seed
+//! [`spindle_helper::presence::ConnectionMap`] with whatever connections predate this process
+//! (see `seed_presence_map`'s doc comment for the exact fold logic and its one flagged gap). Every
+//! DISCONNECT additionally triggers [`HelperView::delete_session_record`] for that connection's
+//! `nats_fp`, host or device alike (DESIGN.md §A5's "cleaned up on DISCONNECT/expiry"). See
+//! `spindle_helper::presence`'s own module doc for the wire schema, the `$SYS` payload shapes
+//! assumed here (no local ground truth exists for them — see that doc's evidence note), and the
+//! explicit list of what's still out of scope (kick relay, split-brain, multi-server `CONNZ`,
+//! leader-only publishing).
 //!
 //! # `verify_nkey_sig` (DESIGN.md §A4 step 1: "signing the server nonce with its session nkey")
 //! Satisfied the same way S1 proved it: the authorization request's `connect_opts.sig` is the
@@ -55,6 +67,7 @@ use spindle_helper::memory_store::InMemoryHelperView;
 use spindle_helper::natsjwt::{self, NatsJwtError};
 use spindle_helper::permissions::{Limits, SubjectPermissions};
 use spindle_helper::pg_store::PgStore;
+use spindle_helper::presence;
 use spindle_helper::session::SessionRecord;
 use spindle_helper::turn::{self, TurnConfig};
 use std::env;
@@ -400,6 +413,13 @@ impl HelperView for Store {
         }
     }
 
+    fn delete_session_record(&mut self, nats_fp: &spindle_core::Fingerprint) {
+        match self {
+            Store::Memory(s) => s.delete_session_record(nats_fp),
+            Store::Pg(s) => s.delete_session_record(nats_fp),
+        }
+    }
+
     fn record_turn_issuance(
         &mut self,
         root_fp: &spindle_core::Fingerprint,
@@ -537,6 +557,24 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     let mut sub = callout_client.subscribe("$SYS.REQ.USER.AUTH").await?;
 
+    // Presence (DESIGN.md §A3/§A6 — see this file's module docs). Both `$SYS.ACCOUNT.*.CONNECT`
+    // and `.DISCONNECT` are subscribed on the system/callout connection, matching where `$SYS.REQ.
+    // USER.AUTH` itself lives — `$SYS.>` is system-account subject space, unreachable from the
+    // application-account `app_client` connection (see the module docs' "two connections" note).
+    let mut connect_sub: Option<async_nats::Subscriber> =
+        Some(callout_client.subscribe("$SYS.ACCOUNT.*.CONNECT").await?);
+    let mut disconnect_sub: Option<async_nats::Subscriber> =
+        Some(callout_client.subscribe("$SYS.ACCOUNT.*.DISCONNECT").await?);
+
+    // `helper.presence.get.*` — same subject-parametrization shape as `helper.turn.get.*` above
+    // (DESIGN.md v0.9.8, pending doc amendment — see `spindle_helper::presence`'s module doc).
+    let mut presence_sub: Option<async_nats::Subscriber> = match &app_client {
+        Some(client) => Some(client.subscribe("helper.presence.get.*").await?),
+        None => None,
+    };
+
+    let mut presence_map = seed_presence_map(&callout_client, &mut store, now_secs()).await;
+
     // Periodic best-effort cleanup of expired session records (DESIGN.md §A9b: "a cleanup path
     // for expired rows (on-read filter + periodic delete — keep simple)"). The on-read `exp`
     // filter in `HelperView::session_record` already makes this a non-correctness-affecting
@@ -560,7 +598,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 let Some(reply) = msg.reply.clone() else {
                     continue;
                 };
-                let resp = match handle_one(&msg.payload, &config.account_name, &app_kp, &mut store) {
+                let resp = match handle_one(&msg.payload, &config.account_name, &app_kp, &mut store, &mut presence_map) {
                     Ok(resp) => resp,
                     Err(e) => {
                         tracing::error!(error = %e, "internal error building callout response");
@@ -597,6 +635,68 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     let _ = client.flush().await;
                 }
             }
+            msg = next_or_pending(&mut presence_sub) => {
+                let Some(msg) = msg else {
+                    tracing::warn!("helper.presence.get.* subscription ended unexpectedly");
+                    presence_sub = None;
+                    continue;
+                };
+                let Some(reply) = msg.reply.clone() else {
+                    continue;
+                };
+                let reply_payload = presence::handle_presence_get(
+                    msg.subject.as_str(),
+                    &mut store,
+                    &presence_map,
+                    now_secs(),
+                );
+                if let Some(client) = &app_client {
+                    if let Err(e) = client.publish(reply, reply_payload.into()).await {
+                        tracing::error!(error = %e, "failed to publish helper.presence.get.<nfp> response");
+                    }
+                    let _ = client.flush().await;
+                }
+            }
+            msg = next_or_pending(&mut connect_sub) => {
+                let Some(msg) = msg else {
+                    tracing::warn!("$SYS.ACCOUNT.*.CONNECT subscription ended unexpectedly");
+                    connect_sub = None;
+                    continue;
+                };
+                let Some(user_pk) = user_from_sys_event(&msg.payload) else {
+                    tracing::warn!(
+                        payload = %String::from_utf8_lossy(&msg.payload),
+                        "CONNECT event had no recognizable client.user — ignoring"
+                    );
+                    continue;
+                };
+                if let Some(delta) = presence_map.connect(&user_pk, now_secs()) {
+                    publish_presence_delta(&app_client, delta).await;
+                }
+            }
+            msg = next_or_pending(&mut disconnect_sub) => {
+                let Some(msg) = msg else {
+                    tracing::warn!("$SYS.ACCOUNT.*.DISCONNECT subscription ended unexpectedly");
+                    disconnect_sub = None;
+                    continue;
+                };
+                let Some(user_pk) = user_from_sys_event(&msg.payload) else {
+                    tracing::warn!(
+                        payload = %String::from_utf8_lossy(&msg.payload),
+                        "DISCONNECT event had no recognizable client.user — ignoring"
+                    );
+                    continue;
+                };
+                // Eager session-record cleanup (DESIGN.md §A5 "cleaned up on DISCONNECT/expiry")
+                // applies to every disconnecting user, host or device alike — decoupled from the
+                // presence map below, which only exists for registered hosts.
+                if let Ok(nats_fp) = auth_token::nats_fp_of_nkey(&user_pk) {
+                    store.delete_session_record(&nats_fp);
+                }
+                if let Some(delta) = presence_map.disconnect(&user_pk, now_secs()) {
+                    publish_presence_delta(&app_client, delta).await;
+                }
+            }
             _ = purge_interval.tick() => {
                 store.purge_expired_sessions(now_secs());
             }
@@ -605,6 +705,164 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     tracing::info!("spindle-helper shut down cleanly");
     Ok(())
+}
+
+// ================================================================================================
+// Presence wiring (DESIGN.md §A3/§A6) — bridges `$SYS` events/CONNZ into
+// `spindle_helper::presence::ConnectionMap`. See that module's own doc comment for the pure
+// connection-tracking logic and wire schema; everything below is I/O only.
+// ================================================================================================
+
+/// Extracts the client's session-nkey public-key string (`client.user`) from a `$SYS.ACCOUNT.*.
+/// CONNECT`/`.DISCONNECT` event payload. Modeled tolerantly via `serde_json::Value` (matching
+/// `handle_one`'s own style for external wire shapes) rather than a typed struct: the `async-nats`
+/// crate this binary depends on does not model `$SYS` event payloads at all (confirmed by
+/// grepping its source for `ConnectEvent`/`DisconnectEvent`/`client_info` — zero matches; these
+/// events only ever reach a subscriber as raw JSON), and no local capture of a real event exists
+/// in this repo to verify the exact shape against (`spikes/s1-callout` only ever captured its own
+/// callout's `client_info`, not `$SYS.ACCOUNT.*` events). The `{"client": {"user": "<pubkey>",
+/// ...}}` shape assumed here follows nats-server's documented system-event schema from general
+/// knowledge, not a local capture — flagged here explicitly per the task's evidence requirement.
+/// Any other shape (or a missing/non-string `user`) is treated as "ignore this event," not a
+/// fatal error — an unrecognized or malformed system event should never take the responder down.
+fn user_from_sys_event(payload: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    value
+        .get("client")?
+        .get("user")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Publishes one `host.<hfp>.presence` delta (DESIGN.md §A6: "push deltas `{host_fp, state,
+/// last_seen}` only") on `app_client`, or logs a degraded-mode warning and drops it if
+/// `APP_CONN_SEED` is unset — the same pattern `helper.turn.get.<nfp>` already uses when the
+/// application connection is absent.
+async fn publish_presence_delta(
+    app_client: &Option<async_nats::Client>,
+    delta: presence::PresenceDelta,
+) {
+    let Some(client) = app_client else {
+        tracing::warn!(
+            host_fp = %delta.host_fp,
+            "APP_CONN_SEED not set — dropping a host.<hfp>.presence delta"
+        );
+        return;
+    };
+    let subject = format!("host.{}.presence", delta.host_fp);
+    let payload = match serde_json::to_vec(&delta.entry) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to serialize a presence delta");
+            return;
+        }
+    };
+    if let Err(e) = client.publish(subject, payload.into()).await {
+        tracing::error!(error = %e, "failed to publish a host.<hfp>.presence delta");
+    }
+    let _ = client.flush().await;
+}
+
+/// Seeds a fresh [`presence::ConnectionMap`] from a `$SYS.REQ.SERVER.PING.CONNZ` reply at startup
+/// (DESIGN.md §A6: "CONNZ on start + ... deltas"). Best-effort: any failure (timeout, unparseable
+/// reply, an unrecognized shape) is a warning, not a fatal error — presence self-heals from
+/// `$SYS.ACCOUNT.*.CONNECT|DISCONNECT` deltas as connections churn, so starting with an empty map
+/// is safe, just momentarily stale (every host reads offline/unknown until its next CONNECT).
+///
+/// Multi-server `CONNZ` aggregation (a cluster's `$SYS.REQ.SERVER.PING.CONNZ` fans out to every
+/// node in the cluster and each node replies separately) is explicitly deferred to the HA slice
+/// (DESIGN.md §A6/S8) — this takes only the first reply, matching a single-helper-instance
+/// deployment.
+///
+/// Payload shape assumed (same caveat as [`user_from_sys_event`]: no local capture exists, this
+/// follows nats-server's documented monitoring/CONNZ schema from general knowledge): the reply is
+/// `{"server": {...}, "data": {"connections": [{"user": "<pubkey>", ...}, ...], ...}, ...}`; a
+/// bare top-level `connections` array is also tolerated in case of a differently-wrapped reply.
+///
+/// # Host-user resolution gap (flagged ambiguity, not silently resolved)
+/// [`presence::ConnectionMap::register_host_user`] is normally populated live, at the moment a
+/// host's callout succeeds (`handle_one`'s Host branch, below). CONNZ rows for connections
+/// established *before this helper process started* were never seen by that code path, so there
+/// is no `user_pk -> host_fp` binding for them yet — nothing in the CONNZ row itself names a
+/// `host_fp`. This function closes that gap the only way available without extending the wire
+/// schema: for each row's `user` (nkey pubkey), it derives `nats_fp` exactly as the callout does
+/// (`auth_token::nats_fp_of_nkey`) and looks up that `nats_fp`'s durable session record. A record
+/// whose `host_fps` is the single-element, self-referential `[root_fp]` — the shape
+/// `decide_host_connect` always builds for a host connection (see `authz.rs`) — is recognized as
+/// a host session, and its `root_fp` (== `host_fp`) is registered before folding the connection
+/// in. A connection with no durable session record at all (the in-memory store was never durable
+/// to begin with, or the record already expired) is silently skipped: from CONNZ alone it's
+/// indistinguishable from a device or the helper's own connection, and presence for it simply
+/// reads "offline/unknown" until its own next CONNECT/DISCONNECT cycle re-establishes it live.
+async fn seed_presence_map(
+    callout_client: &async_nats::Client,
+    store: &mut Store,
+    now: u64,
+) -> presence::ConnectionMap {
+    let mut map = presence::ConnectionMap::new();
+
+    let reply = match tokio::time::timeout(
+        Duration::from_secs(5),
+        callout_client.request("$SYS.REQ.SERVER.PING.CONNZ", Vec::new().into()),
+    )
+    .await
+    {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "CONNZ request failed — starting presence with an empty map");
+            return map;
+        }
+        Err(_) => {
+            tracing::warn!("CONNZ request timed out — starting presence with an empty map");
+            return map;
+        }
+    };
+
+    let value: serde_json::Value = match serde_json::from_slice(&reply.payload) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "CONNZ reply was not valid JSON — starting presence with an empty map"
+            );
+            return map;
+        }
+    };
+
+    let connections = value
+        .get("data")
+        .and_then(|d| d.get("connections"))
+        .or_else(|| value.get("connections"))
+        .and_then(|c| c.as_array());
+
+    let Some(connections) = connections else {
+        tracing::warn!(
+            "CONNZ reply had no recognizable connections array — starting presence with an empty map"
+        );
+        return map;
+    };
+
+    for conn in connections {
+        let Some(user_pk) = conn.get("user").and_then(|u| u.as_str()) else {
+            continue;
+        };
+        let Ok(nats_fp) = auth_token::nats_fp_of_nkey(user_pk) else {
+            continue;
+        };
+        let Some(session) = store.session_record(&nats_fp, now) else {
+            continue;
+        };
+        let is_host_session = session.host_fps.len() == 1 && session.host_fps[0] == session.root_fp;
+        if !is_host_session {
+            continue;
+        }
+        map.register_host_user(user_pk.to_string(), session.root_fp);
+        // Discard the delta: nothing is subscribed to host.<hfp>.presence yet this early in
+        // startup, and every seeded connection is by definition not a fresh transition.
+        let _ = map.connect(user_pk, now);
+    }
+
+    map
 }
 
 fn verifying_key_from_raw(raw: &[u8]) -> anyhow::Result<spindle_core::VerifyingKey> {
@@ -685,6 +943,7 @@ fn handle_one(
     account_name: &str,
     app_kp: &KeyPair,
     view: &mut impl HelperView,
+    presence_map: &mut presence::ConnectionMap,
 ) -> Result<Option<String>, HandleError> {
     let req_str = std::str::from_utf8(request_payload).map_err(|_| HandleError::NonUtf8Payload)?;
     let claims = natsjwt::decode_claims_unverified(req_str)?;
@@ -825,7 +1084,13 @@ fn handle_one(
                 authz::decide_host_connect(&presented, verify_nkey_sig, now, view, jitter);
             match decision {
                 AuthzDecision::Authorized(auth) => {
+                    // DESIGN.md §A3/§A6: the presence map needs a `user_pk -> host_fp` binding to
+                    // ever recognize this connection's own future CONNECT/DISCONNECT events — the
+                    // callout is the only place that knows both facts at once. For a host
+                    // connection, `root_fp == host_fp` (see `authz.rs`'s `decide_host_connect`).
+                    let host_fp = auth.session_record.root_fp;
                     view.put_session_record(auth.session_record);
+                    presence_map.register_host_user(connect_nkey, host_fp);
                     Ok(respond_ok(auth.permissions, auth.limits, 1))
                 }
                 AuthzDecision::Refused(reason) => {

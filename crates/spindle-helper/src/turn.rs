@@ -129,11 +129,7 @@ pub fn mint_credentials(secret: &str, label: &str, expiry: u64) -> (String, Stri
 /// token doesn't decode as a [`Fingerprint`] under the same base32 `Display` encoding every other
 /// `<...fp>` subject token uses (DESIGN.md §A5; see `permissions.rs`'s module doc).
 fn parse_subject_nats_fp(subject: &str) -> Option<Fingerprint> {
-    let token = subject.strip_prefix(SUBJECT_PREFIX)?;
-    if token.is_empty() {
-        return None;
-    }
-    token.parse::<Fingerprint>().ok()
+    crate::parse_fp_after_prefix(subject, SUBJECT_PREFIX)
 }
 
 /// Decodes and authorizes one `helper.turn.get.<nfp>` request, enforcing the per-`root_fp` quota

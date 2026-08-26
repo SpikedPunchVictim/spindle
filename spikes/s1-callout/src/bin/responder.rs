@@ -127,6 +127,10 @@ impl HelperView for InMemoryHelperView {
         self.sessions.get(nats_fp).filter(|r| r.exp > now).cloned()
     }
 
+    fn delete_session_record(&mut self, nats_fp: &Fingerprint) {
+        self.sessions.remove(nats_fp);
+    }
+
     fn record_turn_issuance(
         &mut self,
         root_fp: &Fingerprint,

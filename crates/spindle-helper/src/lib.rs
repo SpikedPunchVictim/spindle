@@ -50,9 +50,18 @@
 //!   successful callout now persists (see [`authz::HelperView::put_session_record`]) and
 //!   quota-limited per `root_fp` via [`authz::HelperView::record_turn_issuance`]. See that
 //!   module's own doc comment for the wire-schema detail.
+//! - [`presence`] — [`presence::ConnectionMap`] + [`presence::handle_presence_get`] (DESIGN.md
+//!   §A3/§A5/§A6, subject parametrized the same way as `helper.turn.get.<nfp>`): the live
+//!   connection map `src/bin/helper.rs` feeds from `$SYS.REQ.SERVER.PING.CONNZ` at startup and
+//!   `$SYS.ACCOUNT.*.CONNECT|DISCONNECT` deltas thereafter, answering
+//!   `helper.presence.get.<nfp>` snapshots and computing `host.<hfp>.presence` push deltas. See
+//!   that module's own doc comment for the wire-schema detail and for why `unresponsive` (§A6/§A9)
+//!   isn't tracked here.
 //!
-//! **Still out of scope** (later slices): presence (`$SYS` event bridging into
-//! `host.<hfp>.presence`) and the admin-command verifier (`registry.admin.>`).
+//! **Still out of scope** (later slices): the admin-command verifier (`registry.admin.>`), the
+//! kick relay, split-brain newest-wins policy, multi-server `CONNZ` aggregation, and leader-only
+//! delta publishing (A10.23) — see `presence.rs`'s module doc for the presence-specific subset of
+//! this list.
 //!
 //! # Design notes and ambiguities (reported, not silently resolved)
 //!
@@ -73,12 +82,43 @@ pub mod memory_store;
 pub mod natsjwt;
 pub mod permissions;
 pub mod pg_store;
+pub mod presence;
 pub mod session;
 pub mod turn;
 
+use spindle_core::Fingerprint;
+
+/// Parses the final `.`-delimited token of `subject` as a [`Fingerprint`], requiring `subject` to
+/// start with `prefix` exactly. Shared by `turn.rs`'s `helper.turn.get.<nfp>` and `presence.rs`'s
+/// `helper.presence.get.<nfp>` subject parsers — both need byte-identical "strip this literal
+/// prefix, reject an empty or non-fingerprint remainder" logic, since both scope caller identity
+/// to the subject token a NATS permission already gated (never a request-payload field).
+pub(crate) fn parse_fp_after_prefix(subject: &str, prefix: &str) -> Option<Fingerprint> {
+    let token = subject.strip_prefix(prefix)?;
+    if token.is_empty() {
+        return None;
+    }
+    token.parse::<Fingerprint>().ok()
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn scaffold() { /* compilation of this crate is the assertion */
+    }
+
+    #[test]
+    fn parse_fp_after_prefix_round_trips() {
+        let fp = Fingerprint::of_parts(&[b"lib-rs-shared-helper-test"]);
+        let subject = format!("helper.presence.get.{fp}");
+        assert_eq!(parse_fp_after_prefix(&subject, "helper.presence.get."), Some(fp));
+    }
+
+    #[test]
+    fn parse_fp_after_prefix_rejects_wrong_prefix_or_empty_token() {
+        assert_eq!(parse_fp_after_prefix("helper.presence.get", "helper.presence.get."), None);
+        assert_eq!(parse_fp_after_prefix("helper.presence.get.", "helper.presence.get."), None);
     }
 }

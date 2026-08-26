@@ -265,6 +265,14 @@ impl PgStore {
         })
     }
 
+    async fn delete_session_record_async(&self, nats_fp: &Fingerprint) {
+        sqlx::query("DELETE FROM session_records WHERE nats_fp = $1")
+            .bind(fp_bytes(nats_fp))
+            .execute(&self.pool)
+            .await
+            .expect("delete_session_record");
+    }
+
     async fn record_turn_issuance_async(
         &self,
         root_fp: &Fingerprint,
@@ -399,6 +407,10 @@ impl HelperView for PgStore {
 
     fn session_record(&mut self, nats_fp: &Fingerprint, now: u64) -> Option<SessionRecord> {
         run_blocking(self.session_record_async(nats_fp, now))
+    }
+
+    fn delete_session_record(&mut self, nats_fp: &Fingerprint) {
+        run_blocking(self.delete_session_record_async(nats_fp))
     }
 
     fn record_turn_issuance(
@@ -562,6 +574,26 @@ mod tests {
             store.session_record(&nats_fp, 2_000).is_none(),
             "exp is exclusive: at/after exp the record must read as absent"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_session_record_removes_a_present_row_and_is_a_no_op_when_absent() {
+        let _guard = TEST_LOCK.lock().await;
+        let Some(mut store) = test_store().await else {
+            return;
+        };
+        let nats_fp = fp(b"pg-nats-delete");
+        store.put_session_record(SessionRecord::new(
+            nats_fp,
+            fp(b"pg-root-delete"),
+            vec![],
+            "member".to_string(),
+            2_000,
+        ));
+        assert!(store.session_record(&nats_fp, 1_000).is_some());
+        store.delete_session_record(&nats_fp);
+        assert!(store.session_record(&nats_fp, 1_000).is_none());
+        store.delete_session_record(&nats_fp); // must not panic on an already-absent row
     }
 
     #[tokio::test(flavor = "multi_thread")]
