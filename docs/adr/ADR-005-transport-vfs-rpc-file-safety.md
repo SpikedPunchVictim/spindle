@@ -124,6 +124,16 @@ peer. Decision A10.31 splits the transport by peer type:
 VFS RPC, the chunk/manifest/resume format, and received-file policy (below) are transport-agnostic and unaffected by
 this split — they run unchanged over either the QUIC stream pair or the WebRTC channel pair.
 
+**[amended 2026-08-26, DESIGN.md v0.9.12]** The QUIC control stream's wire format is now implemented and codified
+(`spindle-net`, `spindle-host-core`; end-to-end tested): VFS RPC frames on the control stream use a 4-byte
+big-endian length prefix followed by a canonical-CBOR payload, capped at 256 KiB (comfortably above the 64 KiB
+chunk size plus CBOR overhead); the ALPN token is `spindle-vfs/1`; the certificate fingerprint is SHA-256 of the
+certificate's DER encoding; pinning is **mutual** — each side pins the other's per-session certificate fingerprint,
+sourced from the A7-verified envelope per the identity-binding bullet above. A framing or decode violation
+(oversized length prefix, truncated frame, a request that doesn't decode) closes the connection rather than
+producing a typed VFS error — typed `VfsErrorCode` replies (VFS error model, below) apply only to well-formed,
+already-authenticated requests.
+
 ### VFS RPC surface
 
 The control channel carries CBOR-encoded RPCs (canonical CBOR per ADR-004's A7b profile):

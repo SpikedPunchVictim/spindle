@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.11) + Execution Plan
+# Spindle — System Design Document (draft v0.9.12) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -18,7 +18,10 @@
 > (2026-08-26). v0.9.10: §A8 VFS error codes extended (+`unsupported_version`, `already_exists`, `file_changed`) from
 > slice-3 implementation evidence (2026-08-26). v0.9.11: FreeSpaceProbe backend decided — rustix (Unix) +
 > windows-sys (Windows), both already-transitive via cap-std, promoted to direct target-scoped deps of
-> spindle-host-core (user decision 2026-08-26; A9c manifest amended). Remaining **[USER DECISION]** items: A10.6–9,
+> spindle-host-core (user decision 2026-08-26; A9c manifest amended). v0.9.12: QUIC VFS-RPC control-stream wire
+> facts codified from Stage 6 slice 5 — 4-byte big-endian length-prefixed canonical CBOR framing (256 KiB cap),
+> ALPN `spindle-vfs/1`, SHA-256-of-DER cert fingerprints with mutual per-session pinning, framing violations close
+> the connection (2026-08-26; A9c manifest amended — rcgen). Remaining **[USER DECISION]** items: A10.6–9,
 > A10.24 (license), and the **[DEFAULT]**-flagged rows in A10.
 
 ---
@@ -499,7 +502,12 @@ discovered divergence between op-key-signed caps and the root-derived `host_fp` 
   QUIC certificate, fingerprint pinned via the A7-verified envelope (the DTLS rule, restated for this transport —
   A6). quinn's default congestion control is TCP-class, which is exactly what the S3 evidence shows the path
   supports (plain TCP does 60.7 MB/s on the identical shaped path). One control stream (VFS RPC) + data streams;
-  64 KiB chunks; resumable transfers/manifests unchanged (below).
+  64 KiB chunks; resumable transfers/manifests unchanged (below). **[amended v0.9.12, Stage 6 slice 5]** VFS RPC
+  frames on the control stream: a 4-byte big-endian length prefix + canonical CBOR payload, capped at 256 KiB
+  (comfortably above the 64 KiB chunk plus CBOR overhead); ALPN token `spindle-vfs/1`; certificate fingerprint =
+  SHA-256 of the DER; pinning is **mutual** — each side pins the other's per-session cert fingerprint from the
+  verified envelope; framing/decode violations close the connection (typed VFS errors are only for well-formed
+  requests).
 - **Browser transport: WebRTC data channel.** Rust: `webrtc-rs` (≥ 0.20, sans-I/O core), used only when a browser
   peer is on the other end. Channels: one reliable-ordered control channel (VFS RPC) + **one** unordered-reliable
   data channel (all channels share one SCTP association/cwnd; more channels don't add throughput); 64 KiB chunks;
@@ -683,7 +691,7 @@ spindle/
 |---------|------|------------|
 | Runtime | tokio, tracing, thiserror (libs) / anyhow (bins) | Node 22 LTS (CLI/admin), evergreen browsers per A7 |
 | NATS | async-nats | nats.ws |
-| WebRTC | webrtc ≥0.20 (browser peers; ice reused standalone for QUIC punching) + quinn (native↔native QUIC) | browser RTCPeerConnection |
+| WebRTC | webrtc ≥0.20 (browser peers; ice reused standalone for QUIC punching) + quinn (native↔native QUIC) + rcgen (per-session QUIC certs) | browser RTCPeerConnection |
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
 | Encoding | hand-rolled zero-dep canonical codec in spindle-proto (strict non-canonical rejection; minicbor rejected — decoder abstracts the raw bytes) | own canonical encoder in @spindle/proto |
 | Storage | rusqlite (bundled) host-side; sqlx/Postgres helper-side | IndexedDB (caps, resume manifests) |
@@ -939,6 +947,11 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.12 (2026-08-26)** — Stage 6 slice 5 wire facts codified: QUIC VFS-RPC control-stream framing (4-byte
+  big-endian length prefix, canonical CBOR, 256 KiB cap), ALPN `spindle-vfs/1`, SHA-256-of-DER cert fingerprints
+  with mutual per-session pinning; framing violations close the connection. A9c manifest: rcgen added
+  (per-session QUIC certs). Envelope-carried fingerprint exchange and the WebRTC data-channel binding remain
+  Stage 5.
 - **v0.9.11 (2026-08-26)** — FreeSpaceProbe backend decided (user, 2026-08-26): rustix statvfs (Unix) +
   windows-sys GetDiskFreeSpaceExW (Windows), both already-transitive via cap-std, promoted to direct
   target-scoped deps of spindle-host-core; probe failure fails closed (reports 0 → storage_full), preserving

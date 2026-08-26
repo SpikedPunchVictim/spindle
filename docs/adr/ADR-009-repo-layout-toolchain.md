@@ -108,7 +108,7 @@ display state, or opaque handles across the Tauri IPC boundary — never a priva
 |---------|------|------------|
 | Runtime | tokio, tracing, thiserror (libs) / anyhow (bins) | Node 22 LTS (CLI/admin), evergreen browsers per A7 |
 | NATS | async-nats | nats.ws |
-| WebRTC | webrtc ≥0.20 (datachannel-rs = S3 fallback) | browser RTCPeerConnection |
+| WebRTC | webrtc ≥0.20 (browser peers; ice reused standalone for QUIC punching) + quinn (native↔native QUIC) **[amended v0.9.6, A10.31/32]** + rcgen (per-session QUIC certs) **[amended v0.9.12]** | browser RTCPeerConnection |
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
 | Encoding | hand-rolled zero-dep canonical codec in spindle-proto (strict non-canonical rejection; minicbor rejected — decoder abstracts the raw bytes) **[amended v0.9.3]** | own canonical encoder in @spindle/proto |
 | Storage | rusqlite (bundled) host-side; sqlx/Postgres helper-side | IndexedDB (caps, resume manifests) |
@@ -122,6 +122,11 @@ display state, or opaque handles across the Tauri IPC boundary — never a priva
 windows-sys GetDiskFreeSpaceExW (Windows), both already-transitive via cap-std, promoted to direct target-scoped
 deps of spindle-host-core; probe failure fails closed (reports 0 → storage_full), preserving DESIGN.md §A4b's
 free-space floor. DESIGN.md A9c manifest amended (Confinement row above).
+
+**Amendment (2026-08-26, v0.9.12)**: WebRTC row reconciled — it had gone stale since v0.9.6 (2026-08-24), never
+updated for the A10.31/A10.32 transport split (`quinn` added for native↔native QUIC transfers, standalone ICE
+reused from `webrtc-rs`); brought to parity with DESIGN.md §A9c now, alongside this slice's `rcgen` (per-session
+QUIC certs) addition. Found while cross-checking this slice's docs amendment against ADR-009's mirror.
 
 ### Versioning & release (DESIGN.md §A9c)
 
