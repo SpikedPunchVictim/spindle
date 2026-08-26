@@ -3,5 +3,30 @@ name = "spindle-host-core"
 version.workspace = true
 edition.workspace = true
 
-# No dependencies yet.
+# Crate layering law (A9c boundary rule 3 / DESIGN.md §A9c: proto ← core ← {net, vfs} ← host-core):
+# Stage 6 slice 3 gives this crate its first real dependencies. `spindle-vfs` (and transitively
+# `spindle-core`, `spindle-proto`) supplies the shares/groups/entitlements engine, the entitlement
+# algebra, path confinement, SQLite persistence, and the audit chain this slice's `VfsRpcServer`
+# is built on. `spindle-proto` supplies the VFS RPC wire types directly (not just transitively via
+# `spindle-vfs`, which does not depend on `spindle-proto` for wire concerns) — the server decodes
+# `VfsRequestEnvelope`/encodes `VfsReply` itself. `cap-std` is taken directly (not just through
+# `spindle-vfs`) because the server holds a `cap_std::fs::Dir` value per request, obtained from
+# `spindle_vfs::confine::open_share_root`, to perform the actual `read`/`list` I/O. `thiserror`
+# matches every other library crate in this workspace. Deliberately **not** a dependency this
+# slice: `spindle-net` — the task brief scopes this slice to a transport-agnostic server (bytes
+# in/typed-request in, bytes out/typed-reply out); binding to a real transport is Stage 6 slice 4
+# territory (see this crate's `lib.rs` module doc comment, which the slice-1 stub incorrectly
+# claimed as a slice-3 dependency — corrected here).
 [dependencies]
+spindle-core = { path = "../spindle-core" }
+spindle-proto = { path = "../spindle-proto" }
+spindle-vfs = { path = "../spindle-vfs" }
+cap-std = { workspace = true }
+thiserror = { workspace = true }
+
+# tempfile is crate-local only (not a workspace dependency), matching the precedent set by
+# `spindle-vfs`'s own `Cargo.toml`: negative/integration tests need disposable real temp
+# directories to run confinement/RPC pipeline tests against; this never becomes a runtime
+# dependency of spindle-host-core.
+[dev-dependencies]
+tempfile = "3"

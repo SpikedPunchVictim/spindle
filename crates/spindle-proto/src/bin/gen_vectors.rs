@@ -17,6 +17,9 @@ use spindle_proto::artifacts::{
 };
 use spindle_proto::canonical::{canonical_encode, CborValue};
 use spindle_proto::tags;
+use spindle_proto::vfs_rpc::{
+    DirEntry, EntryKind, VfsErrorCode, VfsPerms, VfsReply, VfsRequest, VfsRequestEnvelope,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -244,6 +247,7 @@ fn main() {
         "canonical-cbor.json",
         canonical_cbor_vectors(),
     );
+    write_vector_file(&vectors_dir, "vfs-rpc.json", vfs_rpc_vectors());
 }
 
 fn vectors_dir() -> PathBuf {
@@ -821,5 +825,221 @@ fn canonical_cbor_vectors() -> Json {
             ),
         ),
         ("cases", Json::Arr(cases)),
+    ])
+}
+
+// ---- VFS RPC (DESIGN.md §A8, Stage 6 slice 3) ----
+//
+// Not A7b signed artifacts (see `spindle_proto::vfs_rpc`'s module doc comment) — no domain tag,
+// no signing input, so each case here is `{name, description, decoded, canonical_cbor_hex}`
+// rather than the artifact-vector shape's extra `signing_input_hex` field. `decoded` reuses
+// `cbor_to_json` (the same generic CBOR-to-JSON mirror `admin-command.json`'s open-ended `args`
+// field already relies on) rather than a bespoke per-op JSON shape, since the six ops carry
+// different field sets.
+
+fn vfs_rpc_case(name: &'static str, description: &'static str, cbor: CborValue) -> Json {
+    let bytes = canonical_encode(&cbor);
+    Json::Obj(vec![
+        ("name", Json::Str(name.into())),
+        ("description", Json::Str(description.into())),
+        ("decoded", cbor_to_json(&cbor)),
+        ("canonical_cbor_hex", Json::hex(&bytes)),
+    ])
+}
+
+fn vfs_rpc_vectors() -> Json {
+    let requests = vec![
+        vfs_rpc_case(
+            "list_root_no_cursor",
+            "`list` at the share-root-relative virtual path \"Photos\", first page (no cursor, \
+             server-default limit).",
+            VfsRequestEnvelope {
+                v: 1,
+                request: VfsRequest::List {
+                    path: "Photos".to_string(),
+                    cursor: None,
+                    limit: None,
+                },
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "list_with_cursor_and_limit",
+            "`list` continuing from an opaque cursor, with an explicit page-size limit.",
+            VfsRequestEnvelope {
+                v: 1,
+                request: VfsRequest::List {
+                    path: "Photos".to_string(),
+                    cursor: Some(rep(0x01, 4)),
+                    limit: Some(50),
+                },
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "stat",
+            "`stat` a single virtual path.",
+            VfsRequestEnvelope {
+                v: 1,
+                request: VfsRequest::Stat {
+                    path: "Photos/Vacation/img.jpg".to_string(),
+                },
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "read_one_chunk",
+            "`read` one 64 KiB chunk starting at offset 65536 (DESIGN.md §A8 max chunk size).",
+            VfsRequestEnvelope {
+                v: 1,
+                request: VfsRequest::Read {
+                    path: "Photos/Vacation/img.jpg".to_string(),
+                    offset: 65536,
+                    len: 65536,
+                },
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "mkdir",
+            "`mkdir` a new virtual directory.",
+            VfsRequestEnvelope {
+                v: 1,
+                request: VfsRequest::Mkdir {
+                    path: "Photos/NewAlbum".to_string(),
+                },
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "delete",
+            "`delete` a virtual path.",
+            VfsRequestEnvelope {
+                v: 1,
+                request: VfsRequest::Delete {
+                    path: "Photos/old.jpg".to_string(),
+                },
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "whoami",
+            "`whoami` — no fields beyond the shared `v`/`op` envelope.",
+            VfsRequestEnvelope {
+                v: 1,
+                request: VfsRequest::Whoami,
+            }
+            .to_cbor(),
+        ),
+    ];
+
+    let mut replies = vec![
+        vfs_rpc_case(
+            "list_reply_one_entry_more_pages",
+            "`list` reply with one directory entry and a continuation cursor.",
+            VfsReply::List {
+                entries: vec![DirEntry {
+                    name: "Vacation".to_string(),
+                    kind: EntryKind::Dir,
+                    size: 0,
+                    mtime: 1_755_907_200,
+                    perms_here: VfsPerms::BROWSE,
+                }],
+                next_cursor: Some(rep(0x02, 4)),
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "list_reply_empty_last_page",
+            "`list` reply with zero entries and no continuation cursor (end of listing) — also \
+             exercises the empty-array canonical encoding edge case for this schema.",
+            VfsReply::List {
+                entries: vec![],
+                next_cursor: None,
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "stat_reply_file",
+            "`stat` reply for a regular file with browse+download granted here.",
+            VfsReply::Stat {
+                kind: EntryKind::File,
+                size: 4_194_304,
+                mtime: 1_755_907_200,
+                perms_here: VfsPerms::BROWSE.union(VfsPerms::DOWNLOAD),
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "read_reply_partial_chunk",
+            "`read` reply carrying one chunk of file data, more remaining (`eof: false`).",
+            VfsReply::Read {
+                data: rep(0xab, 128),
+                eof: false,
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "read_reply_final_chunk",
+            "`read` reply carrying the last chunk of a file (`eof: true`), including the \
+             zero-length-at-exact-boundary case.",
+            VfsReply::Read {
+                data: vec![],
+                eof: true,
+            }
+            .to_cbor(),
+        ),
+        vfs_rpc_case(
+            "mkdir_reply",
+            "`mkdir` success acknowledgement.",
+            VfsReply::Mkdir.to_cbor(),
+        ),
+        vfs_rpc_case(
+            "delete_reply",
+            "`delete` success acknowledgement.",
+            VfsReply::Delete.to_cbor(),
+        ),
+        vfs_rpc_case(
+            "whoami_reply",
+            "`whoami` reply — trimmed per DESIGN.md §A4b/A12 #32: display name and effective \
+             paths only, no group names.",
+            VfsReply::Whoami {
+                member_display: "Alex".to_string(),
+                effective_paths: vec!["Photos/Vacation".to_string(), "Drop".to_string()],
+            }
+            .to_cbor(),
+        ),
+    ];
+
+    for code in [
+        VfsErrorCode::NotFound,
+        VfsErrorCode::QuotaExceeded,
+        VfsErrorCode::GrantsChanged,
+        VfsErrorCode::ResumeExpired,
+        VfsErrorCode::UploadRejected,
+        VfsErrorCode::StorageFull,
+        VfsErrorCode::Throttled,
+        VfsErrorCode::UnsupportedVersion,
+    ] {
+        replies.push(vfs_rpc_case(
+            "error_reply",
+            "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's \
+             UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+            VfsReply::Error { code }.to_cbor(),
+        ));
+    }
+
+    Json::Obj(vec![
+        (
+            "description",
+            Json::Str(
+                "VFS RPC wire types (DESIGN.md §A8), Stage 6 slice 3: request/reply CBOR shapes \
+                 for list/stat/read/mkdir/delete/whoami and the typed error-code model. Not A7b \
+                 signed artifacts — no domain tag, no signing input."
+                    .to_string(),
+            ),
+        ),
+        ("requests", Json::Arr(requests)),
+        ("replies", Json::Arr(replies)),
     ])
 }

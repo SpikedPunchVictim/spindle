@@ -17,6 +17,7 @@ source of truth for what "correct wire format" means across languages.
 | `admin-command.json` | `AdminCommand` (A3b/A7b) — 3 cases exercising `args` as a map, a text-valued map, and CBOR `null`. |
 | `host-op-key-cert.json` | `HostOpKeyCert` (A4) — 2 cases: freshly issued, rotated. |
 | `canonical-cbor.json` | Primitive canonical-CBOR encoding cases (RFC 8949 §4.2.1) independent of any Spindle artifact type: integer shortest-form boundaries (23/24/255/256/65535/65536/4294967295/4294967296), negative integers, byte strings, text strings, arrays (including empty), map key ordering (by length, and by content at equal length), nested maps, and the three allowed simple values (`true`/`false`/`null`). For validating a canonical CBOR encoder at the byte level, independent of the artifact-level vectors. |
+| `vfs-rpc.json` | VFS RPC wire types (DESIGN.md §A8, Stage 6 slice 3) — **not** one of the seven A7b signed artifacts (no domain tag, no signing input), so this file's shape differs slightly from the artifact files (see below). `requests`: one case per op (`list` with and without a cursor/limit, `stat`, `read`, `mkdir`, `delete`, `whoami`). `replies`: one case per op plus every one of the eight typed [`spindle_proto::vfs_rpc::VfsErrorCode`] values (DESIGN.md's seven named codes plus this crate's own `UnsupportedVersion` addition — see that module's doc comment for why). **The TS twin (`@spindle/proto`) does not implement this schema yet** — flagged as a required follow-up before the CI vector cross-check job can cover it; see `IMPLEMENTATION_PLAN.md`'s Stage 6 slice 3 note. |
 
 Each artifact-level case has the shape `{name, description, decoded, canonical_cbor_hex,
 signing_input_hex}`: `decoded` mirrors the Rust struct's fields as JSON (byte strings as
@@ -34,6 +35,13 @@ aren't signed artifacts.
 fixed byte pattern (e.g. repeated `0x99`), **not** a valid signature over its `signing_input_hex`.
 Vectors asserting real signature validity land in Stage 3 once `spindle-core` exists to produce
 and verify real Ed25519 signatures over these same canonical bytes.
+
+**`vfs-rpc.json`'s shape**: each case is `{name, description, decoded, canonical_cbor_hex}` — no
+`signing_input_hex`, since VFS RPC messages travel inside an already-authenticated,
+already-encrypted session (DESIGN.md §A8) and are never individually signed. `decoded` uses the
+same generic `{type, value}` CBOR-to-JSON mirror `admin-command.json`'s open-ended `args` field
+already relies on, rather than a bespoke per-op JSON shape (the six ops carry different field
+sets).
 
 ## How they're generated
 

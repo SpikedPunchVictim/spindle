@@ -22,6 +22,8 @@
 //!   #31).
 //! - [`windows`] — Windows-only attack surface (reserved device names, ADS, `\\?\` paths); real
 //!   bodies, `#[cfg(windows)]`-gated items (A12 #19, Windows-specific S11 cases 11-14).
+//! - [`listing`] — directory listing, `mkdir`, and `delete` primitives (Stage 6 slice 3 addition,
+//!   for `spindle-host-core`'s VFS RPC server; not part of the original S11 spike).
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
@@ -31,6 +33,7 @@ use thiserror::Error;
 
 pub mod fold;
 pub mod identity;
+pub mod listing;
 pub mod overlap;
 pub mod upload;
 pub mod windows;
@@ -40,6 +43,7 @@ pub use identity::{
     file_identity, identity_of_ambient_path, nlink_guard, read_confined_with_identity_check,
     resolve_identity, stat_through_dir, FileIdentity,
 };
+pub use listing::{create_dir_confined, list_dir, remove_confined, RealDirEntry, RealEntryKind};
 pub use overlap::overlap_check;
 pub use upload::{upload_target_path, write_is_authorized};
 

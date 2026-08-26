@@ -42,6 +42,19 @@
 //! via a `HeadSigner` trait so key custody stays out of this crate. Still not in this slice: the
 //! VFS RPC server and `spindle-host-core` wiring (tracked in `IMPLEMENTATION_PLAN.md`).
 //! 73 tests (77 including the 4 Windows-only cases).
+//!
+//! **Slice 3** (`spindle-host-core`'s VFS RPC server, implemented in that crate — not this one):
+//! this crate gained exactly two additions to support it, both additive/non-breaking to slices
+//! 1-2: [`confine::listing`] (directory listing, `mkdir`, and `delete` primitives through the same
+//! `cap-std` `Dir` capability — slice 1/2 never needed to enumerate or mutate a directory's real
+//! entries, only stat/read/write single files) and a `mount_path` collision check in
+//! [`store::Store::add_share`] (`StoreError::MountPathCollision` — the store already rejected
+//! overlapping *real* roots but had no equivalent check for overlapping *virtual* `mount_path`s,
+//! flagged and closed per that slice's task brief). The RPC server, the mount-path-to-share
+//! virtual-tree resolution step, and the effective-perms/identity caches all live in
+//! `spindle-host-core`, per the crate layering law — see that crate's `lib.rs` module doc comment.
+//! 76 tests (79 including the 4 Windows-only cases, and 3 new `MountPathCollision` tests in
+//! `store`).
 
 pub mod algebra;
 pub mod audit;
