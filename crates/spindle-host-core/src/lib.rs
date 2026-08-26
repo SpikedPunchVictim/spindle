@@ -1,11 +1,14 @@
 //! `spindle-host-core` — the host library: the VFS RPC server (DESIGN.md §A8, §A4b), this crate's
-//! whole deliverable across Stage 6 slices 3-4. Crate layering law (A9c boundary rule 3 /
+//! whole deliverable across Stage 6 slices 3-5. Crate layering law (A9c boundary rule 3 /
 //! DESIGN.md §A9c: `proto ← core ← {net, vfs} ← host-core`): this crate depends on `spindle-vfs`
 //! (and transitively `spindle-core`) plus `spindle-proto` directly (for the wire types
-//! [`server::VfsRpcServer`] decodes/encodes) — **not** on `spindle-net`. Binding to a real
-//! transport (accepting connections, framing, backpressure, streaming a `read`/`upload_chunk`
-//! reply's bytes rather than returning them in one shot) remains out of scope for this crate
-//! (`spindle-net`'s job, still unscheduled as of this slice).
+//! [`server::VfsRpcServer`] decodes/encodes). **As of Stage 6 slice 5**, this crate also depends on
+//! `spindle-net` — the layering law explicitly permits `host-core -> net` — for [`serve`]'s binding
+//! loop, which reads/writes `spindle_net::framing` frames off a real QUIC control stream
+//! (`spindle_net::quic`) and calls straight into [`server::VfsRpcServer::handle_bytes`]. Streaming
+//! a `read`/`upload_chunk` reply's bytes across multiple frames rather than one shot, and binding
+//! the browser-peer WebRTC data-channel transport, remain out of scope (Stage 5, unscheduled as of
+//! this slice — see [`serve`]'s module doc comment).
 //!
 //! Per A9c boundary rule 3, nothing below `apps/*/src-tauri` depends on `tauri` — the `apps/host`
 //! Tauri shell (Stage 7) will embed this crate in-process and expose only a minimal, typed IPC
@@ -35,6 +38,12 @@
 //! - [`ratelimit`] (crate-private, Stage 6 slice 4) — [`ratelimit::RateLimiter`], the per-caller
 //!   token-bucket limiter DESIGN.md §A5 describes for pre-auth connects, adapted here to the
 //!   post-auth VFS RPC entry point.
+//! - [`serve`] (Stage 6 slice 5) — [`serve::serve_control_stream`], the binding loop: reads
+//!   [`spindle_net::framing`] frames off a real duplex stream (production: a
+//!   `spindle_net::quic::ControlStream`'s QUIC control stream), calls
+//!   [`server::VfsRpcServer::handle_bytes`], and writes the reply frame back. Framing/decode
+//!   violations close the connection rather than producing a typed [`spindle_proto::VfsErrorCode`]
+//!   — see that module's doc comment for the §A5 uniform-drop rationale.
 //!
 //! # Pipeline order (task brief; see [`server::VfsRpcServer::handle`]'s doc comment for the
 //! authoritative, code-adjacent version of this list)
@@ -55,8 +64,13 @@
 //! transport-agnostic and pure/testable (bytes-in/bytes-out, or typed request/typed reply —
 //! [`server::VfsRpcServer`] offers both).
 //!
-//! **Out**: binding to any real transport (`spindle-net`).
+//! **In (Stage 6 slice 5 addition)**: [`serve::serve_control_stream`] — binding
+//! [`server::VfsRpcServer::handle_bytes`] to a real QUIC control stream (`spindle-net`).
+//!
+//! **Out**: streaming a `read`/`upload_chunk` reply's bytes across multiple frames instead of one
+//! shot; the browser-peer WebRTC data-channel transport (needs signaling — Stage 5, unscheduled).
 
+pub mod serve;
 pub mod server;
 
 mod cache;
@@ -66,6 +80,7 @@ mod mount;
 mod ratelimit;
 mod upload;
 
+pub use serve::{serve_control_stream, ServeError};
 pub use server::{SessionContext, VfsRpcServer};
 
 #[cfg(test)]

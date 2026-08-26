@@ -12,17 +12,23 @@ edition.workspace = true
 # `VfsRequestEnvelope`/encodes `VfsReply` itself. `cap-std` is taken directly (not just through
 # `spindle-vfs`) because the server holds a `cap_std::fs::Dir` value per request, obtained from
 # `spindle_vfs::confine::open_share_root`, to perform the actual `read`/`list` I/O. `thiserror`
-# matches every other library crate in this workspace. Deliberately **not** a dependency this
-# slice: `spindle-net` — the task brief scopes this slice to a transport-agnostic server (bytes
-# in/typed-request in, bytes out/typed-reply out); binding to a real transport is Stage 6 slice 4
-# territory (see this crate's `lib.rs` module doc comment, which the slice-1 stub incorrectly
-# claimed as a slice-3 dependency — corrected here).
+# matches every other library crate in this workspace.
+#
+# Stage 6 slice 5 adds `spindle-net` (the layering law explicitly allows host-core -> net) for
+# `serve.rs`'s binding loop: it reads/writes `spindle_net::framing` frames off a real QUIC control
+# stream and calls straight into this crate's own `VfsRpcServer::handle_bytes` — no new wire
+# dependency beyond `spindle-net` itself, since the frame payloads are still this crate's own
+# canonical-CBOR bytes. `tokio` is new here too: `serve_control_stream` is `async fn`, generic over
+# any `tokio::io::{AsyncRead, AsyncWrite}` half (not tied to QUIC specifically — see that
+# function's doc comment).
 [dependencies]
 spindle-core = { path = "../spindle-core" }
 spindle-proto = { path = "../spindle-proto" }
 spindle-vfs = { path = "../spindle-vfs" }
+spindle-net = { path = "../spindle-net" }
 cap-std = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 
 # `rustix`/`windows-sys` back `limits::OsFreeSpace` (DESIGN.md §A4b free-space floor; user decision
 # 2026-08-26 — A9c manifest amended). Both are already-transitive dependencies of this crate via

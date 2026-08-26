@@ -3,5 +3,47 @@ name = "spindle-net"
 version.workspace = true
 edition.workspace = true
 
-# No dependencies yet.
+# Crate layering law (A9c boundary rule 3 / DESIGN.md §A9c: proto ← core ← {net, vfs} ← {host-core,
+# client-core}): Stage 6 slice 5 gives this crate its first real dependencies, all confined to the
+# QUIC control-stream transport (DESIGN.md §A8/A10.32) graduated from spikes/s19-quic-transport.
+# `spindle-proto`/`spindle-core` are taken directly per the layering law (this crate sits directly
+# above `core`); `spindle-vfs`/`spindle-host-core` are deliberately NOT dependencies here (the
+# layering law forbids `net` from depending on either — the direction is host-core -> net, not the
+# reverse). NATS/WebRTC/ICE/the transfer manager remain future additions (Stage 5, unscheduled as
+# of this slice) — see this crate's `lib.rs` module doc comment.
 [dependencies]
+spindle-core = { path = "../spindle-core" }
+spindle-proto = { path = "../spindle-proto" }
+thiserror = { workspace = true }
+sha2 = { workspace = true } # cert fingerprint (SHA-256 of the DER) — same derivation as A10.32/S19
+
+tokio = { workspace = true } # workspace already declares features = ["full"]
+
+# Exact S19 recipe (spikes/s19-quic-transport/Cargo.toml), reused verbatim rather than
+# re-litigated: `default-features = false` + `["runtime-tokio", "rustls-ring"]` keeps this crate's
+# dep tree to the pure-Rust `ring` crypto provider only (no cmake, no C toolchain needed to
+# `cargo build`) — quinn's default features pull in `platform-verifier` (irrelevant: this crate
+# always uses a custom fingerprint-pinning verifier, never the platform trust store) and, via
+# rustls's own defaults, `aws-lc-rs` (a cmake+C-toolchain build S19/S3 already document the pain
+# of on this workspace's dev machines).
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+
+# Matches quinn's `rustls-ring` selection above: `default-features = false` + `["ring", "std"]`
+# avoids also pulling in rustls's own default `aws-lc-rs` provider alongside `ring` (both would
+# otherwise build). The custom `ServerCertVerifier`/`ClientCertVerifier` fingerprint-pinning
+# verifiers (A10.32; mutual pinning is this slice's addition over S19's server-only pinning) live
+# on the base `rustls::client::danger`/`rustls::server::danger` modules in 0.23 with no separate
+# cargo feature gate.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+# Self-signed per-session QUIC certificate (A10.32) — a fresh cert+key generated once per session
+# by `quic::SessionCert`. **Not yet in the A9c dependency manifest** (DESIGN.md §A9c's table lists
+# `quinn` for QUIC but no certificate-generation crate) — flagged in this slice's report as a
+# documentation gap, not silently resolved; S19 already carries this exact dependency as
+# spike-local precedent.
+rcgen = "0.13"
+
+# No dev-dependencies: this crate's own unit tests (framing round-trip/split-read/oversize,
+# quic mutual-pinning handshake) exercise `tokio` (already a normal dependency, `features =
+# ["full"]` from the workspace pin includes `#[tokio::test]`), `quinn`, and `rustls` directly —
+# no test-only crate needed.

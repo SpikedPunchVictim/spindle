@@ -3265,16 +3265,28 @@ dependencies = [
  "cap-std",
  "rustix",
  "spindle-core",
+ "spindle-net",
  "spindle-proto",
  "spindle-vfs",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "windows-sys 0.60.2",
 ]
 
 [[package]]
 name = "spindle-net"
 version = "0.1.0"
+dependencies = [
+ "quinn",
+ "rcgen 0.13.2",
+ "rustls",
+ "sha2",
+ "spindle-core",
+ "spindle-proto",
+ "thiserror 1.0.69",
+ "tokio",
+]
 
 [[package]]
 name = "spindle-proto"

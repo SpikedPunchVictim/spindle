@@ -350,9 +350,84 @@ spindle-host-core -p spindle-proto -p spindle-vfs`: 188 tests passing (66 + 36 +
 slice 3; 4 Windows-only cases still compile-gated), `0 failed`; `cargo check --workspace` and
 `cargo clippy --workspace --all-targets -- -D warnings` both exit 0. No new dependency was added to
 any crate. **Status: Complete** for this slice's own scope (upload sessions, quotas, rate limits,
-the ten-code error model); Stage 6 as a whole stays **In Progress** — real transport binding via
-`spindle-net` (mentioned in slice 3's pending note above) was never in this slice's task brief and
-remains unaddressed.
+the ten-code error model). Stage 6 as a whole stayed **In Progress** at the end of this slice — real
+transport binding via `spindle-net` (mentioned in slice 3's pending note above) was never in this
+slice's task brief and remained unaddressed; see slice 5 below, which closes the QUIC half of that
+gap.
+
+**Slice 5** (2026-08-26) — binds `VfsRpcServer::handle_bytes` to a real QUIC control stream,
+graduating `spikes/s19-quic-transport`'s proven quinn 0.11 recipe (rustls+`ring` provider via
+`default-features = false, features = ["runtime-tokio", "rustls-ring"]` — avoids pulling in
+`aws-lc-rs`'s cmake/C-toolchain requirement; rcgen 0.13 self-signed per-session certs; SHA-256-of-
+DER fingerprint pinning) out of the spike and into production. `spindle-net` (previously an empty
+Stage 1 stub) gains two modules: `framing` (a 4-byte big-endian length-prefixed frame format over
+any `tokio::io::{AsyncRead, AsyncWrite}` pair, `MAX_FRAME_LEN = 256 KiB`, with unit tests for
+round-trip, split reads, oversize rejection, and — a deliberately distinct pair of outcomes — clean
+EOF between frames vs. a truncated mid-frame read) and `quic` (`SessionCert::generate` wraps
+`rcgen::generate_simple_self_signed` + a SHA-256 fingerprint; `QuicServer::bind`/`accept` and
+`QuicClient::connect` implement **mutual** certificate pinning — S19 only pinned the server's cert
+from the client side; this slice adds a custom `rustls::server::danger::ClientCertVerifier` so the
+server also pins the client's cert by fingerprint, required because a VFS RPC session's
+`SessionContext{member_id, device_fp}` must be transport-authenticated on *both* legs, not just
+one — over ALPN token `b"spindle-vfs/1"`). Envelope integration (the A7b signed-artifact handshake
+that establishes `SessionContext` itself) and the browser-peer WebRTC data-channel transport are
+explicitly out of scope, deferred to Stage 5 (unscheduled) — this slice binds the already-
+authenticated control stream's bytes only, exactly like `serve_control_stream` below assumes.
+
+`spindle-host-core` gains a `spindle-net` path dependency (permitted by the A9c layering law:
+`host-core -> net`) and one new module, `serve` (`serve::serve_control_stream`): a plain read-
+dispatch-write loop — read a `spindle_net::framing` frame, hand its bytes to
+`VfsRpcServer::handle_bytes`, write the reply frame, repeat until the peer's clean EOF or a
+protocol violation. `VfsRpcServer::handle_bytes` takes `&self` and its caches are `RefCell`-based
+(deliberately `!Sync`), so the loop is generic over any `(R: AsyncRead, W: AsyncWrite)` pair rather
+than tied to `quinn` concretely, is driven by exactly one task per session, and never reaches for
+an `Arc<Mutex<_>>`/`unsafe impl Sync` wrapper to work around that — `handle_bytes`'s `&self`
+contract was a clean fit for this loop shape, nothing about it fought the binding. A framing
+violation (oversized length prefix, truncated frame) or a payload that fails to decode as a
+`VfsRequestEnvelope` closes the connection rather than producing a typed `VfsErrorCode` reply — by
+analogy by DESIGN.md §A5's pre-auth "uniform silent drop" rule, extended here to a transport-level
+violation that (unlike every real `VfsErrorCode`) has no VFS-semantic outcome to name. `now_fn: impl
+Fn() -> u64` is an injectable clock, matching every other timestamp in this crate's pipeline.
+
+A new integration test, `tests/quic_rpc.rs`, drives a real localhost QUIC connection end to end
+(temp share + seeded member, `Harness` pattern copied from `tests/rpc_negative.rs`): a full session
+— `whoami` → `list` → `read` (bytes verified) → `upload_open`/`upload_chunk`/`upload_commit`
+(uploaded file verified on disk after the loop's clean-EOF return) → a denied `read` (typed
+`not_found`, per §A4b) — plus three negative cases: connecting with the wrong expected server
+fingerprint fails at handshake; a client cert whose fingerprint the server was not told to expect
+is rejected (server-side rejection asserted as the authoritative property — TLS 1.3's client-side
+handshake completion can race ahead of the server's verification, so the client-side outcome is
+only checked, not asserted, if it happens to differ); and a hand-crafted oversized length prefix
+gets the connection closed with no reply, never reaching `handle_bytes`. Requests are built and
+decoded via `spindle-proto`'s own canonical-CBOR types end to end, doubling as a soft wire-vector
+check. Two quinn implicit-close-on-drop races were worked around during development (documented
+in-line at both fix sites): dropping the last `Connection` handle immediately sends
+`ApplicationClose`, which beats a peer's own graceful stream-FIN read if the connection is dropped
+before that read completes — fixed by holding each side's `Connection` alive (via explicit
+synchronization, or by returning it out of a spawned task) until the other side's corresponding
+read has already resolved, rather than asserting exact timing.
+
+`cargo test -p spindle-net -p spindle-host-core`: `spindle-net` 13 tests (up from 0), `spindle-
+host-core` 72 tests (55 unit + 13 `rpc_negative` + 4 new `quic_rpc`, up from 66 unit-only in slice
+4 — `rpc_negative`'s 13 were already counted separately from the unit total in slice 3/4's own
+figures). `cargo test --workspace`: all green, 0 failed. `cargo fmt --all -- --check` and `cargo
+clippy --workspace --all-targets -- -D warnings` both exit 0. Lockfile delta: **zero new
+crate@version entries** — `quinn`, `rustls`, `rcgen`, `sha2`, and `thiserror` were already present
+in `Cargo.lock` (pulled in transitively via `spikes/s19-quic-transport`); the only diff is the
+dependency-edge lists for `spindle-net`/`spindle-host-core` themselves gaining entries for
+already-resolved crates.
+
+**Two findings flagged, not fixed, per this slice's task brief**: (1) the 4-byte big-endian
+length-prefix framing format and the `b"spindle-vfs/1"` ALPN token are now wire-protocol facts with
+no home in DESIGN.md §A8 ("One control stream (VFS RPC) + data streams") — needs a docs amendment;
+(2) `rcgen` is a new *direct* production dependency of `spindle-net` not listed in §A9c's
+crate/dependency manifest table (only `quinn` is listed there for QUIC) — needs a manifest-table
+amendment alongside finding (1).
+
+**Status**: Stage 6 stays **In Progress** — this slice closes the QUIC-transport-binding gap slice
+4 left open, but S11's full negative-test suite still needs to run in CI against this real
+implementation (Stage 6's own Success Criteria above) and that CI wiring is being tracked/handled
+separately from this slice's scope.
 
 ## Stage 7: client-core + Tauri apps init + engine-api/engine-tauri/ui
 **Goal**: Implement `spindle-client-core`; initialize `apps/host` and `apps/client` as real Tauri
