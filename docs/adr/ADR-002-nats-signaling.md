@@ -7,8 +7,9 @@ and WebRTC Signaling"). Remains **Proposed** until spikes **S1** (callout negati
 size / callout cost at scale) pass; see `docs/SPIKES.md`.
 
 **2026-08-24**: S1 (callout negative-test suite) **PASSED 19/19** against live NATS 2.10, confirming the helper's
-two-connection account bridging by account isolation (see topology table below). S12 (CONNECT size / callout cost at
-scale) is still pending — Status stays **Proposed** until it passes.
+account bridging is impossible over one dual-privileged connection — account isolation forces a split (see topology
+table below) **[amended 2026-08-26, v0.9.9, S5 — the split is three-way, not two-way; see the 2026-08-26 note
+below]**. S12 (CONNECT size / callout cost at scale) is still pending — Status stays **Proposed** until it passes.
 
 **2026-08-25 (DESIGN v0.9.7, A12 #45)**: `helper.turn.get` parametrized to `helper.turn.get.<nfp>`, closing a
 TURN quota-griefing gap — caller identity previously traveled as a self-declared `nats_fp` field in the request
@@ -22,6 +23,23 @@ subject would let any authenticated device self-declare another session's `nats_
 hosts that user holds capabilities for. Identity now comes from the subject token the callout grants (`pub
 helper.presence.get.<own_nfp>`), the same fix shape as v0.9.7's `helper.turn.get.<nfp>`. See the amended subject
 table, permissions list, and account-topology table below.
+
+**2026-08-26 (DESIGN v0.9.9, S5 PASSED 15/15)**: presence spike S5 ran live against nats-server 2.10 (0.01 s
+clean / 42.4 s dead vs the 5 s / 60 s bars; spikes/s5-presence/RESULTS.md) and falsified the two-connection
+helper account-bridging model this ADR finalized on S1. `$SYS.ACCOUNT.*.CONNECT|DISCONNECT` events are ordinary
+SYS-account pub/sub broadcasts — invisible to a connection outside the SYS account — while the callout responder
+structurally lives in its own dedicated AUTH account (`auth_callout.account` in `deploy/nats/nats-server.conf`,
+distinct from the APP account whose nkey signs the issued JWTs, `auth_callout.issuer`) in server-config
+auth-callout mode; nats-server special-cases only `$SYS.REQ.USER.AUTH` and `$SYS.REQ.SERVER.PING.CONNZ` to answer
+any `auth_callout.auth_users` connection cross-account. The helper therefore needs **three** connections, not two:
+the callout connection (AUTH account), a dedicated SYS-account connection for `$SYS.ACCOUNT.*` events and the
+future kick relay, and the existing APP-account connection. This also corrects the account count itself: DESIGN.md
+§A10.15's "one application account + system account" was already stale against the S1-era config, which carried
+the AUTH account from the start — it is three accounts (APP, AUTH, SYS), not two. S1's account-isolation finding
+is not overturned — it still rules out one
+dual-privileged connection — S5 sharpens it from two-way to three-way. Deploy now provisions this:
+`deploy/nats/nats-server.conf` defines `SYS_CONN_USER` in the SYS account, and the helper takes `SYS_CONN_SEED`
+from the compose environment. See the amended topology table below.
 
 ## Context
 
@@ -172,8 +190,10 @@ Client                          NATS                            Host
 
 ### NATS account topology (DESIGN.md §A10.15 / §A5 requirement)
 
-DESIGN.md pins the shape (one application account + one system account, explicit denies on `$SYS.>`/`$JS.>`/
-`_INBOX.>`) but does not fully specify export/import wiring for every cross-boundary subject. The table below is
+DESIGN.md pins the shape (one application account + a dedicated AUTH callout account + one system account
+**[amended 2026-08-26, v0.9.9 — was stated as two accounts; the AUTH account was already present in the S1-era
+config]**, explicit denies on `$SYS.>`/`$JS.>`/`_INBOX.>`) but does not fully specify export/import wiring for
+every cross-boundary subject. The table below is
 derived faithfully from §A3 (components) and §A5 (subject table); rows not directly pinned by DESIGN.md are marked
 **"to be finalized in S1."**
 
@@ -189,7 +209,7 @@ derived faithfully from §A3 (components) and §A5 (subject table); rows not dir
 | `registry.admin.>` | APP account (operator, mTLS + operator cert) | APP account, imported by broker helper only | Service (request/reply via `allow_responses`) | Signed admin commands (ADR-007, §A3b) | Pinned by §A5 |
 | `host.<hfp>.>` (`connect`, `sess.<cfp>.<sid>.c2h`/`h2c`, `presence`) | APP account | APP account, scoped per-connection by callout-issued permissions (no wildcard subs) | Pub/sub, request/reply | Signaling subjects (§A5) | Pinned by §A5 |
 | `_INBOX_<dfp>.>` | APP account (private per-device prefix) | APP account; only the owning device subscribes; host publishes into it via `allow_responses` after prefix validation | Reply-only | Private reply inbox (§A5; closes ADR-001 §A12 #2) | Pinned by §A5 |
-| **Broker helper's own connection(s)**: two separate connections (one per account) — one on the system account (callout responder, `$SYS` events, CONNZ, KICK) and one on the application account (`helper.*` request/reply, `host.<hfp>.presence` publishing, `registry.*` subscriptions) — bridging `$SYS` events into APP-account publishes, rather than one dual-privileged connection | — | — | — | Confirmed by S1's negative-test suite: account isolation prevents a single dual-privileged connection from holding both SYS and APP grants | **Finalized 2026-08-24 (S1 PASSED 19/19)** |
+| **Broker helper's own connections (three, not two)** **[amended 2026-08-26, v0.9.9, S5]**: (1) **callout connection** — the dedicated AUTH account (`auth_callout.account`; holds only the callout responder user, `auth_callout.auth_users` member): callout responder on `$SYS.REQ.USER.AUTH`, plus the startup `$SYS.REQ.SERVER.PING.CONNZ` request; (2) **SYS-account connection** — dedicated nkey, genuine SYS-account member: subscribes `$SYS.ACCOUNT.*.CONNECT|DISCONNECT`, will carry the kick relay (`$SYS.REQ.SERVER.<id>.KICK`); (3) **APP-account connection**: `helper.*` request/reply, `host.<hfp>.presence` publishing, `registry.*` subscriptions | — | — | — | nats-server special-cases only `$SYS.REQ.USER.AUTH`/`$SYS.REQ.SERVER.PING.CONNZ` to answer any `auth_callout.auth_users` connection cross-account; `$SYS.ACCOUNT.*` events are ordinary SYS-account broadcasts, invisible outside the SYS account. The issuer key that signs every callout-granted JWT belongs to the APP account (`auth_callout.issuer`), not the AUTH account — issuer and responder are deliberately split across accounts, which is why one dual-privileged connection cannot exist (S1) and why the callout responder cannot itself be a SYS-account member in server-config callout mode (S5) — forcing three connections, not two, over three accounts (APP, AUTH, SYS), not two | **Finalized 2026-08-24 (S1), amended 2026-08-26 (v0.9.9, S5 PASSED 15/15)** |
 | Explicit deny: `$SYS.>` (all other system subjects) | — | Denied for every APP-account connection (device, host) | n/a | Prevents devices/hosts from reading arbitrary system events (A10.15) | Pinned by §A5 permissions list |
 | Explicit deny: `$JS.>` | — | Denied for every APP-account connection | n/a | No JetStream in v1 (§A3, Alternatives Considered) | Pinned by §A3/§A11 |
 | Explicit deny: `_INBOX.>` (broad wildcard) | — | Denied for every APP-account connection; only the caller's own `_INBOX_<dfp>.>` is permitted | n/a | Prevents reading other devices' inboxes (ADR-001 §A12 #2) | Pinned by §A5 |

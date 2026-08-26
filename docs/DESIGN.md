@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.8) + Execution Plan
+# Spindle — System Design Document (draft v0.9.9) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -13,9 +13,10 @@
 > (user decisions 2026-08-23). v0.9.6: transport split decided — QUIC (via `quinn`) for native↔native file
 > transfers, WebRTC data channels retained only where a browser peer is involved (user decisions 2026-08-24).
 > v0.9.7: TURN credential request hardened — subject parametrized to `helper.turn.get.<nfp>`; username =
-> `expiry:root_fp` (2026-08-25). v0.9.8: `helper.presence.get` likewise parametrized to
-> `helper.presence.get.<nfp>` (2026-08-26). Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and
-> the **[DEFAULT]**-flagged rows in A10.
+> `expiry:root_fp` (2026-08-25). v0.9.8: `helper.presence.get` likewise parametrized to `helper.presence.get.<nfp>`
+> (2026-08-26). v0.9.9: helper account bridging corrected to a three-connection model on S5's live evidence
+> (2026-08-26). Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and the **[DEFAULT]**-flagged rows
+> in A10.
 
 ---
 
@@ -375,14 +376,23 @@ Photos because they're in Family") derived directly from the union model.
   `nats_fp → {root_fp, host_fps, quota_profile, exp}` to the helper store, so the helper can authorize non-callout
   requests (`helper.presence.get.<nfp>`, `helper.turn.get.<nfp>` — keyed by the subject token) — cleaned up on
   DISCONNECT/expiry.
-  **Account topology (A10.15)**: one application account + system account; every cross-boundary subject
-  (`$SYS.REQ.USER.AUTH`, `$SYS` events, `helper.*`, `registry.*`) gets an explicit export/import row in ADR-002's
-  topology table — no implicit sharing.
-- **Helper account bridging [DEFAULT]**: the broker helper holds **two separate NATS connections** — one on the
-  system account (callout responder, `$SYS` events, CONNZ, KICK) and one on the application account
-  (`helper.*` request/reply, `host.<hfp>.presence` publishing, `registry.*` subscriptions) — rather than one
-  dual-privileged connection; finalized in S1 and recorded in ADR-002's topology table (confirmed in S1: account
-  isolation prevents a single dual-privileged connection).
+  **Account topology (A10.15)**: one application account + a dedicated AUTH (callout) account + system account
+  **[amended v0.9.9 — the S1-era config already carried the AUTH account; recorded now]**; every cross-boundary
+  subject (`$SYS.REQ.USER.AUTH`, `$SYS` events, `helper.*`, `registry.*`) gets an explicit export/import row in
+  ADR-002's topology table — no implicit sharing.
+- **Helper account bridging [DEFAULT]**: the broker helper holds **three separate NATS connections**, not two
+  **[amended v0.9.9, S5]** — (1) a **callout connection** on the dedicated AUTH account (`auth_callout.account`;
+  holds only the callout responder user — the JWT issuer key belongs to the APP account): callout responder on
+  `$SYS.REQ.USER.AUTH`, plus the startup `$SYS.REQ.SERVER.PING.CONNZ` request; (2) a **SYS-account connection**
+  (dedicated nkey, genuine SYS-account member): subscribes `$SYS.ACCOUNT.*.CONNECT|DISCONNECT` and will carry the
+  kick relay (`$SYS.REQ.SERVER.<id>.KICK`) once it lands; (3) an **APP-account connection**: `helper.*`
+  request/reply, `host.<hfp>.presence` publishing, `registry.*` subscriptions. The split is forced by nats-server
+  itself: in server-config auth-callout mode the callout responder structurally lives in its own AUTH account, and
+  the server special-cases only `$SYS.REQ.USER.AUTH`/`$SYS.REQ.SERVER.PING.CONNZ` to answer cross-account —
+  `$SYS.ACCOUNT.*` events are ordinary SYS-account broadcasts, invisible to a non-SYS-account subscription. S1's
+  finding that account isolation rules out one dual-privileged connection still holds; S5 sharpened the split from
+  two connections to three. Finalized in S1, amended in S5; recorded in ADR-002's
+  topology table.
 - **Host MUST validate** on every `connect`: reply subject starts with `_INBOX_<from_fp>.`; sender is an active member
   device (cheap check **before** crypto) or holds a valid unused invite; per-`from_fp` token bucket and
   max-concurrent-sessions; `sid` not bound to a different `from_fp`. All rejections are **uniform silent drops**
@@ -708,7 +718,7 @@ Docker is explicitly not the primary dev environment.
 | 12 | Device certification | **[DEFAULT]** root-signed only; root on primary device (OS keystore) + recovery phrase; browsers never primary |
 | 13 | Host identity | **[DEFAULT]** host root (backed up) signs operating key; reinstall from backup keeps identity |
 | 14 | Helper state | **[DEFAULT]** small replicated store: host-signed revocation/epoch records, connection map, TURN counters, metadata retention; no membership data |
-| 15 | NATS account topology | **[DEFAULT]** one application account for all devices + system account for helper; explicit denies on `$SYS.>`, `$JS.>`, `_INBOX.>` |
+| 15 | NATS account topology | **[DEFAULT]** one application account for all devices + a dedicated AUTH (callout) account + system account for helper; explicit denies on `$SYS.>`, `$JS.>`, `_INBOX.>` **[amended v0.9.9 — three accounts, not two; the AUTH account was already present in the S1-era config]** |
 | 16 | Canonical encoding | **[DEFAULT]** deterministic CBOR (RFC 8949 §4.2.1) for envelopes, caps, VFS RPC; versioned, no downgrade |
 | 17 | Host admission default mode | **DECIDED 2026-08-23:** `invite` |
 | 18 | Admission mechanisms | **DECIDED 2026-08-23:** invite tokens **and** fingerprint pre-registration |
@@ -813,7 +823,7 @@ Docker is explicitly not the primary dev environment.
 | S2 | webrtc-rs ↔ browser trickle ICE over NATS | Median connect < 2 s LAN, < 5 s across NATs |
 | S8 | Helper HA; 5k clients re-auth in a minute | No failed auths; p99 callout < 250 ms |
 | S4 | NAT traversal with/without coturn; cost model | Relay %; **cost/GB** |
-| S5 | Presence via `$SYS` events; ping tuning | ≤ 5 s clean / ≤ 60 s dead |
+| **S5** | Presence via `$SYS` events; ping tuning | **DONE** — 0.01 s clean / 42.4 s dead (bars 5/60 s); evidence in spikes/s5-presence/RESULTS.md |
 | S6 | Browser crypto + alg_id interop | Envelope round-trip Rust↔browser, 3 browsers |
 | S9 | Revoke → kick → host rejects | < 5 s end to end |
 | S10 | Invite/redeem + "Preview as" + permission grid with a non-technical tester | Completes unaided; can explain why a member sees what they see |
@@ -922,6 +932,12 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.9 (2026-08-26)** — S5 (presence) PASSED 15/15 against the composed stack (0.01 s clean / 42.4 s dead
+  vs the 5 s / 60 s bars; spikes/s5-presence/RESULTS.md) and falsified the two-connection helper bridging model:
+  `$SYS.ACCOUNT.*` events are SYS-account broadcasts, while the callout responder structurally lives in the AUTH
+  account (only `$SYS.REQ.USER.AUTH`/CONNZ are special-cased cross-account) — §A5 bridging row amended to three
+  connections (callout, SYS events, APP). CONNZ identity requires `{"auth": true}` / `authorized_user`. Account
+  topology corrected alongside: application + dedicated AUTH (callout) + system — three accounts, not two (A10.15).
 - **v0.9.8 (2026-08-26)** — `helper.presence.get` parametrized to `helper.presence.get.<nfp>` as presence lands
   in the helper (A12 #46): a bare subject would let any authenticated device query another session's fingerprint
   and learn which hosts that user holds caps for — same fix shape as v0.9.7's `helper.turn.get.<nfp>`.
