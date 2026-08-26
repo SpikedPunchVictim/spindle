@@ -19,11 +19,15 @@
 //! - [`fold`] — case/Unicode fold-key comparison and collision detection against existing dirents
 //!   (A12 #20, #31).
 //! - [`upload`] — upload-relative path scoping and overwrite-requires-`delete` gating (A12 #23,
-//!   #31).
+//!   #31). Stage 6 slice 4 added the hidden upload-staging filename convention
+//!   ([`upload::staging_name`]/[`upload::is_staging_name`]) DESIGN.md §A8's transfer manager
+//!   needs ("staging files use a hidden name never listed").
 //! - [`windows`] — Windows-only attack surface (reserved device names, ADS, `\\?\` paths); real
 //!   bodies, `#[cfg(windows)]`-gated items (A12 #19, Windows-specific S11 cases 11-14).
 //! - [`listing`] — directory listing, `mkdir`, and `delete` primitives (Stage 6 slice 3 addition,
-//!   for `spindle-host-core`'s VFS RPC server; not part of the original S11 spike).
+//!   for `spindle-host-core`'s VFS RPC server; not part of the original S11 spike). Slice 4 made
+//!   `list_dir` filter out any entry matching [`upload::is_staging_name`], regardless of
+//!   `show_hidden`.
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
@@ -45,7 +49,9 @@ pub use identity::{
 };
 pub use listing::{create_dir_confined, list_dir, remove_confined, RealDirEntry, RealEntryKind};
 pub use overlap::overlap_check;
-pub use upload::{upload_target_path, write_is_authorized};
+pub use upload::{
+    finalize_upload, is_staging_name, staging_name, upload_target_path, write_is_authorized,
+};
 
 /// Errors from the confinement layer. Each variant's doc comment on its emitting function names
 /// the DESIGN.md §A4b rule and A12 red-team row it is part of closing.

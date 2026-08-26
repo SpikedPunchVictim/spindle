@@ -1,5 +1,5 @@
 {
-  "description": "VFS RPC wire types (DESIGN.md §A8), Stage 6 slice 3: request/reply CBOR shapes for list/stat/read/mkdir/delete/whoami and the typed error-code model. Not A7b signed artifacts — no domain tag, no signing input.",
+  "description": "VFS RPC wire types (DESIGN.md §A8), Stage 6 slices 3-4: request/reply CBOR shapes for list/stat/read/mkdir/delete/whoami, the four upload-session ops (upload_open/upload_chunk/upload_commit/upload_abort), and the ten-code typed error model. Not A7b signed artifacts — no domain tag, no signing input.",
   "requests": [
     {
       "name": "list_root_no_cursor",
@@ -310,6 +310,216 @@
         ]
       },
       "canonical_cbor_hex": "a2617601626f7005"
+    },
+    {
+      "name": "upload_open",
+      "description": "`upload_open` — begin (or resume) a resumable upload session (DESIGN.md §A8 transfer manager), carrying the whole-file declared size/hash and a signature over that manifest by the sending device's key.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 6
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "path"
+            },
+            "value": {
+              "type": "text",
+              "value": "Drop/incoming.bin"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "size"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1048576
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "hash"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "manifest_sig"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a6617601626f700664686173685820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa64706174687144726f702f696e636f6d696e672e62696e6473697a651a001000006c6d616e69666573745f7369675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "name": "upload_chunk",
+      "description": "`upload_chunk` — append one chunk at the session's next-expected-offset (DESIGN.md §A8 max chunk size, same 64 KiB bound as `read`).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 7
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "session_id"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "03030303030303030303030303030303"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "offset"
+            },
+            "value": {
+              "type": "uint",
+              "value": 65536
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "data"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a5617601626f700764646174615880cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc666f66667365741a000100006a73657373696f6e5f69645003030303030303030303030303030303"
+    },
+    {
+      "name": "upload_commit",
+      "description": "`upload_commit` — finalize a completed upload session.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 8
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "session_id"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "03030303030303030303030303030303"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a3617601626f70086a73657373696f6e5f69645003030303030303030303030303030303"
+    },
+    {
+      "name": "upload_abort",
+      "description": "`upload_abort` — discard an in-progress upload session and its staged bytes.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 9
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "session_id"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "03030303030303030303030303030303"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a3617601626f70096a73657373696f6e5f69645003030303030303030303030303030303"
     }
   ],
   "replies": [
@@ -669,8 +879,8 @@
       "canonical_cbor_hex": "a3626f70056e6d656d6265725f646973706c617964416c65786f6566666563746976655f7061746873826f50686f746f732f5661636174696f6e6444726f70"
     },
     {
-      "name": "error_reply",
-      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "name": "upload_open_reply_new_session",
+      "description": "`upload_open` reply for a brand-new session (offset 0).",
       "decoded": {
         "type": "map",
         "value": [
@@ -682,6 +892,156 @@
             "value": {
               "type": "uint",
               "value": 6
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "session_id"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "03030303030303030303030303030303"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "offset"
+            },
+            "value": {
+              "type": "uint",
+              "value": 0
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a3626f7006666f6666736574006a73657373696f6e5f69645003030303030303030303030303030303"
+    },
+    {
+      "name": "upload_open_reply_resumed_session",
+      "description": "`upload_open` reply for a resumed session — same `(path, size, hash)` as a still-live session, returning its current next-expected-offset instead of starting over.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 6
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "session_id"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "03030303030303030303030303030303"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "offset"
+            },
+            "value": {
+              "type": "uint",
+              "value": 65536
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a3626f7006666f66667365741a000100006a73657373696f6e5f69645003030303030303030303030303030303"
+    },
+    {
+      "name": "upload_chunk_reply",
+      "description": "`upload_chunk` reply — the session's next-expected-offset after appending this chunk.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 7
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "offset"
+            },
+            "value": {
+              "type": "uint",
+              "value": 131072
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2626f7007666f66667365741a00020000"
+    },
+    {
+      "name": "upload_commit_reply",
+      "description": "`upload_commit` success acknowledgement.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 8
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a1626f7008"
+    },
+    {
+      "name": "upload_abort_reply",
+      "description": "`upload_abort` success acknowledgement.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 9
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a1626f7009"
+    },
+    {
+      "name": "error_reply",
+      "description": "One of the ten typed VFS error codes (DESIGN.md §A8's seven, this crate's UnsupportedVersion addition, and the v0.9.10 amendment's already_exists/file_changed — see `spindle_proto::vfs_rpc`'s schema-choices table and module doc comment).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 10
             }
           },
           {
@@ -696,11 +1056,11 @@
           }
         ]
       },
-      "canonical_cbor_hex": "a2626f700664636f646500"
+      "canonical_cbor_hex": "a2626f700a64636f646500"
     },
     {
       "name": "error_reply",
-      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "description": "One of the ten typed VFS error codes (DESIGN.md §A8's seven, this crate's UnsupportedVersion addition, and the v0.9.10 amendment's already_exists/file_changed — see `spindle_proto::vfs_rpc`'s schema-choices table and module doc comment).",
       "decoded": {
         "type": "map",
         "value": [
@@ -711,7 +1071,7 @@
             },
             "value": {
               "type": "uint",
-              "value": 6
+              "value": 10
             }
           },
           {
@@ -726,11 +1086,11 @@
           }
         ]
       },
-      "canonical_cbor_hex": "a2626f700664636f646501"
+      "canonical_cbor_hex": "a2626f700a64636f646501"
     },
     {
       "name": "error_reply",
-      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "description": "One of the ten typed VFS error codes (DESIGN.md §A8's seven, this crate's UnsupportedVersion addition, and the v0.9.10 amendment's already_exists/file_changed — see `spindle_proto::vfs_rpc`'s schema-choices table and module doc comment).",
       "decoded": {
         "type": "map",
         "value": [
@@ -741,7 +1101,7 @@
             },
             "value": {
               "type": "uint",
-              "value": 6
+              "value": 10
             }
           },
           {
@@ -756,11 +1116,11 @@
           }
         ]
       },
-      "canonical_cbor_hex": "a2626f700664636f646502"
+      "canonical_cbor_hex": "a2626f700a64636f646502"
     },
     {
       "name": "error_reply",
-      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "description": "One of the ten typed VFS error codes (DESIGN.md §A8's seven, this crate's UnsupportedVersion addition, and the v0.9.10 amendment's already_exists/file_changed — see `spindle_proto::vfs_rpc`'s schema-choices table and module doc comment).",
       "decoded": {
         "type": "map",
         "value": [
@@ -771,7 +1131,7 @@
             },
             "value": {
               "type": "uint",
-              "value": 6
+              "value": 10
             }
           },
           {
@@ -786,11 +1146,11 @@
           }
         ]
       },
-      "canonical_cbor_hex": "a2626f700664636f646503"
+      "canonical_cbor_hex": "a2626f700a64636f646503"
     },
     {
       "name": "error_reply",
-      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "description": "One of the ten typed VFS error codes (DESIGN.md §A8's seven, this crate's UnsupportedVersion addition, and the v0.9.10 amendment's already_exists/file_changed — see `spindle_proto::vfs_rpc`'s schema-choices table and module doc comment).",
       "decoded": {
         "type": "map",
         "value": [
@@ -801,7 +1161,7 @@
             },
             "value": {
               "type": "uint",
-              "value": 6
+              "value": 10
             }
           },
           {
@@ -816,11 +1176,11 @@
           }
         ]
       },
-      "canonical_cbor_hex": "a2626f700664636f646504"
+      "canonical_cbor_hex": "a2626f700a64636f646504"
     },
     {
       "name": "error_reply",
-      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "description": "One of the ten typed VFS error codes (DESIGN.md §A8's seven, this crate's UnsupportedVersion addition, and the v0.9.10 amendment's already_exists/file_changed — see `spindle_proto::vfs_rpc`'s schema-choices table and module doc comment).",
       "decoded": {
         "type": "map",
         "value": [
@@ -831,7 +1191,7 @@
             },
             "value": {
               "type": "uint",
-              "value": 6
+              "value": 10
             }
           },
           {
@@ -846,11 +1206,11 @@
           }
         ]
       },
-      "canonical_cbor_hex": "a2626f700664636f646505"
+      "canonical_cbor_hex": "a2626f700a64636f646505"
     },
     {
       "name": "error_reply",
-      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "description": "One of the ten typed VFS error codes (DESIGN.md §A8's seven, this crate's UnsupportedVersion addition, and the v0.9.10 amendment's already_exists/file_changed — see `spindle_proto::vfs_rpc`'s schema-choices table and module doc comment).",
       "decoded": {
         "type": "map",
         "value": [
@@ -861,7 +1221,7 @@
             },
             "value": {
               "type": "uint",
-              "value": 6
+              "value": 10
             }
           },
           {
@@ -876,11 +1236,11 @@
           }
         ]
       },
-      "canonical_cbor_hex": "a2626f700664636f646506"
+      "canonical_cbor_hex": "a2626f700a64636f646506"
     },
     {
       "name": "error_reply",
-      "description": "One of the eight typed VFS error codes (DESIGN.md §A8's seven, plus this crate's UnsupportedVersion addition — see `spindle_proto::vfs_rpc`'s schema-choices table).",
+      "description": "One of the ten typed VFS error codes (DESIGN.md §A8's seven, this crate's UnsupportedVersion addition, and the v0.9.10 amendment's already_exists/file_changed — see `spindle_proto::vfs_rpc`'s schema-choices table and module doc comment).",
       "decoded": {
         "type": "map",
         "value": [
@@ -891,7 +1251,7 @@
             },
             "value": {
               "type": "uint",
-              "value": 6
+              "value": 10
             }
           },
           {
@@ -906,7 +1266,67 @@
           }
         ]
       },
-      "canonical_cbor_hex": "a2626f700664636f646507"
+      "canonical_cbor_hex": "a2626f700a64636f646507"
+    },
+    {
+      "name": "error_reply",
+      "description": "One of the ten typed VFS error codes (DESIGN.md §A8's seven, this crate's UnsupportedVersion addition, and the v0.9.10 amendment's already_exists/file_changed — see `spindle_proto::vfs_rpc`'s schema-choices table and module doc comment).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 10
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "code"
+            },
+            "value": {
+              "type": "uint",
+              "value": 8
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2626f700a64636f646508"
+    },
+    {
+      "name": "error_reply",
+      "description": "One of the ten typed VFS error codes (DESIGN.md §A8's seven, this crate's UnsupportedVersion addition, and the v0.9.10 amendment's already_exists/file_changed — see `spindle_proto::vfs_rpc`'s schema-choices table and module doc comment).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "op"
+            },
+            "value": {
+              "type": "uint",
+              "value": 10
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "code"
+            },
+            "value": {
+              "type": "uint",
+              "value": 9
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a2626f700a64636f646509"
     }
   ]
 }

@@ -63,7 +63,8 @@ pub use artifacts::{
 pub use canonical::{canonical_decode, canonical_encode, CborError, CborValue};
 pub use vfs_rpc::{
     DirEntry, EntryKind, VfsErrorCode, VfsPerms, VfsReply, VfsRequest, VfsRequestEnvelope,
-    CURRENT_PROTOCOL_VERSION, MAX_LIST_PAGE, MAX_READ_CHUNK, MIN_PROTOCOL_VERSION,
+    CURRENT_PROTOCOL_VERSION, MAX_LIST_PAGE, MAX_READ_CHUNK, MAX_UPLOAD_CHUNK,
+    MIN_PROTOCOL_VERSION, UPLOAD_SESSION_TTL_SECS,
 };
 
 #[cfg(test)]

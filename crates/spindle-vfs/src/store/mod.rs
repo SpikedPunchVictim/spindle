@@ -387,25 +387,27 @@ impl Store {
     }
 
     fn devices_for_member(&self, member_id: MemberId) -> Result<Vec<Device>, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT device_fp, label, added, revoked FROM devices WHERE member_id = ?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT device_fp, label, added, revoked, sign_pk FROM devices WHERE member_id = ?1",
+        )?;
         let rows = stmt.query_map(params![member_id.0 as i64], |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
+                r.get::<_, Option<Vec<u8>>>(4)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (fp_bytes, label, added, revoked) = row?;
+            let (fp_bytes, label, added, revoked, sign_pk) = row?;
             out.push(Device {
                 device_fp: Fingerprint::from_slice(&fp_bytes)?,
                 label,
                 added: added as u64,
                 revoked: revoked != 0,
+                sign_pk,
             });
         }
         Ok(out)
@@ -467,19 +469,33 @@ impl Store {
     // Devices
     // ---------------------------------------------------------------------------------------
 
+    /// `sign_pk` is the device's Ed25519 signing public key — DESIGN.md §A4's device certificates
+    /// already carry it; this is where the host pins it at enrollment (see
+    /// `crate::model::Device::sign_pk`'s doc comment, Stage 6 slice 4 schema addition). `None` is
+    /// accepted (e.g. a test that never needs upload-manifest verification), but a real enrollment
+    /// flow should always supply one — a device with no key on file cannot have any upload it
+    /// signs verified later.
     pub fn add_device(
         &self,
         member_id: MemberId,
         device_fp: Fingerprint,
         label: &str,
         added: u64,
+        sign_pk: Option<&[u8]>,
     ) -> Result<(), StoreError> {
         if self.get_member(member_id)?.is_none() {
             return Err(StoreError::MemberNotFound(member_id));
         }
         self.conn.execute(
-            "INSERT INTO devices (device_fp, member_id, label, added, revoked) VALUES (?1, ?2, ?3, ?4, 0)",
-            params![device_fp.to_vec(), member_id.0 as i64, label, added as i64],
+            "INSERT INTO devices (device_fp, member_id, label, added, revoked, sign_pk) \
+             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+            params![
+                device_fp.to_vec(),
+                member_id.0 as i64,
+                label,
+                added as i64,
+                sign_pk.map(|k| k.to_vec()),
+            ],
         )?;
         Ok(())
     }
@@ -494,6 +510,22 @@ impl Store {
             return Err(StoreError::DeviceNotFound(device_fp));
         }
         Ok(())
+    }
+
+    /// The device's pinned signing public key, if any (Stage 6 slice 4 — see
+    /// `crate::model::Device::sign_pk`'s doc comment). `Ok(None)` means either the device has no
+    /// key on file or the device does not exist — this method deliberately does not distinguish
+    /// the two (an upload-manifest-verification caller treats both identically: "cannot verify").
+    pub fn device_sign_pk(&self, device_fp: Fingerprint) -> Result<Option<Vec<u8>>, StoreError> {
+        let key: Option<Option<Vec<u8>>> = self
+            .conn
+            .query_row(
+                "SELECT sign_pk FROM devices WHERE device_fp = ?1",
+                params![device_fp.to_vec()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(key.flatten())
     }
 
     // ---------------------------------------------------------------------------------------
@@ -912,6 +944,93 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Upload quotas (DESIGN.md §A4b: "quotas per member and per share"), Stage 6 slice 4 addition
+    // ---------------------------------------------------------------------------------------
+    //
+    // **Design choice, flagged per the task brief rather than resolved silently**: these counters
+    // track cumulative bytes that moved through *this crate's* upload path (successful
+    // `upload_commit` calls, net of overwrite deltas), not a recursive walk of real on-disk usage.
+    // DESIGN.md's "quotas per member and per share" appears in §A4b's list of upload-edge rules,
+    // in the same breath as "uploads land only under the granted subpath" and "received-file
+    // policy" — i.e. in context, about the upload flow specifically, not the share's total disk
+    // footprint (which may include content the owner placed directly on the real filesystem,
+    // never seen by any VFS RPC call). A store-backed running counter was chosen over computing
+    // usage on demand (e.g. a directory walk) because the latter would be too slow to check before
+    // every chunk write on a large share, and because "how many bytes has this member/share
+    // consumed via uploads" has no other durable source of truth once files sit anonymously on
+    // the real filesystem.
+    //
+    // **Documented limitation**: `share_upload_bytes` is accurate for deletes (a delete always
+    // knows the real size of what it removes, regardless of who uploaded it, so
+    // [`Store::adjust_share_upload_bytes`] is called with a negative delta from
+    // `spindle-host-core`'s delete handler). `member_upload_bytes` is **not** symmetrically
+    // decremented on a delete performed by a different member, because no ownership ledger here
+    // maps a real file back to the member who uploaded it (DESIGN.md does not specify this depth
+    // of per-member accounting). A member's own counter therefore only grows via their own
+    // commits and shrinks only via deltas from their own overwrites; deleting content does not
+    // retroactively refund any member's quota. Acceptable for generous, host-configured default
+    // limits; a full ownership ledger is out of scope for this slice.
+
+    /// Adjusts `member_id`'s running upload-byte counter by `delta` (which may be negative, e.g.
+    /// an overwrite that shrank a file), clamped at 0, and returns the new total. Creates the
+    /// counter row on first use.
+    pub fn adjust_member_upload_bytes(
+        &self,
+        member_id: MemberId,
+        delta: i64,
+    ) -> Result<u64, StoreError> {
+        self.conn.execute(
+            "INSERT INTO member_upload_bytes (member_id, bytes) VALUES (?1, MAX(?2, 0)) \
+             ON CONFLICT(member_id) DO UPDATE SET bytes = MAX(bytes + ?2, 0)",
+            params![member_id.0 as i64, delta],
+        )?;
+        self.member_upload_bytes(member_id)
+    }
+
+    /// `member_id`'s current running upload-byte total (0 if it has never uploaded anything).
+    pub fn member_upload_bytes(&self, member_id: MemberId) -> Result<u64, StoreError> {
+        let bytes: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT bytes FROM member_upload_bytes WHERE member_id = ?1",
+                params![member_id.0 as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(bytes.unwrap_or(0) as u64)
+    }
+
+    /// Adjusts `share_id`'s running upload-byte counter by `delta`, clamped at 0, and returns the
+    /// new total. Creates the counter row on first use. See the module-section doc comment above
+    /// for why this counter (unlike [`Store::adjust_member_upload_bytes`]) is kept exactly in sync
+    /// with deletes.
+    pub fn adjust_share_upload_bytes(
+        &self,
+        share_id: ShareId,
+        delta: i64,
+    ) -> Result<u64, StoreError> {
+        self.conn.execute(
+            "INSERT INTO share_upload_bytes (share_id, bytes) VALUES (?1, MAX(?2, 0)) \
+             ON CONFLICT(share_id) DO UPDATE SET bytes = MAX(bytes + ?2, 0)",
+            params![share_id.0 as i64, delta],
+        )?;
+        self.share_upload_bytes(share_id)
+    }
+
+    /// `share_id`'s current running upload-byte total (0 if nothing has ever been uploaded to it).
+    pub fn share_upload_bytes(&self, share_id: ShareId) -> Result<u64, StoreError> {
+        let bytes: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT bytes FROM share_upload_bytes WHERE share_id = ?1",
+                params![share_id.0 as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(bytes.unwrap_or(0) as u64)
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1493,6 +1612,102 @@ mod tests {
             .burn_invite_nonce(&[2u8; 8], member_id, b"cap-b", 2)
             .expect("burn b");
         assert_ne!(a, b);
+    }
+
+    // ---- Devices: sign_pk (Stage 6 slice 4) ----
+
+    #[test]
+    fn device_sign_pk_round_trips_and_defaults_to_none() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let fp_no_key = Fingerprint::of_parts(&[b"device-no-key"]);
+        let fp_with_key = Fingerprint::of_parts(&[b"device-with-key"]);
+
+        store
+            .add_device(member_id, fp_no_key, "Laptop", 0, None)
+            .expect("add_device without key");
+        store
+            .add_device(member_id, fp_with_key, "Phone", 0, Some(&[0xAB; 32]))
+            .expect("add_device with key");
+
+        assert_eq!(store.device_sign_pk(fp_no_key).expect("lookup"), None);
+        assert_eq!(
+            store.device_sign_pk(fp_with_key).expect("lookup"),
+            Some(vec![0xAB; 32])
+        );
+        assert_eq!(
+            store
+                .device_sign_pk(Fingerprint::of_parts(&[b"unknown-device"]))
+                .expect("lookup nonexistent"),
+            None,
+            "an unknown device_fp is treated the same as a known device with no key on file"
+        );
+    }
+
+    // ---- Upload quotas (Stage 6 slice 4) ----
+
+    #[test]
+    fn member_upload_bytes_accumulates_and_clamps_at_zero() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+
+        assert_eq!(store.member_upload_bytes(member_id).expect("read"), 0);
+        assert_eq!(
+            store
+                .adjust_member_upload_bytes(member_id, 1000)
+                .expect("adjust"),
+            1000
+        );
+        assert_eq!(
+            store
+                .adjust_member_upload_bytes(member_id, 500)
+                .expect("adjust"),
+            1500
+        );
+        // A negative delta larger than the current total clamps at 0 rather than going negative.
+        assert_eq!(
+            store
+                .adjust_member_upload_bytes(member_id, -10_000)
+                .expect("adjust"),
+            0
+        );
+    }
+
+    #[test]
+    fn share_upload_bytes_accumulates_independently_of_member() {
+        let sandbox = tempdir().expect("tempdir");
+        let store = Store::open_in_memory().expect("open");
+        let share_id = store
+            .add_share(
+                "Drop",
+                "Drop",
+                sandbox.path(),
+                ShareFlags {
+                    allow_upload: true,
+                    ..ShareFlags::default()
+                },
+                &[],
+                0,
+            )
+            .expect("add_share");
+
+        assert_eq!(store.share_upload_bytes(share_id).expect("read"), 0);
+        assert_eq!(
+            store
+                .adjust_share_upload_bytes(share_id, 2048)
+                .expect("adjust"),
+            2048
+        );
+        assert_eq!(
+            store
+                .adjust_share_upload_bytes(share_id, -1000)
+                .expect("adjust"),
+            1048
+        );
     }
 
     // ---- Integration: store -> algebra survives a reopen ----

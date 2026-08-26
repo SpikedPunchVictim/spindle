@@ -1,24 +1,32 @@
-//! VFS RPC wire types (DESIGN.md §A8 "VFS RPC" + "VFS error model"), Stage 6 slice 3.
+//! VFS RPC wire types (DESIGN.md §A8 "VFS RPC" + "VFS error model"), Stage 6 slices 3-4.
 //!
-//! These types carry the six read-side/metadata VFS operations across the control
-//! channel/stream once a session is authenticated (post-DTLS/QUIC handshake) — they are **not**
-//! one of A7b's seven signed-artifact kinds (no domain-separation tag, no `sig` field, no
-//! [`crate::tags`] involvement): §A8 places VFS RPC *inside* the already-authenticated,
-//! already-encrypted session, so per-message signing would be redundant with the transport's own
-//! integrity guarantee. Like every other wire type in this crate, encoding is this crate's
-//! canonical CBOR ([`crate::canonical`]) with the same closed-schema/strict-type discipline
-//! `artifacts.rs` uses (unknown fields rejected, missing required fields rejected) — see
-//! [`crate::artifacts`]'s `MapReader`, reused here as `pub(crate)`.
+//! These types carry the ten VFS operations across the control channel/stream once a session is
+//! authenticated (post-DTLS/QUIC handshake) — they are **not** one of A7b's seven signed-artifact
+//! kinds (no domain-separation tag, no `sig` field, no [`crate::tags`] involvement): §A8 places
+//! VFS RPC *inside* the already-authenticated, already-encrypted session, so per-message signing
+//! would be redundant with the transport's own integrity guarantee. Like every other wire type in
+//! this crate, encoding is this crate's canonical CBOR ([`crate::canonical`]) with the same
+//! closed-schema/strict-type discipline `artifacts.rs` uses (unknown fields rejected, missing
+//! required fields rejected) — see [`crate::artifacts`]'s `MapReader`, reused here as
+//! `pub(crate)`.
 //!
-//! # Scope (Stage 6 slice 3 — deliberately bounded, see `IMPLEMENTATION_PLAN.md`)
+//! # Scope
 //!
-//! **In**: `list`, `stat`, `read` (chunked, offset/len), `mkdir`, `delete`, `whoami`, and the
-//! [`VfsErrorCode`] typed error model.
+//! **Slice 3**: `list`, `stat`, `read` (chunked, offset/len), `mkdir`, `delete`, `whoami`, and the
+//! [`VfsErrorCode`] typed error model (eight codes).
 //!
-//! **Out** (slice 4): `upload`'s resumable-session wire types (staging names, manifests, TTL) —
-//! DESIGN.md §A8's "transfer manager" / "upload sessions" paragraphs. `resume_expired` and
-//! `upload_rejected` below are defined now (per the task brief: "define all codes now even though
-//! some fire only in slice 4") but nothing in this slice ever produces them.
+//! **Slice 4 (this addition)**: `upload_open`/`upload_chunk`/`upload_commit`/`upload_abort` —
+//! DESIGN.md §A8's "transfer manager" / "upload sessions" paragraphs — plus two more error codes,
+//! `already_exists` and `file_changed`, added by the DESIGN.md v0.9.10 amendment (ADR-005,
+//! amended 2026-08-26) specifically so this slice's remapped denials (see below) have dedicated
+//! wire values instead of borrowing slice 3's `not_found`/`upload_rejected` as stopgaps.
+//!
+//! **Remapped from slice 3** (`spindle-host-core` changes, not this crate's own history, but
+//! recorded here since [`VfsErrorCode`] is "the schema-of-record" per the v0.9.10 changelog):
+//! mkdir-over-an-existing-name-without-delete used to report `upload_rejected` and now reports
+//! [`VfsErrorCode::AlreadyExists`]; a read whose file identity changed between `stat` and `read`
+//! (TOCTOU) used to report `not_found` and now reports [`VfsErrorCode::FileChanged`]. Both remaps
+//! are visible in `spindle-host-core::server`'s handler code and tests.
 //!
 //! # Schema choices (this crate's established practice — see `lib.rs`'s schema-choices table for
 //! the A7b-artifact precedent this follows)
@@ -27,7 +35,12 @@
 //! |---|---|
 //! | Wire shape | One CBOR map per message, request and reply alike: `{"op": <uint>, ...op-specific fields}`, with the request side additionally carrying `"v"` (protocol version). This mirrors `Envelope`'s single-flat-map-with-a-small-int-discriminant style rather than introducing a CBOR tag or a nested `{"kind": ..., "payload": {...}}` envelope. |
 //! | `v` (protocol version) | Present on every **request**, absent from every **reply** — DESIGN.md's negotiation language ("peers negotiate the highest common version with no downgrade below each side's minimum") is about the client asserting a version per call and the server accepting-or-rejecting it, not a per-message bidirectional handshake; a reply is already scoped to the request it answers. See [`VfsRequestEnvelope`]. |
-//! | `op` discriminant | A small unsigned integer (0–5 for requests, 0–6 for replies — `Error` is reply-only, value 6), exactly like `Capability.kind`'s precedent: a fixed, closed discriminant set that doesn't need self-description on the wire. |
+//! | `op` discriminant | A small unsigned integer (0–9 for requests, 0–10 for replies — `Error` is reply-only, value 10), exactly like `Capability.kind`'s precedent: a fixed, closed discriminant set that doesn't need self-description on the wire. Slice 4 appended `UploadOpen=6, UploadChunk=7, UploadCommit=8, UploadAbort=9` to both enums rather than renumbering slice 3's values, and moved `Error` from 6 to 10 — an additive-only change, but one that breaks wire compatibility with any slice-3-only peer; acceptable pre-1.0, flagged here per this crate's convention. |
+//! | Upload session id | Opaque `Vec<u8>` (like `list`'s cursor), not a decoded integer — `spindle-host-core` generates and interprets it; this crate only round-trips bytes. |
+//! | `upload_chunk`'s `data` | `Vec<u8>`, capped server-side at [`MAX_UPLOAD_CHUNK`] (same 64 KiB bound as `read`, DESIGN.md §A8) — enforced by `spindle-host-core`, not this crate's decoder, matching `read`'s `len` precedent above. |
+//! | `upload_chunk`'s reply | `{offset}` — the session's new next-expected-offset after appending this chunk, so a resuming client always knows where to continue without a separate `stat`-like round trip. |
+//! | `upload_open`'s `hash`/`manifest_sig` | Opaque `Vec<u8>` (like `Envelope.sig`/`from_fp`) — this crate has no crypto dependency (same A9c boundary rule `artifacts.rs` documents) and does not know or enforce a hash/signature algorithm or length; `spindle-host-core` verifies `manifest_sig` against the sending device's pinned public key via `spindle-core`. |
+//! | `upload_commit`/`upload_abort` replies | Empty acks (`{op}` only), mirroring `Mkdir`/`Delete`'s existing empty-ack shape. |
 //! | Virtual paths | Plain UTF-8 text (`/`-separated), never a dedicated wire type — `spindle-proto` sits below `spindle-vfs` in the crate graph (`proto ← core ← {net, vfs} ← host-core`) and must not depend on `spindle_vfs::model::VirtualPath`; callers (`spindle-host-core`) parse/render via that type. |
 //! | `list`'s `cursor` | Opaque bytes (`Option<Vec<u8>>`, key omission when absent — same optional-field convention as `Envelope.eph_pk`), not a decoded integer/string — the host-core paging implementation owns the cursor's internal shape (currently an audit/entry sequence-adjacent encoding; see `spindle-host-core`), and an opaque wire type means that internal shape can change without a wire-schema break. |
 //! | `list`'s `limit` | Optional `u32`; omitted means "use the server's default/max page" ([`MAX_LIST_PAGE`]). A client-supplied value above the server max is clamped server-side, not rejected — same posture as `spindle-vfs::audit::Audit::list`'s existing `page_size` clamp (precedent inside this same codebase). |
@@ -55,6 +68,18 @@ pub const MAX_LIST_PAGE: u32 = 500;
 
 /// Maximum bytes in one `read` reply chunk (DESIGN.md §A8, verbatim: "64 KiB chunks").
 pub const MAX_READ_CHUNK: u32 = 64 * 1024;
+
+/// Maximum bytes in one `upload_chunk` request (DESIGN.md §A8, same "64 KiB chunks" bound as
+/// `read` — the transfer manager paragraph does not give uploads a separate figure, and nothing
+/// suggests one direction should differ from the other).
+pub const MAX_UPLOAD_CHUNK: u32 = MAX_READ_CHUNK;
+
+/// Upload session TTL (DESIGN.md §A8 "transfer manager": "sessions expire after 48h"). Expressed
+/// in seconds, matching every other `ts: u64` in this crate/`spindle-host-core`. Not itself a wire
+/// field — `spindle-host-core` adds this to the session's creation `ts` to compute the `expires`
+/// value in the host-side session object; recorded here since it is the schema-of-record constant
+/// DESIGN.md specifies a number for.
+pub const UPLOAD_SESSION_TTL_SECS: u64 = 48 * 60 * 60;
 
 // ================================================================================================
 // Small closed-set enums (wire: small unsigned integers, per this crate's established convention)
@@ -128,36 +153,52 @@ fn perms_from_reader(m: &MapReader<'_>, key: &'static str) -> Result<VfsPerms, P
 
 /// DESIGN.md §A8 "VFS error model": the typed error codes returned *inside* the authenticated
 /// session (§A5's uniform-silent-drop rule applies only pre-auth — see the module doc comment on
-/// [`crate::vfs_rpc`] and DESIGN.md §A8's error-model paragraph, quoted there verbatim). All seven
-/// named codes are defined now even though `resume_expired`/`upload_rejected`/`storage_full` fire
-/// only once the slice-4 upload/transfer-manager/quota work lands — see the module doc comment's
-/// scope section. [`VfsErrorCode::UnsupportedVersion`] is this crate's own addition beyond
-/// DESIGN.md's literal list — see the schema-choices table above.
+/// [`crate::vfs_rpc`] and DESIGN.md §A8's error-model paragraph, quoted there verbatim). Ten codes
+/// total: DESIGN.md's original seven, this crate's own [`VfsErrorCode::UnsupportedVersion`]
+/// addition (see the schema-choices table above), and the two the v0.9.10 amendment added —
+/// [`VfsErrorCode::AlreadyExists`] and [`VfsErrorCode::FileChanged`] — specifically to give this
+/// slice's upload/mkdir/read denials dedicated wire values (see the module doc comment's "Remapped
+/// from slice 3" note).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsErrorCode {
     /// The requested path does not exist, OR the caller is not authorized to see it — DESIGN.md
     /// §A4b: "unauthorized == not found", deliberately the *same* wire value for both causes.
     NotFound = 0,
-    /// A per-member/per-share/per-transfer quota was exceeded (slice 4: upload/transfer quotas).
+    /// A per-member/per-share/per-transfer quota was exceeded (DESIGN.md §A4b "quotas per member
+    /// and per share").
     QuotaExceeded = 1,
     /// The member's effective grants changed since an in-flight operation began (e.g. a
     /// resumable upload's entitlement was revoked mid-transfer — DESIGN.md §A8 "an entitlement
     /// change mid-transfer aborts the session").
     GrantsChanged = 2,
-    /// A resumable upload session's TTL (DESIGN.md §A8: 48 h) expired.
+    /// A resumable upload session's TTL (DESIGN.md §A8: 48 h) expired, or a caller referenced a
+    /// session id the host no longer has (already committed, aborted, or GC'd).
     ResumeExpired = 3,
-    /// An uploaded file was rejected (manifest verification failure, unsafe name, size cap, etc.
-    /// — DESIGN.md §A8 "received-file policy").
+    /// An uploaded file was rejected (manifest verification failure, unsafe name, size cap,
+    /// whole-file hash mismatch at commit, etc. — DESIGN.md §A8 "received-file policy").
     UploadRejected = 4,
     /// The host's free-space floor was reached (DESIGN.md §A8 "owner live operations": "host-level
     /// free-space floor that pauses uploads before the disk fills").
     StorageFull = 5,
     /// A rate limit was hit (distinct from the pre-auth callout rate limits of §A3/§A5 — this is
-    /// the post-auth, per-session/per-member VFS-op rate limit the task brief defers to slice 4).
+    /// the post-auth, per-caller VFS-RPC-entry-point token-bucket limit, DESIGN.md §A5's
+    /// per-`from_fp` token bucket adapted to this layer).
     Throttled = 6,
     /// This crate's addition (not one of DESIGN.md's seven) — see the schema-choices table above.
     /// The request's [`VfsRequestEnvelope::v`] was below the server's [`MIN_PROTOCOL_VERSION`].
     UnsupportedVersion = 7,
+    /// **v0.9.10 addition.** A write (upload landing, or `mkdir`) collided with an existing name
+    /// (including a case/Unicode fold collision) and the caller lacked `delete` — DESIGN.md §A4b
+    /// "collision == overwrite; overwrite requires delete". Replaces slice 3's `upload_rejected`
+    /// stopgap for `mkdir`-over-an-existing-name (see `spindle-host-core::server::handle_mkdir`).
+    AlreadyExists = 8,
+    /// **v0.9.10 addition.** Two meanings, both "the file is not what the caller thought it was
+    /// when the operation was planned": (1) DESIGN.md §A4b's stat→read TOCTOU identity check
+    /// aborted a `read` (replaces slice 3's `not_found` stopgap — see
+    /// `spindle-host-core::server::handle_read`); (2) DESIGN.md §A8's transfer-manager
+    /// resume-conflict signal — an `upload_chunk`'s declared `offset` did not match the session's
+    /// tracked next-expected-offset.
+    FileChanged = 9,
 }
 
 impl VfsErrorCode {
@@ -175,6 +216,8 @@ impl VfsErrorCode {
             5 => Ok(VfsErrorCode::StorageFull),
             6 => Ok(VfsErrorCode::Throttled),
             7 => Ok(VfsErrorCode::UnsupportedVersion),
+            8 => Ok(VfsErrorCode::AlreadyExists),
+            9 => Ok(VfsErrorCode::FileChanged),
             other => Err(ProtoError::InvalidEnumValue("code", other)),
         }
     }
@@ -232,6 +275,10 @@ enum ReqOp {
     Mkdir = 3,
     Delete = 4,
     Whoami = 5,
+    UploadOpen = 6,
+    UploadChunk = 7,
+    UploadCommit = 8,
+    UploadAbort = 9,
 }
 
 impl ReqOp {
@@ -247,6 +294,10 @@ impl ReqOp {
             3 => Ok(ReqOp::Mkdir),
             4 => Ok(ReqOp::Delete),
             5 => Ok(ReqOp::Whoami),
+            6 => Ok(ReqOp::UploadOpen),
+            7 => Ok(ReqOp::UploadChunk),
+            8 => Ok(ReqOp::UploadCommit),
+            9 => Ok(ReqOp::UploadAbort),
             other => Err(ProtoError::InvalidEnumValue("op", other)),
         }
     }
@@ -260,7 +311,13 @@ enum ReplyOp {
     Mkdir = 3,
     Delete = 4,
     Whoami = 5,
-    Error = 6,
+    UploadOpen = 6,
+    UploadChunk = 7,
+    UploadCommit = 8,
+    UploadAbort = 9,
+    /// Moved from 6 (slice 3) to 10 (slice 4) to make room for the four upload reply ops above —
+    /// see the schema-choices table's `op` discriminant row.
+    Error = 10,
 }
 
 impl ReplyOp {
@@ -276,7 +333,11 @@ impl ReplyOp {
             3 => Ok(ReplyOp::Mkdir),
             4 => Ok(ReplyOp::Delete),
             5 => Ok(ReplyOp::Whoami),
-            6 => Ok(ReplyOp::Error),
+            6 => Ok(ReplyOp::UploadOpen),
+            7 => Ok(ReplyOp::UploadChunk),
+            8 => Ok(ReplyOp::UploadCommit),
+            9 => Ok(ReplyOp::UploadAbort),
+            10 => Ok(ReplyOp::Error),
             other => Err(ProtoError::InvalidEnumValue("op", other)),
         }
     }
@@ -308,6 +369,34 @@ pub enum VfsRequest {
     Delete { path: String },
     /// `whoami → {member_display, effective_paths}`. No fields of its own.
     Whoami,
+    /// `upload_open(path, size, hash, manifest_sig) → {session_id, offset}` (DESIGN.md §A8
+    /// "transfer manager"). `size` is the whole-file declared size; `hash` the whole-file declared
+    /// hash; `manifest_sig` a signature (by the sending device's key) over the manifest
+    /// (path+size+hash) — verified by `spindle-host-core` before any chunk is accepted and again
+    /// immediately before the staged file is moved into place. Calling this again with the same
+    /// `(path, size, hash)` for a still-live session resumes it (returns its current offset)
+    /// rather than starting a new one.
+    UploadOpen {
+        path: String,
+        size: u64,
+        hash: Vec<u8>,
+        manifest_sig: Vec<u8>,
+    },
+    /// `upload_chunk(session_id, offset, data) → {offset}`. `offset` must equal the session's
+    /// current next-expected-offset exactly (DESIGN.md §A8 transfer manager: resume via
+    /// next-expected-offset) — a mismatch is a resume conflict ([`VfsErrorCode::FileChanged`]).
+    /// `data` is capped server-side at [`MAX_UPLOAD_CHUNK`].
+    UploadChunk {
+        session_id: Vec<u8>,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    /// `upload_commit(session_id)`. Verifies the accumulated bytes' hash and the manifest
+    /// signature, checks overwrite/quota/entitlement one last time, then moves the staged file
+    /// into place.
+    UploadCommit { session_id: Vec<u8> },
+    /// `upload_abort(session_id)`. Discards the session and its staged bytes.
+    UploadAbort { session_id: Vec<u8> },
 }
 
 const LIST_REQ_FIELDS: &[&str] = &["v", "op", "path", "cursor", "limit"];
@@ -316,6 +405,10 @@ const READ_REQ_FIELDS: &[&str] = &["v", "op", "path", "offset", "len"];
 const MKDIR_REQ_FIELDS: &[&str] = &["v", "op", "path"];
 const DELETE_REQ_FIELDS: &[&str] = &["v", "op", "path"];
 const WHOAMI_REQ_FIELDS: &[&str] = &["v", "op"];
+const UPLOAD_OPEN_REQ_FIELDS: &[&str] = &["v", "op", "path", "size", "hash", "manifest_sig"];
+const UPLOAD_CHUNK_REQ_FIELDS: &[&str] = &["v", "op", "session_id", "offset", "data"];
+const UPLOAD_COMMIT_REQ_FIELDS: &[&str] = &["v", "op", "session_id"];
+const UPLOAD_ABORT_REQ_FIELDS: &[&str] = &["v", "op", "session_id"];
 
 /// A [`VfsRequest`] plus the protocol-version field every request carries (DESIGN.md §A8: "RPC
 /// carries a protocol version"). Encoded as a single flat CBOR map — see the schema-choices table
@@ -371,6 +464,40 @@ impl VfsRequestEnvelope {
                 ("path", CborValue::text(path.clone())),
             ],
             VfsRequest::Whoami => vec![v_entry, ("op", ReqOp::Whoami.to_cbor())],
+            VfsRequest::UploadOpen {
+                path,
+                size,
+                hash,
+                manifest_sig,
+            } => vec![
+                v_entry,
+                ("op", ReqOp::UploadOpen.to_cbor()),
+                ("path", CborValue::text(path.clone())),
+                ("size", CborValue::uint(*size)),
+                ("hash", CborValue::bytes(hash.clone())),
+                ("manifest_sig", CborValue::bytes(manifest_sig.clone())),
+            ],
+            VfsRequest::UploadChunk {
+                session_id,
+                offset,
+                data,
+            } => vec![
+                v_entry,
+                ("op", ReqOp::UploadChunk.to_cbor()),
+                ("session_id", CborValue::bytes(session_id.clone())),
+                ("offset", CborValue::uint(*offset)),
+                ("data", CborValue::bytes(data.clone())),
+            ],
+            VfsRequest::UploadCommit { session_id } => vec![
+                v_entry,
+                ("op", ReqOp::UploadCommit.to_cbor()),
+                ("session_id", CborValue::bytes(session_id.clone())),
+            ],
+            VfsRequest::UploadAbort { session_id } => vec![
+                v_entry,
+                ("op", ReqOp::UploadAbort.to_cbor()),
+                ("session_id", CborValue::bytes(session_id.clone())),
+            ],
         };
         CborValue::map(entries)
     }
@@ -422,6 +549,35 @@ impl VfsRequestEnvelope {
                 m.deny_unknown_fields(WHOAMI_REQ_FIELDS)?;
                 VfsRequest::Whoami
             }
+            ReqOp::UploadOpen => {
+                m.deny_unknown_fields(UPLOAD_OPEN_REQ_FIELDS)?;
+                VfsRequest::UploadOpen {
+                    path: m.text("path")?,
+                    size: m.u64("size")?,
+                    hash: m.bytes("hash")?,
+                    manifest_sig: m.bytes("manifest_sig")?,
+                }
+            }
+            ReqOp::UploadChunk => {
+                m.deny_unknown_fields(UPLOAD_CHUNK_REQ_FIELDS)?;
+                VfsRequest::UploadChunk {
+                    session_id: m.bytes("session_id")?,
+                    offset: m.u64("offset")?,
+                    data: m.bytes("data")?,
+                }
+            }
+            ReqOp::UploadCommit => {
+                m.deny_unknown_fields(UPLOAD_COMMIT_REQ_FIELDS)?;
+                VfsRequest::UploadCommit {
+                    session_id: m.bytes("session_id")?,
+                }
+            }
+            ReqOp::UploadAbort => {
+                m.deny_unknown_fields(UPLOAD_ABORT_REQ_FIELDS)?;
+                VfsRequest::UploadAbort {
+                    session_id: m.bytes("session_id")?,
+                }
+            }
         };
         Ok(VfsRequestEnvelope { v: ver, request })
     }
@@ -458,6 +614,21 @@ pub enum VfsReply {
         member_display: String,
         effective_paths: Vec<String>,
     },
+    /// Reply to [`VfsRequest::UploadOpen`]: the (possibly resumed) session's id and its current
+    /// next-expected-offset (0 for a brand-new session).
+    UploadOpen {
+        session_id: Vec<u8>,
+        offset: u64,
+    },
+    /// Reply to [`VfsRequest::UploadChunk`]: the session's next-expected-offset after appending
+    /// this chunk.
+    UploadChunk {
+        offset: u64,
+    },
+    /// Empty ack, mirroring [`VfsReply::Mkdir`]/[`VfsReply::Delete`].
+    UploadCommit,
+    /// Empty ack, mirroring [`VfsReply::Mkdir`]/[`VfsReply::Delete`].
+    UploadAbort,
     Error {
         code: VfsErrorCode,
     },
@@ -469,6 +640,10 @@ const READ_REPLY_FIELDS: &[&str] = &["op", "data", "eof"];
 const MKDIR_REPLY_FIELDS: &[&str] = &["op"];
 const DELETE_REPLY_FIELDS: &[&str] = &["op"];
 const WHOAMI_REPLY_FIELDS: &[&str] = &["op", "member_display", "effective_paths"];
+const UPLOAD_OPEN_REPLY_FIELDS: &[&str] = &["op", "session_id", "offset"];
+const UPLOAD_CHUNK_REPLY_FIELDS: &[&str] = &["op", "offset"];
+const UPLOAD_COMMIT_REPLY_FIELDS: &[&str] = &["op"];
+const UPLOAD_ABORT_REPLY_FIELDS: &[&str] = &["op"];
 const ERROR_REPLY_FIELDS: &[&str] = &["op", "code"];
 
 impl VfsReply {
@@ -526,6 +701,17 @@ impl VfsReply {
                     ),
                 ),
             ],
+            VfsReply::UploadOpen { session_id, offset } => vec![
+                ("op", ReplyOp::UploadOpen.to_cbor()),
+                ("session_id", CborValue::bytes(session_id.clone())),
+                ("offset", CborValue::uint(*offset)),
+            ],
+            VfsReply::UploadChunk { offset } => vec![
+                ("op", ReplyOp::UploadChunk.to_cbor()),
+                ("offset", CborValue::uint(*offset)),
+            ],
+            VfsReply::UploadCommit => vec![("op", ReplyOp::UploadCommit.to_cbor())],
+            VfsReply::UploadAbort => vec![("op", ReplyOp::UploadAbort.to_cbor())],
             VfsReply::Error { code } => {
                 vec![("op", ReplyOp::Error.to_cbor()), ("code", code.to_cbor())]
             }
@@ -595,6 +781,27 @@ impl VfsReply {
                     member_display: m.text("member_display")?,
                     effective_paths,
                 }
+            }
+            ReplyOp::UploadOpen => {
+                m.deny_unknown_fields(UPLOAD_OPEN_REPLY_FIELDS)?;
+                VfsReply::UploadOpen {
+                    session_id: m.bytes("session_id")?,
+                    offset: m.u64("offset")?,
+                }
+            }
+            ReplyOp::UploadChunk => {
+                m.deny_unknown_fields(UPLOAD_CHUNK_REPLY_FIELDS)?;
+                VfsReply::UploadChunk {
+                    offset: m.u64("offset")?,
+                }
+            }
+            ReplyOp::UploadCommit => {
+                m.deny_unknown_fields(UPLOAD_COMMIT_REPLY_FIELDS)?;
+                VfsReply::UploadCommit
+            }
+            ReplyOp::UploadAbort => {
+                m.deny_unknown_fields(UPLOAD_ABORT_REPLY_FIELDS)?;
+                VfsReply::UploadAbort
             }
             ReplyOp::Error => {
                 m.deny_unknown_fields(ERROR_REPLY_FIELDS)?;
@@ -674,6 +881,35 @@ mod tests {
             v: 1,
             request: VfsRequest::Whoami,
         });
+        rt_req(&VfsRequestEnvelope {
+            v: 1,
+            request: VfsRequest::UploadOpen {
+                path: "Drop/incoming.bin".to_string(),
+                size: 1_048_576,
+                hash: vec![0xAA; 32],
+                manifest_sig: vec![0xBB; 64],
+            },
+        });
+        rt_req(&VfsRequestEnvelope {
+            v: 1,
+            request: VfsRequest::UploadChunk {
+                session_id: vec![1, 2, 3, 4],
+                offset: 65536,
+                data: vec![0xCC; 4096],
+            },
+        });
+        rt_req(&VfsRequestEnvelope {
+            v: 1,
+            request: VfsRequest::UploadCommit {
+                session_id: vec![1, 2, 3, 4],
+            },
+        });
+        rt_req(&VfsRequestEnvelope {
+            v: 1,
+            request: VfsRequest::UploadAbort {
+                session_id: vec![1, 2, 3, 4],
+            },
+        });
     }
 
     #[test]
@@ -708,7 +944,24 @@ mod tests {
             member_display: "Alex".to_string(),
             effective_paths: vec!["Photos/Vacation".to_string(), "Drop".to_string()],
         });
-        for code in [
+        rt_reply(&VfsReply::UploadOpen {
+            session_id: vec![1, 2, 3, 4],
+            offset: 0,
+        });
+        rt_reply(&VfsReply::UploadOpen {
+            session_id: vec![1, 2, 3, 4],
+            offset: 65536,
+        });
+        rt_reply(&VfsReply::UploadChunk { offset: 131072 });
+        rt_reply(&VfsReply::UploadCommit);
+        rt_reply(&VfsReply::UploadAbort);
+        for code in all_error_codes() {
+            rt_reply(&VfsReply::Error { code });
+        }
+    }
+
+    fn all_error_codes() -> [VfsErrorCode; 10] {
+        [
             VfsErrorCode::NotFound,
             VfsErrorCode::QuotaExceeded,
             VfsErrorCode::GrantsChanged,
@@ -717,9 +970,9 @@ mod tests {
             VfsErrorCode::StorageFull,
             VfsErrorCode::Throttled,
             VfsErrorCode::UnsupportedVersion,
-        ] {
-            rt_reply(&VfsReply::Error { code });
-        }
+            VfsErrorCode::AlreadyExists,
+            VfsErrorCode::FileChanged,
+        ]
     }
 
     #[test]
@@ -762,7 +1015,7 @@ mod tests {
         assert_eq!(err, ProtoError::InvalidEnumValue("op", 99));
 
         let bad_code = CborValue::map(vec![
-            ("op", CborValue::uint(6)),
+            ("op", CborValue::uint(10)),
             ("code", CborValue::uint(99)),
         ]);
         let bytes = canonical_encode(&bad_code);
@@ -786,17 +1039,7 @@ mod tests {
 
     #[test]
     fn all_error_codes_distinct_and_round_trip_u64() {
-        let codes = [
-            VfsErrorCode::NotFound,
-            VfsErrorCode::QuotaExceeded,
-            VfsErrorCode::GrantsChanged,
-            VfsErrorCode::ResumeExpired,
-            VfsErrorCode::UploadRejected,
-            VfsErrorCode::StorageFull,
-            VfsErrorCode::Throttled,
-            VfsErrorCode::UnsupportedVersion,
-        ];
-        for (i, c) in codes.iter().enumerate() {
+        for (i, c) in all_error_codes().iter().enumerate() {
             assert_eq!(*c as u64, i as u64);
         }
     }
@@ -804,5 +1047,35 @@ mod tests {
     #[test]
     fn max_read_chunk_is_64_kib() {
         assert_eq!(MAX_READ_CHUNK, 65536);
+    }
+
+    #[test]
+    fn max_upload_chunk_matches_max_read_chunk() {
+        assert_eq!(MAX_UPLOAD_CHUNK, MAX_READ_CHUNK);
+    }
+
+    #[test]
+    fn upload_session_ttl_is_48_hours() {
+        assert_eq!(UPLOAD_SESSION_TTL_SECS, 48 * 60 * 60);
+    }
+
+    #[test]
+    fn rejects_unknown_field_on_upload_open() {
+        let mut cbor = VfsRequestEnvelope {
+            v: 1,
+            request: VfsRequest::UploadOpen {
+                path: "x".to_string(),
+                size: 1,
+                hash: vec![0],
+                manifest_sig: vec![0],
+            },
+        }
+        .to_cbor();
+        if let CborValue::Map(entries) = &mut cbor {
+            entries.push((CborValue::text("bogus"), CborValue::uint(1)));
+        }
+        let bytes = canonical_encode(&cbor);
+        let err = VfsRequestEnvelope::from_canonical_bytes(&bytes).unwrap_err();
+        assert_eq!(err, ProtoError::UnknownField("bogus".to_string()));
     }
 }
