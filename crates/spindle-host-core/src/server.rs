@@ -595,7 +595,9 @@ impl<'s> VfsRpcServer<'s> {
                 );
                 VfsReply::Read { data, eof }
             }
-            Err((outcome, code)) => self.deny_with_code(ts, member, ctx, "read", Some(path), outcome, code),
+            Err((outcome, code)) => {
+                self.deny_with_code(ts, member, ctx, "read", Some(path), outcome, code)
+            }
         }
     }
 
@@ -856,24 +858,50 @@ impl<'s> VfsRpcServer<'s> {
         let mount_table = MountTable::build(shares);
 
         let Ok(vp) = VirtualPath::parse(path) else {
-            return self.deny(ts, member, ctx, "upload_open", Some(path), "denied:not_found");
+            return self.deny(
+                ts,
+                member,
+                ctx,
+                "upload_open",
+                Some(path),
+                "denied:not_found",
+            );
         };
         let (share, subpath) = match mount_table.resolve(&vp) {
             MountLookup::Share { share, subpath } => (share, subpath),
             MountLookup::Intermediate(_) | MountLookup::NotFound => {
-                return self.deny(ts, member, ctx, "upload_open", Some(path), "denied:not_found")
+                return self.deny(
+                    ts,
+                    member,
+                    ctx,
+                    "upload_open",
+                    Some(path),
+                    "denied:not_found",
+                )
             }
         };
 
         // Upload implies resolve-without-listing (drop-box, DESIGN.md §A4b): only `upload` (not
         // `browse`) is required here.
         let decision = effective.resolve_access(share, &subpath);
-        if !decision.perms().contains(Perms::UPLOAD) || !share.flags.allow_upload || share.flags.read_only
+        if !decision.perms().contains(Perms::UPLOAD)
+            || !share.flags.allow_upload
+            || share.flags.read_only
         {
-            return self.deny(ts, member, ctx, "upload_open", Some(path), "denied:not_found");
+            return self.deny(
+                ts,
+                member,
+                ctx,
+                "upload_open",
+                Some(path),
+                "denied:not_found",
+            );
         }
 
-        let member_bytes = self.store.member_upload_bytes(member.member_id).unwrap_or(0);
+        let member_bytes = self
+            .store
+            .member_upload_bytes(member.member_id)
+            .unwrap_or(0);
         if member_bytes.saturating_add(size) > self.limits.max_member_upload_bytes {
             return self.deny_with_code(
                 ts,
@@ -928,12 +956,26 @@ impl<'s> VfsRpcServer<'s> {
             Ok(d) => d,
             Err(_) => {
                 self.upload_sessions.remove(&session.id);
-                return self.deny(ts, member, ctx, "upload_open", Some(path), "denied:not_found");
+                return self.deny(
+                    ts,
+                    member,
+                    ctx,
+                    "upload_open",
+                    Some(path),
+                    "denied:not_found",
+                );
             }
         };
         if session.offset == 0 && dir.create(confine::staging_name(&session.id)).is_err() {
             self.upload_sessions.remove(&session.id);
-            return self.deny(ts, member, ctx, "upload_open", Some(path), "denied:not_found");
+            return self.deny(
+                ts,
+                member,
+                ctx,
+                "upload_open",
+                Some(path),
+                "denied:not_found",
+            );
         }
 
         self.audit(
@@ -1061,7 +1103,14 @@ impl<'s> VfsRpcServer<'s> {
         }
 
         let Ok(Some(share)) = self.store.get_share(session.share_id) else {
-            return self.deny(ts, member, ctx, "upload_chunk", Some(&path_str), "denied:not_found");
+            return self.deny(
+                ts,
+                member,
+                ctx,
+                "upload_chunk",
+                Some(&path_str),
+                "denied:not_found",
+            );
         };
 
         // Free-space floor, checked BEFORE accepting these chunk bytes (task brief wording).
@@ -1080,7 +1129,14 @@ impl<'s> VfsRpcServer<'s> {
         let dir = match confine::open_share_root(&share.real_root) {
             Ok(d) => d,
             Err(_) => {
-                return self.deny(ts, member, ctx, "upload_chunk", Some(&path_str), "denied:not_found")
+                return self.deny(
+                    ts,
+                    member,
+                    ctx,
+                    "upload_chunk",
+                    Some(&path_str),
+                    "denied:not_found",
+                )
             }
         };
         let staging = confine::staging_name(&session.id);
@@ -1089,7 +1145,14 @@ impl<'s> VfsRpcServer<'s> {
         let mut file = match dir.open_with(&staging, &opts) {
             Ok(f) => f,
             Err(_) => {
-                return self.deny(ts, member, ctx, "upload_chunk", Some(&path_str), "denied:not_found")
+                return self.deny(
+                    ts,
+                    member,
+                    ctx,
+                    "upload_chunk",
+                    Some(&path_str),
+                    "denied:not_found",
+                )
             }
         };
         if file.seek(SeekFrom::Start(offset)).is_err() || file.write_all(data).is_err() {
@@ -1160,7 +1223,14 @@ impl<'s> VfsRpcServer<'s> {
         }
 
         let Ok(Some(share)) = self.store.get_share(session.share_id) else {
-            return self.deny(ts, member, ctx, "upload_commit", Some(&path_str), "denied:not_found");
+            return self.deny(
+                ts,
+                member,
+                ctx,
+                "upload_commit",
+                Some(&path_str),
+                "denied:not_found",
+            );
         };
 
         let (shares, entitlements) = match self.grants_cache.get(self.store) {
@@ -1181,16 +1251,32 @@ impl<'s> VfsRpcServer<'s> {
         let effective = EffectiveGrants::compute(member, &entitlements, version);
         let decision = effective.resolve_access(&share, &session.subpath);
         let can_delete = decision.perms().contains(Perms::DELETE);
-        if !decision.perms().contains(Perms::UPLOAD) || !share.flags.allow_upload || share.flags.read_only
+        if !decision.perms().contains(Perms::UPLOAD)
+            || !share.flags.allow_upload
+            || share.flags.read_only
         {
             self.abort_and_gc(&session);
-            return self.deny(ts, member, ctx, "upload_commit", Some(&path_str), "denied:not_found");
+            return self.deny(
+                ts,
+                member,
+                ctx,
+                "upload_commit",
+                Some(&path_str),
+                "denied:not_found",
+            );
         }
 
         let dir = match confine::open_share_root(&share.real_root) {
             Ok(d) => d,
             Err(_) => {
-                return self.deny(ts, member, ctx, "upload_commit", Some(&path_str), "denied:not_found")
+                return self.deny(
+                    ts,
+                    member,
+                    ctx,
+                    "upload_commit",
+                    Some(&path_str),
+                    "denied:not_found",
+                )
             }
         };
         let staging = confine::staging_name(&session.id);
@@ -1203,7 +1289,14 @@ impl<'s> VfsRpcServer<'s> {
         let staged_bytes = match dir.read(&staging) {
             Ok(b) => b,
             Err(_) => {
-                return self.deny(ts, member, ctx, "upload_commit", Some(&path_str), "denied:not_found")
+                return self.deny(
+                    ts,
+                    member,
+                    ctx,
+                    "upload_commit",
+                    Some(&path_str),
+                    "denied:not_found",
+                )
             }
         };
         let actual_hash = Fingerprint::of_parts(&[&staged_bytes]).to_vec();
@@ -1244,7 +1337,10 @@ impl<'s> VfsRpcServer<'s> {
 
         // Quota re-check: usage may have grown since `upload_open` (other sessions committing
         // concurrently).
-        let member_bytes = self.store.member_upload_bytes(member.member_id).unwrap_or(0);
+        let member_bytes = self
+            .store
+            .member_upload_bytes(member.member_id)
+            .unwrap_or(0);
         if member_bytes.saturating_add(session.size) > self.limits.max_member_upload_bytes {
             return self.deny_with_code(
                 ts,
@@ -1269,7 +1365,12 @@ impl<'s> VfsRpcServer<'s> {
             );
         }
 
-        match confine::finalize_upload(&dir, &staging, &session.subpath.to_path_string(), can_delete) {
+        match confine::finalize_upload(
+            &dir,
+            &staging,
+            &session.subpath.to_path_string(),
+            can_delete,
+        ) {
             Ok(true) => {
                 self.upload_sessions.remove(&session.id);
                 self.identity_cache
@@ -1305,7 +1406,14 @@ impl<'s> VfsRpcServer<'s> {
             ),
             Err(_) => {
                 self.abort_and_gc(&session);
-                self.deny(ts, member, ctx, "upload_commit", Some(&path_str), "denied:not_found")
+                self.deny(
+                    ts,
+                    member,
+                    ctx,
+                    "upload_commit",
+                    Some(&path_str),
+                    "denied:not_found",
+                )
             }
         }
     }
@@ -1704,7 +1812,11 @@ mod tests {
         /// upload-manifest-signature tests' way of getting a `(device_fp, SigningKey)` pair the
         /// server can actually verify against (see `crate::server`'s
         /// `verify_manifest_signature`).
-        fn add_signing_device(&self, member_id: MemberId, label: &str) -> (Fingerprint, SigningKey) {
+        fn add_signing_device(
+            &self,
+            member_id: MemberId,
+            label: &str,
+        ) -> (Fingerprint, SigningKey) {
             let device_fp = Fingerprint::of_parts(&[b"device", label.as_bytes()]);
             let signing_key = SigningKey::from_bytes(&{
                 let mut seed = [0u8; 32];
@@ -2105,7 +2217,13 @@ mod tests {
             self.h.share_real_root(self.share_id)
         }
 
-        fn open(&self, server: &VfsRpcServer<'_>, ts: u64, virtual_path: &str, data: &[u8]) -> Vec<u8> {
+        fn open(
+            &self,
+            server: &VfsRpcServer<'_>,
+            ts: u64,
+            virtual_path: &str,
+            data: &[u8],
+        ) -> Vec<u8> {
             let hash = sha256(data);
             let sig = sign_manifest(&self.signing_key, virtual_path, data.len() as u64, &hash);
             let reply = server.handle(
@@ -2199,15 +2317,13 @@ mod tests {
             data
         );
         assert_eq!(
-            fx.h
-                .store
+            fx.h.store
                 .member_upload_bytes(fx.member_id)
                 .expect("member_upload_bytes"),
             data.len() as u64
         );
         assert_eq!(
-            fx.h
-                .store
+            fx.h.store
                 .share_upload_bytes(fx.share_id)
                 .expect("share_upload_bytes"),
             data.len() as u64
@@ -2260,7 +2376,11 @@ mod tests {
         );
         match reopened {
             VfsReply::UploadOpen { offset, .. } => {
-                assert_eq!(offset, first_chunk.len() as u64, "resumes at next-expected-offset")
+                assert_eq!(
+                    offset,
+                    first_chunk.len() as u64,
+                    "resumes at next-expected-offset"
+                )
             }
             other => panic!("expected UploadOpen, got {other:?}"),
         }
@@ -2339,7 +2459,11 @@ mod tests {
                 },
             ),
         );
-        let reply = server.handle(&fx.ctx(), 3, req(1, VfsRequest::UploadCommit { session_id }));
+        let reply = server.handle(
+            &fx.ctx(),
+            3,
+            req(1, VfsRequest::UploadCommit { session_id }),
+        );
         assert_eq!(
             reply,
             VfsReply::Error {
@@ -2370,7 +2494,11 @@ mod tests {
                 },
             ),
         );
-        let reply = server.handle(&fx.ctx(), 3, req(1, VfsRequest::UploadCommit { session_id }));
+        let reply = server.handle(
+            &fx.ctx(),
+            3,
+            req(1, VfsRequest::UploadCommit { session_id }),
+        );
         assert_eq!(
             reply,
             VfsReply::Error {
@@ -2459,7 +2587,12 @@ mod tests {
         let reply = server.handle(
             &fx.ctx(),
             3,
-            req(1, VfsRequest::UploadCommit { session_id: session_id.clone() }),
+            req(
+                1,
+                VfsRequest::UploadCommit {
+                    session_id: session_id.clone(),
+                },
+            ),
         );
         assert_eq!(
             reply,
@@ -2475,7 +2608,11 @@ mod tests {
         // The session survives an `already_exists` refusal — a client can grant itself `delete`
         // out of band and retry `upload_commit` without re-uploading anything (asserted here by
         // just retrying the commit after this test's fixture is rebuilt with `delete` below).
-        let reply_again = server.handle(&fx.ctx(), 4, req(1, VfsRequest::UploadCommit { session_id }));
+        let reply_again = server.handle(
+            &fx.ctx(),
+            4,
+            req(1, VfsRequest::UploadCommit { session_id }),
+        );
         assert_eq!(
             reply_again,
             VfsReply::Error {
@@ -2505,9 +2642,16 @@ mod tests {
                 },
             ),
         );
-        let reply = server.handle(&fx.ctx(), 3, req(1, VfsRequest::UploadCommit { session_id }));
+        let reply = server.handle(
+            &fx.ctx(),
+            3,
+            req(1, VfsRequest::UploadCommit { session_id }),
+        );
         assert_eq!(reply, VfsReply::UploadCommit);
-        assert_eq!(std::fs::read(root.join("existing.txt")).expect("read"), data);
+        assert_eq!(
+            std::fs::read(root.join("existing.txt")).expect("read"),
+            data
+        );
     }
 
     #[test]
@@ -2532,7 +2676,11 @@ mod tests {
                 },
             ),
         );
-        let reply = server.handle(&fx.ctx(), 3, req(1, VfsRequest::UploadCommit { session_id }));
+        let reply = server.handle(
+            &fx.ctx(),
+            3,
+            req(1, VfsRequest::UploadCommit { session_id }),
+        );
         assert_eq!(
             reply,
             VfsReply::Error {
@@ -2552,7 +2700,16 @@ mod tests {
             1
         );
 
-        let reply = server.handle(&fx.ctx(), 2, req(1, VfsRequest::UploadAbort { session_id: session_id.clone() }));
+        let reply = server.handle(
+            &fx.ctx(),
+            2,
+            req(
+                1,
+                VfsRequest::UploadAbort {
+                    session_id: session_id.clone(),
+                },
+            ),
+        );
         assert_eq!(reply, VfsReply::UploadAbort);
         assert_eq!(
             std::fs::read_dir(fx.real_root()).expect("read_dir").count(),

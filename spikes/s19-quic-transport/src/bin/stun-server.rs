@@ -32,7 +32,9 @@ use rtc_stun::message::{Message, BINDING_REQUEST, BINDING_SUCCESS};
 use rtc_stun::xoraddr::XorMappedAddress;
 
 fn main() -> std::io::Result<()> {
-    let bind_addr = std::env::args().nth(1).unwrap_or_else(|| "0.0.0.0:3478".to_string());
+    let bind_addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "0.0.0.0:3478".to_string());
     let socket = UdpSocket::bind(&bind_addr)?;
     eprintln!("stun-server: listening on {bind_addr}");
 
@@ -53,7 +55,10 @@ fn main() -> std::io::Result<()> {
             continue;
         }
         if req.typ != BINDING_REQUEST {
-            eprintln!("stun-server: dropping non-Binding-Request STUN message from {from} (typ={:?})", req.typ);
+            eprintln!(
+                "stun-server: dropping non-Binding-Request STUN message from {from} (typ={:?})",
+                req.typ
+            );
             continue;
         }
 

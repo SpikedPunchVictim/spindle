@@ -254,7 +254,13 @@ mod tests {
         let nats_fp = fp(b"nats-a");
         assert!(v.session_record(&nats_fp, 1_000).is_none());
 
-        let record = SessionRecord::new(nats_fp, fp(b"root-a"), vec![fp(b"host-a")], "member".to_string(), 2_000);
+        let record = SessionRecord::new(
+            nats_fp,
+            fp(b"root-a"),
+            vec![fp(b"host-a")],
+            "member".to_string(),
+            2_000,
+        );
         v.put_session_record(record.clone());
         assert_eq!(v.session_record(&nats_fp, 1_000), Some(record));
     }
@@ -263,7 +269,8 @@ mod tests {
     fn session_record_is_absent_once_expired() {
         let mut v = view(AdmissionMode::Open);
         let nats_fp = fp(b"nats-b");
-        let record = SessionRecord::new(nats_fp, fp(b"root-b"), vec![], "member".to_string(), 1_000);
+        let record =
+            SessionRecord::new(nats_fp, fp(b"root-b"), vec![], "member".to_string(), 1_000);
         v.put_session_record(record);
         assert!(v.session_record(&nats_fp, 999).is_some());
         assert!(
@@ -315,7 +322,11 @@ mod tests {
             2_000,
         ));
         let got = v.session_record(&nats_fp, 0).expect("record present");
-        assert_eq!(got.root_fp, fp(b"root-new"), "later write must replace the earlier one");
+        assert_eq!(
+            got.root_fp,
+            fp(b"root-new"),
+            "later write must replace the earlier one"
+        );
     }
 
     #[test]
@@ -383,8 +394,20 @@ mod tests {
         let mut v = view(AdmissionMode::Open);
         let live_fp = fp(b"nats-live");
         let expired_fp = fp(b"nats-expired");
-        v.put_session_record(SessionRecord::new(live_fp, fp(b"root"), vec![], "member".to_string(), 5_000));
-        v.put_session_record(SessionRecord::new(expired_fp, fp(b"root"), vec![], "member".to_string(), 1_000));
+        v.put_session_record(SessionRecord::new(
+            live_fp,
+            fp(b"root"),
+            vec![],
+            "member".to_string(),
+            5_000,
+        ));
+        v.put_session_record(SessionRecord::new(
+            expired_fp,
+            fp(b"root"),
+            vec![],
+            "member".to_string(),
+            1_000,
+        ));
         v.purge_expired_sessions(2_000);
         assert!(v.session_record(&live_fp, 0).is_some());
         assert!(!v.sessions.contains_key(&expired_fp));

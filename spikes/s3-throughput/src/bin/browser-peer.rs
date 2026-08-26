@@ -299,13 +299,13 @@ impl Config {
             match (stats_interval_ms > 0, &stats_out) {
                 (true, None) => {
                     return Err(anyhow!(
-                        "--stats-interval-ms requires --stats-out <path> (nothing to write samples to)"
-                    ))
+                    "--stats-interval-ms requires --stats-out <path> (nothing to write samples to)"
+                ))
                 }
                 (false, Some(_)) => {
                     return Err(anyhow!(
-                        "--stats-out requires --stats-interval-ms <N> (nothing would ever be sampled)"
-                    ))
+                    "--stats-out requires --stats-interval-ms <N> (nothing would ever be sampled)"
+                ))
                 }
                 _ => {}
             }
@@ -347,9 +347,13 @@ fn print_usage() {
     println!();
     println!("OPTIONS:");
     println!("    --mode <send|recv|relay>  required: send = Rust pushes bytes to the browser");
-    println!("                        (download path); recv = browser pushes bytes to Rust (upload");
+    println!(
+        "                        (download path); recv = browser pushes bytes to Rust (upload"
+    );
     println!("                        path); relay = NO Rust WebRTC peer — pairs two");
-    println!("                        browser-peer.html instances (?role=recv / ?role=send&bytes=N)");
+    println!(
+        "                        browser-peer.html instances (?role=recv / ?role=send&bytes=N)"
+    );
     println!("                        and blindly forwards signaling so they transfer directly");
     println!("                        against each other's dcSCTP (A10.29 control cell); --bytes/");
     println!("                        --chunk/--sctp-buf/--threshold are accepted but ignored in");
@@ -365,15 +369,23 @@ fn print_usage() {
     );
     println!("    --threshold <bytes> bufferedAmountLowThreshold (default: 1048576)");
     println!("    --json              print one machine-readable JSON result line");
-    println!("    --stats-interval-ms <N>  sample stats every N ms, send/recv mode only (default: 0,");
+    println!(
+        "    --stats-interval-ms <N>  sample stats every N ms, send/recv mode only (default: 0,"
+    );
     println!("                        disabled). Requires --stats-out in send/recv mode.");
-    println!("    --stats-out <path>  send/recv mode: JSON-lines file for Rust-side PeerConnection");
+    println!(
+        "    --stats-out <path>  send/recv mode: JSON-lines file for Rust-side PeerConnection"
+    );
     println!("                        stats samples (required with --stats-interval-ms there).");
     println!("                        relay mode: JSON-lines sidecar the two browser pages' own");
-    println!("                        milestone/progress/stats messages are appended to as they're");
+    println!(
+        "                        milestone/progress/stats messages are appended to as they're"
+    );
     println!("                        forwarded (optional; --stats-interval-ms not needed there).");
     println!("    --relay-watchdog-secs <N>  relay mode only: how long to wait for the receiver's");
-    println!("                        result message before giving up (default: 300). NOT the same");
+    println!(
+        "                        result message before giving up (default: 300). NOT the same"
+    );
     println!("                        as send/recv mode's fixed 60s stall watchdog — a shaped-RTT");
     println!("                        cell can be slow-but-still-progressing for far longer than");
     println!("                        60s without being stalled; raise this (or pass a value that");
@@ -485,7 +497,9 @@ const RELAY_CHUNK_BYTES: usize = 64 * 1024;
 /// Accepts one signaling connection and completes the WebSocket handshake. Factored out of the
 /// original single-connection `run()` flow so `run_relay` (which needs to accept **two**
 /// connections) can reuse it.
-async fn accept_signaling(listener: &TcpListener) -> Result<(WebSocketStream<TcpStream>, SocketAddr)> {
+async fn accept_signaling(
+    listener: &TcpListener,
+) -> Result<(WebSocketStream<TcpStream>, SocketAddr)> {
     let (stream, peer_addr) = listener
         .accept()
         .await
@@ -673,7 +687,9 @@ async fn run_relay(cfg: &Config, listener: TcpListener) -> Result<ExitCode> {
                 .create(true)
                 .append(true)
                 .open(path)
-                .with_context(|| format!("opening --stats-out {path:?} (relay browser-event sidecar)"))?;
+                .with_context(|| {
+                    format!("opening --stats-out {path:?} (relay browser-event sidecar)")
+                })?;
             Some(Arc::new(Mutex::new(f)))
         }
         None => None,
@@ -725,7 +741,9 @@ async fn run_relay(cfg: &Config, listener: TcpListener) -> Result<ExitCode> {
         match msg.role.as_str() {
             "recv" => break msg,
             "send" => send_result = Some(msg),
-            other => eprintln!("browser-peer: relay: ignoring result with unexpected role {other:?}"),
+            other => {
+                eprintln!("browser-peer: relay: ignoring result with unexpected role {other:?}")
+            }
         }
     };
 
@@ -740,7 +758,9 @@ async fn run_relay(cfg: &Config, listener: TcpListener) -> Result<ExitCode> {
             recv_result.bytes, recv_result.elapsed_secs, recv_result.mb_per_s,
         );
     } else {
-        println!("browser-peer: A10.29 relay — Chrome dcSCTP vs. Chrome dcSCTP (docs/DESIGN.md §A8)");
+        println!(
+            "browser-peer: A10.29 relay — Chrome dcSCTP vs. Chrome dcSCTP (docs/DESIGN.md §A8)"
+        );
         println!("config: mode=relay (no Rust WebRTC peer; two browser-peer.html pages paired via signaling relay)");
         println!(
             "result (authoritative, receiver side): {:.3} MB/s ({:.3} s)",

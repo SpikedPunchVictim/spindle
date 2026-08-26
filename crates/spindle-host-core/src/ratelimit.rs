@@ -69,7 +69,8 @@ impl RateLimiter {
         });
 
         let elapsed = ts.saturating_sub(bucket.last_refill_ts) as f64;
-        bucket.tokens = (bucket.tokens + elapsed * self.config.refill_per_sec).min(self.config.burst);
+        bucket.tokens =
+            (bucket.tokens + elapsed * self.config.refill_per_sec).min(self.config.burst);
         bucket.last_refill_ts = ts;
 
         if bucket.tokens >= 1.0 {

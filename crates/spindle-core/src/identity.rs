@@ -276,8 +276,12 @@ mod tests {
     fn sign_bytes_verify_bytes_round_trip() {
         let signer = SigningKey::from_bytes(&[0x40; 32]);
         let sig = sign_bytes(&signer, b"spindle-audit-head-v1 payload");
-        verify_bytes(&signer.verifying_key(), b"spindle-audit-head-v1 payload", &sig)
-            .expect("valid signature must verify");
+        verify_bytes(
+            &signer.verifying_key(),
+            b"spindle-audit-head-v1 payload",
+            &sig,
+        )
+        .expect("valid signature must verify");
     }
 
     #[test]

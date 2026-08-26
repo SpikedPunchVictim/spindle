@@ -113,12 +113,21 @@ mod tests {
     fn parse_fp_after_prefix_round_trips() {
         let fp = Fingerprint::of_parts(&[b"lib-rs-shared-helper-test"]);
         let subject = format!("helper.presence.get.{fp}");
-        assert_eq!(parse_fp_after_prefix(&subject, "helper.presence.get."), Some(fp));
+        assert_eq!(
+            parse_fp_after_prefix(&subject, "helper.presence.get."),
+            Some(fp)
+        );
     }
 
     #[test]
     fn parse_fp_after_prefix_rejects_wrong_prefix_or_empty_token() {
-        assert_eq!(parse_fp_after_prefix("helper.presence.get", "helper.presence.get."), None);
-        assert_eq!(parse_fp_after_prefix("helper.presence.get.", "helper.presence.get."), None);
+        assert_eq!(
+            parse_fp_after_prefix("helper.presence.get", "helper.presence.get."),
+            None
+        );
+        assert_eq!(
+            parse_fp_after_prefix("helper.presence.get.", "helper.presence.get."),
+            None
+        );
     }
 }

@@ -190,7 +190,10 @@ async fn wait_for_delta_state(
 
 /// Asserts no `host.<hfp>.presence` delta of ANY state arrives within `budget` — the "no flip"
 /// half of the overlap checks (scenario e).
-async fn assert_no_delta(sub: &mut async_nats::Subscriber, budget: Duration) -> Option<serde_json::Value> {
+async fn assert_no_delta(
+    sub: &mut async_nats::Subscriber,
+    budget: Duration,
+) -> Option<serde_json::Value> {
     match timeout(budget, sub.next()).await {
         Ok(Some(msg)) => serde_json::from_slice::<serde_json::Value>(&msg.payload).ok(),
         _ => None,
@@ -245,7 +248,9 @@ async fn spawn_fake_host(
         .ok_or_else(|| anyhow::anyhow!("fake_host closed stdout without printing READY"))?;
     let host_fp = line
         .strip_prefix("READY ")
-        .ok_or_else(|| anyhow::anyhow!("fake_host's first line was not 'READY <host_fp>': {line:?}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("fake_host's first line was not 'READY <host_fp>': {line:?}")
+        })?
         .to_string();
     Ok((FakeHost { child, pid }, host_fp))
 }
@@ -269,7 +274,9 @@ struct Checks {
 
 impl Checks {
     fn new() -> Self {
-        Self { results: Vec::new() }
+        Self {
+            results: Vec::new(),
+        }
     }
 
     fn record(&mut self, name: &str, passed: bool, detail: impl Into<String>) {
@@ -277,7 +284,11 @@ impl Checks {
         println!(
             "[{}] {name}{}",
             if passed { "PASS" } else { "FAIL" },
-            if detail.is_empty() { String::new() } else { format!(" -- {detail}") }
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" -- {detail}")
+            }
         );
         self.results.push((name.to_string(), passed, detail));
     }
@@ -305,7 +316,11 @@ fn print_summary(checks: &Checks) {
         println!(
             "  [{}] {name}{}",
             if *ok { "PASS" } else { "FAIL" },
-            if detail.is_empty() { String::new() } else { format!(" -- {detail}") }
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" -- {detail}")
+            }
         );
     }
 }
@@ -393,7 +408,8 @@ async fn main() -> anyhow::Result<ExitCode> {
             let entry = hosts
                 .iter()
                 .find(|h| h.get("host_fp").and_then(|v| v.as_str()) == Some(host_fp_str.as_str()));
-            let online = entry.and_then(|e| e.get("state")).and_then(|v| v.as_str()) == Some("online");
+            let online =
+                entry.and_then(|e| e.get("state")).and_then(|v| v.as_str()) == Some("online");
             Ok((ok && online, format!("reply={reply}")))
         })
         .await;
@@ -403,7 +419,8 @@ async fn main() -> anyhow::Result<ExitCode> {
     // subject name, matters) but giving it a real member cap keeps this a realistic full
     // connection rather than a connect-only stub.
     let cap_b = fixtures::member_capability(&host_identity, device_b.root_fp, 0, exp, vec![0xB1]);
-    let (client_b, _events_b, nats_fp_b) = connect_device(&url, &device_b, vec![cap_b], exp).await?;
+    let (client_b, _events_b, nats_fp_b) =
+        connect_device(&url, &device_b, vec![cap_b], exp).await?;
     checks.record(
         "b_device_b_connects_for_negative_test",
         true,
@@ -420,7 +437,9 @@ async fn main() -> anyhow::Result<ExitCode> {
             // synchronous error from the call that attempted it -- see
             // spike-s1-callout/src/bin/s1-tests.rs's module doc for the empirical basis).
             let foreign_subject = format!("helper.presence.get.{nats_fp_b}");
-            let _ = client_a.publish(foreign_subject.clone(), Vec::new().into()).await;
+            let _ = client_a
+                .publish(foreign_subject.clone(), Vec::new().into())
+                .await;
             let _ = client_a.flush().await;
             let violated = wait_for_violation(
                 &events_a,
@@ -428,7 +447,10 @@ async fn main() -> anyhow::Result<ExitCode> {
                 800,
             )
             .await;
-            Ok((violated, format!("violation_seen={violated} subject={foreign_subject}")))
+            Ok((
+                violated,
+                format!("violation_seen={violated} subject={foreign_subject}"),
+            ))
         })
         .await;
 
@@ -458,12 +480,20 @@ async fn main() -> anyhow::Result<ExitCode> {
     checks
         .run("c_clean_disconnect_requery_reports_offline", async {
             let reply = presence_get(&client_a, nats_fp_a).await?;
-            let hosts = reply.get("hosts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let hosts = reply
+                .get("hosts")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
             let entry = hosts
                 .iter()
                 .find(|h| h.get("host_fp").and_then(|v| v.as_str()) == Some(host_fp_str.as_str()));
-            let offline = entry.and_then(|e| e.get("state")).and_then(|v| v.as_str()) == Some("offline");
-            let has_last_seen = entry.and_then(|e| e.get("last_seen")).map(|v| !v.is_null()).unwrap_or(false);
+            let offline =
+                entry.and_then(|e| e.get("state")).and_then(|v| v.as_str()) == Some("offline");
+            let has_last_seen = entry
+                .and_then(|e| e.get("last_seen"))
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
             Ok((offline && has_last_seen, format!("reply={reply}")))
         })
         .await;
@@ -484,12 +514,17 @@ async fn main() -> anyhow::Result<ExitCode> {
             true,
             format!("elapsed={:.2}s", elapsed.as_secs_f64()),
         ),
-        None => checks.record("d_reconnect_delta_reports_online", false, "no online delta observed within 10s"),
+        None => checks.record(
+            "d_reconnect_delta_reports_online",
+            false,
+            "no online delta observed within 10s",
+        ),
     }
 
     let dead_t0 = Instant::now();
     signal(fh2.pid, "STOP")?;
-    let dead_result = wait_for_delta_state(&mut presence_sub, "offline", Duration::from_secs(90)).await;
+    let dead_result =
+        wait_for_delta_state(&mut presence_sub, "offline", Duration::from_secs(90)).await;
     let _ = dead_t0;
     match dead_result {
         Some((elapsed, delta)) => {
@@ -526,7 +561,8 @@ async fn main() -> anyhow::Result<ExitCode> {
     all_pids.push(fh4.pid);
     // fh3 and fh4 are now two independent, live connections for the same host_fp (connection
     // count == 2, DESIGN.md §A6's "presence is by connection count, not a boolean").
-    let no_flip_on_second_connect = assert_no_delta(&mut presence_sub, Duration::from_secs(2)).await;
+    let no_flip_on_second_connect =
+        assert_no_delta(&mut presence_sub, Duration::from_secs(2)).await;
     checks.record(
         "e_second_concurrent_connect_does_not_re_flip_online",
         no_flip_on_second_connect.is_none(),
@@ -534,15 +570,21 @@ async fn main() -> anyhow::Result<ExitCode> {
     );
 
     signal(fh3.pid, "TERM")?;
-    let flip_after_dropping_one_of_two = assert_no_delta(&mut presence_sub, Duration::from_secs(3)).await;
+    let flip_after_dropping_one_of_two =
+        assert_no_delta(&mut presence_sub, Duration::from_secs(3)).await;
     checks
         .run("e_drop_one_of_two_connections_keeps_online", async {
             let reply = presence_get(&client_a, nats_fp_a).await?;
-            let hosts = reply.get("hosts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let hosts = reply
+                .get("hosts")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
             let entry = hosts
                 .iter()
                 .find(|h| h.get("host_fp").and_then(|v| v.as_str()) == Some(host_fp_str.as_str()));
-            let still_online = entry.and_then(|e| e.get("state")).and_then(|v| v.as_str()) == Some("online");
+            let still_online =
+                entry.and_then(|e| e.get("state")).and_then(|v| v.as_str()) == Some("online");
             Ok((
                 still_online && flip_after_dropping_one_of_two.is_none(),
                 format!("reply={reply} unexpected_delta={flip_after_dropping_one_of_two:?}"),
@@ -557,7 +599,8 @@ async fn main() -> anyhow::Result<ExitCode> {
     all_pids.push(fh5.pid);
     let no_flip_on_reconnect = assert_no_delta(&mut presence_sub, Duration::from_secs(2)).await;
     signal(fh4.pid, "TERM")?;
-    let no_flip_after_stale_disconnect = assert_no_delta(&mut presence_sub, Duration::from_secs(3)).await;
+    let no_flip_after_stale_disconnect =
+        assert_no_delta(&mut presence_sub, Duration::from_secs(3)).await;
     checks.record(
         "e_reconnect_before_stale_disconnect_never_flips_offline",
         no_flip_on_reconnect.is_none() && no_flip_after_stale_disconnect.is_none(),
@@ -588,7 +631,10 @@ async fn main() -> anyhow::Result<ExitCode> {
                 .args(["compose", "-f", &compose_file, "restart", "helper"])
                 .status()
                 .await?;
-            Ok((status.success(), format!("docker compose restart helper exit={status}")))
+            Ok((
+                status.success(),
+                format!("docker compose restart helper exit={status}"),
+            ))
         })
         .await;
 
@@ -602,7 +648,8 @@ async fn main() -> anyhow::Result<ExitCode> {
                         .and_then(|h| h.as_array())
                         .map(|hosts| {
                             hosts.iter().any(|h| {
-                                h.get("host_fp").and_then(|v| v.as_str()) == Some(host_fp_str.as_str())
+                                h.get("host_fp").and_then(|v| v.as_str())
+                                    == Some(host_fp_str.as_str())
                                     && h.get("state").and_then(|v| v.as_str()) == Some("online")
                             })
                         })

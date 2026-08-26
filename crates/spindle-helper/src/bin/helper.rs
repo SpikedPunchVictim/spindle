@@ -231,20 +231,22 @@ impl Config {
                     })?)
                 }
                 "--database-url" => {
-                    database_url = Some(args.next().ok_or_else(|| {
-                        ConfigError::FlagMissingValue("database-url".to_string())
-                    })?)
+                    database_url =
+                        Some(args.next().ok_or_else(|| {
+                            ConfigError::FlagMissingValue("database-url".to_string())
+                        })?)
                 }
                 "--turn-secret" => {
-                    turn_secret = Some(args.next().ok_or_else(|| {
-                        ConfigError::FlagMissingValue("turn-secret".to_string())
-                    })?)
+                    turn_secret =
+                        Some(args.next().ok_or_else(|| {
+                            ConfigError::FlagMissingValue("turn-secret".to_string())
+                        })?)
                 }
                 "--turn-uris" => {
-                    turn_uris = Some(
-                        args.next()
-                            .ok_or_else(|| ConfigError::FlagMissingValue("turn-uris".to_string()))?,
-                    )
+                    turn_uris =
+                        Some(args.next().ok_or_else(|| {
+                            ConfigError::FlagMissingValue("turn-uris".to_string())
+                        })?)
                 }
                 "--turn-ttl-secs" => {
                     turn_ttl_secs = Some(args.next().ok_or_else(|| {
@@ -414,7 +416,9 @@ impl HelperView for Store {
             Store::Memory(s) => {
                 s.burn_admission_token(host_fp, nonce, label, quota_profile, admitted_at)
             }
-            Store::Pg(s) => s.burn_admission_token(host_fp, nonce, label, quota_profile, admitted_at),
+            Store::Pg(s) => {
+                s.burn_admission_token(host_fp, nonce, label, quota_profile, admitted_at)
+            }
         }
     }
 
@@ -564,7 +568,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
             tracing::info!("DATABASE_URL set — connecting to Postgres and running migrations");
             let pg = PgStore::connect(url, config.admission_mode, operator_pk)
                 .await
-                .map_err(|e| anyhow::anyhow!("failed to connect to Postgres / run migrations: {e}"))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to connect to Postgres / run migrations: {e}")
+                })?;
             tracing::info!("Postgres store ready");
             Store::Pg(pg)
         }
@@ -574,7 +580,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
                  admission, session, and TURN-usage fact is lost on restart. Never use this in \
                  production."
             );
-            Store::Memory(Box::new(InMemoryHelperView::new(config.admission_mode, operator_pk)))
+            Store::Memory(Box::new(InMemoryHelperView::new(
+                config.admission_mode,
+                operator_pk,
+            )))
         }
     };
 

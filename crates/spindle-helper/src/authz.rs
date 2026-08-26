@@ -266,7 +266,12 @@ pub trait HelperView {
     /// but the store operation and its SQL semantics are this slice's deliverable regardless, so
     /// the read side above (`revocation_epoch`/`is_revoked`) has something to prove itself against
     /// in the store-contract tests.
-    fn record_revocation(&mut self, host_fp: Fingerprint, epoch: u64, revoked_subjects: &[Fingerprint]);
+    fn record_revocation(
+        &mut self,
+        host_fp: Fingerprint,
+        epoch: u64,
+        revoked_subjects: &[Fingerprint],
+    );
 
     /// Best-effort cleanup of session records whose `exp` has already passed. No-op by default
     /// (the on-read `exp` filter in [`session_record`](HelperView::session_record) already hides
@@ -426,15 +431,11 @@ pub fn decide_device_connect(
         (true, false) => {
             permissions::client_connect_only_permissions(device_fp, &connect_only_hosts)
         }
-        (false, false) => permissions::client_member_permissions(
-            device_fp,
-            presented.nats_fp,
-            &full_hosts,
-        )
-        .merge(permissions::client_connect_only_permissions(
-            device_fp,
-            &connect_only_hosts,
-        )),
+        (false, false) => {
+            permissions::client_member_permissions(device_fp, presented.nats_fp, &full_hosts).merge(
+                permissions::client_connect_only_permissions(device_fp, &connect_only_hosts),
+            )
+        }
         (true, true) => unreachable!("checked above"),
     };
 
@@ -1037,11 +1038,10 @@ mod tests {
         let AuthzDecision::Authorized(auth) = decision else {
             panic!("expected authorization, got {decision:?}");
         };
-        let expected = permissions::client_member_permissions(device_fp, nats_fp, &[full_host])
-            .merge(permissions::client_connect_only_permissions(
-                device_fp,
-                &[stale_host],
-            ));
+        let expected =
+            permissions::client_member_permissions(device_fp, nats_fp, &[full_host]).merge(
+                permissions::client_connect_only_permissions(device_fp, &[stale_host]),
+            );
         assert_eq!(auth.permissions, expected);
     }
 

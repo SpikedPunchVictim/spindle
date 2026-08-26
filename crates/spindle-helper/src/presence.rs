@@ -168,7 +168,10 @@ impl ConnectionMap {
     /// arrives" reconnect-overlap case — neither is a state change).
     pub fn connect(&mut self, user_pk: &str, now: u64) -> Option<PresenceDelta> {
         let host_fp = *self.user_to_host.get(user_pk)?;
-        let state = self.hosts.entry(host_fp).or_insert(HostState { count: 0, last_seen: now });
+        let state = self.hosts.entry(host_fp).or_insert(HostState {
+            count: 0,
+            last_seen: now,
+        });
         let was_online = state.is_online();
         state.count += 1;
         state.last_seen = now;
@@ -191,7 +194,10 @@ impl ConnectionMap {
     /// it can't reach zero while a newer connection already bumped the count back up).
     pub fn disconnect(&mut self, user_pk: &str, now: u64) -> Option<PresenceDelta> {
         let host_fp = *self.user_to_host.get(user_pk)?;
-        let state = self.hosts.entry(host_fp).or_insert(HostState { count: 0, last_seen: now });
+        let state = self.hosts.entry(host_fp).or_insert(HostState {
+            count: 0,
+            last_seen: now,
+        });
         let was_online = state.is_online();
         state.count = state.count.saturating_sub(1);
         state.last_seen = now;
@@ -342,7 +348,9 @@ mod tests {
         let mut map = ConnectionMap::new();
         let host = fp(b"host-a");
         map.register_host_user("U-a1", host);
-        let delta = map.connect("U-a1", 1_000).expect("first connect must flip online");
+        let delta = map
+            .connect("U-a1", 1_000)
+            .expect("first connect must flip online");
         assert_eq!(delta.host_fp, host);
         assert_eq!(delta.entry.state, PresenceState::Online);
         assert_eq!(delta.entry.last_seen, Some(1_000));
@@ -426,7 +434,10 @@ mod tests {
         let host = fp(b"host-a");
         map.register_host_user("U-a1", host);
         map.connect("U-a1", 1_000);
-        assert!(map.disconnect("U-a1", 1_100).is_some(), "the real offline flip");
+        assert!(
+            map.disconnect("U-a1", 1_100).is_some(),
+            "the real offline flip"
+        );
         assert_eq!(
             map.disconnect("U-a1", 1_200),
             None,
@@ -508,8 +519,14 @@ mod tests {
 
     #[test]
     fn presence_state_serializes_lowercase() {
-        assert_eq!(serde_json::to_string(&PresenceState::Online).unwrap(), "\"online\"");
-        assert_eq!(serde_json::to_string(&PresenceState::Offline).unwrap(), "\"offline\"");
+        assert_eq!(
+            serde_json::to_string(&PresenceState::Online).unwrap(),
+            "\"online\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PresenceState::Offline).unwrap(),
+            "\"offline\""
+        );
     }
 
     // ---- parse_subject_nats_fp ------------------------------------------------------------------
@@ -517,10 +534,7 @@ mod tests {
     #[test]
     fn parse_subject_round_trips_a_fingerprint() {
         let nats_fp = fp(b"nats-presence-parse");
-        assert_eq!(
-            parse_subject_nats_fp(&subject_for(&nats_fp)),
-            Some(nats_fp)
-        );
+        assert_eq!(parse_subject_nats_fp(&subject_for(&nats_fp)), Some(nats_fp));
     }
 
     #[test]

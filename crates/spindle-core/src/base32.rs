@@ -113,11 +113,20 @@ mod tests {
 
     #[test]
     fn decode_rejects_invalid_characters() {
-        assert_eq!(decode_no_pad("mzx!w6").unwrap_err(), DecodeError::InvalidChar);
+        assert_eq!(
+            decode_no_pad("mzx!w6").unwrap_err(),
+            DecodeError::InvalidChar
+        );
         // Uppercase is rejected too — encode_no_pad never produces it.
-        assert_eq!(decode_no_pad("MZXW6").unwrap_err(), DecodeError::InvalidChar);
+        assert_eq!(
+            decode_no_pad("MZXW6").unwrap_err(),
+            DecodeError::InvalidChar
+        );
         // '0', '1', '8', '9' are not in the RFC 4648 base32 alphabet.
-        assert_eq!(decode_no_pad("mzxw0").unwrap_err(), DecodeError::InvalidChar);
+        assert_eq!(
+            decode_no_pad("mzxw0").unwrap_err(),
+            DecodeError::InvalidChar
+        );
     }
 
     #[test]
@@ -125,7 +134,10 @@ mod tests {
         // "my" decodes to "f" (1 byte); its last symbol carries 2 real bits + 3 padding bits that
         // must be zero. "mz" flips one of those padding bits, so it must be rejected even though
         // it superficially "looks like" valid base32.
-        assert_eq!(decode_no_pad("mz").unwrap_err(), DecodeError::NonCanonicalPadding);
+        assert_eq!(
+            decode_no_pad("mz").unwrap_err(),
+            DecodeError::NonCanonicalPadding
+        );
     }
 
     #[test]

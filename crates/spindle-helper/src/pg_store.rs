@@ -239,11 +239,7 @@ impl PgStore {
         .expect("put_session_record upsert");
     }
 
-    async fn session_record_async(
-        &self,
-        nats_fp: &Fingerprint,
-        now: u64,
-    ) -> Option<SessionRecord> {
+    async fn session_record_async(&self, nats_fp: &Fingerprint, now: u64) -> Option<SessionRecord> {
         sqlx::query(
             "SELECT root_fp, host_fps, quota_profile, exp FROM session_records
              WHERE nats_fp = $1 AND exp > $2",
@@ -280,7 +276,11 @@ impl PgStore {
         monthly_quota: u64,
     ) -> Result<u64, u64> {
         let period = (now / TURN_PERIOD_SECS) as i64;
-        let mut tx = self.pool.begin().await.expect("begin turn-usage transaction");
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .expect("begin turn-usage transaction");
 
         sqlx::query(
             "INSERT INTO turn_usage (root_fp, period, count) VALUES ($1, $2, 0)
@@ -307,14 +307,13 @@ impl PgStore {
         let result = match admitted {
             Some(row) => Ok(row.get::<i64, _>("count") as u64),
             None => {
-                let row = sqlx::query(
-                    "SELECT count FROM turn_usage WHERE root_fp = $1 AND period = $2",
-                )
-                .bind(fp_bytes(root_fp))
-                .bind(period)
-                .fetch_one(&mut *tx)
-                .await
-                .expect("turn_usage current-count read");
+                let row =
+                    sqlx::query("SELECT count FROM turn_usage WHERE root_fp = $1 AND period = $2")
+                        .bind(fp_bytes(root_fp))
+                        .bind(period)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .expect("turn_usage current-count read");
                 Err(row.get::<i64, _>("count") as u64)
             }
         };
@@ -329,7 +328,11 @@ impl PgStore {
         epoch: u64,
         revoked_subjects: &[Fingerprint],
     ) {
-        let mut tx = self.pool.begin().await.expect("begin revocation transaction");
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .expect("begin revocation transaction");
 
         sqlx::query(
             "INSERT INTO revocation_epochs (host_fp, epoch) VALUES ($1, $2)
@@ -398,7 +401,13 @@ impl HelperView for PgStore {
         quota_profile: String,
         admitted_at: u64,
     ) -> Option<AdmissionRecord> {
-        run_blocking(self.burn_admission_token_async(host_fp, nonce, label, quota_profile, admitted_at))
+        run_blocking(self.burn_admission_token_async(
+            host_fp,
+            nonce,
+            label,
+            quota_profile,
+            admitted_at,
+        ))
     }
 
     fn put_session_record(&mut self, record: SessionRecord) {
@@ -511,7 +520,10 @@ mod tests {
             "gold".to_string(),
             1_000,
         );
-        assert_eq!(replay, first, "re-presenting the same nonce must replay idempotently");
+        assert_eq!(
+            replay, first,
+            "re-presenting the same nonce must replay idempotently"
+        );
 
         let other_host = fp(b"pg-host-b");
         let stolen = store.burn_admission_token(
@@ -525,7 +537,10 @@ mod tests {
             stolen, None,
             "a different host reusing the same nonce must be rejected"
         );
-        assert_eq!(store.admission_record(&host).map(|r| r.quota_profile), Some("gold".to_string()));
+        assert_eq!(
+            store.admission_record(&host).map(|r| r.quota_profile),
+            Some("gold".to_string())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -602,12 +617,27 @@ mod tests {
         let Some(store) = test_store().await else {
             return;
         };
-        let live = SessionRecord::new(fp(b"pg-nats-live"), fp(b"root"), vec![], "member".to_string(), 5_000);
-        let expired = SessionRecord::new(fp(b"pg-nats-expired"), fp(b"root"), vec![], "member".to_string(), 1_000);
+        let live = SessionRecord::new(
+            fp(b"pg-nats-live"),
+            fp(b"root"),
+            vec![],
+            "member".to_string(),
+            5_000,
+        );
+        let expired = SessionRecord::new(
+            fp(b"pg-nats-expired"),
+            fp(b"root"),
+            vec![],
+            "member".to_string(),
+            1_000,
+        );
         store.put_session_record_async(live.clone()).await;
         store.put_session_record_async(expired).await;
 
-        let deleted = store.purge_expired_sessions(2_000).await.expect("purge succeeds");
+        let deleted = store
+            .purge_expired_sessions(2_000)
+            .await
+            .expect("purge succeeds");
         assert_eq!(deleted, 1);
         assert!(store.session_record_async(&live.nats_fp, 0).await.is_some());
     }

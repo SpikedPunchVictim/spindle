@@ -200,7 +200,9 @@ use rtc_ice::Event as IceEvent;
 use rtc_shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtc_stun::message::{Getter as _, Message as StunMessage, TransactionId, BINDING_REQUEST};
 use rtc_stun::xoraddr::XorMappedAddress;
-use rtc_turn::client::{Client as TurnClient, ClientConfig as TurnClientConfig, Event as TurnEvent};
+use rtc_turn::client::{
+    Client as TurnClient, ClientConfig as TurnClientConfig, Event as TurnEvent,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
@@ -486,9 +488,7 @@ impl Config {
                 "--turn-user-label" => {
                     turn_user_label = next_val::<String>(&mut args, "--turn-user-label")?
                 }
-                "--turn-ttl-secs" => {
-                    turn_ttl_secs = next_val(&mut args, "--turn-ttl-secs")?
-                }
+                "--turn-ttl-secs" => turn_ttl_secs = next_val(&mut args, "--turn-ttl-secs")?,
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -574,7 +574,9 @@ impl Config {
                     ));
                 }
                 if stun.is_some() {
-                    return Err(anyhow!("--stun requires --transport ice (relay does not gather srflx candidates)"));
+                    return Err(anyhow!(
+                        "--stun requires --transport ice (relay does not gather srflx candidates)"
+                    ));
                 }
                 if turn.is_none() {
                     return Err(anyhow!("--transport relay requires --turn <host:port>"));
@@ -703,7 +705,9 @@ fn print_usage() {
     println!(
         "    --transport <direct|ice|relay>  direct (default): --listen/--connect address the QUIC socket."
     );
-    println!("                        ice (S19 leg 2): punch the socket via rtc-ice first, see --signal");
+    println!(
+        "                        ice (S19 leg 2): punch the socket via rtc-ice first, see --signal"
+    );
     println!("                        relay (S19 leg 3): relay the socket via a TURN server, see --signal/--turn*");
     println!(
         "    --signal <listen:<port>|connect:<host:port>>  required with --transport ice/relay: TCP"
@@ -713,16 +717,16 @@ fn print_usage() {
     println!("                        (NAT-punch matrix; unused/unneeded on loopback)");
     println!("    --ice-bind <ip>     --transport ice/relay only: local interface IP to bind+advertise (default 127.0.0.1)");
     println!("    --turn <addr>       --transport relay: required, TURN server to allocate a relayed address from");
-    println!("    --turn-secret <s>   --transport relay: required, coturn use-auth-secret shared secret");
+    println!(
+        "    --turn-secret <s>   --transport relay: required, coturn use-auth-secret shared secret"
+    );
     println!("    --turn-user-label <s>  --transport relay: device_fp stand-in for minted credentials (default quic-peer-spike)");
     println!("    --turn-ttl-secs <N> --transport relay: credential expiry TTL in seconds (default 3600)");
     println!();
     println!("EXAMPLES:");
     println!("    quic-peer --mode recv --listen 127.0.0.1:5701 --bytes 64 --json");
     println!("    quic-peer --mode send --connect 127.0.0.1:5701 --cert-fp sha256:ab12... --bytes 64 --json");
-    println!(
-        "    quic-peer --mode recv --transport ice --signal listen:6000 --bytes 64 --json"
-    );
+    println!("    quic-peer --mode recv --transport ice --signal listen:6000 --bytes 64 --json");
     println!(
         "    quic-peer --mode send --transport ice --signal connect:127.0.0.1:6000 --bytes 64 --json"
     );
@@ -942,7 +946,9 @@ async fn drive_ice_agent(
     socket: &tokio::net::UdpSocket,
     timeout: Duration,
 ) -> Result<SocketAddr> {
-    let local_addr = socket.local_addr().context("reading ICE socket local addr")?;
+    let local_addr = socket
+        .local_addr()
+        .context("reading ICE socket local addr")?;
     let mut buf = vec![0u8; 2048];
     let deadline = Instant::now() + timeout;
 
@@ -1161,7 +1167,11 @@ async fn ice_punch(
     }
 
     agent
-        .start_connectivity_checks(is_controlling, remote_msg.ufrag.clone(), remote_msg.pwd.clone())
+        .start_connectivity_checks(
+            is_controlling,
+            remote_msg.ufrag.clone(),
+            remote_msg.pwd.clone(),
+        )
         .context("starting ICE connectivity checks")?;
 
     let remote_addr = drive_ice_agent(&mut agent, &udp, handshake_timeout).await?;
@@ -1222,7 +1232,9 @@ async fn drive_turn_until<T>(
     timeout: Duration,
     mut extract: impl FnMut(&TurnEvent) -> Option<Result<T>>,
 ) -> Result<T> {
-    let local_addr = socket.local_addr().context("reading TURN socket local addr")?;
+    let local_addr = socket
+        .local_addr()
+        .context("reading TURN socket local addr")?;
     let mut buf = vec![0u8; 2048];
     let deadline = Instant::now() + timeout;
     loop {
@@ -1246,7 +1258,9 @@ async fn drive_turn_until<T>(
         let wake_at = client
             .poll_timeout()
             .unwrap_or_else(|| Instant::now() + Duration::from_millis(100));
-        let sleep_for = wake_at.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+        let sleep_for = wake_at
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
         tokio::select! {
             _ = tokio::time::sleep(sleep_for) => {
                 client.handle_timeout(Instant::now()).context("TURN client timeout handling failed")?;
@@ -1328,9 +1342,9 @@ async fn turn_relay_setup(
         TurnEvent::AllocateError(tid, e) if *tid == alloc_tid => {
             Some(Err(anyhow!("TURN Allocate failed: {e}")))
         }
-        TurnEvent::TransactionTimeout(tid) if *tid == alloc_tid => {
-            Some(Err(anyhow!("TURN Allocate timed out (no response from {turn_addr})")))
-        }
+        TurnEvent::TransactionTimeout(tid) if *tid == alloc_tid => Some(Err(anyhow!(
+            "TURN Allocate timed out (no response from {turn_addr})"
+        ))),
         _ => None,
     })
     .await
@@ -1445,7 +1459,10 @@ impl TurnRelaySocket {
     /// which ignores this, or the `UdpPoller`, which propagates it) decides what that means.
     fn drain_wire(&self, inner: &mut TurnInner) -> io::Result<()> {
         while let Some(transmit) = inner.retry_wire.pop_front() {
-            match self.socket.try_send_to(&transmit.message, transmit.transport.peer_addr) {
+            match self
+                .socket
+                .try_send_to(&transmit.message, transmit.transport.peer_addr)
+            {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     inner.retry_wire.push_front(transmit);
@@ -1455,7 +1472,10 @@ impl TurnRelaySocket {
             }
         }
         while let Some(transmit) = inner.client.poll_write() {
-            match self.socket.try_send_to(&transmit.message, transmit.transport.peer_addr) {
+            match self
+                .socket
+                .try_send_to(&transmit.message, transmit.transport.peer_addr)
+            {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     inner.retry_wire.push_back(transmit);
@@ -1686,7 +1706,9 @@ async fn run_recv(cfg: &Config) -> Result<(u64, f64)> {
                     recv_queue: std::collections::VecDeque::new(),
                 }),
             });
-            eprintln!("quic-peer: relay: quinn endpoint bound over relayed address {own_relayed_addr}");
+            eprintln!(
+                "quic-peer: relay: quinn endpoint bound over relayed address {own_relayed_addr}"
+            );
             Endpoint::new_with_abstract_socket(
                 EndpointConfig::default(),
                 Some(server_config),
@@ -1907,7 +1929,9 @@ async fn run_send(cfg: &Config) -> Result<(u64, f64)> {
                     recv_queue: std::collections::VecDeque::new(),
                 }),
             });
-            eprintln!("quic-peer: relay: quinn endpoint bound over relayed address {own_relayed_addr}");
+            eprintln!(
+                "quic-peer: relay: quinn endpoint bound over relayed address {own_relayed_addr}"
+            );
             let mut endpoint = Endpoint::new_with_abstract_socket(
                 EndpointConfig::default(),
                 None,

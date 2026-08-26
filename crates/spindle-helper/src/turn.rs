@@ -254,10 +254,7 @@ mod tests {
     #[test]
     fn parse_subject_round_trips_a_fingerprint() {
         let nats_fp = fp(b"nats-subject-parse");
-        assert_eq!(
-            parse_subject_nats_fp(&subject_for(&nats_fp)),
-            Some(nats_fp)
-        );
+        assert_eq!(parse_subject_nats_fp(&subject_for(&nats_fp)), Some(nats_fp));
     }
 
     #[test]
@@ -368,7 +365,8 @@ mod tests {
             monthly_quota: 10,
         };
         let nats_fp = fp(b"nats-no-session");
-        let reply_bytes = handle_turn_get(&subject_for(&nats_fp), b"", Some(&config), &mut s, 1_000);
+        let reply_bytes =
+            handle_turn_get(&subject_for(&nats_fp), b"", Some(&config), &mut s, 1_000);
         let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
         assert_eq!(reply.error.as_deref(), Some("no active session"));
     }
@@ -432,7 +430,8 @@ mod tests {
         assert_eq!(reply.uris, Some(config.uris.clone()));
         let username = reply.username.expect("username present");
         assert_eq!(username, format!("{}:{}", now + 1_800, root_fp));
-        let expected_credential = mint_credentials(&config.secret, &root_fp.to_string(), now + 1_800).1;
+        let expected_credential =
+            mint_credentials(&config.secret, &root_fp.to_string(), now + 1_800).1;
         assert_eq!(reply.credential, Some(expected_credential));
     }
 
@@ -454,9 +453,13 @@ mod tests {
             ttl_secs: 60,
             monthly_quota: 10,
         };
-        let reply_bytes = handle_turn_get(&subject_for(&nats_fp), b"", Some(&config), &mut s, 1_000);
+        let reply_bytes =
+            handle_turn_get(&subject_for(&nats_fp), b"", Some(&config), &mut s, 1_000);
         let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
-        assert!(reply.error.is_none(), "empty body must be accepted: {reply:?}");
+        assert!(
+            reply.error.is_none(),
+            "empty body must be accepted: {reply:?}"
+        );
     }
 
     #[test]
@@ -480,7 +483,10 @@ mod tests {
         let reply_bytes =
             handle_turn_get(&subject_for(&nats_fp), b"{}", Some(&config), &mut s, 1_000);
         let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
-        assert!(reply.error.is_none(), "`{{}}` body must be accepted: {reply:?}");
+        assert!(
+            reply.error.is_none(),
+            "`{{}}` body must be accepted: {reply:?}"
+        );
     }
 
     #[test]
@@ -509,9 +515,13 @@ mod tests {
             "something_else": 42,
         }))
         .unwrap();
-        let reply_bytes = handle_turn_get(&subject_for(&nats_fp), &body, Some(&config), &mut s, 1_000);
+        let reply_bytes =
+            handle_turn_get(&subject_for(&nats_fp), &body, Some(&config), &mut s, 1_000);
         let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
-        assert!(reply.error.is_none(), "unknown fields must be ignored: {reply:?}");
+        assert!(
+            reply.error.is_none(),
+            "unknown fields must be ignored: {reply:?}"
+        );
         let username = reply.username.expect("username present");
         assert_eq!(
             username,
@@ -565,7 +575,8 @@ mod tests {
             ttl_secs: 60,
             monthly_quota: 10,
         };
-        let reply_bytes = handle_turn_get(&subject_for(&nats_fp), b"", Some(&config), &mut s, 1_000);
+        let reply_bytes =
+            handle_turn_get(&subject_for(&nats_fp), b"", Some(&config), &mut s, 1_000);
         let reply: TurnGetReply = serde_json::from_slice(&reply_bytes).unwrap();
         assert_eq!(reply.error.as_deref(), Some("no active session"));
     }
