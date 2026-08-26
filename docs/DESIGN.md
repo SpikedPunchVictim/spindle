@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.9) + Execution Plan
+# Spindle — System Design Document (draft v0.9.10) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -15,8 +15,9 @@
 > v0.9.7: TURN credential request hardened — subject parametrized to `helper.turn.get.<nfp>`; username =
 > `expiry:root_fp` (2026-08-25). v0.9.8: `helper.presence.get` likewise parametrized to `helper.presence.get.<nfp>`
 > (2026-08-26). v0.9.9: helper account bridging corrected to a three-connection model on S5's live evidence
-> (2026-08-26). Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and the **[DEFAULT]**-flagged rows
-> in A10.
+> (2026-08-26). v0.9.10: §A8 VFS error codes extended (+`unsupported_version`, `already_exists`, `file_changed`) from
+> slice-3 implementation evidence (2026-08-26). Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and
+> the **[DEFAULT]**-flagged rows in A10.
 
 ---
 
@@ -536,9 +537,13 @@ discovered divergence between op-key-signed caps and the root-derived `host_fp` 
   the session and GCs the partial; the signed manifest is verified **before** the file is moved into place.
 - **VFS error model** (post-DTLS, inside the authenticated session — the silent-drop rule applies only pre-auth):
   typed error codes (`not_found`, `quota_exceeded`, `grants_changed`, `resume_expired`, `upload_rejected`,
-  `storage_full`, `throttled`) with UI copy per code. Pre-auth failures remain uniform on the wire; the client
-  derives honest composite states ("host offline — or your access changed; it will retry"). One narrow exception:
-  invite-redemption results are returned inside the verified reply envelope (accepted / expired / already-used).
+  `storage_full`, `throttled`, `unsupported_version`, `already_exists`, `file_changed`) with UI copy per code.
+  `unsupported_version` fires pre-dispatch on the §A8 version gate; `already_exists` is the §A4b
+  overwrite-requires-delete refusal for name collisions; `file_changed` is the §A4b stat→read identity-check abort
+  and the transfer manager's resume-conflict signal. **[amended v0.9.10, Stage 6 slice 3]** Pre-auth failures
+  remain uniform on the wire; the client derives honest composite states ("host offline — or your access changed;
+  it will retry"). One narrow exception: invite-redemption results are returned inside the verified reply envelope
+  (accepted / expired / already-used).
 
 ## A9. UX requirements (the bar the spikes must meet)
 
@@ -932,6 +937,10 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.10 (2026-08-26)** — §A8 typed VFS error codes extended to ten on Stage-6-slice-3 evidence:
+  `unsupported_version` (protocol-version gate, pre-dispatch), `already_exists` (overwrite-requires-delete name
+  collision), `file_changed` (TOCTOU identity-check abort / resume conflict). Wire enum in spindle-proto/vfs_rpc.rs
+  is the schema-of-record.
 - **v0.9.9 (2026-08-26)** — S5 (presence) PASSED 15/15 against the composed stack (0.01 s clean / 42.4 s dead
   vs the 5 s / 60 s bars; spikes/s5-presence/RESULTS.md) and falsified the two-connection helper bridging model:
   `$SYS.ACCOUNT.*` events are SYS-account broadcasts, while the callout responder structurally lives in the AUTH

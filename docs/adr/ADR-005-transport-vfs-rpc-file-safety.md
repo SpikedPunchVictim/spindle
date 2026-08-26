@@ -185,10 +185,13 @@ manifest is verified **before** the file is moved into place (DESIGN.md A8).
 
 Inside an authenticated session (post-DTLS), the pre-auth uniform-silent-drop rule no longer applies; instead, the
 VFS surfaces typed error codes with UI copy per code: `not_found`, `quota_exceeded`, `grants_changed`,
-`resume_expired`, `upload_rejected`, `storage_full`, `throttled`. Pre-auth failures remain uniform on the wire, and
-the client derives honest composite states such as "host offline — or your access changed; it will retry." One
-narrow exception: invite-redemption results are returned inside the verified reply envelope as
-accepted/expired/already-used (DESIGN.md A8).
+`resume_expired`, `upload_rejected`, `storage_full`, `throttled`, `unsupported_version`, `already_exists`,
+`file_changed`. Pre-auth failures remain uniform on the wire, and the client derives honest composite states such as
+"host offline — or your access changed; it will retry." One narrow exception: invite-redemption results are returned
+inside the verified reply envelope as accepted/expired/already-used (DESIGN.md A8). `unsupported_version` fires
+pre-dispatch on the protocol version gate above; `already_exists` is the overwrite-requires-delete refusal for name
+collisions (Received-file policy, above); `file_changed` is the resume-conflict abort described above under Transfer
+manager. **[amended 2026-08-26, DESIGN.md v0.9.10]**
 
 ### Acceptance criteria (DESIGN.md §A9 — the UX bar the spikes must meet)
 
