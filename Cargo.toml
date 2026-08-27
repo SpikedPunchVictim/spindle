@@ -72,6 +72,14 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
 
 # Confinement
 cap-std = ">=3.4.1"
+# `cap-fs-ext` is the same-repo (bytecodealliance/cap-std) companion crate that exposes
+# `OpenOptionsMaybeDirExt::maybe_dir` — needed by spindle-vfs's `stat_through_dir`/
+# `resolve_identity` so opening a directory-through-`Dir` handle works on Windows (plain `open`
+# never sets `FILE_FLAG_BACKUP_SEMANTICS` there, so it fails for directories; see
+# crates/spindle-vfs/src/confine/identity.rs doc comments). Pinned to the same `4.0.3` release as
+# the resolved cap-std/cap-primitives (its own Cargo.toml requires an exact-matching
+# cap-primitives version internally) so the three stay in lockstep in the same 4.x family.
+cap-fs-ext = ">=4.0.3"
 
 # OS / shell
 keyring = "2"

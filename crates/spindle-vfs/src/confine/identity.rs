@@ -2,7 +2,19 @@
 //! -race per-chunk identity check (DESIGN.md §A4b; closes A12 #29, #30).
 
 use super::ConfineError;
-use cap_std::fs::Dir;
+use cap_fs_ext::OpenOptionsMaybeDirExt;
+use cap_std::fs::{Dir, OpenOptions};
+
+/// `read(true)` + [`OpenOptionsMaybeDirExt::maybe_dir`] `OpenOptions` used by both
+/// [`stat_through_dir`] and [`resolve_identity`] to open a `virtual_path` that may name either a
+/// file or a directory. Plain `Dir::open` (equivalent to `OpenOptions::new().read(true)`, per
+/// `cap-std`'s own implementation) never sets Windows' `FILE_FLAG_BACKUP_SEMANTICS`, so opening a
+/// *directory* through it fails there — see the doc comments below for why this matters.
+fn maybe_dir_read_options() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    opts.read(true).maybe_dir(true);
+    opts
+}
 
 /// A cross-platform file-identity value: two dirents with equal identity are the same underlying
 /// file regardless of what name(s) reach them — the primitive every TOCTOU/overlap check in this
@@ -60,8 +72,16 @@ pub fn identity_of_ambient_path(path: &std::path::Path) -> std::io::Result<FileI
 /// convenient for stable, cross-platform metadata fields (size, timestamps, permissions); it is
 /// **not** used for identity or link-count, which need [`file_identity`] / [`nlink_guard`]
 /// instead (see their doc comments for why `Metadata` alone cannot provide those on Windows).
+///
+/// `virtual_path` may name a file *or* a directory — opens with [`maybe_dir_read_options`], not
+/// plain `Dir::open`. On Windows, opening a directory via `CreateFile` fails without
+/// `FILE_FLAG_BACKUP_SEMANTICS` (which plain `read(true)` never sets); without `maybe_dir(true)`
+/// here, every directory entry a caller stats through this function errors, and e.g.
+/// `confine::list_dir`'s `let Ok(meta) = stat_through_dir(...) else { continue }` silently drops
+/// it from the listing — the Windows-only CI failure this function's `maybe_dir` requirement
+/// fixes (`server::tests::list_shows_only_browsable_entries_and_descends_into_them`).
 pub fn stat_through_dir(dir: &Dir, virtual_path: &str) -> Result<std::fs::Metadata, ConfineError> {
-    dir.open(virtual_path)
+    dir.open_with(virtual_path, &maybe_dir_read_options())
         .and_then(|f| f.into_std().metadata())
         .map_err(|e| ConfineError::io(virtual_path, e))
 }
@@ -70,9 +90,17 @@ pub fn stat_through_dir(dir: &Dir, virtual_path: &str) -> Result<std::fs::Metada
 /// resolved entry is reached via a symlink whose target is inside the root) and returns its file
 /// identity. This is the primitive both [`nlink_guard`]'s callers and
 /// [`read_confined_with_identity_check`]'s TOCTOU check build on.
+///
+/// Like [`stat_through_dir`], opens with [`maybe_dir_read_options`] (not plain `Dir::open`) so
+/// `virtual_path` naming a directory doesn't fail to open on Windows (needs
+/// `FILE_FLAG_BACKUP_SEMANTICS`, which `maybe_dir(true)` sets there and which is a no-op on Unix,
+/// where opening a directory read-only already succeeds). `file_identity`'s Windows branch
+/// (`same_file::Handle::from_file`) only needs `GetFileInformationByHandle` on the resulting
+/// handle, which works the same for a file or a directory handle — so once the handle opens at
+/// all, identity resolution itself needs no further directory-specific handling.
 pub fn resolve_identity(dir: &Dir, virtual_path: &str) -> Result<FileIdentity, ConfineError> {
     let file = dir
-        .open(virtual_path)
+        .open_with(virtual_path, &maybe_dir_read_options())
         .map_err(|e| ConfineError::io(virtual_path, e))?
         .into_std();
     file_identity(&file).map_err(|e| ConfineError::io(virtual_path, e))
@@ -154,6 +182,35 @@ mod tests {
     use super::*;
     use crate::confine::open_share_root;
     use tempfile::tempdir;
+
+    // ---- stat/identity through a directory (pins the Windows `maybe_dir` contract) ----
+
+    #[test]
+    fn stat_through_dir_succeeds_on_a_directory_entry() {
+        // Pins the contract that made the Windows-only CI failure possible:
+        // `server::tests::list_shows_only_browsable_entries_and_descends_into_them` listed
+        // "Photos" and got 0 entries because `stat_through_dir` opened every directory entry with
+        // plain `read(true)`, which fails on Windows for a directory (no
+        // `FILE_FLAG_BACKUP_SEMANTICS`) and made `confine::list_dir` silently skip it. This test
+        // passes trivially on Unix (opening a directory read-only always succeeds there) but
+        // directly exercises the `maybe_dir(true)` fix on Windows CI.
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        std::fs::create_dir(root.join("Vacation")).expect("create subdirectory");
+        let dir = open_share_root(&root).expect("open share root");
+
+        let meta = stat_through_dir(&dir, "Vacation").expect("stat a directory entry");
+        assert!(meta.is_dir(), "Vacation must stat as a directory");
+
+        let identity = resolve_identity(&dir, "Vacation").expect("resolve identity of a directory");
+        // Re-resolving must be stable (same directory, same identity) — otherwise every
+        // `nlink_guard`/TOCTOU caller that re-checks a directory's identity would spuriously fail.
+        assert_eq!(
+            identity,
+            resolve_identity(&dir, "Vacation").expect("resolve identity again")
+        );
+    }
 
     // ---- Hardlink bypass guard ----
 

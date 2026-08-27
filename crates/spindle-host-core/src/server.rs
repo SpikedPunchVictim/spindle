@@ -1981,6 +1981,41 @@ mod tests {
     }
 
     #[test]
+    fn stat_reports_kind_dir_for_a_real_directory() {
+        // Regression test: `stat_in_share` gets its metadata from
+        // `confine_identity::stat_through_dir`, which opens `subpath` through the share's `Dir`
+        // capability with plain `read(true)` before the `maybe_dir(true)` fix. On Windows, opening
+        // a *directory* that way fails (needs `FILE_FLAG_BACKUP_SEMANTICS`), so `stat_in_share`'s
+        // `.ok()?` would turn a stat of a real, browsable directory into `denied:not_found` —
+        // exactly the failure mode `list_shows_only_browsable_entries_and_descends_into_them`
+        // (this module) hit for listings. This test pins the RPC-level contract for `stat`.
+        let h = Harness::new();
+        let (member_id, _) = h.add_active_member("Alex");
+        let share_id = h.add_share("Photos", "Photos", ShareFlags::default());
+        let root = h.share_real_root(share_id);
+        std::fs::create_dir(root.join("Vacation")).expect("mkdir Vacation");
+        h.grant(member_id, share_id, "", Perms::BROWSE | Perms::DOWNLOAD);
+
+        let server = h.server();
+        let reply = server.handle(
+            &h.ctx(member_id),
+            1,
+            req(
+                1,
+                VfsRequest::Stat {
+                    path: "Photos/Vacation".to_string(),
+                },
+            ),
+        );
+        match reply {
+            VfsReply::Stat { kind, .. } => {
+                assert_eq!(kind, EntryKind::Dir);
+            }
+            other => panic!("expected Stat, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn read_returns_requested_chunk_and_reports_eof() {
         let h = Harness::new();
         let (member_id, _) = h.add_active_member("Alex");
