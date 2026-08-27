@@ -133,7 +133,7 @@ unchanged.
 by browse, upload-without-listing, delete-required-to-overwrite, case/Unicode collision ==
 overwrite, not-found for unauthorized paths).
 **Tests**: `spindle-vfs`/`spindle-host-core` unit + integration tests; S11 suite in CI.
-**Status**: In Progress
+**Status**: Complete
 **Note**: slice 1 — `spindle-vfs`'s two foundation modules, both pure/in-memory (no SQLite, no
 VFS RPC, no `spindle-host-core` yet). `confine` graduates S11's prototype helpers to production
 quality (real `thiserror` error types, doc comments citing the A12 rows each closes): share-root
@@ -424,10 +424,15 @@ no home in DESIGN.md §A8 ("One control stream (VFS RPC) + data streams") — ne
 crate/dependency manifest table (only `quinn` is listed there for QUIC) — needs a manifest-table
 amendment alongside finding (1).
 
-**Status**: Stage 6 stays **In Progress** — this slice closes the QUIC-transport-binding gap slice
-4 left open, but S11's full negative-test suite still needs to run in CI against this real
-implementation (Stage 6's own Success Criteria above) and that CI wiring is being tracked/handled
-separately from this slice's scope.
+**Status**: Stage 6 is **Complete** — the last open criterion, S11's full negative-test suite
+running in CI against the real implementation, closed with run `33101311525` on `85459aa`, green on
+all three OSes including the vector cross-check. This was the first run in which `spindle-vfs`'s
+test binary actually executed on Windows; earlier runs aborted at `spindle-host-core` before
+reaching it, so the S11 suite is only now genuinely exercised on all three platforms. Getting there
+took four CI rounds, and each surfaced a real platform bug rather than a flake: a Linux inode-reuse
+flake plus a Windows `FileIdentity` compile error (`5c42716`), cap-std's `Dir::open` failing on
+Windows and silently dropping every directory from listings (`9a27bdc`), and the Windows host
+pinning delete-denying handles via a `FileIdentity` retained in `IdentityCache` (`85459aa`).
 
 ## Stage 7: client-core + Tauri apps init + engine-api/engine-tauri/ui
 **Goal**: Implement `spindle-client-core`; initialize `apps/host` and `apps/client` as real Tauri
