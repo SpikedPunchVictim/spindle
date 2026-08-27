@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.12) + Execution Plan
+# Spindle — System Design Document (draft v0.9.13) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -21,7 +21,10 @@
 > spindle-host-core (user decision 2026-08-26; A9c manifest amended). v0.9.12: QUIC VFS-RPC control-stream wire
 > facts codified from Stage 6 slice 5 — 4-byte big-endian length-prefixed canonical CBOR framing (256 KiB cap),
 > ALPN `spindle-vfs/1`, SHA-256-of-DER cert fingerprints with mutual per-session pinning, framing violations close
-> the connection (2026-08-26; A9c manifest amended — rcgen). Remaining **[USER DECISION]** items: A10.6–9,
+> the connection (2026-08-26; A9c manifest amended — rcgen). v0.9.13: Windows CI surfaced a real §A4b confinement
+> bug — cap-std's `Dir::open` cannot open directory handles on Windows, silently dropping directories from listings
+> and failing stat-on-directory; fixed via `cap-fs-ext`'s `OpenOptionsMaybeDirExt::maybe_dir(true)` (2026-08-26;
+> A9c manifest amended — cap-fs-ext). Remaining **[USER DECISION]** items: A10.6–9,
 > A10.24 (license), and the **[DEFAULT]**-flagged rows in A10.
 
 ---
@@ -695,7 +698,7 @@ spindle/
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
 | Encoding | hand-rolled zero-dep canonical codec in spindle-proto (strict non-canonical rejection; minicbor rejected — decoder abstracts the raw bytes) | own canonical encoder in @spindle/proto |
 | Storage | rusqlite (bundled) host-side; sqlx/Postgres helper-side | IndexedDB (caps, resume manifests) |
-| Confinement | cap-std ≥3.4.1 + rustix (unix) / windows-sys (windows) free-space probe — already-transitive, promoted direct | — (browser sandbox) |
+| Confinement | cap-std ≥3.4.1 + rustix (unix) / windows-sys (windows) free-space probe — already-transitive, promoted direct + cap-fs-ext (maybe_dir directory opens — Windows FILE_FLAG_BACKUP_SEMANTICS) | — (browser sandbox) |
 | OS / shell | keyring, tauri 2 + plugins (tray, autostart, single-instance, updater), qrcode | @tauri-apps/api |
 | UI | — | React, Vite, @spindle/ui |
 | CLI | — | commander |
@@ -947,6 +950,10 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.13 (2026-08-26)** — Windows CI surfaced a real §A4b confinement bug: cap-std's Dir::open cannot open
+  directory handles on Windows, silently dropping every directory from listings and failing stat-on-directory;
+  fixed via cap-fs-ext (same-repo cap-std companion) OpenOptionsMaybeDirExt::maybe_dir(true), keeping the
+  handle-based stat→read TOCTOU discipline. A9c manifest amended (cap-fs-ext).
 - **v0.9.12 (2026-08-26)** — Stage 6 slice 5 wire facts codified: QUIC VFS-RPC control-stream framing (4-byte
   big-endian length prefix, canonical CBOR, 256 KiB cap), ALPN `spindle-vfs/1`, SHA-256-of-DER cert fingerprints
   with mutual per-session pinning; framing violations close the connection. A9c manifest: rcgen added

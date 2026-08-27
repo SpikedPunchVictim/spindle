@@ -112,7 +112,7 @@ display state, or opaque handles across the Tauri IPC boundary — never a priva
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
 | Encoding | hand-rolled zero-dep canonical codec in spindle-proto (strict non-canonical rejection; minicbor rejected — decoder abstracts the raw bytes) **[amended v0.9.3]** | own canonical encoder in @spindle/proto |
 | Storage | rusqlite (bundled) host-side; sqlx/Postgres helper-side | IndexedDB (caps, resume manifests) |
-| Confinement | cap-std ≥3.4.1 + rustix (unix) / windows-sys (windows) free-space probe — already-transitive, promoted direct **[amended v0.9.11]** | — (browser sandbox) |
+| Confinement | cap-std ≥3.4.1 + rustix (unix) / windows-sys (windows) free-space probe — already-transitive, promoted direct **[amended v0.9.11]** + cap-fs-ext (maybe_dir directory opens — Windows FILE_FLAG_BACKUP_SEMANTICS) **[amended v0.9.13]** | — (browser sandbox) |
 | OS / shell | keyring, tauri 2 + plugins (tray, autostart, single-instance, updater), qrcode | @tauri-apps/api |
 | UI | — | React, Vite, @spindle/ui |
 | CLI | — | commander |
@@ -127,6 +127,12 @@ free-space floor. DESIGN.md A9c manifest amended (Confinement row above).
 updated for the A10.31/A10.32 transport split (`quinn` added for native↔native QUIC transfers, standalone ICE
 reused from `webrtc-rs`); brought to parity with DESIGN.md §A9c now, alongside this slice's `rcgen` (per-session
 QUIC certs) addition. Found while cross-checking this slice's docs amendment against ADR-009's mirror.
+
+**Amendment (2026-08-26, v0.9.13)**: Windows CI surfaced a real DESIGN.md §A4b confinement bug: cap-std's
+`Dir::open` cannot open directory handles on Windows, silently dropping every directory from listings and failing
+stat-on-directory; fixed via `cap-fs-ext` (same-repo cap-std companion) `OpenOptionsMaybeDirExt::maybe_dir(true)`,
+keeping the handle-based stat→read TOCTOU discipline intact. DESIGN.md A9c manifest amended (Confinement row
+above).
 
 ### Versioning & release (DESIGN.md §A9c)
 
