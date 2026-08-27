@@ -54,12 +54,12 @@ impl IdentityCache {
         member_id: MemberId,
         share_id: ShareId,
         path: &VirtualPath,
-        current: FileIdentity,
+        current: &FileIdentity,
     ) -> bool {
         self.last_seen
             .borrow()
             .get(&(member_id, share_id, path.clone()))
-            .is_some_and(|prev| *prev != current)
+            .is_some_and(|prev| prev != current)
     }
 
     /// Drops one entry — called after a `delete` removes the file (there is nothing left to
@@ -72,43 +72,49 @@ impl IdentityCache {
     }
 }
 
-#[cfg(test)]
+// This module's tests build `FileIdentity` values from bare `(u64, u64)` tuples via the local
+// `identity()` helper, which only typechecks when `FileIdentity` *is* `(u64, u64)` — i.e. on
+// Unix (see `spindle_vfs::confine::identity::FileIdentity`'s doc comment: on Windows it's
+// `same_file::Handle`, which cannot be constructed from raw integers). Gating the whole module
+// on `unix` (rather than sprinkling `#[cfg(unix)]` on each item, which left `use super::*`
+// unused when built on Windows — that unused import was a real Windows CI compile failure) is
+// simpler than writing a parallel `Handle`-based Windows harness, and there is nothing
+// platform-specific in `IdentityCache` itself left unexercised on Windows: it's a thin
+// `HashMap` wrapper that is generic over `FileIdentity` and never branches on it, so these tests
+// verify the same cache logic on both platforms even though they can only compile on one.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     fn identity(a: u64, b: u64) -> FileIdentity {
         (a, b)
     }
 
-    #[cfg(unix)]
     #[test]
     fn no_prior_observation_is_not_a_mismatch() {
         let cache = IdentityCache::new();
         let path = VirtualPath::parse("img.jpg").unwrap();
-        assert!(!cache.mismatches(MemberId(1), ShareId(1), &path, identity(1, 2)));
+        assert!(!cache.mismatches(MemberId(1), ShareId(1), &path, &identity(1, 2)));
     }
 
-    #[cfg(unix)]
     #[test]
     fn records_and_detects_a_mismatch_then_forgets() {
         let cache = IdentityCache::new();
         let path = VirtualPath::parse("img.jpg").unwrap();
         cache.record(MemberId(1), ShareId(1), &path, identity(1, 2));
 
-        assert!(!cache.mismatches(MemberId(1), ShareId(1), &path, identity(1, 2)));
-        assert!(cache.mismatches(MemberId(1), ShareId(1), &path, identity(9, 9)));
+        assert!(!cache.mismatches(MemberId(1), ShareId(1), &path, &identity(1, 2)));
+        assert!(cache.mismatches(MemberId(1), ShareId(1), &path, &identity(9, 9)));
 
         cache.forget(MemberId(1), ShareId(1), &path);
-        assert!(!cache.mismatches(MemberId(1), ShareId(1), &path, identity(9, 9)));
+        assert!(!cache.mismatches(MemberId(1), ShareId(1), &path, &identity(9, 9)));
     }
 
-    #[cfg(unix)]
     #[test]
     fn distinct_members_do_not_share_a_baseline() {
         let cache = IdentityCache::new();
         let path = VirtualPath::parse("img.jpg").unwrap();
         cache.record(MemberId(1), ShareId(1), &path, identity(1, 2));
-        assert!(!cache.mismatches(MemberId(2), ShareId(1), &path, identity(9, 9)));
+        assert!(!cache.mismatches(MemberId(2), ShareId(1), &path, &identity(9, 9)));
     }
 }

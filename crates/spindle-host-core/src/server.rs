@@ -635,7 +635,7 @@ impl<'s> VfsRpcServer<'s> {
             confine_identity::resolve_identity(&dir, &relative).map_err(not_found)?;
         if self
             .identity_cache
-            .mismatches(member.member_id, share.share_id, subpath, pre_identity)
+            .mismatches(member.member_id, share.share_id, subpath, &pre_identity)
         {
             self.identity_cache
                 .forget(member.member_id, share.share_id, subpath);
@@ -3047,10 +3047,20 @@ mod tests {
         );
         assert!(matches!(first, VfsReply::Read { .. }));
 
-        // Replace the file's real content out from under the cached identity (new inode via
-        // remove+recreate, simulating a rename-race).
-        std::fs::remove_file(root.join("a.bin")).expect("remove");
-        std::fs::write(root.join("a.bin"), vec![2u8; 10]).expect("rewrite a.bin");
+        // Replace the file's real content out from under the cached identity by writing the new
+        // content to a sibling path and renaming it over `a.bin` — this is DESIGN.md §A4b's
+        // actual threat model ("rename races"), and it guarantees a fresh inode/identity on every
+        // filesystem. (An earlier version of this test used remove_file + write to force a new
+        // inode; that was flaky on Linux (ext4/tmpfs), where a freed inode number is commonly
+        // reused immediately by the very next file created, so the old `(dev, ino)` and the new
+        // one could compare equal and the identity mismatch would never fire. macOS/APFS
+        // allocates inodes monotonically, so the old pattern happened to pass there, but it
+        // relied on filesystem-specific behavior instead of a real distinct-identity guarantee.
+        // Writing under a different name first — while `a.bin` still exists — means the replacement
+        // is always a distinct inode before the rename ever touches `a.bin`.)
+        let replacement = root.join("a.bin.tmp");
+        std::fs::write(&replacement, vec![2u8; 10]).expect("write replacement");
+        std::fs::rename(&replacement, root.join("a.bin")).expect("rename over a.bin");
 
         let second = server.handle(
             &h.ctx(member_id),
