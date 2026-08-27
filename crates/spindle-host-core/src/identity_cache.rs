@@ -72,17 +72,10 @@ impl IdentityCache {
     }
 }
 
-// This module's tests build `FileIdentity` values from bare `(u64, u64)` tuples via the local
-// `identity()` helper, which only typechecks when `FileIdentity` *is* `(u64, u64)` — i.e. on
-// Unix (see `spindle_vfs::confine::identity::FileIdentity`'s doc comment: on Windows it's
-// `same_file::Handle`, which cannot be constructed from raw integers). Gating the whole module
-// on `unix` (rather than sprinkling `#[cfg(unix)]` on each item, which left `use super::*`
-// unused when built on Windows — that unused import was a real Windows CI compile failure) is
-// simpler than writing a parallel `Handle`-based Windows harness, and there is nothing
-// platform-specific in `IdentityCache` itself left unexercised on Windows: it's a thin
-// `HashMap` wrapper that is generic over `FileIdentity` and never branches on it, so these tests
-// verify the same cache logic on both platforms even though they can only compile on one.
-#[cfg(all(test, unix))]
+// `FileIdentity` is `(u64, u64)` on every platform (see
+// `spindle_vfs::confine::identity::FileIdentity`'s doc comment), so these tests build identities
+// from bare `(u64, u64)` tuples via the local `identity()` helper and run on all platforms.
+#[cfg(test)]
 mod tests {
     use super::*;
 

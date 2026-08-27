@@ -18,18 +18,31 @@ fn maybe_dir_read_options() -> OpenOptions {
 
 /// A cross-platform file-identity value: two dirents with equal identity are the same underlying
 /// file regardless of what name(s) reach them — the primitive every TOCTOU/overlap check in this
-/// module builds on. On Unix this is the `(dev, ino)` pair. On Windows,
-/// `std::os::windows::fs::MetadataExt`'s identity accessors (`volume_serial_number`,
-/// `file_index`) are gated behind the nightly-only `windows_by_handle` feature
-/// (rust-lang/rust#63010) and are unusable on stable Rust — going through `std`'s own `Metadata`
-/// type (rather than `cap-std`'s wrapper) does not sidestep this; the feature gate is on the
-/// accessor itself. Windows identity instead goes through the `same-file` crate's `Handle`, which
-/// gets the equivalent `(volume serial, file index)` pair via `GetFileInformationByHandle` on
-/// stable Rust.
-#[cfg(unix)]
+/// module builds on. On Unix this is the `(dev, ino)` pair. On Windows it is `(volume serial
+/// number, file index)`, obtained via `GetFileInformationByHandle` through `winapi-util` (the same
+/// underlying call `std::os::windows::fs::MetadataExt`'s identity accessors would use, but those
+/// are gated behind the nightly-only `windows_by_handle` feature — rust-lang/rust#63010 — and
+/// unusable on stable Rust; going through `std`'s own `Metadata` type rather than `cap-std`'s
+/// wrapper does not sidestep this, the feature gate is on the accessor itself).
+///
+/// This is deliberately a plain, comparable value on **both** platforms rather than a live handle.
+/// It used to be `same_file::Handle` on Windows, which retains an open `std::fs::File` for as long
+/// as the `Handle` lives. `spindle_host_core::identity_cache::IdentityCache` stores `FileIdentity`
+/// values in a `HashMap` keyed by `(member, share, path)` and keeps them *across RPC calls*
+/// (DESIGN.md §A4b's stat→read TOCTOU rule spanning separate `stat`/`read` requests) — so a
+/// handle-valued identity pinned one open handle per stat'd/read path for the life of the process,
+/// with no eviction. On Windows this was worse than a resource leak: cap-primitives strips
+/// `FILE_SHARE_DELETE` from any handle opened with `maybe_dir(true)` (as [`resolve_identity`]
+/// does), so every such pinned handle also denied rename and delete of that path to every other
+/// process on the system. That is exactly what the Windows-only CI failure in
+/// `server::tests::read_toctou_identity_change_is_file_changed` caught (`rename over a.bin: Os {
+/// code: 5, kind: PermissionDenied }`) — the cache's own previously-recorded identity handle was
+/// still open and blocking the test's rename. Making `FileIdentity` a plain `(u64, u64)` restores
+/// the spirit of DESIGN.md §A4b's "no long-lived subdirectory handles" property (stated there for
+/// path resolution) at the identity layer too: identity resolution may open a handle transiently,
+/// but the value that outlives the call — and that the cache stores indefinitely — is just two
+/// integers, not a handle.
 pub type FileIdentity = (u64, u64);
-#[cfg(windows)]
-pub type FileIdentity = same_file::Handle;
 
 #[cfg(unix)]
 fn identity_from_metadata(meta: &std::fs::Metadata) -> FileIdentity {
@@ -46,15 +59,19 @@ pub fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
     }
     #[cfg(windows)]
     {
-        same_file::Handle::from_file(file.try_clone()?)
+        let info = winapi_util::file::information(file)?;
+        Ok((info.volume_serial_number(), info.file_index()))
     }
 }
 
 /// Computes the [`FileIdentity`] of an ambient filesystem `path` that has not been opened yet —
 /// used by [`super::overlap::overlap_check`], which compares share roots (which may be
-/// directories) by real path before either is opened as a `Dir`. On Windows this goes through
-/// `same_file::Handle::from_path`, which (unlike a plain `File::open`) opens directories
-/// correctly via `FILE_FLAG_BACKUP_SEMANTICS`.
+/// directories) by real path before either is opened as a `Dir`. On Windows this opens `path` via
+/// `same_file::Handle::from_path`, which (unlike a plain `File::open`) opens directories correctly
+/// via `FILE_FLAG_BACKUP_SEMANTICS` — that open is still needed, but the `Handle` is deliberately
+/// transient here: it exists only long enough for `winapi_util::file::information` to read the
+/// `(volume serial, file index)` pair off it, and is dropped (along with the handle it holds) when
+/// this function returns, so no handle outlives the call.
 pub fn identity_of_ambient_path(path: &std::path::Path) -> std::io::Result<FileIdentity> {
     #[cfg(unix)]
     {
@@ -62,7 +79,9 @@ pub fn identity_of_ambient_path(path: &std::path::Path) -> std::io::Result<FileI
     }
     #[cfg(windows)]
     {
-        same_file::Handle::from_path(path)
+        let handle = same_file::Handle::from_path(path)?;
+        let info = winapi_util::file::information(handle.as_file())?;
+        Ok((info.volume_serial_number(), info.file_index()))
     }
 }
 
@@ -95,9 +114,13 @@ pub fn stat_through_dir(dir: &Dir, virtual_path: &str) -> Result<std::fs::Metada
 /// `virtual_path` naming a directory doesn't fail to open on Windows (needs
 /// `FILE_FLAG_BACKUP_SEMANTICS`, which `maybe_dir(true)` sets there and which is a no-op on Unix,
 /// where opening a directory read-only already succeeds). `file_identity`'s Windows branch
-/// (`same_file::Handle::from_file`) only needs `GetFileInformationByHandle` on the resulting
+/// (`winapi_util::file::information`) only needs `GetFileInformationByHandle` on the resulting
 /// handle, which works the same for a file or a directory handle — so once the handle opens at
-/// all, identity resolution itself needs no further directory-specific handling.
+/// all, identity resolution itself needs no further directory-specific handling. The opened `file`
+/// below is a local binding that is dropped when this function returns; nothing here keeps it (or
+/// any handle derived from it) alive past the call, which is what lets the `maybe_dir(true)`
+/// open's missing `FILE_SHARE_DELETE` (stripped by cap-primitives for such opens) be harmless —
+/// see [`FileIdentity`]'s doc comment for why that distinction matters.
 pub fn resolve_identity(dir: &Dir, virtual_path: &str) -> Result<FileIdentity, ConfineError> {
     let file = dir
         .open_with(virtual_path, &maybe_dir_read_options())
@@ -209,6 +232,43 @@ mod tests {
         assert_eq!(
             identity,
             resolve_identity(&dir, "Vacation").expect("resolve identity again")
+        );
+    }
+
+    #[test]
+    fn resolve_identity_does_not_pin_the_file_against_rename() {
+        // Regression for the Windows-only CI failure in
+        // `server::tests::read_toctou_identity_change_is_file_changed`
+        // (`rename over a.bin: Os { code: 5, kind: PermissionDenied }`). `FileIdentity` used to be
+        // `same_file::Handle` on Windows, which retains an open `std::fs::File`; since
+        // `resolve_identity` opens with `maybe_dir(true)` (cap-primitives strips
+        // `FILE_SHARE_DELETE` from such opens), a caller that held onto the returned identity —
+        // exactly what `spindle_host_core::identity_cache::IdentityCache` does across RPC calls —
+        // pinned an open, delete-denying handle on the file for as long as the identity value
+        // lived. This test passes trivially on Unix (a plain `(dev, ino)` pair never holds a
+        // handle) and is the actual Windows regression guard: a retained `FILE_SHARE_DELETE`-less
+        // handle would make the rename below fail with `ERROR_ACCESS_DENIED`.
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        let dir = open_share_root(&root).expect("open share root");
+
+        dir.write("pinned.txt", b"original content")
+            .expect("write pinned.txt");
+        let before = resolve_identity(&dir, "pinned.txt").expect("resolve identity before rename");
+
+        // `before` is still alive here. If it (or anything it resolved through) retained an open
+        // handle to pinned.txt, this rename would fail on Windows.
+        dir.write("replacement.txt", b"replacement content")
+            .expect("write replacement.txt");
+        dir.rename("replacement.txt", &dir, "pinned.txt")
+            .expect("rename over pinned.txt must succeed — identity must not pin an open handle");
+
+        assert_ne!(
+            before,
+            resolve_identity(&dir, "pinned.txt").expect("resolve identity after rename"),
+            "the swap must still be detected: identity must differ after the rename even though \
+             resolving it holds no handle"
         );
     }
 
