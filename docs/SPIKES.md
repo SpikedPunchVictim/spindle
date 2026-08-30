@@ -241,6 +241,11 @@ CI.
 - Confirm the loss-tolerant/retry behavior A6 requires ("`connect` timeout covers the answer only
   (5 s, one retry); ICE streams independently; losses tolerated/retried") under induced packet
   loss.
+- 2026-08-30: split into two legs. Leg A covers the native↔native QUIC signaling path — the same
+  §A6 connect/offer/answer/trickle-ICE flow over live NATS, measuring the same connect-latency
+  bar — planned for Stage 5. Leg B is the real browser peer, deferred to Stage 8 alongside the
+  browser engine (`engine-web` + `apps/web`); until then a `webrtc-rs` stand-in misrepresents a
+  real browser, per S3's measured numbers.
 
 **Pass criterion (verbatim, A13)**: *"Median connect < 2 s LAN, < 5 s across NATs."*
 
@@ -248,7 +253,21 @@ CI.
 success criteria require this bar met. Validates **ADR-002** (NATS signaling, §A6 flows) and
 **ADR-005** (transport).
 
-**Status**: Not run.
+**Status**: Leg A (native↔native QUIC signaling, Stage 5) — not run. Leg B (real browser peer,
+Stage 8) — not run. Leg A must answer:
+- Does a full A7-envelope connect handshake complete over the composed stack under S1's
+  callout-scoped permissions — `host.<h>.connect` request/reply with `_INBOX` prefix validation,
+  then trickle ICE on `host.<h>.sess.<c>.<sid>.c2h` / `.h2c` (S1 proved the callout loop and §A5
+  scoping generally, but never these subjects)?
+- What is the measured median connect latency, LAN and across NATs (no number exists yet)?
+- Does the envelope-carried QUIC certificate fingerprint feed the existing
+  `QuicServer::bind`/`QuicClient::connect` seam unchanged, or does the seam need a different
+  shape?
+- Does trickle ICE converge with `rtc-ice`'s sans-io agent when candidates arrive asynchronously
+  over NATS, rather than out-of-band as in S19 leg 2?
+- Does the `seq` discipline survive real reordering/retry (the §A6/§A7 ambiguity noted in
+  `IMPLEMENTATION_PLAN.md` Stage 5)?
+- Does no-responders on `connect` actually yield the instant "host is offline" §A6 requires?
 
 ---
 

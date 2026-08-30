@@ -110,11 +110,13 @@ process, not the containerized one); Postgres store + coturn pending.
 `quinn` running over a `webrtc-rs`-`ice`-punched UDP socket, with a per-session self-signed cert
 pinned via the connect envelope (mirrors the DTLS fingerprint rule) and transport negotiated
 inside that envelope (`quic` when both peers are native, WebRTC otherwise).
-**Success Criteria**: S2 (median connect < 2 s LAN, < 5 s across NATs) met; S5 (presence ≤ 5 s
-clean / ≤ 60 s dead) met; S9 (revoke→kick→reject < 5 s) met; S14 (revoke while host offline;
-callout refuses before host returns) met; S18 (cap lifecycle: expiry→connect-only→re-issue;
-device bootstrap; no lockout in any path) met; S19 (quinn-over-punched-ICE native↔native: ≥ 15
-MB/s @ 50 ms, NAT-combination punch/relay success) met for the QUIC path.
+**Success Criteria**: S2's bar (median connect < 2 s LAN, < 5 s across NATs) met on the
+native↔native QUIC path — the same §A6 signaling flow, subjects, envelopes and trickle ICE,
+differing only in the final transport; S2's browser leg is deferred to Stage 8. S5 (presence
+≤ 5 s clean / ≤ 60 s dead) met; S9 (revoke→kick→reject < 5 s) met; S14 (revoke while host
+offline; callout refuses before host returns) met; S18 (cap lifecycle: expiry→connect-only→
+re-issue; device bootstrap; no lockout in any path) met; S19 (quinn-over-punched-ICE
+native↔native: ≥ 15 MB/s @ 50 ms, NAT-combination punch/relay success) met for the QUIC path.
 **Tests**: S2/S5/S9/S14/S18/S19 automated suites graduated into CI.
 **Status**: Not Started
 **Note**: S5 spike: **PASS** (2026-08-25/26, 15/15 automated checks against the composed
@@ -124,6 +126,29 @@ connection wiring for `$SYS.ACCOUNT.*.CONNECT|DISCONNECT`, CONNZ's real `authori
 name). This validates only the presence slice of this stage's success criteria — S2/S9/S14/S18/S19
 and the WebRTC/QUIC signaling work itself remain not started, so this stage's own Status is
 unchanged.
+**Note**: 2026-08-30 decision — WebRTC data-channel binding moves out of this stage into the
+Design Reserve, to be built in Stage 8, not here. No browser peer exists until Stage 8
+(`engine-web` + `apps/web`); `spindle-client-core` is currently a 12-line scaffold with zero
+dependencies; and spike S3 already measured that a `webrtc-rs` stand-in misrepresents a real
+browser (`webrtc-rs`↔Chrome 0.885 MB/s send / 0.083 MB/s recv; Chromium↔Chromium 0.845 MB/s @
+50 ms). DESIGN.md's A10.31 already scopes WebRTC to browser peers only, so this is a
+build-sequencing decision, not a design change — this stage is native↔native QUIC end to end,
+with NATS signaling. Separately, the signaling payload's wire types are spiked crate-local
+first: spike S2 settles the payload shape using `spindle-net`-local types, and once settled it
+is frozen into `spindle-proto` with golden vectors and a TypeScript twin, the established
+pattern for every other wire type here — a wire format is expensive to reverse, so it should
+not be frozen ahead of evidence. `spindle_proto::artifacts::Envelope.kind` is currently a bare
+`u16` with no named constants, and no signaling payload types (offer/answer/ICE/transport-
+negotiation/cert-fingerprint) exist in `spindle-proto` at all today. This stage's work is
+planned as four slices: (1) spike S2 in `spikes/s2-signaling`, throwaway, against the composed
+`deploy/docker-compose.yml` stack; (2) promote the settled wire types into `spindle-proto` with
+golden vectors and a TS twin; (3) signaling in `spindle-net` for both peer roles, wired to the
+existing QUIC seam; (4) S9/S14/S18 — revocation, kick relay, cap lifecycle. One spec ambiguity
+the spike must settle: §A7 requires `seq` strictly increasing per `(sid, direction)`, while §A6
+says ICE losses are "tolerated/retried" — a retried ICE envelope either reuses its `seq` (which
+a receiver must reject as replay) or burns a new one (making the retry a different envelope);
+gaps are permitted by "strictly increasing" but reordering is not. This likely needs a §A6/§A7
+amendment once the spike settles it.
 
 ## Stage 6: spindle-vfs + host-core
 **Goal**: Implement the shares/groups/entitlements engine and the VFS RPC server in
