@@ -41,11 +41,13 @@ services:
     volumes:
       - spindle-postgres-data:/var/lib/postgresql/data
     ports:
-      - "5434:5432" # Host side published as 5434, not 5432 — dev boxes commonly already have a
-        # native or containerized Postgres bound to 5432 (this one did). The container-internal
-        # port and DATABASE_URL below (which addresses the "postgres" service by Docker DNS name,
-        # not this host mapping) are unaffected — only host-side tools (psql, TEST_DATABASE_URL)
-        # need the 5434 mapping.
+      - "12019:5432" # Host side published as 12019, not 5432 — dev boxes commonly already have a
+        # native or containerized Postgres bound to 5432 (this one did), and this machine also runs
+        # several other containerized Postgres instances in the 5432/15433-15436 range, so a port
+        # well clear of that cluster was chosen deliberately. The container-internal port and
+        # DATABASE_URL below (which addresses the "postgres" service by Docker DNS name, not this
+        # host mapping) are unaffected — only host-side tools (psql, TEST_DATABASE_URL) need the
+        # 12019 mapping.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-spindle} -d ${POSTGRES_DB:-spindle}"]
       interval: 2s

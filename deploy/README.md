@@ -78,14 +78,16 @@ this stack's own database:
 
 ```sh
 docker compose -f deploy/docker-compose.yml up -d
-TEST_DATABASE_URL="postgres://spindle:spindle-dev-only@127.0.0.1:5434/spindle" \
+TEST_DATABASE_URL="postgres://spindle:spindle-dev-only@127.0.0.1:12019/spindle" \
   cargo test -p spindle-helper
 docker compose -f deploy/docker-compose.yml down
 ```
 
-(Host-side Postgres port is `5434`, not the default `5432` — dev boxes commonly already have a
-Postgres bound to `5432`; see `docker-compose.yml`'s port mapping comment. Only host-side tools need
-this — the `helper` container itself addresses `postgres:5432` over the compose network, unaffected.)
+(Host-side Postgres port is `12019`, not the default `5432` — dev boxes commonly already have a
+Postgres bound to `5432`, and this machine runs several other containerized Postgres instances in
+the `5432`/`15433`-`15436` range; see `docker-compose.yml`'s port mapping comment. Only host-side
+tools need this — the `helper` container itself addresses `postgres:5432` over the compose network,
+unaffected.)
 
 ## Files
 
