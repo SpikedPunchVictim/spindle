@@ -3182,6 +3182,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "spike-s2-signaling"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "futures-util",
+ "nkeys",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "spike-s1-callout",
+ "spindle-core",
+ "spindle-proto",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "spike-s3-throughput"
 version = "0.1.0"
 dependencies = [

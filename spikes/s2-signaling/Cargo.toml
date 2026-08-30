@@ -1,0 +1,52 @@
+[package]
+name = "spike-s2-signaling"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# S2 leg A step A (docs/SPIKES.md / docs/DESIGN.md §A13, §A6, §A7): first empirical test of the
+# §A6 connect + trickle-ICE signaling flow against the live composed stack, exercising the real
+# NATS Auth Callout scoping the same way spike-s5-presence does (deploy/docker-compose.yml's
+# `nats` + `postgres` + `helper`, not a throwaway in-process nats-server). Deliberately does NOT
+# do ICE or QUIC — see RESULTS.md for exactly what this step answers and defers.
+[dependencies]
+# Reused rather than re-derived: the device/host identity, capability-minting, and CBOR
+# `auth_token` fixtures this spike needs are exactly spike-s1-callout's own (see that crate's
+# fixtures.rs module doc for why that envelope shape is spike-local by design). Same reuse
+# spike-s5-presence already established as this repo's pattern for talking to the real composed
+# helper.
+spike-s1-callout = { path = "../s1-callout" }
+# spindle-core::envelope is the real A7 seal/open implementation under test — this spike is
+# explicitly validating the *actual* crypto/verification code, not a stand-in.
+spindle-core = { path = "../../crates/spindle-core" }
+# spindle-core::envelope::{seal,open} operate on spindle_proto::artifacts::Envelope directly.
+spindle-proto = { path = "../../crates/spindle-proto" }
+
+tokio = { workspace = true }
+# Real NATS client wired against the composed stack's nats-server, exactly as s1/s5 do.
+async-nats = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+
+# nkeys: generates the per-connection session nkey (ed25519) each CONNECT presents, same as
+# s1/s5's fixtures expect.
+nkeys = "0.4"
+
+# The signaling payload types (offer/answer/ice) defined in this crate are deliberately
+# spike-local (IMPLEMENTATION_PLAN Stage 5's newest Note: a wire format is expensive to reverse,
+# so these are not promoted into spindle-proto until the shape is settled with golden vectors).
+# serde/serde_json encode/decode them inside the envelope's plaintext — the simplest option that
+# needs no new canonical-CBOR schema for values nothing outside this crate ever decodes.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Ephemeral X25519 keypairs for the A7 session-key handshake (eph_pk_c / eph_pk_h). Not
+# re-exported by spindle-core (only `DeviceKey::agree_public_key()`'s `x25519_dalek::PublicKey`
+# return type is visible), so this spike needs its own direct dependency to name the type and
+# generate fresh ephemeral secrets.
+x25519-dalek = { workspace = true }
+
+rand = { workspace = true }
+futures-util = "0.3"
