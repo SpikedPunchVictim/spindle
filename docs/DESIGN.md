@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.13) + Execution Plan
+# Spindle — System Design Document (draft v0.9.14) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -24,8 +24,12 @@
 > the connection (2026-08-26; A9c manifest amended — rcgen). v0.9.13: Windows CI surfaced a real §A4b confinement
 > bug — cap-std's `Dir::open` cannot open directory handles on Windows, silently dropping directories from listings
 > and failing stat-on-directory; fixed via `cap-fs-ext`'s `OpenOptionsMaybeDirExt::maybe_dir(true)` (2026-08-26;
-> A9c manifest amended — cap-fs-ext). Remaining **[USER DECISION]** items: A10.6–9,
-> A10.24 (license), and the **[DEFAULT]**-flagged rows in A10.
+> A9c manifest amended — cap-fs-ext). v0.9.14: spike S2 leg A replaced §A7's single session key with a two-key
+> schedule — offer under ephemeral-static `k0`, answer onward under ephemeral-ephemeral `k1` — and withdrew the
+> blanket forward-secrecy claim for the offer; "retried" clarified as a new envelope with a fresh `seq`
+> (2026-08-30; user decisions). Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), A10.34–36
+> (device agreement-key distribution, host device identity, `inbox` semantics), and the **[DEFAULT]**-flagged
+> rows in A10.
 
 ---
 
@@ -437,6 +441,11 @@ Client                          NATS                            Host
   │ ◄═══════════ DataChannel (DTLS/SCTP) → VFS RPC session bound to device_fp ═══════════► │
 ```
 - `connect` timeout covers the answer only (5 s, one retry); ICE streams independently; losses tolerated/retried.
+  **[clarified v0.9.14]** "retried" always means a **new envelope with a fresh `seq`**, never a byte-identical
+  retransmit — see §A7. Reordered envelopes are dropped, not buffered.
+- **[amended v0.9.14]** The `connect` offer is sealed under the bootstrap key `k0` (client ephemeral × host static
+  agreement key); the answer carries `eph_pk_h` and every message from the answer onward uses `k1`
+  (ephemeral-ephemeral) — §A7 key schedule.
 - ICE servers + TURN creds per session from the broker helper; `iceTransportPolicy: relay` privacy option.
 - For native↔native QUIC sessions, the same envelopes carry ICE candidates and the peer's QUIC certificate
   fingerprint; the TLS handshake is verified against that pinned fingerprint (same rule as the DTLS case above,
@@ -448,22 +457,42 @@ Client                          NATS                            Host
 
 ```
 Envelope { v:1, alg_id, from_fp, to_fp, sid, kind, seq, ts, eph_pk?, ciphertext, sig }
-Session key:  k = HKDF-SHA256(X25519(eph_self, eph_peer) || X25519(dev_self, dev_agree_peer),
-                              info = "spindle-sess-v1" || sid || from_fp || to_fp)   (ephemeral-static hybrid)
+Key schedule: two keys per session — the offer is the first message and the client has no peer ephemeral yet.
+  k0 (offer only)  = HKDF-SHA256(X25519(eph_c, dev_agree_h) || X25519(dev_agree_c, dev_agree_h),
+                                 info = "spindle-sess-boot-v1" || sid || from_fp || to_fp)  (ephemeral-static)
+  k1 (all others)  = HKDF-SHA256(X25519(eph_self, eph_peer) || X25519(dev_self, dev_agree_peer),
+                                 info = "spindle-sess-v1" || sid || from_fp || to_fp)  (ephemeral-ephemeral hybrid)
 AEAD:         AES-256-GCM, nonce = direction(1) || seq(11) — deterministic, never reused; AAD = canonical header
 sig:          Ed25519(dev_sign_from, "spindle-env-v1" || canonical(header) || ciphertext)
 canonical():  deterministic CBOR per RFC 8949 §4.2.1 (same profile for VFS RPC)
 ```
+**Key schedule rationale [amended v0.9.14]**: the connect offer is sealed under `k0`, whose first term binds the
+client's ephemeral to the host's **static** agreement key — the client cannot know `eph_pk_h` before the host has
+replied. The host's answer carries `eph_pk_h`; from that message on **both directions use `k1`**, a full
+ephemeral-ephemeral hybrid. This is the X3DH initial-message shape and costs no extra round trip. The distinct
+HKDF `info` labels (`spindle-sess-boot-v1` / `spindle-sess-v1`) domain-separate the two keys, which otherwise share
+(sid, from_fp, to_fp); a receiver decrypts `kind = offer` under `k0` and every other `kind` under `k1` — never both.
 **Receiver MUST**: verify `sig` under the **pinned** key for `from_fp` (or, for an invite redemption, under the key
 carried in the device certificate, which must chain to a root and be HMAC-bound to the invite nonce); `to_fp == self`;
 sender active/not revoked; `sid` matches subject and is bound to `from_fp`; `seq` strictly increasing per
 (sid, direction); `|ts − now| ≤ 2 min`; `kind` matches subject; `v`/`alg_id` not below the peer's pinned minimum.
-Failure ⇒ drop, count, alert on threshold.
+Failure ⇒ drop, count, alert on threshold. A **retry is never a byte-identical retransmit**: re-sending a message (a
+`connect` retry, a re-offered ICE candidate) means a **new envelope with a fresh `seq`**, so strict per-(sid,
+direction) monotonicity holds unconditionally and byte-identical replays are always rejected — ICE candidates are
+idempotent at the ICE layer, so a duplicate candidate under a new `seq` is harmless. Residual accepted risk: genuine
+network **reordering** delivers an out-of-order envelope, which is dropped rather than buffered (ICE recovers via
+its own retransmits).
 **Browser crypto**: WebCrypto Ed25519/X25519 (Firefox 129+, Safari 17+, Chrome 137+) with `@noble/curves` fallback;
 AES-GCM/HKDF native. **Clock skew**: the helper returns server time in the callout reply; clients compute an offset
 for `ts`/`exp` checks and the UI warns on large skew.
-**Properties**: registry cannot read or forge SDP/ICE; device-key compromise does not retroactively decrypt captured
-signaling; replay/splicing/downgrade rejected.
+**Properties**: registry cannot read or forge SDP/ICE; replay/splicing/downgrade rejected. **Forward secrecy is
+message-scoped [amended v0.9.14]**: the answer and every message after it are sealed under `k1` and stay secret
+against later device-key compromise, but the **offer is not** — `k0` is derivable from the host's static agreement
+key, so an attacker who captures signaling and later compromises that key **can decrypt captured offers** (the
+client's SDP, and the client ephemeral). Accepted, with eyes open, to keep connect at one round trip; the earlier
+unqualified claim that "device-key compromise does not retroactively decrypt captured signaling" was false for the
+offer and is withdrawn. Mitigation available if the exposure is later judged unacceptable: rotate the host
+agreement key on a schedule, bounding the window of retroactively-readable offers.
 
 ## A7b. Signed-artifact profile (applies A7's discipline to every signed thing)
 
@@ -754,6 +783,10 @@ Docker is explicitly not the primary dev environment.
 | 30 | Capability signer model | **DECIDED 2026-08-24:** cap embeds host_root_pk + root-signed op-key cert, signed by the op key; host_fp always root-derived (S1 finding; keeps root cold) |
 | 31 | Transport split | **DECIDED 2026-08-24:** QUIC (quinn) for native↔native; WebRTC data channels only for browser peers; browser WAN ceiling stated in A9/UI |
 | 32 | QUIC NAT traversal & stack | **DECIDED 2026-08-24:** quinn + standalone ICE (reuse webrtc-rs ice + coturn); per-session self-signed QUIC cert pinned via A7 envelope; iroh rejected |
+| 33 | Signaling key schedule (offer bootstrap) | **DECIDED 2026-08-30:** two keys per session — offer under `k0` (ephemeral-static), answer and all later messages under `k1` (ephemeral-ephemeral); X3DH initial-message shape, no extra round trip; forward secrecy for the offer explicitly traded away (A7) |
+| 34 | Device agreement-key distribution | **[USER DECISION]** No wire artifact carries a device's raw X25519 **agreement** public key — `DeviceCertificate` carries only the `device_fp` hash — so A7's `X25519(dev_self, dev_agree_peer)` term has no defined source at connect time. Options: add the agreement key to the device certificate; derive it from the signing key (Ed25519→X25519 birational map); or a separate pinned-key exchange. (S2 leg A step A finding, 2026-08-30.) |
+| 35 | Host device identity for E2E envelopes | **[USER DECISION]** A host's own **device** keypair for A7 envelope signing/agreement is undefined relative to `host_fp` (root-derived, cold — A10.30). Options: the host op key doubles as its device key; a dedicated host device key certified by the op key; or the root signs directly. Interacts with A10.34. (S2 leg A step A finding, 2026-08-30.) |
+| 36 | Envelope `inbox` field semantics | **[USER DECISION]** §A6's connect envelope carries an `inbox` field whose relationship to the NATS reply subject (`_INBOX_<c>.x`) is unstated: redundant, authoritative, or a binding of the reply subject into the signed header (which would let the host detect reply-subject substitution). Wire-visible ⇒ expensive to reverse. (S2 leg A step A finding, 2026-08-30.) |
 
 ## A11. Alternatives considered
 
@@ -950,6 +983,18 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.14 (2026-08-30)** — Spike S2 leg A step A (envelope-over-NATS, 8/8 against the composed stack;
+  spikes/s2-signaling/RESULTS.md) surfaced four design gaps; two resolved by user decision, two recorded as open.
+  §A7's single session key is replaced by a **two-key schedule**: the connect offer is sealed under `k0`
+  (client ephemeral × host **static** agreement key, `info = "spindle-sess-boot-v1"`), the answer and every later
+  message under `k1` (ephemeral-ephemeral, unchanged formula) — the client cannot know `eph_pk_h` before the host
+  replies, so the previous formula was unimplementable for the offer. Cost stated honestly: §A7's blanket
+  "device-key compromise does not retroactively decrypt captured signaling" is **false for the offer** and has been
+  withdrawn and re-scoped (A10.33). §A6/§A7 "retried" clarified: a retry is a new envelope with a fresh `seq`,
+  never a byte-identical retransmit, preserving strict per-(sid, direction) monotonicity. Two gaps left open as
+  **[USER DECISION]**: no wire artifact carries a device's raw X25519 agreement key (A10.34), and a host's own
+  device identity for envelope crypto is undefined relative to `host_fp` (A10.35); the unstated `inbox` field
+  semantics recorded alongside (A10.36).
 - **v0.9.13 (2026-08-26)** — Windows CI surfaced a real §A4b confinement bug: cap-std's Dir::open cannot open
   directory handles on Windows, silently dropping every directory from listings and failing stat-on-directory;
   fixed via cap-fs-ext (same-repo cap-std companion) OpenOptionsMaybeDirExt::maybe_dir(true), keeping the
