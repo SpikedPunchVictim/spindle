@@ -397,7 +397,10 @@ async fn handle_connect(state: &HostState, msg: async_nats::Message) {
         });
 
     let answer_payload = AnswerPayload {
-        answer: format!("answer-for-{}", offer.offer),
+        transport: "test".to_string(),
+        ufrag: format!("answer-for-{}", offer.ufrag),
+        pwd: String::new(),
+        cert_fp: String::new(),
     };
     let answer_env = seal_payload(
         SealPayloadParams {
@@ -501,7 +504,11 @@ async fn handle_ice_c2h(state: &HostState, msg: async_nats::Message) {
         let seq_out = sess.next_seq_h2c;
         sess.next_seq_h2c += 1;
         let echo = IcePayload {
-            candidate: format!("host-echo-of:{}", ice.candidate),
+            candidate: Some(format!(
+                "host-echo-of:{}",
+                ice.candidate.clone().unwrap_or_default()
+            )),
+            end_of_candidates: false,
         };
         let echo_env = seal_payload(
             SealPayloadParams {
@@ -613,8 +620,11 @@ async fn do_handshake(
     );
 
     let offer_payload = OfferPayload {
-        offer: offer_text.clone(),
         inbox: format!("_INBOX_{}", device.device_fp),
+        transport: "test".to_string(),
+        ufrag: offer_text.clone(),
+        pwd: String::new(),
+        cert_fp: String::new(),
     };
     let offer_env = seal_payload(
         SealPayloadParams {
@@ -787,11 +797,11 @@ async fn main() -> anyhow::Result<ExitCode> {
         {
             Ok((state, elapsed, answer)) => {
                 let expected = format!("answer-for-{offer_text}");
-                if answer.answer != expected {
+                if answer.ufrag != expected {
                     round_trip_ok = false;
                     round_trip_detail = format!(
                         "iteration {i}: got answer {:?} want {:?}",
-                        answer.answer, expected
+                        answer.ufrag, expected
                     );
                 }
                 latencies.push(elapsed);
@@ -850,8 +860,11 @@ async fn main() -> anyhow::Result<ExitCode> {
             &host_device_fp,
         );
         let offer_payload = OfferPayload {
-            offer: "offer-bad-reply".to_string(),
             inbox: format!("_INBOX_{}", device_a.device_fp),
+            transport: "test".to_string(),
+            ufrag: "offer-bad-reply".to_string(),
+            pwd: String::new(),
+            cert_fp: String::new(),
         };
         let offer_env = seal_payload(
             SealPayloadParams {
@@ -926,7 +939,8 @@ async fn main() -> anyhow::Result<ExitCode> {
                 eph_pk: None,
             },
             &IcePayload {
-                candidate: candidate.clone(),
+                candidate: Some(candidate.clone()),
+                end_of_candidates: false,
             },
         );
         client_a
@@ -964,7 +978,7 @@ async fn main() -> anyhow::Result<ExitCode> {
                     match open_payload::<IcePayload>(open_params, &env) {
                         Ok(p) => {
                             session.min_seq_h2c = Some(env.seq);
-                            p.candidate == format!("host-echo-of:{candidate}")
+                            p.candidate == Some(format!("host-echo-of:{candidate}"))
                         }
                         Err(_) => false,
                     }
@@ -1006,8 +1020,11 @@ async fn main() -> anyhow::Result<ExitCode> {
                 eph_pk: Some(eph_c.public_bytes()),
             },
             &OfferPayload {
-                offer: "unreachable".to_string(),
                 inbox: format!("_INBOX_{}", device_a.device_fp),
+                transport: "test".to_string(),
+                ufrag: "unreachable".to_string(),
+                pwd: String::new(),
+                cert_fp: String::new(),
             },
         );
 
@@ -1083,7 +1100,8 @@ async fn main() -> anyhow::Result<ExitCode> {
                     eph_pk: None,
                 },
                 &IcePayload {
-                    candidate: candidate.to_string(),
+                    candidate: Some(candidate.to_string()),
+                    end_of_candidates: false,
                 },
             )
         };

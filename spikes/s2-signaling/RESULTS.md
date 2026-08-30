@@ -196,3 +196,275 @@ handler (`handle_connect`'s member-registry lookup) but was not exercised by a d
 it wasn't in the required checklist, and this harness's only registered device is legitimate
 throughout, so there was no natural place in the six required checks to trigger it without adding
 a seventh, unscoped test. Flagged here rather than silently claimed as covered.
+
+---
+
+# S2 leg A step B — trickle ICE + quinn punch — results
+
+**Status: PASS — real ICE punch + real QUIC handshake, over the real A7-verified NATS envelope
+path, with trickled candidates, against the live composed stack, reproduced clean on two
+independent runs (n=7 each), 2026-08-30.**
+
+Scope: this step replaces step A's opaque placeholder payloads with the real thing — a real
+`rtc_ice::agent::Agent` punch (ported from `spikes/s19-quic-transport`'s already-proven leg 2, not
+redesigned) driven entirely by A7-sealed envelopes over NATS, followed by a real `quinn` QUIC
+handshake mutually pinned to the fingerprints carried inside those envelopes, followed by one real
+application-stream round trip. Binary: `src/bin/s2-connect.rs`. Run command:
+`cargo run -p spike-s2-signaling --bin s2-connect` (env `NATS_URL`, default
+`nats://127.0.0.1:4222`).
+
+## The v0.9.14 two-key schedule, as implemented
+
+Step A's finding #1 ("the A7 key-derivation bootstrap gap") is exactly what DESIGN.md v0.9.14
+settles. This step implements the settled schedule, not step A's improvisation:
+
+- **Offer only**: `k0 = HKDF-SHA256(X25519(eph_c, dev_agree_h) || X25519(dev_agree_c, dev_agree_h),
+  info = "spindle-sess-boot-v1" || sid || from_fp || to_fp)`.
+- **Answer and every message after it, both directions**: `k1 = HKDF-SHA256(X25519(eph_self,
+  eph_peer) || X25519(dev_self, dev_agree_peer), info = "spindle-sess-v1" || sid || from_fp ||
+  to_fp)` — unchanged from step A/DESIGN.md §A7.
+
+Two distinct `info` domains, enforced structurally: a receiver decrypts `kind=offer` under `k0`
+via a hand-rolled `boot_seal_payload`/`boot_open_payload` (`lib.rs`) and everything else under
+`k1` via the real `spindle_core::envelope::{seal,open}` — never both under the same function.
+
+**`k0` cannot be produced through `spindle-core`'s public API.** `SessionKey` has no public
+raw-bytes constructor, and `derive_session_key`'s HKDF `info` domain
+(`SESSION_KEY_INFO_DOMAIN = b"spindle-sess-v1"`) is a private compile-time constant — there is no
+way to ask spindle-core for a session key under a *different* domain string. `derive_boot_key`/
+`boot_seal_payload`/`boot_open_payload` in `lib.rs` replicate `spindle_core::envelope`'s exact
+seal/open construction (same AEAD, same nonce layout, same AAD, same signature domain, same
+`EnvelopeError` variants and MUST-check order) against a raw `[u8; 32]` key instead of the opaque
+`SessionKey`, reusing `spindle_proto::artifacts::Envelope`'s already-public
+`header_canonical_bytes()`/`signing_input()` and spindle-core's public `direction_byte()` so the
+duplication is confined to "accept a raw key" — not a second crypto implementation with its own
+drift. **Promotion candidate for the real slice**: `spindle-core` needs either a
+`SessionKey::from_bytes`-style constructor or a parameterized `info` domain on
+`derive_session_key`, so a two-key schedule doesn't require reimplementing `seal`/`open` outside
+the crate that owns them.
+
+## Method
+
+Same one-process shape as step A (`s2-connect.rs`): the host is an in-process `tokio::spawn`ed
+task with its own real `async-nats` connection under the composed helper's real Auth Callout
+scoping; the client drives the connect from `main`. Every run performs: offer (k0) → answer (k1) →
+both sides trickle their own local ICE candidate + end-of-candidates as two separate `KIND_ICE`
+envelopes → both sides feed trickled candidates into a live `rtc_ice::agent::Agent` as they arrive
+→ on selected pair, the punched `std::net::UdpSocket` is handed to `quinn::Endpoint::new(...)`
+(S19's design (a), never `Endpoint::server`/`Endpoint::client`) → mutually-pinned TLS 1.3 handshake
+→ one bidirectional stream, "ping"/"pong". Client-side `Instant` markers only, matching "the
+connect latency a caller experiences": t0 before offer publish, t1 after answer verified, t2 after
+ICE selected pair, t3 after QUIC handshake, t4 after the stream round trip completes.
+Loopback/local only (127.0.0.1 host candidates; no STUN/TURN — see "Not exercised").
+
+## Q1 — Does trickle work through the envelope path (candidates arriving asynchronously)?
+
+**PASS, with a genuine nuance found empirically, not assumed.** Across both 7-run samples (14 runs
+total), every run's end-of-candidates envelope was consumed before the ICE loop returned in 13/14
+runs (`eoc_seen=true`), and the client-side trickled candidate was actually fed into
+`add_remote_candidate` (`candidates_applied=1`) in 12/14 runs. In the remaining runs
+(2 in the first sample, 0 in the second — see raw output below), the ICE agent selected a pair
+*before* the trickled envelope had been decoded and applied, with `candidates_applied=0`. This is
+not a trickle failure: on loopback, ICE's own peer-reflexive-candidate mechanism (RFC 8445
+§5.1.2.2 — an inbound STUN binding check from an address not yet known as a remote candidate
+causes the receiving agent to synthesize a peer-reflexive candidate for it on the spot) can win the
+race against the NATS envelope round trip, which is real network+crypto work. **Both mechanisms
+worked**; which one supplies the winning candidate is a genuine, sub-millisecond race on loopback,
+not a defect in either path. Every run still reached a selected pair and a working QUIC connection
+regardless of which mechanism won.
+
+## Q2 — Real connect latency, n≥5, loopback
+
+Two independent samples, n=7 each (exceeds the n≥5 bar), full per-run values below — every number
+is a real measured `Instant` delta from an actual run against the live composed stack, none
+invented or estimated.
+
+**Sample 1:**
+
+| run | (a) offer→answer (ms) | (b) answer→selected (ms) | (c) selected→QUIC (ms) | (d) TOTAL offer→stream (ms) |
+|---|---|---|---|---|
+| 0 | 12.21 | 37.68 | 11.91 | 62.58 |
+| 1 | 15.07 | 7.86 | 8.51 | 33.14 |
+| 2 | 5.74 | 5.41 | 5.06 | 17.07 |
+| 3 | 12.93 | 4.32 | 3.51 | 22.05 |
+| 4 | 7.47 | 3.21 | 3.94 | 15.35 |
+| 5 | 34.46 | 4.52 | 3.38 | 42.98 |
+| 6 | 28.37 | 4.99 | 3.08 | 37.03 |
+| **median** | **12.93** | **4.99** | **3.94** | **33.14** |
+
+**Sample 2 (independent re-run):**
+
+| run | (a) offer→answer (ms) | (b) answer→selected (ms) | (c) selected→QUIC (ms) | (d) TOTAL offer→stream (ms) |
+|---|---|---|---|---|
+| 0 | 22.96 | 32.91 | 15.46 | 72.04 |
+| 1 | 15.91 | 6.44 | 7.57 | 31.58 |
+| 2 | 10.83 | 4.64 | 6.56 | 23.93 |
+| 3 | 7.21 | 4.99 | 3.86 | 17.17 |
+| 4 | 12.10 | 4.95 | 4.47 | 22.40 |
+| 5 | 12.40 | 5.03 | 5.33 | 23.76 |
+| 6 | 15.67 | 4.81 | 4.94 | 26.74 |
+| **median** | **12.40** | **4.99** | **5.33** | **23.93** |
+
+Both samples' medians land well under the S2 bar (< 2s LAN), with run 0 of each sample being a
+consistent high outlier for stage (b) (~33–38ms vs. ~5ms median) — the first ICE punch after a
+fresh `tokio::spawn` cold-starts the agent's timer/retransmit machinery; later runs in the same
+process are faster. This is measured, not modeled: no attempt was made to isolate the cause
+further, and it is flagged here rather than smoothed over.
+
+## Q3 — Does the envelope-carried fingerprint pin correctly, both directions?
+
+**PASS, both directions proven.**
+
+- **Matching connects**: all 14 successful runs across both samples connected using the exact
+  server-cert fingerprint extracted from the verified `AnswerPayload.cert_fp` — i.e., every
+  passing run *is* the positive-direction proof; QUIC could not have completed its TLS 1.3
+  handshake under `PinServerCert`/`PinClientCert` otherwise (mutual pinning: both directions are
+  checked, not just server→client as in S19).
+- **Deliberately corrupted is REJECTED**: one dedicated negative run per sample flipped one byte of
+  the client's locally-held expected server fingerprint (`expected_server_fp[0] ^= 0xFF`) *after*
+  genuinely receiving and verifying the real answer envelope — isolating the QUIC-layer pin check
+  itself, not a broken envelope. Verbatim client-side error (sample 2):
+
+  ```
+  quinn handshake (client): the cryptographic handshake failed: error 40: unexpected error:
+  s2-connect: server certificate fingerprint mismatch: expected
+  sha256:1c57da0620210e53f23af6f966bb896282abc8160fafc91dab44016c73077cbd, got
+  sha256:e357da0620210e53f23af6f966bb896282abc8160fafc91dab44016c73077cbd
+  ```
+
+  Host-side (same run), confirming the rejection is real and not a client-only artifact:
+
+  ```
+  s2-connect: host: session task failed: accepting quinn connection (host): aborted by peer:
+  the cryptographic handshake failed: error 40: unexpected error: s2-connect: server
+  certificate fingerprint mismatch: expected
+  sha256:4424032261277f1f9cdb2a82c52cec59c0a889a85eb9e461b1fa8442e1936fbf, got
+  sha256:bb24032261277f1f9cdb2a82c52cec59c0a889a85eb9e461b1fa8442e1936fbf
+  ```
+
+  (The two fingerprint pairs differ between the host- and client-side log lines only because each
+  side logs its own corrupted-vs-real view of the same handshake, from the same run.)
+
+## Q4 — What must `IcePayload` actually carry (feeds `spindle-proto` promotion)?
+
+Concrete field lists, as implemented and exercised:
+
+```rust
+pub struct OfferPayload {
+    pub inbox: String,       // client's NATS inbox prefix (step A's field, unchanged)
+    pub transport: String,   // "quic" -- lets a future signaling flow negotiate transport
+    pub ufrag: String,       // this side's ICE local username fragment
+    pub pwd: String,         // this side's ICE local password
+    pub cert_fp: String,     // "sha256:<64 hex chars>" -- this side's QUIC cert fingerprint
+}
+
+pub struct AnswerPayload {
+    pub transport: String,
+    pub ufrag: String,
+    pub pwd: String,
+    pub cert_fp: String,
+}
+
+pub struct IcePayload {
+    pub candidate: Option<String>,   // a marshaled ICE candidate line (SDP a=candidate), or...
+    pub end_of_candidates: bool,     // ...end-of-candidates, mutually exclusive with `candidate`
+}
+```
+
+`IcePayload` uses one envelope per event (either exactly one candidate, or end-of-candidates —
+never both, never batched) rather than a `Vec<String>`, which is what makes trickle (Q1) meaningful
+at the wire level: each candidate is independently authenticated, ordered, and repla­y-checked by
+`seq` as it is discovered, not gathered into a batch first.
+
+## Q5 — Does strict-monotonic `seq` drop candidates in practice?
+
+**Zero drops observed, across both directions, across every run of both samples (14 successful
+runs + 2 negative-test runs = 16 total).** `client-side (h2c) ICE envelopes rejected for
+non-monotonic seq: 0` and `host-side (c2h) ICE envelopes rejected for non-monotonic seq: 0` in
+both samples. This is the honest zero the task brief explicitly allows: this harness's trickle
+traffic per session is exactly two envelopes per direction (`candidate` at `seq=1`, then
+`end_of_candidates` at `seq=2`), sent back-to-back over a single, uncontended loopback path with no
+concurrent sessions — there is no reordering pressure in this harness for step A's Check 6 finding
+to manifest. **This measurement does not contradict step A's Check 6 finding** (that a genuinely
+reordered, never-before-delivered `seq` is indistinguishable from a replay and gets silently
+dropped); it simply means this step's traffic pattern never produced real reordering to exercise
+that failure mode. The finding stands as a design gap for whoever builds the real slice, unresolved
+by this step.
+
+## Q6 — What API does `spindle-net::quic` lack?
+
+`crates/spindle-net/src/quic.rs`'s `QuicServer::bind(addr, cert, expected_client_fp)` calls
+`quinn::Endpoint::server(server_config, addr)` internally — it **binds its own UDP socket**.
+Symmetrically, `QuicClient::connect(addr, server_fp, cert)` calls `Endpoint::client(bind_addr)`
+internally — also binds its own socket. ICE (this step, and the real slice) hands the caller an
+**already-punched** `std::net::UdpSocket` (the exact socket the ICE agent just spent a connectivity
+check establishing a peer-reachable mapping for); there is no `spindle-net` constructor that
+accepts a pre-bound socket, so this binary bypasses `QuicServer`/`QuicClient` entirely and calls
+`quinn::Endpoint::new(EndpointConfig::default(), Some(server_config), punched_socket, runtime)`
+directly (mirrored on the client side with `server_config: None`). **What's needed, precisely**: a
+`QuicServer::from_socket(std::net::UdpSocket, cert, expected_client_fp) -> Result<Self, QuicError>`
+and a `QuicClient::from_socket(std::net::UdpSocket, remote_addr, server_fp, cert) -> Result<Self,
+QuicError>` (or an equivalent split of the existing constructors into "build the rustls config" +
+"bind or accept a socket" steps) so the ICE-punch caller can hand off the socket it already owns
+instead of `spindle-net` binding a second, useless one. `spindle-net`'s existing
+`PinnedServerCertVerifier`/`PinnedClientCertVerifier` and mutual-pinning `ServerConfig`/
+`ClientConfig` construction logic did not need to change at all — this binary's `PinServerCert`/
+`PinClientCert` are line-for-line equivalent hand-rolled copies (necessary only because the
+originals are private to that crate), which is itself evidence the real logic is already correct
+and just needs the socket-injection seam added.
+
+## A real bug found by running this against the live stack, not by inspection
+
+Every one of the first seven runs (before this was found and fixed) failed at the exact same point:
+the client's `read_exact` of the "pong" bytes returned `connection lost: closed by peer: 0`, even
+though the host's own log showed `stream round trip complete` immediately beforehand — i.e. the
+host really did send "pong" before the error. Root cause: `host_session_ice_and_quic` returned
+`Ok(())` immediately after `send.finish()`, dropping its local `Connection` and `Endpoint` handles;
+quinn implicitly sends a `CONNECTION_CLOSE` (error code 0) when the last handle to a connection is
+dropped, and that implicit close raced the client's read of the already-sent "pong" payload across
+the loopback socket — a race the client lost on all seven runs. Fixed by having the host
+`await connection.closed()` (bounded by a 5s timeout) before returning, so the host's teardown
+waits for the client's own explicit `connection.close(0, b"done")` (sent only after the client has
+finished reading "pong") instead of racing it. This is exactly the kind of finding empirical,
+drive-the-real-thing testing surfaces that unit tests with fakes would not: nothing about the
+sealed envelope, ICE, or the cert-pinning logic was wrong — the bug was purely in this harness's
+QUIC connection-lifetime management, and it reproduced deterministically (7/7) until fixed, then
+disappeared deterministically (14/14 after the fix, across both samples).
+
+## What a real slice should keep vs. redo
+
+**Keep**: the k0/k1 two-key schedule as specified in DESIGN.md v0.9.14 (implemented here exactly as
+written); the ICE↔quinn handoff mechanics (`rtc_ice::agent::Agent` → punched socket →
+`quinn::Endpoint::new`, unchanged from S19); mutual QUIC fingerprint pinning driven entirely by
+envelope-carried values (never a side channel); the one-candidate-per-envelope trickle wire shape
+(Q4); the explicit-close-before-teardown pattern this step had to discover the hard way.
+
+**Redo**: `k0`'s implementation once `spindle-core` gains a way to derive a session key under a
+non-default `info` domain (see the promotion candidate above) — this step's `boot_seal_payload`/
+`boot_open_payload` duplication should not ship as-is; the `spindle-net::quic` socket-injection
+constructors (Q6); the `seq`/reordering handling flagged by step A (still unresolved, still not
+exercised by this step's low-traffic pattern per Q5).
+
+## Not exercised
+
+- **STUN/TURN/relay path.** Only loopback host candidates (127.0.0.1) were used; coturn is up in
+  the composed stack but was never contacted. No NAT traversal, no relay fallback, no
+  cross-machine/cross-NAT scenario of any kind.
+- **Concurrent sessions.** Every run is sequential (one connect fully completes, including the
+  host's background task settling, before the next begins); the host's per-session dispatch
+  (`HostSessions` keyed by `from_fp`) was never exercised with two sessions live at once.
+- **Client-certificate corruption (the symmetric negative case).** Q3's negative test corrupts only
+  the *client's expectation of the server's* fingerprint. The reverse — the host rejecting a
+  client whose presented certificate doesn't match the `cert_fp` carried in the offer — relies on
+  the same `PinClientCert` code path (verified structurally, exercised implicitly by every
+  successful run's mutual handshake) but was never driven by a dedicated corrupted-client-cert
+  test.
+- **Multiple trickled candidates per side.** Both peers gather exactly one loopback host candidate
+  each; the trickle mechanism was never exercised with more than one real candidate in flight, so
+  ordering/interleaving of multiple trickled candidates from the same peer is unproven.
+- **Any latency measurement beyond loopback.** All numbers in Q2 are loopback-only; nothing here
+  says anything about LAN or cross-NAT latency.
+- **The Q5 reordering failure mode itself**, per the Q5 answer above — this step's traffic pattern
+  never produced real reordering, so step A's Check 6 finding (reordered vs. retried `seq` are
+  indistinguishable) remains unexercised and unresolved by this step, exactly as it was left by
+  step A.

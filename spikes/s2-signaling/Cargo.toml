@@ -50,3 +50,33 @@ x25519-dalek = { workspace = true }
 
 rand = { workspace = true }
 futures-util = "0.3"
+
+# ── Step B (S2 leg A, this crate's `s2-connect` binary): DESIGN.md v0.9.14 two-key schedule ────
+# `k0` (the offer-only bootstrap key) cannot be produced through spindle-core's public API at all
+# (`SessionKey` has no raw-bytes constructor and `derive_session_key`'s HKDF `info` domain is a
+# private compile-time constant) — see lib.rs's module doc "Why k0 is a hand-rolled seal/open".
+# These three replicate spindle-core::envelope's exact seal/open construction for k0 only, against
+# spindle_proto::artifacts::Envelope's already-public fields/methods. Versions match
+# crates/spindle-core/Cargo.toml exactly (workspace deps), so this is the identical crypto stack
+# spindle-core itself builds against, not a second implementation with its own version drift.
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+# Names `ed25519_dalek::{Signature, Verifier}` for boot_open_payload's signature check
+# (spindle-core re-exports `SigningKey`/`VerifyingKey` but not `Signature`, and `Verifier` is a
+# trait that must be in scope to call `.verify()`). Version matches spindle-core's own dependency.
+ed25519-dalek = { workspace = true }
+
+# ── Step B: real ICE + quinn QUIC, ported from spikes/s19-quic-transport's already-proven leg-2
+# recipe (rtc_ice::agent::Agent -> punched std::net::UdpSocket -> quinn::Endpoint::new; see that
+# crate's quic-peer.rs module doc comment for the empirical groundwork). Dependency lines and
+# feature selections copied verbatim from spikes/s19-quic-transport/Cargo.toml — see that file's
+# own comments for why each selection (`ring`-only, no cmake/aws-lc-sys) is load-bearing on this
+# macOS host; not re-derived here.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+rtc-ice = { version = "0.20.3", default-features = false, features = ["ring"] }
+rtc-shared = "0.20.3"
+sansio = "1.0.1"
+bytes = "1.12.1"
