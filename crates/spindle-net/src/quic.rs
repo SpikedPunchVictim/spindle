@@ -300,6 +300,74 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// ── TLS config builders (one per side — see the module doc comment below) ──────────────────────────
+//
+// `spikes/s2-signaling/src/bin/s2-connect.rs`'s RESULTS.md Q6 finding is the reason these two
+// functions exist as their own thing rather than being inlined into `QuicServer::bind`/
+// `QuicClient::connect` the way S19 did it: that spike proved the real ICE-punch handoff hands a
+// caller an already-connected `std::net::UdpSocket`, not an address to dial — so this module needs
+// a second constructor per side (`from_socket`) that skips the internal `Endpoint::server`/
+// `Endpoint::client` bind and instead wraps the caller's socket directly. If that second
+// constructor built its own copy of the pinning rustls/ALPN config instead of calling the same
+// builder `bind`/`connect` call, the two paths could drift out of sync over time (e.g. someone
+// tightens the cipher suite list in one place and forgets the other) and the punched-socket path
+// could silently lose mutual fingerprint pinning — exactly the false-green class this codebase
+// treats as severity zero (see `s2-connect.rs`'s own "[FAIL] ... false green" negative-test
+// wording). Routing both `bind`/`from_socket` and `connect`/`from_socket` through one
+// `build_server_config`/`build_client_config` each makes that drift impossible by construction:
+// there is only one place that can build a server (or client) TLS config, so there is nothing for
+// the two entry points to disagree about.
+
+/// Builds the server-side rustls/QUIC config: TLS 1.3, `cert` presented as the server's identity,
+/// mutual pinning via [`PinnedClientCertVerifier`] against `expected_client_fp`, and the fixed
+/// [`ALPN`] token. The ONLY place a `quinn::ServerConfig` is constructed in this module — both
+/// [`QuicServer::bind`] and [`QuicServer::from_socket`] call this (see the comment above).
+fn build_server_config(
+    cert: &SessionCert,
+    expected_client_fp: [u8; 32],
+) -> Result<quinn::ServerConfig, QuicError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let client_verifier = Arc::new(PinnedClientCertVerifier {
+        expected: expected_client_fp,
+        provider: provider.clone(),
+    });
+    let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(vec![cert.cert_der()], cert.key_der())?;
+    server_crypto.alpn_protocols = vec![ALPN.to_vec()];
+
+    let quic_server_crypto = QuicServerConfig::try_from(server_crypto)?;
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(
+        quic_server_crypto,
+    )))
+}
+
+/// Builds the client-side rustls/QUIC config: TLS 1.3, `cert` presented as the client's own
+/// identity (for the server's [`PinnedClientCertVerifier`] to pin), pinning of the server's
+/// certificate via [`PinnedServerCertVerifier`] against `server_fp`, and the fixed [`ALPN`] token.
+/// The ONLY place a `quinn::ClientConfig` is constructed in this module — both
+/// [`QuicClient::connect`] and [`QuicClient::from_socket`] call this (see the comment above).
+fn build_client_config(
+    server_fp: [u8; 32],
+    cert: &SessionCert,
+) -> Result<quinn::ClientConfig, QuicError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let server_verifier = Arc::new(PinnedServerCertVerifier {
+        expected: server_fp,
+        provider: provider.clone(),
+    });
+    let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(server_verifier)
+        .with_client_auth_cert(vec![cert.cert_der()], cert.key_der())?;
+    client_crypto.alpn_protocols = vec![ALPN.to_vec()];
+
+    let quic_client_crypto = QuicClientConfig::try_from(client_crypto)?;
+    Ok(quinn::ClientConfig::new(Arc::new(quic_client_crypto)))
+}
+
 // ── Control stream ───────────────────────────────────────────────────────────────────────────────
 
 /// One bidirectional QUIC stream (DESIGN.md §A8: "One control stream (VFS RPC)"), plus the
@@ -332,21 +400,42 @@ impl QuicServer {
         cert: &SessionCert,
         expected_client_fp: [u8; 32],
     ) -> Result<Self, QuicError> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let client_verifier = Arc::new(PinnedClientCertVerifier {
-            expected: expected_client_fp,
-            provider: provider.clone(),
-        });
-        let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_client_cert_verifier(client_verifier)
-            .with_single_cert(vec![cert.cert_der()], cert.key_der())?;
-        server_crypto.alpn_protocols = vec![ALPN.to_vec()];
-
-        let quic_server_crypto = QuicServerConfig::try_from(server_crypto)?;
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_crypto));
-
+        let server_config = build_server_config(cert, expected_client_fp)?;
         let endpoint = Endpoint::server(server_config, addr)?;
+        Ok(QuicServer { endpoint })
+    }
+
+    /// Wraps an already-bound (and, for the real ICE-punch caller, already-connected/"punched")
+    /// `std::net::UdpSocket` instead of binding a fresh one — the gap `spikes/s2-signaling`'s
+    /// `s2-connect.rs` (S2 leg A step B) found empirically: a real ICE agent hands back a socket
+    /// that has already exchanged connectivity-check packets with the peer, so a constructor that
+    /// insists on binding its own socket (as [`QuicServer::bind`] does via
+    /// `quinn::Endpoint::server`) can't be used at all after an ICE punch — that spike had to
+    /// bypass this module entirely and call `quinn::Endpoint::new` directly (see its module doc
+    /// comment's "What changed vs. `spikes/s19-quic-transport`'s leg 2" section and its Q6
+    /// finding). This constructor is that missing piece: same TLS/pinning setup as `bind` (both
+    /// call [`build_server_config`] — see that function's doc comment for why there is exactly one
+    /// builder), just handed a socket instead of an address.
+    ///
+    /// The socket must already be in non-blocking mode — `quinn::Endpoint::new` requires this of
+    /// whatever `std::net::UdpSocket` it wraps (it turns the socket into an async I/O source
+    /// itself; a blocking socket would stall the whole tokio runtime on every read). A socket
+    /// produced by converting a `tokio::net::UdpSocket` via `.into_std()` (as `s2-connect.rs` does
+    /// with its ICE-punched socket) is already non-blocking for exactly this reason; a socket
+    /// bound directly via `std::net::UdpSocket::bind` is not and must be switched with
+    /// `set_nonblocking(true)` before being passed here.
+    pub fn from_socket(
+        socket: std::net::UdpSocket,
+        cert: &SessionCert,
+        expected_client_fp: [u8; 32],
+    ) -> Result<Self, QuicError> {
+        let server_config = build_server_config(cert, expected_client_fp)?;
+        let endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
         Ok(QuicServer { endpoint })
     }
 
@@ -393,20 +482,7 @@ impl QuicClient {
         server_fp: [u8; 32],
         cert: &SessionCert,
     ) -> Result<ControlStream, QuicError> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let server_verifier = Arc::new(PinnedServerCertVerifier {
-            expected: server_fp,
-            provider: provider.clone(),
-        });
-        let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .dangerous()
-            .with_custom_certificate_verifier(server_verifier)
-            .with_client_auth_cert(vec![cert.cert_der()], cert.key_der())?;
-        client_crypto.alpn_protocols = vec![ALPN.to_vec()];
-
-        let quic_client_crypto = QuicClientConfig::try_from(client_crypto)?;
-        let client_config = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+        let client_config = build_client_config(server_fp, cert)?;
 
         let bind_addr: SocketAddr = if addr.is_ipv6() {
             "[::]:0".parse().unwrap()
@@ -429,6 +505,47 @@ impl QuicClient {
             recv,
         })
     }
+
+    /// Connects over an already-bound (and, for the real ICE-punch caller, already-connected/
+    /// "punched") `std::net::UdpSocket` instead of letting quinn bind a fresh one — the client-side
+    /// twin of [`QuicServer::from_socket`]; see that constructor's doc comment for why this exists
+    /// (the `s2-connect.rs` spike's Q6 finding: `Endpoint::client` binds its own socket, which is
+    /// exactly the socket an ICE punch has already handed the caller, wasted). Same TLS/pinning
+    /// setup as `connect` (both call [`build_client_config`] — see that function's doc comment for
+    /// why there is exactly one builder), just handed a socket instead of an address to bind.
+    ///
+    /// `addr` is the remote endpoint to dial (the ICE-selected candidate pair's address) — unlike
+    /// `connect`, there is no separate "local bind address" parameter, since the whole point of
+    /// this constructor is that the socket is already bound (and already punched) to somewhere.
+    ///
+    /// Per [`QuicServer::from_socket`]'s doc comment, `socket` must already be non-blocking;
+    /// `quinn::Endpoint::new` requires it. "localhost" is still used as the SNI value here for the
+    /// same reason `connect` uses it above: the pinning verifier ([`PinnedServerCertVerifier`])
+    /// ignores the server name entirely, but rustls/quinn still require a well-formed one.
+    pub async fn from_socket(
+        socket: std::net::UdpSocket,
+        addr: SocketAddr,
+        server_fp: [u8; 32],
+        cert: &SessionCert,
+    ) -> Result<ControlStream, QuicError> {
+        let client_config = build_client_config(server_fp, cert)?;
+        let endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
+
+        let connection = endpoint
+            .connect_with(client_config, addr, "localhost")?
+            .await?;
+        let (send, recv) = connection.open_bi().await?;
+        Ok(ControlStream {
+            connection,
+            send,
+            recv,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +554,30 @@ mod tests {
 
     fn localhost(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    // A pinning negative test must assert the rejection *reason*, never bare `is_err()` — an
+    // idle timeout is also an `Err`, and a bare check cannot tell the two apart, so it silently
+    // stops protecting the property it names. Concretely: mutation-testing
+    // `PinnedClientCertVerifier::verify_client_cert` to accept every certificate does not fail a
+    // suite built on `is_err()` alone — the handshake then succeeds, the server's `accept_bi()`
+    // waits forever for a stream the client never writes to, and the connection's 30s idle
+    // timeout eventually produces `QuicError::Connection(ConnectionError::TimedOut)`, which is
+    // still an `Err`. Every negative test below goes through [`assert_pinning_rejected`], which
+    // checks the formatted error for the verifier's own mismatch message instead.
+    fn assert_pinning_rejected<T>(result: Result<T, QuicError>, needle: &str) {
+        match result {
+            Err(err) => {
+                let rendered = format!("{err:?}");
+                assert!(
+                    rendered.contains(needle),
+                    "expected a pinning rejection containing {needle:?}, got: {rendered}"
+                );
+            }
+            Ok(_) => {
+                panic!("expected a pinning rejection containing {needle:?}, but the call succeeded")
+            }
+        }
     }
 
     #[tokio::test]
@@ -506,10 +647,7 @@ mod tests {
         });
 
         let result = QuicClient::connect(addr, wrong_fp, &client_cert).await;
-        assert!(
-            result.is_err(),
-            "connecting with the wrong expected server fingerprint must fail"
-        );
+        assert_pinning_rejected(result, "server certificate fingerprint mismatch");
 
         server_task.abort();
     }
@@ -541,10 +679,151 @@ mod tests {
             QuicClient::connect(addr, server_cert.fingerprint(), &actual_client_cert).await;
 
         let server_result = server_task.await.expect("server task");
-        assert!(
-            server_result.is_err(),
-            "the server must reject a client certificate that doesn't match the pinned fingerprint"
-        );
+        assert_pinning_rejected(server_result, "client certificate fingerprint mismatch");
+
+        if let Ok(control) = client_result {
+            let reason = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                control.connection.closed(),
+            )
+            .await
+            .expect("connection must close (not hang) after a rejected client cert");
+            assert!(
+                !matches!(reason, quinn::ConnectionError::LocallyClosed),
+                "connection must close due to the server's rejection, not a clean local close: \
+                 {reason:?}"
+            );
+        }
+    }
+
+    /// Binds a `std::net::UdpSocket` the way an ICE punch would hand one to
+    /// [`QuicServer::from_socket`]/[`QuicClient::from_socket`]: bound (here, to an ephemeral
+    /// loopback port rather than an actually-punched remote peer — these tests only need to prove
+    /// the socket-accepting constructors preserve pinning, not re-prove ICE punching, which
+    /// `spikes/s2-signaling`'s `s2-connect.rs` already did against the real stack) and switched to
+    /// non-blocking mode, which `quinn::Endpoint::new` requires of whatever socket it wraps (see
+    /// [`QuicServer::from_socket`]'s doc comment).
+    fn bind_std_socket() -> std::net::UdpSocket {
+        let socket = std::net::UdpSocket::bind(localhost(0)).expect("bind std UdpSocket");
+        socket
+            .set_nonblocking(true)
+            .expect("set std UdpSocket non-blocking");
+        socket
+    }
+
+    #[tokio::test]
+    async fn from_socket_round_trip() {
+        // Same synchronization rationale as `mutual_pinning_handshake_and_control_stream_round_trip`
+        // above: both sides must agree who writes/reads when before either drops its
+        // `ControlStream`, since dropping the last `Connection` handle implicitly closes it.
+        let server_cert = SessionCert::generate().expect("server cert");
+        let client_cert = SessionCert::generate().expect("client cert");
+
+        let server_socket = bind_std_socket();
+        let addr = server_socket.local_addr().expect("server local_addr");
+        let client_socket = bind_std_socket();
+
+        let server =
+            QuicServer::from_socket(server_socket, &server_cert, client_cert.fingerprint())
+                .expect("QuicServer::from_socket");
+
+        let server_task = tokio::spawn(async move {
+            let mut control = server.accept().await.expect("server accept");
+            let ping = crate::framing::read_frame(&mut control.recv)
+                .await
+                .expect("server read")
+                .expect("Some(frame)");
+            assert_eq!(ping, b"ping");
+            crate::framing::write_frame(&mut control.send, b"pong")
+                .await
+                .expect("server write");
+            let eof = crate::framing::read_frame(&mut control.recv)
+                .await
+                .expect("server read after pong");
+            assert!(eof.is_none(), "client must cleanly finish its send side");
+        });
+
+        let mut control =
+            QuicClient::from_socket(client_socket, addr, server_cert.fingerprint(), &client_cert)
+                .await
+                .expect("QuicClient::from_socket");
+        crate::framing::write_frame(&mut control.send, b"ping")
+            .await
+            .expect("client write");
+        let reply = crate::framing::read_frame(&mut control.recv)
+            .await
+            .expect("client read")
+            .expect("Some(frame)");
+        assert_eq!(reply, b"pong");
+        control.send.finish().expect("client finish send side");
+
+        server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn from_socket_enforces_server_fingerprint_pinning() {
+        // Load-bearing: proves `QuicClient::from_socket` still runs its connection through
+        // `build_client_config`/`PinnedServerCertVerifier` rather than skipping pinning because a
+        // pre-bound socket was supplied instead of an address to dial.
+        let server_cert = SessionCert::generate().expect("server cert");
+        let client_cert = SessionCert::generate().expect("client cert");
+        let wrong_fp = SessionCert::generate().expect("decoy cert").fingerprint();
+
+        let server_socket = bind_std_socket();
+        let addr = server_socket.local_addr().expect("server local_addr");
+        let client_socket = bind_std_socket();
+
+        let server =
+            QuicServer::from_socket(server_socket, &server_cert, client_cert.fingerprint())
+                .expect("QuicServer::from_socket");
+
+        let server_task = tokio::spawn(async move {
+            // The client's handshake fails before ever completing, so `accept` never returns a
+            // connection; this task's only job is to not hang the test — a timeout races it.
+            let _ = server.accept().await;
+        });
+
+        let result = QuicClient::from_socket(client_socket, addr, wrong_fp, &client_cert).await;
+        assert_pinning_rejected(result, "server certificate fingerprint mismatch");
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn from_socket_enforces_client_fingerprint_pinning() {
+        // Load-bearing: proves `QuicServer::from_socket` still runs its connection through
+        // `build_server_config`/`PinnedClientCertVerifier` rather than skipping pinning because a
+        // pre-bound socket was supplied instead of an address to bind.
+        let server_cert = SessionCert::generate().expect("server cert");
+        let expected_client_cert = SessionCert::generate().expect("expected client cert");
+        let actual_client_cert = SessionCert::generate().expect("actual (wrong) client cert");
+
+        let server_socket = bind_std_socket();
+        let addr = server_socket.local_addr().expect("server local_addr");
+        let client_socket = bind_std_socket();
+
+        let server = QuicServer::from_socket(
+            server_socket,
+            &server_cert,
+            expected_client_cert.fingerprint(),
+        )
+        .expect("QuicServer::from_socket");
+
+        let server_task = tokio::spawn(async move { server.accept().await });
+
+        // Same TLS-1.3-optimistic-client-view caveat as
+        // `wrong_client_cert_is_rejected_by_the_server` above: `connect` returning `Ok` here is not
+        // itself proof of a bug — `server_task`'s result is the property this test checks.
+        let client_result = QuicClient::from_socket(
+            client_socket,
+            addr,
+            server_cert.fingerprint(),
+            &actual_client_cert,
+        )
+        .await;
+
+        let server_result = server_task.await.expect("server task");
+        assert_pinning_rejected(server_result, "client certificate fingerprint mismatch");
 
         if let Ok(control) = client_result {
             let reason = tokio::time::timeout(
