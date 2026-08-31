@@ -27,6 +27,7 @@ export {
   RevocationRecord,
   AdminCommand,
   HostOpKeyCert,
+  HostDeviceCert,
 } from "./artifacts.js";
 export type { ProtoErrorKind } from "./artifacts.js";
 

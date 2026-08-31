@@ -2,8 +2,8 @@
 
 Golden test vectors: canonical CBOR bytes for every A7b signed-artifact type (envelope,
 member/invite capability, admission token, device certificate, revocation record, admin command,
-host op-key certificate), plus a primitive-level canonical CBOR encoding vector file — the single
-source of truth for what "correct wire format" means across languages.
+host op-key certificate, host device certificate), plus a primitive-level canonical CBOR encoding
+vector file — the single source of truth for what "correct wire format" means across languages.
 
 ## Files
 
@@ -16,6 +16,7 @@ source of truth for what "correct wire format" means across languages.
 | `revocation-record.json` | `RevocationRecord` (A4) — 3 cases, including a zero-length `revoked` array (empty-array encoding edge case). |
 | `admin-command.json` | `AdminCommand` (A3b/A7b) — 3 cases exercising `args` as a map, a text-valued map, and CBOR `null`. |
 | `host-op-key-cert.json` | `HostOpKeyCert` (A4) — 2 cases: freshly issued, rotated. |
+| `host-device-cert.json` | `HostDeviceCert` (A4, decision A10.35) — 2 cases: freshly issued, re-signed on the next op-key window. Self-verifying like `capability.json` (embeds `host_fp`/`host_root_pk`/`op_cert`), plus the host's dedicated `host_device_fp`/`alg_id`/`sign_pk`/`agree_pk` — the host's §A7 envelope identity, never a NATS-subject-scoping fingerprint. No `nats_fp` field — see the discrepancy note on `HostDeviceCert` in `crates/spindle-proto/src/artifacts.rs`. |
 | `canonical-cbor.json` | Primitive canonical-CBOR encoding cases (RFC 8949 §4.2.1) independent of any Spindle artifact type: integer shortest-form boundaries (23/24/255/256/65535/65536/4294967295/4294967296), negative integers, byte strings, text strings, arrays (including empty), map key ordering (by length, and by content at equal length), nested maps, and the three allowed simple values (`true`/`false`/`null`). For validating a canonical CBOR encoder at the byte level, independent of the artifact-level vectors. |
 | `vfs-rpc.json` | VFS RPC wire types (DESIGN.md §A8, Stage 6 slice 3) — **not** one of the seven A7b signed artifacts (no domain tag, no signing input), so this file's shape differs slightly from the artifact files (see below). `requests`: one case per op (`list` with and without a cursor/limit, `stat`, `read`, `mkdir`, `delete`, `whoami`). `replies`: one case per op plus every one of the eight typed [`spindle_proto::vfs_rpc::VfsErrorCode`] values (DESIGN.md's seven named codes plus this crate's own `UnsupportedVersion` addition — see that module's doc comment for why). **The TS twin (`@spindle/proto`) does not implement this schema yet** — flagged as a required follow-up before the CI vector cross-check job can cover it; see `IMPLEMENTATION_PLAN.md`'s Stage 6 slice 3 note. |
 | `signaling.json` | Signaling payload wire types (DESIGN.md §A6/§A7, §A10.31/32), promoted from `spikes/s2-signaling`'s crate-local types — **not** one of the seven A7b signed artifacts (no domain tag, no signing input): these payloads are always the plaintext sealed inside an already-signed `Envelope`, so this file's shape matches `vfs-rpc.json`'s (see below), not the artifact files'. `offers`: `OfferPayload` cases for both `transport` values plus a boundary-length case (`inbox`/`ufrag`/`pwd` each at their length cap). `answers`: `AnswerPayload` cases for both `transport` values. `ice`: `IcePayload` cases — a host candidate, a `srflx` candidate with `raddr`/`rport`, the end-of-candidates marker (`candidate` key omitted, not CBOR null), and a boundary-length candidate. Both the Rust encoder and the TS twin (`@spindle/proto`'s `signaling.ts`) are covered by this file from the start — see `packages/proto/test/signaling.test.ts`. |

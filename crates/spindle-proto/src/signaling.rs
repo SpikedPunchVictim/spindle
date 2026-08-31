@@ -4,7 +4,7 @@
 //! empirical work that settled these fields: a real connect/answer/trickle-ICE exchange run
 //! end-to-end over the A7 envelope).
 //!
-//! # Not one of A7b's seven signed artifacts
+//! # Not one of A7b's eight signed artifacts
 //! Like [`crate::vfs_rpc`], these types carry no domain-separation tag and no `sig` field of
 //! their own — see that module's doc comment for the general shape of this argument. Here it
 //! applies for a different reason: an offer/answer/ICE payload is never signed or encoded on the

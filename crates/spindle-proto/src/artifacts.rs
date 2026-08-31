@@ -1,4 +1,4 @@
-//! Wire types for the A7 envelope and the six other A7b signed-artifact kinds.
+//! Wire types for the A7 envelope and the seven other A7b signed-artifact kinds.
 //!
 //! Every type here is a thin, lossless mapping to/from [`CborValue`] plus a canonical-bytes
 //! convenience wrapper. Field *values* are opaque (`Vec<u8>` for fingerprints/keys/signatures,
@@ -818,6 +818,133 @@ impl HostOpKeyCert {
     }
 }
 
+// ============================================================================================
+// HostDeviceCert (A4/A7b, decision A10.35, 2026-08-31)
+// ============================================================================================
+
+/// `HostDeviceCert { host_fp, host_root_pk, op_cert, host_device_fp, alg_id, sign_pk, agree_pk,
+/// ts, exp, sig_host_op }` (DESIGN.md §A4, as amended v0.9.16, A10.34/A10.35).
+///
+/// A10.35 decided a host has **two** fingerprints and they are not interchangeable: `host_fp =
+/// SHA-256(host_root_pk)` scopes every §A5 NATS subject and is never an envelope field, while the
+/// **host device fingerprint** is the host's §A7 envelope identity (`to_fp`/`from_fp`) and never
+/// appears in a NATS subject. The host device keypair is dedicated (generated like any other
+/// device — §A4 Device), certified by the host **operating** key rather than the root, chaining
+/// root → op → device: `sig_host_op(host_device_fp, alg_id, sign_pk, agree_pk, ts)`. This keeps
+/// the root cold (A10.30's rule) and means device-key rotation never re-walls members.
+///
+/// A client fetches this artifact via `helper.devcert.get.<nfp>` already pinning `host_fp` from
+/// enrollment, so — exactly like [`Capability`] (decision A10.30) — this artifact is
+/// **self-verifying**: it embeds `host_fp`, `host_root_pk`, and the complete canonical `op_cert`
+/// encoding, needing no external registry lookup to walk root → op → device.
+///
+/// **Why no `nats_fp` field**: the person/device [`DeviceCertificate`] binds `nats_fp` because
+/// that callout ties a NATS session key to a device identity. The host's NATS connection is
+/// authenticated separately, by its own [`HostOpKeyCert`], which already carries the host's
+/// `nats_fp`. This artifact is purely the §A7 envelope identity — adding `nats_fp` here would
+/// duplicate (or, on a bug, contradict) the op cert's own binding rather than serve any need of
+/// its own.
+///
+/// **[A10.34 preimage discipline, mirrored from `DeviceCertificate`]**: `alg_id`/`sign_pk`/
+/// `agree_pk` are the exact preimage `host_device_fp` commits to
+/// (`device_fp_of(alg_id, sign_pk, agree_pk)`, §A4) and are signed material here, not just
+/// carried in `to_cbor`. A verifier is expected to recompute `host_device_fp` from them and
+/// reject on mismatch, the same binding discipline as `DeviceCertificate` (§A7b clarification 6).
+/// As with that type, this crate only carries the bytes structurally — no key-length, curve, or
+/// `alg_id`-value validation, and no recomputation — that is `spindle-core`'s job (A9c boundary
+/// rule 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDeviceCert {
+    pub host_fp: Vec<u8>,
+    pub host_root_pk: Vec<u8>,
+    /// Complete canonical encoding of the host's current [`HostOpKeyCert`], embedded as an opaque
+    /// byte string — the same "embed the whole cert, don't invent a second op-cert shape"
+    /// convention [`Capability::op_cert`] already uses.
+    pub op_cert: Vec<u8>,
+    pub host_device_fp: Vec<u8>,
+    pub alg_id: u8,
+    pub sign_pk: Vec<u8>,
+    pub agree_pk: Vec<u8>,
+    pub ts: u64,
+    pub exp: u64,
+    pub sig_host_op: Vec<u8>,
+}
+
+const HOST_DEVICE_CERT_FIELDS: &[&str] = &[
+    "host_fp",
+    "host_root_pk",
+    "op_cert",
+    "host_device_fp",
+    "alg_id",
+    "sign_pk",
+    "agree_pk",
+    "ts",
+    "exp",
+    "sig_host_op",
+];
+
+impl HostDeviceCert {
+    fn unsigned_entries(&self) -> Vec<(&str, CborValue)> {
+        vec![
+            ("host_fp", CborValue::bytes(self.host_fp.clone())),
+            ("host_root_pk", CborValue::bytes(self.host_root_pk.clone())),
+            ("op_cert", CborValue::bytes(self.op_cert.clone())),
+            (
+                "host_device_fp",
+                CborValue::bytes(self.host_device_fp.clone()),
+            ),
+            ("alg_id", CborValue::uint(self.alg_id as u64)),
+            ("sign_pk", CborValue::bytes(self.sign_pk.clone())),
+            ("agree_pk", CborValue::bytes(self.agree_pk.clone())),
+            ("ts", CborValue::uint(self.ts)),
+            ("exp", CborValue::uint(self.exp)),
+        ]
+    }
+
+    pub fn unsigned_cbor(&self) -> CborValue {
+        CborValue::map(self.unsigned_entries())
+    }
+
+    pub fn to_cbor(&self) -> CborValue {
+        let mut entries = self.unsigned_entries();
+        entries.push(("sig_host_op", CborValue::bytes(self.sig_host_op.clone())));
+        CborValue::map(entries)
+    }
+
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        canonical_encode(&self.to_cbor())
+    }
+
+    pub fn from_cbor(v: &CborValue) -> Result<Self, ProtoError> {
+        let m = MapReader::new(v)?;
+        m.deny_unknown_fields(HOST_DEVICE_CERT_FIELDS)?;
+        Ok(HostDeviceCert {
+            host_fp: m.bytes("host_fp")?,
+            host_root_pk: m.bytes("host_root_pk")?,
+            op_cert: m.bytes("op_cert")?,
+            host_device_fp: m.bytes("host_device_fp")?,
+            alg_id: m.u8("alg_id")?,
+            sign_pk: m.bytes("sign_pk")?,
+            agree_pk: m.bytes("agree_pk")?,
+            ts: m.u64("ts")?,
+            exp: m.u64("exp")?,
+            sig_host_op: m.bytes("sig_host_op")?,
+        })
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ProtoError> {
+        Self::from_cbor(&canonical_decode(bytes)?)
+    }
+
+    /// `"spindle-host-dev-cert-v1" || canonical(self minus sig_host_op)` (A7b).
+    pub fn signing_input(&self) -> Vec<u8> {
+        tags::signing_input(
+            tags::HOST_DEVICE_CERT_V1,
+            &canonical_encode(&self.unsigned_cbor()),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,7 +1148,27 @@ mod tests {
     }
 
     #[test]
-    fn all_seven_signing_inputs_start_with_distinct_tags() {
+    fn host_device_cert_round_trip() {
+        let cert = HostDeviceCert {
+            host_fp: fp(0xf0),
+            host_root_pk: vec![0xf1; 32],
+            op_cert: vec![0xf2; 96], // opaque embedded HostOpKeyCert canonical bytes (dummy length)
+            host_device_fp: fp(0xf3),
+            alg_id: 1,
+            sign_pk: vec![0xf4; 32],
+            agree_pk: vec![0xf5; 32],
+            ts: 1_755_940_000,
+            exp: 1_763_716_000,
+            sig_host_op: sig(0xf6),
+        };
+        let bytes = cert.to_canonical_bytes();
+        let decoded = HostDeviceCert::from_canonical_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, cert);
+        assert_eq!(decoded.to_canonical_bytes(), bytes);
+    }
+
+    #[test]
+    fn all_eight_signing_inputs_start_with_distinct_tags() {
         let env = sample_envelope(true);
         let cap = sample_capability(CapKind::Member);
         let tok = AdmissionToken {
@@ -1065,6 +1212,18 @@ mod tests {
             exp: 2,
             sig_host_root: sig(1),
         };
+        let host_device_cert = HostDeviceCert {
+            host_fp: fp(1),
+            host_root_pk: vec![1; 32],
+            op_cert: vec![1; 8],
+            host_device_fp: fp(2),
+            alg_id: 1,
+            sign_pk: vec![1; 32],
+            agree_pk: vec![2; 32],
+            ts: 1,
+            exp: 2,
+            sig_host_op: sig(1),
+        };
 
         let inputs = [
             env.signing_input(),
@@ -1074,6 +1233,7 @@ mod tests {
             rec.signing_input(),
             admin.signing_input(),
             host_cert.signing_input(),
+            host_device_cert.signing_input(),
         ];
         let tags = [
             tags::ENVELOPE_V1,
@@ -1083,6 +1243,7 @@ mod tests {
             tags::REVOCATION_V1,
             tags::ADMIN_COMMAND_V1,
             tags::HOST_OP_KEY_CERT_V1,
+            tags::HOST_DEVICE_CERT_V1,
         ];
         for (input, tag) in inputs.iter().zip(tags.iter()) {
             assert!(input.starts_with(tag));

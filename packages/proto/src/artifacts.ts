@@ -1,4 +1,4 @@
-// Wire types for the A7 envelope and the six other A7b signed-artifact kinds — the TypeScript
+// Wire types for the A7 envelope and the seven other A7b signed-artifact kinds — the TypeScript
 // twin of `crates/spindle-proto/src/artifacts.rs`.
 //
 // Every type here is a thin, lossless mapping to/from `CborValue` plus a canonical-bytes
@@ -798,6 +798,128 @@ export const HostOpKeyCert = {
     return tags.signingInput(
       tags.HOST_OP_KEY_CERT_V1,
       canonicalEncode(HostOpKeyCert.unsignedCbor(cert)),
+    );
+  },
+};
+
+// ============================================================================================
+// HostDeviceCert (A4/A7b, decision A10.35, 2026-08-31)
+// ============================================================================================
+
+/** `HostDeviceCert { host_fp, host_root_pk, op_cert, host_device_fp, alg_id, sign_pk, agree_pk,
+ * ts, exp, sig_host_op }` (DESIGN.md §A4, as amended v0.9.16, A10.34/A10.35).
+ *
+ * A10.35 decided a host has **two** fingerprints and they are not interchangeable: `host_fp =
+ * SHA-256(host_root_pk)` scopes every §A5 NATS subject and is never an envelope field, while the
+ * **host device fingerprint** is the host's §A7 envelope identity (`to_fp`/`from_fp`) and never
+ * appears in a NATS subject. The host device keypair is dedicated (generated like any other
+ * device — §A4 Device), certified by the host **operating** key rather than the root, chaining
+ * root -> op -> device: `sig_host_op(host_device_fp, alg_id, sign_pk, agree_pk, ts)`. This keeps
+ * the root cold (A10.30's rule) and means device-key rotation never re-walls members.
+ *
+ * A client fetches this artifact via `helper.devcert.get.<nfp>` already pinning `host_fp` from
+ * enrollment, so — exactly like `Capability` (decision A10.30) — this artifact is
+ * **self-verifying**: it embeds `host_fp`, `host_root_pk`, and the complete canonical `op_cert`
+ * encoding, needing no external registry lookup to walk root -> op -> device.
+ *
+ * **Why no `nats_fp` field**: the person/device `DeviceCertificate` binds `nats_fp` because that
+ * callout ties a NATS session key to a device identity. The host's NATS connection is
+ * authenticated separately, by its own `HostOpKeyCert`, which already carries the host's
+ * `nats_fp`. This artifact is purely the §A7 envelope identity — adding `nats_fp` here would
+ * duplicate (or, on a bug, contradict) the op cert's own binding rather than serve any need of its
+ * own.
+ *
+ * **[A10.34 preimage discipline, mirrored from `DeviceCertificate`]**: `alg_id`/`sign_pk`/
+ * `agree_pk` are the exact preimage `host_device_fp` commits to
+ * (`device_fp_of(alg_id, sign_pk, agree_pk)`, §A4) and are signed material here, not just carried
+ * in `toCbor`. A verifier is expected to recompute `host_device_fp` from them and reject on
+ * mismatch, the same binding discipline as `DeviceCertificate` (§A7b clarification 6). As with
+ * that type, this package only carries the bytes structurally — no key-length, curve, or
+ * `alg_id`-value validation, and no recomputation — that is `@spindle/crypto`'s job. */
+export interface HostDeviceCert {
+  host_fp: Uint8Array;
+  host_root_pk: Uint8Array;
+  /** Complete canonical encoding of the host's current `HostOpKeyCert`, embedded as an opaque
+   * byte string — the same "embed the whole cert, don't invent a second op-cert shape" convention
+   * `Capability.op_cert` already uses. */
+  op_cert: Uint8Array;
+  host_device_fp: Uint8Array;
+  alg_id: number;
+  sign_pk: Uint8Array;
+  agree_pk: Uint8Array;
+  ts: bigint;
+  exp: bigint;
+  sig_host_op: Uint8Array;
+}
+
+const HOST_DEVICE_CERT_FIELDS = [
+  "host_fp",
+  "host_root_pk",
+  "op_cert",
+  "host_device_fp",
+  "alg_id",
+  "sign_pk",
+  "agree_pk",
+  "ts",
+  "exp",
+  "sig_host_op",
+] as const;
+
+export const HostDeviceCert = {
+  unsignedEntries(cert: HostDeviceCert): Array<[string, CborValue]> {
+    return [
+      ["host_fp", CborValue.bytes(cert.host_fp)],
+      ["host_root_pk", CborValue.bytes(cert.host_root_pk)],
+      ["op_cert", CborValue.bytes(cert.op_cert)],
+      ["host_device_fp", CborValue.bytes(cert.host_device_fp)],
+      ["alg_id", CborValue.uint(cert.alg_id)],
+      ["sign_pk", CborValue.bytes(cert.sign_pk)],
+      ["agree_pk", CborValue.bytes(cert.agree_pk)],
+      ["ts", CborValue.uint(cert.ts)],
+      ["exp", CborValue.uint(cert.exp)],
+    ];
+  },
+
+  unsignedCbor(cert: HostDeviceCert): CborValue {
+    return CborValue.map(HostDeviceCert.unsignedEntries(cert));
+  },
+
+  toCbor(cert: HostDeviceCert): CborValue {
+    const entries = HostDeviceCert.unsignedEntries(cert);
+    entries.push(["sig_host_op", CborValue.bytes(cert.sig_host_op)]);
+    return CborValue.map(entries);
+  },
+
+  toCanonicalBytes(cert: HostDeviceCert): Uint8Array {
+    return canonicalEncode(HostDeviceCert.toCbor(cert));
+  },
+
+  fromCbor(v: CborValue): HostDeviceCert {
+    const m = new MapReader(v);
+    m.denyUnknownFields(HOST_DEVICE_CERT_FIELDS);
+    return {
+      host_fp: m.bytes("host_fp"),
+      host_root_pk: m.bytes("host_root_pk"),
+      op_cert: m.bytes("op_cert"),
+      host_device_fp: m.bytes("host_device_fp"),
+      alg_id: m.u8("alg_id"),
+      sign_pk: m.bytes("sign_pk"),
+      agree_pk: m.bytes("agree_pk"),
+      ts: m.u64("ts"),
+      exp: m.u64("exp"),
+      sig_host_op: m.bytes("sig_host_op"),
+    };
+  },
+
+  fromCanonicalBytes(bytes: Uint8Array): HostDeviceCert {
+    return HostDeviceCert.fromCbor(decodeCanonicalOrThrow(bytes));
+  },
+
+  /** `"spindle-host-dev-cert-v1" || canonical(self minus sig_host_op)` (A7b). */
+  signingInput(cert: HostDeviceCert): Uint8Array {
+    return tags.signingInput(
+      tags.HOST_DEVICE_CERT_V1,
+      canonicalEncode(HostDeviceCert.unsignedCbor(cert)),
     );
   },
 };

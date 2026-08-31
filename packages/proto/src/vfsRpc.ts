@@ -2,7 +2,7 @@
 // TypeScript twin of `crates/spindle-proto/src/vfs_rpc.rs`.
 //
 // These types carry the ten VFS operations across the control channel/stream once a session is
-// authenticated — they are **not** one of the seven A7b signed-artifact kinds (no
+// authenticated — they are **not** one of the eight A7b signed-artifact kinds (no
 // domain-separation tag, no `sig` field, no `tags.ts` involvement): §A8 places VFS RPC *inside*
 // the already-authenticated, already-encrypted session, so per-message signing would be redundant
 // with the transport's own integrity guarantee. Like every other wire type in this package,

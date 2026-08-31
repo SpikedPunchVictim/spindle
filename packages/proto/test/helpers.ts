@@ -18,6 +18,7 @@ import type {
   RevocationRecord,
   AdminCommand,
   HostOpKeyCert,
+  HostDeviceCert,
 } from "../src/artifacts.js";
 import { CapKind } from "../src/artifacts.js";
 
@@ -160,6 +161,22 @@ export function parseHostOpKeyCert(d: any): HostOpKeyCert {
     ts: BigInt(d.ts),
     exp: BigInt(d.exp),
     sig_host_root: hexToBytes(d.sig_host_root),
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function parseHostDeviceCert(d: any): HostDeviceCert {
+  return {
+    host_fp: hexToBytes(d.host_fp),
+    host_root_pk: hexToBytes(d.host_root_pk),
+    op_cert: hexToBytes(d.op_cert),
+    host_device_fp: hexToBytes(d.host_device_fp),
+    alg_id: Number(d.alg_id),
+    sign_pk: hexToBytes(d.sign_pk),
+    agree_pk: hexToBytes(d.agree_pk),
+    ts: BigInt(d.ts),
+    exp: BigInt(d.exp),
+    sig_host_op: hexToBytes(d.sig_host_op),
   };
 }
 

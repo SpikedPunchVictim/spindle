@@ -8,6 +8,7 @@
 // |---|---|
 // | DeviceCertificate | identity root |
 // | Capability | host operating key, certified by an embedded op_cert chained to host_root_pk (A10.30) |
+// | HostDeviceCert | host operating key, certified by an embedded op_cert chained to host_root_pk (A10.35) |
 // | HostOpKeyCert | host root |
 // | RevocationRecord | host op key or identity root |
 // | AdmissionToken | operator admission key |
@@ -22,6 +23,7 @@ import {
   AdmissionToken,
   Capability,
   DeviceCertificate,
+  HostDeviceCert,
   HostOpKeyCert,
   RevocationRecord,
 } from "@spindle/proto";
@@ -265,4 +267,71 @@ export async function verifyAdminCommand(
   requirePublicKeyLen(operatorPk);
   await verifySigOrThrow(operatorPk, AdminCommand.signingInput(command), command.sig, opts?.backend);
   checkSkew(now, command.ts, ADMIN_COMMAND_CLOCK_SKEW_SECS);
+}
+
+/** Verifies a host device certificate's full root -> operating-key -> device chain (DESIGN.md
+ * §A4, decision A10.35): self-verifying exactly like `verifyCapability` (decision A10.30) — no
+ * external root or registry lookup needed beyond the certificate's own embedded fields.
+ *
+ * **Deliberately stricter than `verifyCapability`**: `expectedHostFp` is a **required** parameter
+ * here, not left to the caller to check separately. A client fetches this certificate from the
+ * helper (`helper.devcert.get.<nfp>`) specifically to learn the host's envelope identity, and it
+ * already pinned `host_fp` at enrollment — making the pin check a required argument means a
+ * caller cannot forget to verify the certificate actually names the host it thinks it is talking
+ * to. `verifyCapability` has no equivalent parameter because a capability's `host_fp` typically
+ * *is* the value the caller is trying to look up, not a value it already holds and must
+ * cross-check.
+ *
+ * Checks run cheap-structural-before-crypto (§A6), in this order:
+ * 1. `alg_id` is a supported suite.
+ * 2. `sign_pk` parses as Ed25519; `agree_pk` is exactly 32 bytes.
+ * 3. `host_device_fp` recomputed from `(alg_id, sign_pk, agree_pk)` matches the certificate's own
+ *    field (§A7b clarification 6's binding discipline, mirrored from `DeviceCertificate`/A10.34).
+ * 4. `host_fp` matches the caller's pinned `expectedHostFp`.
+ * 5. `host_fp == SHA-256(host_root_pk)` — self-consistency of the certificate's own fields (the
+ *    same check `verifyCapability`'s step 1 performs).
+ * 6. The embedded `op_cert` decodes as a `HostOpKeyCert` and chains to `host_root_pk` (including
+ *    its own `exp`), via `verifyHostOpKeyCert`.
+ * 7. `sig_host_op` verifies under the op cert's own certified operating key.
+ * 8. `now` is within `exp`. */
+export async function verifyHostDeviceCert(
+  cert: HostDeviceCert,
+  expectedHostFp: Uint8Array,
+  now: bigint,
+  opts?: BackendOption,
+): Promise<void> {
+  // 1. alg_id supported.
+  if (cert.alg_id !== ALG_ID_V1) throw ArtifactError.unsupportedAlgId();
+
+  // 2. sign_pk / agree_pk parse (length check).
+  requirePublicKeyLen(cert.sign_pk);
+  requirePublicKeyLen(cert.agree_pk);
+
+  // 3. host_device_fp binding — recompute from the certificate's own preimage.
+  const recomputedDeviceFp = await deviceFpOf(cert.alg_id, cert.sign_pk, cert.agree_pk);
+  if (!bytesEqual(recomputedDeviceFp, cert.host_device_fp)) throw ArtifactError.deviceFingerprintMismatch();
+
+  // 4. host_fp matches the caller's pinned expectation (required parameter — see doc comment).
+  if (!bytesEqual(expectedHostFp, cert.host_fp)) throw ArtifactError.hostFingerprintMismatch();
+
+  // 5. host_fp is self-consistent with the embedded host_root_pk.
+  requirePublicKeyLen(cert.host_root_pk);
+  const recomputedHostFp = await rootFpOf(cert.host_root_pk);
+  if (!bytesEqual(recomputedHostFp, cert.host_fp)) throw ArtifactError.hostFingerprintMismatch();
+
+  // 6. Decode + verify the embedded op cert chains to host_root_pk, including its own `exp`.
+  let opCert: HostOpKeyCert;
+  try {
+    opCert = HostOpKeyCert.fromCanonicalBytes(cert.op_cert);
+  } catch {
+    throw ArtifactError.malformedOpCert();
+  }
+  await verifyHostOpKeyCert(opCert, cert.host_root_pk, cert.host_fp, now, opts);
+
+  // 7. sig_host_op verifies under the op cert's own certified operating key.
+  requirePublicKeyLen(opCert.host_op_pk);
+  await verifySigOrThrow(opCert.host_op_pk, HostDeviceCert.signingInput(cert), cert.sig_host_op, opts?.backend);
+
+  // 8. exp check.
+  checkExp(now, cert.exp);
 }

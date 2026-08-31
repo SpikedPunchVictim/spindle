@@ -1,7 +1,7 @@
 //! VFS RPC wire types (DESIGN.md §A8 "VFS RPC" + "VFS error model"), Stage 6 slices 3-4.
 //!
 //! These types carry the ten VFS operations across the control channel/stream once a session is
-//! authenticated (post-DTLS/QUIC handshake) — they are **not** one of A7b's seven signed-artifact
+//! authenticated (post-DTLS/QUIC handshake) — they are **not** one of A7b's eight signed-artifact
 //! kinds (no domain-separation tag, no `sig` field, no [`crate::tags`] involvement): §A8 places
 //! VFS RPC *inside* the already-authenticated, already-encrypted session, so per-message signing
 //! would be redundant with the transport's own integrity guarantee. Like every other wire type in

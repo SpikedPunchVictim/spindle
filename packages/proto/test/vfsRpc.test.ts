@@ -2,7 +2,7 @@
 // `crates/spindle-proto/src/vfs_rpc.rs`. Covers both Stage 6 slice 3 (list/stat/read/mkdir/
 // delete/whoami, eight error codes) and slice 4 (upload_open/upload_chunk/upload_commit/
 // upload_abort, plus the `already_exists`/`file_changed` error codes added by the DESIGN.md
-// v0.9.10 amendment). Unlike the seven A7b artifact vector files (see vectors.test.ts),
+// v0.9.10 amendment). Unlike the eight A7b artifact vector files (see vectors.test.ts),
 // vfs-rpc.json's `decoded` field is the same generic `{type, value}` CBOR-tree mirror
 // canonical-cbor.json uses (see vectors/README.md's "vfs-rpc.json's shape" note) rather than a
 // bespoke per-op JSON shape, since the ten ops carry different field sets. So each case is

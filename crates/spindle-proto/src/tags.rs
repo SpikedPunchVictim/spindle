@@ -24,6 +24,8 @@ pub const REVOCATION_V1: &[u8] = b"spindle-rev-v1";
 pub const ADMIN_COMMAND_V1: &[u8] = b"spindle-adm-cmd-v1";
 /// `HostOpKeyCert` (A4) — signed by the host root.
 pub const HOST_OP_KEY_CERT_V1: &[u8] = b"spindle-host-cert-v1";
+/// `HostDeviceCert` (A4/A10.35) — signed by the host operating key.
+pub const HOST_DEVICE_CERT_V1: &[u8] = b"spindle-host-dev-cert-v1";
 
 /// Concatenates a domain tag with a byte string — `tag || bytes`. No hashing, no signing: this
 /// crate only assembles the exact byte sequence that `spindle-core` will later sign or verify.
@@ -50,7 +52,7 @@ mod tests {
     }
 
     #[test]
-    fn all_seven_tags_distinct() {
+    fn all_eight_tags_distinct() {
         let tags = [
             ENVELOPE_V1,
             CAPABILITY_V1,
@@ -59,6 +61,7 @@ mod tests {
             REVOCATION_V1,
             ADMIN_COMMAND_V1,
             HOST_OP_KEY_CERT_V1,
+            HOST_DEVICE_CERT_V1,
         ];
         for i in 0..tags.len() {
             for j in 0..tags.len() {

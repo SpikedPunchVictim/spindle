@@ -7,18 +7,18 @@
 //! # Modules
 //! - [`canonical`] — the canonical CBOR codec (encoder + strict decoder). See its module docs
 //!   for why it is hand-rolled rather than built on `minicbor`.
-//! - [`tags`] — the seven A7b domain-separation tags and the `tag || bytes` signing-input
+//! - [`tags`] — the eight A7b domain-separation tags and the `tag || bytes` signing-input
 //!   helper.
-//! - [`artifacts`] — the seven A7b wire structures ([`Envelope`], [`Capability`],
+//! - [`artifacts`] — the eight A7b wire structures ([`Envelope`], [`Capability`],
 //!   [`AdmissionToken`], [`DeviceCertificate`], [`RevocationRecord`], [`AdminCommand`],
-//!   [`HostOpKeyCert`]).
+//!   [`HostOpKeyCert`], [`HostDeviceCert`]).
 //! - [`vfs_rpc`] — the VFS RPC wire types (DESIGN.md §A8), Stage 6 slice 3: request/reply types
 //!   for `list`/`stat`/`read`/`mkdir`/`delete`/`whoami` and the typed VFS error-code model. Not
-//!   one of the seven A7b signed artifacts (no domain tag, no `sig`) — see that module's doc
+//!   one of the eight A7b signed artifacts (no domain tag, no `sig`) — see that module's doc
 //!   comment for why.
 //! - [`signaling`] — the connect/answer/trickle-ICE payload wire types (DESIGN.md §A6/§A7,
 //!   §A10.31/32), promoted from `spikes/s2-signaling`'s crate-local types. Also not one of the
-//!   seven A7b signed artifacts — see that module's doc comment for why.
+//!   eight A7b signed artifacts — see that module's doc comment for why.
 //!
 //! # Schema choices
 //!

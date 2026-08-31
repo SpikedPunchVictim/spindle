@@ -41,6 +41,7 @@ export {
   verifyAdmissionToken,
   verifyCapability,
   verifyDeviceCertificate,
+  verifyHostDeviceCert,
   verifyHostOpKeyCert,
   verifyRevocationRecord,
 } from "./artifacts.js";

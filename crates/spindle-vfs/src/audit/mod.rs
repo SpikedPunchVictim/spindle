@@ -7,16 +7,17 @@
 //! [`crate::store::Store::audit`]) rather than opening a second connection to the same file — see
 //! "Transaction discipline" below for why that matters.
 //!
-//! # Not one of the seven A7b wire artifacts
+//! # Not one of the eight A7b wire artifacts
 //!
-//! DESIGN.md §A7b catalogs seven signed wire artifacts (Envelope, Capability, AdmissionToken,
-//! DeviceCertificate, RevocationRecord, AdminCommand, HostOpKeyCert); the audit chain's signed
-//! head is not one of them — it never crosses the wire, it is a host-local durability artifact
-//! only ever read back by the same host that wrote it (via `Store::open`/`Audit::verify_*`). This
-//! mirrors exactly how `spindle-core`'s pre-committed root-rotation record is treated (see
-//! `spindle_core::identity`'s module doc comment: "not one of spindle-proto's seven A7b-cataloged
-//! wire artifacts ... this module defines its own minimal domain-separated signing input inside
-//! this crate rather than adding an unauthorized type to spindle-proto"). Despite being
+//! DESIGN.md §A7b catalogs eight signed wire artifacts (Envelope, Capability, AdmissionToken,
+//! DeviceCertificate, RevocationRecord, AdminCommand, HostOpKeyCert, HostDeviceCert); the audit
+//! chain's signed head is not one of them — it never crosses the wire, it is a host-local
+//! durability artifact only ever read back by the same host that wrote it (via
+//! `Store::open`/`Audit::verify_*`). This mirrors exactly how `spindle-core`'s pre-committed
+//! root-rotation record is treated (see `spindle_core::identity`'s module doc comment: "not one
+//! of spindle-proto's eight A7b-cataloged wire artifact types ... this module defines its own
+//! minimal domain-separated signing input inside this crate rather than adding an unauthorized
+//! type to spindle-proto"). Despite being
 //! crate-local, it still follows A7b's *discipline* (a distinct, versioned domain-separation tag)
 //! — see below.
 //!

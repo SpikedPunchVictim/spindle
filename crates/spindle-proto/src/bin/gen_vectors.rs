@@ -12,8 +12,8 @@
 //! staying dependency-free end to end (library and bin alike).
 
 use spindle_proto::artifacts::{
-    AdminCommand, AdmissionToken, CapKind, Capability, DeviceCertificate, Envelope, HostOpKeyCert,
-    RevocationRecord,
+    AdminCommand, AdmissionToken, CapKind, Capability, DeviceCertificate, Envelope, HostDeviceCert,
+    HostOpKeyCert, RevocationRecord,
 };
 use spindle_proto::canonical::{canonical_encode, CborValue};
 use spindle_proto::signaling::{AnswerPayload, IcePayload, OfferPayload, Transport};
@@ -249,6 +249,11 @@ fn main() {
         &vectors_dir,
         "host-op-key-cert.json",
         host_op_key_cert_vectors(),
+    );
+    write_vector_file(
+        &vectors_dir,
+        "host-device-cert.json",
+        host_device_cert_vectors(),
     );
     write_vector_file(
         &vectors_dir,
@@ -714,6 +719,76 @@ fn host_op_key_cert_vectors() -> Json {
         ),
     ];
     artifact_file("HostOpKeyCert", tags::HOST_OP_KEY_CERT_V1, cases)
+}
+
+// ---- HostDeviceCert ----
+
+fn host_device_cert_vectors() -> Json {
+    // The embedded `op_cert` is itself an opaque `HostOpKeyCert` canonical encoding (A10.35, same
+    // embedding convention as `Capability`'s A10.30 op_cert) — `spindle-proto` has no crypto
+    // dependency, so its `sig_host_root` here is the same kind of dummy byte pattern every other
+    // `sig*` field in this file uses, not a valid signature (see module docs).
+    let dummy_op_cert = HostOpKeyCert {
+        host_op_pk: rep(0xb1, 32),
+        nats_fp: rep(0xb2, 32),
+        ts: 1_755_907_200,
+        exp: 1_763_683_200, // ts + 90 days
+        sig_host_root: rep(0xb3, 64),
+    };
+    let op_cert_bytes = dummy_op_cert.to_canonical_bytes();
+
+    fn build(ts: u64, exp: u64, op_cert_bytes: Vec<u8>) -> HostDeviceCert {
+        HostDeviceCert {
+            host_fp: rep(0xc0, 32),
+            host_root_pk: rep(0xc1, 32),
+            op_cert: op_cert_bytes,
+            host_device_fp: rep(0xc2, 32),
+            alg_id: 1,
+            sign_pk: rep(0xc3, 32),
+            agree_pk: rep(0xc4, 32),
+            ts,
+            exp,
+            sig_host_op: rep(0xc5, 64),
+        }
+    }
+    let c1 = build(1_755_907_200, 1_763_683_200, op_cert_bytes.clone()); // +90 days (rotation-scale exp)
+    let c2 = build(1_763_683_200, 1_771_459_200, op_cert_bytes); // re-signed on next op-key window
+
+    fn decoded(c: &HostDeviceCert) -> Json {
+        Json::Obj(vec![
+            ("host_fp", Json::hex(&c.host_fp)),
+            ("host_root_pk", Json::hex(&c.host_root_pk)),
+            ("op_cert", Json::hex(&c.op_cert)),
+            ("host_device_fp", Json::hex(&c.host_device_fp)),
+            ("alg_id", Json::UInt(c.alg_id as u64)),
+            ("sign_pk", Json::hex(&c.sign_pk)),
+            ("agree_pk", Json::hex(&c.agree_pk)),
+            ("ts", Json::UInt(c.ts)),
+            ("exp", Json::UInt(c.exp)),
+            ("sig_host_op", Json::hex(&c.sig_host_op)),
+        ])
+    }
+
+    let cases = vec![
+        case(
+            "freshly_issued",
+            "Host device certificate at issuance (A10.35): host_fp/host_root_pk/op_cert are the \
+             self-verifying root->op chain (A10.30's embedding convention), host_device_fp is the \
+             host's dedicated A7 envelope identity, signed by the host operating key.",
+            decoded(&c1),
+            &c1.to_canonical_bytes(),
+            &c1.signing_input(),
+        ),
+        case(
+            "resigned_on_next_window",
+            "Same host device identity re-signed with a rolled-forward ts/exp window, mirroring \
+             HostOpKeyCert's rotated case.",
+            decoded(&c2),
+            &c2.to_canonical_bytes(),
+            &c2.signing_input(),
+        ),
+    ];
+    artifact_file("HostDeviceCert", tags::HOST_DEVICE_CERT_V1, cases)
 }
 
 // ---- canonical-cbor.json: primitive canonicalization cases ----

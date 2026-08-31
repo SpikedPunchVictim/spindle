@@ -10,6 +10,7 @@
 //! | [`DeviceCertificate`](spindle_proto::artifacts::DeviceCertificate) | identity root |
 //! | [`Capability`](spindle_proto::artifacts::Capability) | host operating key, chained to the host root via an embedded `op_cert` (decision A10.30; `host_fp` is root-derived, self-verifying) |
 //! | [`HostOpKeyCert`](spindle_proto::artifacts::HostOpKeyCert) | host root |
+//! | [`HostDeviceCert`](spindle_proto::artifacts::HostDeviceCert) | host operating key, chained to the host root via an embedded `op_cert` (decision A10.35; self-verifying like `Capability`, but `verify_host_device_cert` additionally *requires* a pinned `host_fp` argument) |
 //! | [`RevocationRecord`](spindle_proto::artifacts::RevocationRecord) | host op key or identity root |
 //! | [`AdmissionToken`](spindle_proto::artifacts::AdmissionToken) | operator admission key |
 //! | [`AdminCommand`](spindle_proto::artifacts::AdminCommand) | operator admission key |
@@ -22,6 +23,7 @@ mod admin_command;
 mod admission_token;
 mod capability;
 mod device_cert;
+mod host_device_cert;
 mod host_op_key_cert;
 mod revocation;
 
@@ -29,6 +31,7 @@ pub use admin_command::{issue_admin_command, verify_admin_command};
 pub use admission_token::{issue_admission_token, verify_admission_token};
 pub use capability::{issue_capability, verify_capability};
 pub use device_cert::{issue_device_certificate, verify_device_certificate};
+pub use host_device_cert::{issue_host_device_cert, verify_host_device_cert};
 pub use host_op_key_cert::{issue_host_op_key_cert, verify_host_op_key_cert};
 pub use revocation::{is_newer_epoch, issue_revocation_record, verify_revocation_record};
 

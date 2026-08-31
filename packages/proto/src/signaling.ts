@@ -7,7 +7,7 @@
 // instead of a `"sha256:<hex>"` string, `transport` as a closed enum instead of free text, and
 // explicit length caps on the text fields).
 //
-// Not one of the seven A7b signed-artifact kinds (no domain-separation tag, no `sig` field): like
+// Not one of the eight A7b signed-artifact kinds (no domain-separation tag, no `sig` field): like
 // `vfsRpc.ts`, these payloads are never signed independently — an offer/answer/ICE payload is
 // always the *plaintext* that gets AEAD-sealed inside an `Envelope` (`k0` for the offer, `k1` for
 // everything after — DESIGN.md §A7's key schedule), and the envelope's own `spindle-env-v1`

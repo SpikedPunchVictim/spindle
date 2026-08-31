@@ -26,6 +26,8 @@ export const REVOCATION_V1: Uint8Array = encoder.encode("spindle-rev-v1");
 export const ADMIN_COMMAND_V1: Uint8Array = encoder.encode("spindle-adm-cmd-v1");
 /** `HostOpKeyCert` (A4) — signed by the host root. */
 export const HOST_OP_KEY_CERT_V1: Uint8Array = encoder.encode("spindle-host-cert-v1");
+/** `HostDeviceCert` (A4/A10.35) — signed by the host operating key. */
+export const HOST_DEVICE_CERT_V1: Uint8Array = encoder.encode("spindle-host-dev-cert-v1");
 
 /**
  * Concatenates a domain tag with a byte string — `tag || bytes`. No hashing, no signing: this

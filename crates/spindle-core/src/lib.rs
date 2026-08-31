@@ -9,7 +9,8 @@
 //!   `device_fp`, `host_fp`), with a base32 (RFC 4648, no padding, lowercase) `Display`.
 //! - [`identity`] — [`RootKey`] (person/host identity root, pre-committed rotation) and
 //!   [`DeviceKey`] (Ed25519 sign + X25519 agree keypair).
-//! - [`artifacts`] — issue/verify functions for the six non-`Envelope` A7b signed-artifact types.
+//! - [`artifacts`] — issue/verify functions for the seven non-`Envelope` A7b signed-artifact
+//!   types.
 //! - [`envelope`] — the A7 end-to-end signaling envelope: session-key derivation, `seal`/`open`.
 //!
 //! # Design notes and ambiguities (reported, not silently resolved)
@@ -19,7 +20,7 @@
 //!   has no `nbf` field. [`artifacts::verify_capability`] therefore checks only `exp`. See that
 //!   function's doc comment.
 //! - **Root rotation has no proto wire type**: DESIGN.md §A4's `sig_old_root(new_root_pk)` /
-//!   pre-committed-hash rotation is not one of spindle-proto's seven A7b-cataloged artifacts.
+//!   pre-committed-hash rotation is not one of spindle-proto's eight A7b-cataloged artifacts.
 //!   [`identity::sign_root_rotation`]/[`identity::verify_root_rotation`] define their own minimal
 //!   domain-separated signing input inside this crate rather than adding an unauthorized type to
 //!   `spindle-proto`.

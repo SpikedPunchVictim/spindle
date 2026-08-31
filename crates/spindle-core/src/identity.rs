@@ -91,13 +91,13 @@ pub fn root_fp_of(root_pk: &VerifyingKey) -> Fingerprint {
 
 // ---- Pre-committed root rotation ----
 //
-// Root rotation is *not* one of spindle-proto's seven A7b-cataloged wire artifact types
+// Root rotation is *not* one of spindle-proto's eight A7b-cataloged wire artifact types
 // (Envelope, Capability, AdmissionToken, DeviceCertificate, RevocationRecord, AdminCommand,
-// HostOpKeyCert — see spindle_proto::artifacts). DESIGN.md §A4 and ADR-003 describe it in prose
-// only (`sig_old_root(new_root_pk)`, `hash(next_root_pk)` pre-committed), with no corresponding
-// struct in spindle-proto's schema-of-record. Rather than inventing an unauthorized addition to
-// spindle-proto's wire types, this module defines its own minimal domain-separated signing input
-// for the rotation signature, kept entirely inside spindle-core.
+// HostOpKeyCert, HostDeviceCert — see spindle_proto::artifacts). DESIGN.md §A4 and ADR-003
+// describe it in prose only (`sig_old_root(new_root_pk)`, `hash(next_root_pk)` pre-committed),
+// with no corresponding struct in spindle-proto's schema-of-record. Rather than inventing an
+// unauthorized addition to spindle-proto's wire types, this module defines its own minimal
+// domain-separated signing input for the rotation signature, kept entirely inside spindle-core.
 
 const ROOT_ROTATION_TAG: &[u8] = b"spindle-root-rotation-v1";
 

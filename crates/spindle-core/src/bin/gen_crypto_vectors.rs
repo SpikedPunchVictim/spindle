@@ -16,9 +16,9 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use spindle_core::artifacts::{
     issue_admin_command, issue_admission_token, issue_capability, issue_device_certificate,
-    issue_host_op_key_cert, issue_revocation_record, verify_admin_command, verify_admission_token,
-    verify_capability, verify_device_certificate, verify_host_op_key_cert,
-    verify_revocation_record,
+    issue_host_device_cert, issue_host_op_key_cert, issue_revocation_record, verify_admin_command,
+    verify_admission_token, verify_capability, verify_device_certificate, verify_host_device_cert,
+    verify_host_op_key_cert, verify_revocation_record,
 };
 use spindle_core::envelope::{
     derive_bootstrap_key, derive_session_key, open, seal, OpenParams, SealParams,
@@ -225,6 +225,7 @@ fn main() {
     );
     write_vector_file(&dir, "capability.json", capability_vectors());
     write_vector_file(&dir, "host-op-key-cert.json", host_op_key_cert_vectors());
+    write_vector_file(&dir, "host-device-cert.json", host_device_cert_vectors());
     write_vector_file(&dir, "revocation-record.json", revocation_record_vectors());
     write_vector_file(&dir, "admission-token.json", admission_token_vectors());
     write_vector_file(&dir, "admin-command.json", admin_command_vectors());
@@ -521,6 +522,122 @@ fn host_op_key_cert_vectors() -> Json {
                 Json::hex(host_root.public_key().as_bytes()),
             ),
             ("root_fp_hex", Json::hex(&host_root.root_fp().to_vec())),
+        ]),
+        cases,
+    )
+}
+
+// ---- HostDeviceCert ----
+
+/// A10.35: `HostDeviceCert` chains root -> op key -> a dedicated host device key, the host's own
+/// §A7 envelope identity. Reuses `HOST_ROOT_SEED`/`HOST_OP_SEED` (the same host identity
+/// `host_op_key_cert_vectors`/`capability_vectors` already use) and `DEVICE_B_SIGN_SEED`/
+/// `DEVICE_B_AGREE_SEED` (already labeled "host device" — the same identity `envelope_vectors`
+/// uses in the `to_fp` role) so all four vector files describe one consistent host end to end.
+fn host_device_cert_vectors() -> Json {
+    let host_root = RootKey::from_seed(HOST_ROOT_SEED);
+    let host_op = SigningKey::from_bytes(&HOST_OP_SEED);
+    let op_cert_ts = 1_755_907_200;
+    let op_cert_exp = 1_763_683_200; // ts + 90 days
+    let op_cert = issue_host_op_key_cert(
+        &host_root,
+        &host_op.verifying_key(),
+        Fingerprint::of_parts(&[b"gen-crypto-vectors:host-device-cert:op-cert-nats"]),
+        op_cert_ts,
+        op_cert_exp,
+    );
+
+    let host_device = DeviceKey::from_seeds(DEVICE_B_SIGN_SEED, DEVICE_B_AGREE_SEED);
+    let ts = 1_755_907_200;
+    let exp = 1_763_683_200; // ts + 90 days, rotation-scale like the op cert
+
+    let cert = issue_host_device_cert(
+        &host_op,
+        host_root.root_fp(),
+        &host_root.public_key(),
+        &op_cert,
+        host_device.alg_id(),
+        &host_device.sign_public_key(),
+        &host_device.agree_public_key(),
+        ts,
+        exp,
+    );
+    assert!(verify_host_device_cert(&cert, &host_root.root_fp(), ts).is_ok());
+
+    fn decoded(c: &spindle_proto::artifacts::HostDeviceCert) -> Json {
+        Json::Obj(vec![
+            ("host_fp", Json::hex(&c.host_fp)),
+            ("host_root_pk", Json::hex(&c.host_root_pk)),
+            ("op_cert", Json::hex(&c.op_cert)),
+            ("host_device_fp", Json::hex(&c.host_device_fp)),
+            ("alg_id", Json::UInt(c.alg_id as u64)),
+            ("sign_pk", Json::hex(&c.sign_pk)),
+            ("agree_pk", Json::hex(&c.agree_pk)),
+            ("ts", Json::UInt(c.ts)),
+            ("exp", Json::UInt(c.exp)),
+            ("sig_host_op", Json::hex(&c.sig_host_op)),
+        ])
+    }
+
+    let mut tampered = cert.clone();
+    tampered.sig_host_op = flip_last_byte(&cert.sig_host_op);
+    assert!(verify_host_device_cert(&tampered, &host_root.root_fp(), ts).is_err());
+
+    let cases = vec![
+        case(
+            "valid",
+            "Host device certificate chained root -> op cert -> device sig (A10.35): host_fp = \
+             SHA-256(host_root_pk), op_cert is the embedded real HostOpKeyCert, host_device_fp is \
+             the host's dedicated A7 envelope identity, sig_host_op is by the op key op_cert \
+             certifies.",
+            decoded(&cert),
+            &cert.to_canonical_bytes(),
+            &cert.signing_input(),
+            &cert.sig_host_op,
+            true,
+        ),
+        case(
+            "tampered_signature_last_byte",
+            "sig_host_op's last byte flipped; verify_host_device_cert must reject with BadSignature.",
+            decoded(&tampered),
+            &tampered.to_canonical_bytes(),
+            &tampered.signing_input(),
+            &tampered.sig_host_op,
+            false,
+        ),
+    ];
+
+    artifact_file(
+        "HostDeviceCert",
+        spindle_proto::tags::HOST_DEVICE_CERT_V1,
+        Json::Obj(vec![
+            (
+                "role",
+                Json::Str("host_root_and_operating_key_chain".into()),
+            ),
+            ("root_seed", seed_field("TEST-ONLY", &HOST_ROOT_SEED)),
+            (
+                "host_root_pk_hex",
+                Json::hex(host_root.public_key().as_bytes()),
+            ),
+            ("host_fp_hex", Json::hex(&host_root.root_fp().to_vec())),
+            ("op_seed", seed_field("TEST-ONLY", &HOST_OP_SEED)),
+            (
+                "op_public_key_hex",
+                Json::hex(host_op.verifying_key().as_bytes()),
+            ),
+            (
+                "op_cert_canonical_cbor_hex",
+                Json::hex(&op_cert.to_canonical_bytes()),
+            ),
+            (
+                "host_device_sign_seed",
+                seed_field("TEST-ONLY", &DEVICE_B_SIGN_SEED),
+            ),
+            (
+                "host_device_agree_seed",
+                seed_field("TEST-ONLY", &DEVICE_B_AGREE_SEED),
+            ),
         ]),
         cases,
     )

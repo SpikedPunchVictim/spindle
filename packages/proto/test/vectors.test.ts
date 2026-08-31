@@ -1,4 +1,4 @@
-// Golden-vector conformance for all seven A7b wire types (vectors/*.json, excluding
+// Golden-vector conformance for all eight A7b wire types (vectors/*.json, excluding
 // canonical-cbor.json — see canonical.test.ts for that one) plus negative mutation tests: swap
 // key order, lengthen an integer's encoding, and add an unrecognized field, each asserted to be
 // rejected by the strict decoder / closed-schema artifact reader.
@@ -16,6 +16,7 @@ import {
   Capability,
   DeviceCertificate,
   Envelope,
+  HostDeviceCert,
   HostOpKeyCert,
   ProtoError,
   RevocationRecord,
@@ -30,6 +31,7 @@ import {
   parseCapability,
   parseDeviceCertificate,
   parseEnvelope,
+  parseHostDeviceCert,
   parseHostOpKeyCert,
   parseRevocationRecord,
   swapFirstTwoEntries,
@@ -199,6 +201,14 @@ runArtifactSuite({
   toCanonicalBytes: HostOpKeyCert.toCanonicalBytes,
   fromCanonicalBytes: HostOpKeyCert.fromCanonicalBytes,
   signingInput: HostOpKeyCert.signingInput,
+});
+
+runArtifactSuite({
+  fileName: "host-device-cert.json",
+  parse: parseHostDeviceCert,
+  toCanonicalBytes: HostDeviceCert.toCanonicalBytes,
+  fromCanonicalBytes: HostDeviceCert.fromCanonicalBytes,
+  signingInput: HostDeviceCert.signingInput,
 });
 
 describe("device-certificate.json: label field", () => {

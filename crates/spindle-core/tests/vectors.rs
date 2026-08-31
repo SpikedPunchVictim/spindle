@@ -12,13 +12,13 @@
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use spindle_core::artifacts::{
     verify_admin_command, verify_admission_token, verify_capability, verify_device_certificate,
-    verify_host_op_key_cert, verify_revocation_record,
+    verify_host_device_cert, verify_host_op_key_cert, verify_revocation_record,
 };
 use spindle_core::envelope::{open, OpenParams};
 use spindle_core::{root_fp_of, Fingerprint};
 use spindle_proto::artifacts::{
-    AdminCommand, AdmissionToken, Capability, DeviceCertificate, Envelope, HostOpKeyCert,
-    RevocationRecord,
+    AdminCommand, AdmissionToken, Capability, DeviceCertificate, Envelope, HostDeviceCert,
+    HostOpKeyCert, RevocationRecord,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -382,6 +382,48 @@ fn capability_vectors_verify() {
         let now = case.get("decoded").get("exp").as_u64(); // at exactly exp: still valid (now > exp fails)
         let result = verify_capability(&cap, now);
         assert_eq!(result.is_ok(), case.get("signature_valid").as_bool());
+    }
+}
+
+// ================================================================================================
+// HostDeviceCert: self-verifying like Capability, but verify_host_device_cert additionally
+// requires the caller's pinned host_fp (decision A10.35) — this vector's cases all pin the
+// certificate's own declared host_fp, since that's the "client already pinned this host" case the
+// signature-validity cases are exercising.
+// ================================================================================================
+
+#[test]
+fn host_device_cert_vectors_verify() {
+    let doc = load("host-device-cert.json");
+    let expected_host_fp = fingerprint_from_hex(doc.get("signer").get("host_fp_hex"));
+
+    for case in doc.get("cases").as_arr() {
+        let cert = HostDeviceCert {
+            host_fp: case.get("decoded").get("host_fp").hex(),
+            host_root_pk: case.get("decoded").get("host_root_pk").hex(),
+            op_cert: case.get("decoded").get("op_cert").hex(),
+            host_device_fp: case.get("decoded").get("host_device_fp").hex(),
+            alg_id: case.get("decoded").get("alg_id").as_u64() as u8,
+            sign_pk: case.get("decoded").get("sign_pk").hex(),
+            agree_pk: case.get("decoded").get("agree_pk").hex(),
+            ts: case.get("decoded").get("ts").as_u64(),
+            exp: case.get("decoded").get("exp").as_u64(),
+            sig_host_op: case.get("decoded").get("sig_host_op").hex(),
+        };
+        assert_eq!(
+            cert.to_canonical_bytes(),
+            case.get("canonical_cbor_hex").hex()
+        );
+        assert_eq!(cert.signing_input(), case.get("signing_input_hex").hex());
+
+        let now = case.get("decoded").get("exp").as_u64(); // at exactly exp: still valid (now > exp fails)
+        let result = verify_host_device_cert(&cert, &expected_host_fp, now);
+        assert_eq!(
+            result.is_ok(),
+            case.get("signature_valid").as_bool(),
+            "case `{}`",
+            case.get("name").as_str()
+        );
     }
 }
 
