@@ -68,6 +68,7 @@ use spindle_helper::authz::{
     self, AdmissionMode, AdmissionRecord, AuthzDecision, DeviceConnectPresented, HelperView,
     HostConnectPresented,
 };
+use spindle_helper::kick;
 use spindle_helper::memory_store::InMemoryHelperView;
 use spindle_helper::natsjwt::{self, NatsJwtError};
 use spindle_helper::permissions::{Limits, SubjectPermissions};
@@ -655,6 +656,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     let mut presence_map = seed_presence_map(sys_ref, &mut store, now_secs()).await;
 
+    // Kick relay (DESIGN.md §A3, S9 leg 3 — see `spindle_helper::kick`'s module doc). Fed only
+    // from live `$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT` events below, unlike `presence_map`: there
+    // is no CONNZ-seeding equivalent for it (see that module's "Out of scope" section).
+    let mut kick_map = kick::KickMap::new();
+
     // Periodic best-effort cleanup of expired session records (DESIGN.md §A9b: "a cleanup path
     // for expired rows (on-read filter + periodic delete — keep simple)"). The on-read `exp`
     // filter in `HelperView::session_record` already makes this a non-correctness-affecting
@@ -754,6 +760,48 @@ async fn run(config: Config) -> anyhow::Result<()> {
                             revoked_count,
                             "registry.revoke.<hfp> record accepted"
                         );
+
+                        // Leg 3 (S9): kick every live connection the revocation reaches. This
+                        // re-decodes the payload to recover the actual `revoked` fingerprints —
+                        // `RevokeOutcome::Accepted` only reports a count (see `revoke.rs`'s doc
+                        // comment on that type), and `ingest_revocation` already proved the
+                        // payload decodes (it returned `Accepted`), so a decode failure here is
+                        // not expected to ever happen; if it somehow did, no kicks are issued for
+                        // this record rather than panicking.
+                        match spindle_proto::artifacts::RevocationRecord::from_canonical_bytes(&msg.payload) {
+                            Ok(record) => {
+                                let revoked_fps: Vec<spindle_core::Fingerprint> = record
+                                    .revoked
+                                    .iter()
+                                    .filter_map(|b| spindle_core::Fingerprint::from_slice(b).ok())
+                                    .collect();
+                                let plan = kick::kicks_for_revocation(
+                                    &revoked_fps,
+                                    &kick_map,
+                                    &mut store,
+                                    now_secs(),
+                                );
+                                if plan.sessions_without_connection > 0 {
+                                    tracing::info!(
+                                        %host_fp,
+                                        sessions_without_connection = plan.sessions_without_connection,
+                                        "revocation matched live session records with no known \
+                                         connection to kick"
+                                    );
+                                }
+                                for target in plan.targets {
+                                    issue_kick(sys_ref, &target).await;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    %host_fp,
+                                    error = ?e,
+                                    "accepted revocation's payload failed to re-decode for the \
+                                     kick relay — no kicks issued for this record"
+                                );
+                            }
+                        }
                     }
                     revoke::RevokeOutcome::Rejected(reason) => {
                         tracing::warn!(
@@ -785,6 +833,12 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     );
                     continue;
                 };
+                // Kick-relay feed (DESIGN.md §A3, S9): a malformed/missing server.id or
+                // client.id just means this connection isn't kickable yet — never fatal, and
+                // never blocks presence tracking below.
+                if let Some((server_id, cid)) = kick_coords_from_sys_event(&msg.payload) {
+                    kick_map.connect(&user_pk, server_id, cid);
+                }
                 if let Some(delta) = presence_map.connect(&user_pk, now_secs()) {
                     publish_presence_delta(&app_client, delta).await;
                 }
@@ -812,6 +866,12 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 // presence map below, which only exists for registered hosts.
                 if let Ok(nats_fp) = auth_token::nats_fp_of_nkey(&user_pk) {
                     store.delete_session_record(&nats_fp);
+                }
+                // Kick-relay feed: only removes the entry if this DISCONNECT's own cid still
+                // matches what's stored (see `kick::KickMap::disconnect`'s doc comment on why a
+                // stale disconnect must not evict a newer reconnection's coordinates).
+                if let Some((_, cid)) = kick_coords_from_sys_event(&msg.payload) {
+                    kick_map.disconnect(&user_pk, cid);
                 }
                 if let Some(delta) = presence_map.disconnect(&user_pk, now_secs()) {
                     publish_presence_delta(&app_client, delta).await;
@@ -854,6 +914,109 @@ fn user_from_sys_event(payload: &[u8]) -> Option<String> {
         .get("user")?
         .as_str()
         .map(|s| s.to_string())
+}
+
+/// Extracts `(server_id, cid)` from a `$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT` event payload — the
+/// kick relay's per-connection coordinates (DESIGN.md §A3, S9). `server_id` is `server.id`, `cid`
+/// is `client.id` — both established live by `spikes/s9-revoke-kick/RESULTS.md` fact 3 ("The
+/// server id is at `server.id` in every ... advisory. The cid is at `client.id`"). Kept as a
+/// sibling of [`user_from_sys_event`] above rather than folded into it (same tolerant
+/// `serde_json::Value` style, same "malformed event is ignored, never fatal" rule) so a payload
+/// missing only these two fields still resolves `client.user` normally for presence tracking.
+fn kick_coords_from_sys_event(payload: &[u8]) -> Option<(String, u64)> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let server_id = value.get("server")?.get("id")?.as_str()?.to_string();
+    let cid = value.get("client")?.get("id")?.as_u64()?;
+    Some((server_id, cid))
+}
+
+/// Issues one `$SYS.REQ.SERVER.<server_id>.KICK` request for `target` on `sys_client` (the
+/// SYS-account connection `spikes/s9-revoke-kick/RESULTS.md` confirmed live is permitted to issue
+/// KICK) and logs the outcome. **A reply is not success** — RESULTS.md's single most important
+/// finding (fact 5) is that a failed kick still returns a reply (an error object), never a
+/// transport failure, so treating "a reply arrived" as "it worked" reports phantom kicks. Success
+/// is signaled purely by the *absence* of an `error` key in the reply (RESULTS.md §4 — there is
+/// no positive success marker to check for instead), so this parses the reply body and checks for
+/// that key explicitly rather than short-circuiting on `Ok(reply)`.
+///
+/// A transport failure, a timeout, or an unparseable/error reply is logged at `error!` and
+/// swallowed — never propagated — so one failed kick can never take the responder down or stop
+/// the rest of a revocation's batch of kicks from being attempted (`src/bin/helper.rs`'s only
+/// caller loops over every [`kick::KickTarget`] regardless of this call's outcome).
+async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) {
+    let subject = format!("$SYS.REQ.SERVER.{}.KICK", target.server_id);
+    let payload = match serde_json::to_vec(&serde_json::json!({ "cid": target.cid })) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to serialize a KICK request payload");
+            return;
+        }
+    };
+
+    let reply = match tokio::time::timeout(
+        Duration::from_secs(5),
+        sys_client.request(subject.clone(), payload.into()),
+    )
+    .await
+    {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(e)) => {
+            tracing::error!(
+                error = %e,
+                subject = %subject,
+                cid = target.cid,
+                nats_fp = %target.nats_fp,
+                "KICK request failed (transport)"
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::error!(
+                subject = %subject,
+                cid = target.cid,
+                nats_fp = %target.nats_fp,
+                "KICK request timed out"
+            );
+            return;
+        }
+    };
+
+    let value: serde_json::Value = match serde_json::from_slice(&reply.payload) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                subject = %subject,
+                cid = target.cid,
+                nats_fp = %target.nats_fp,
+                reply = %String::from_utf8_lossy(&reply.payload),
+                "KICK reply was not valid JSON — treating as failed, not successful"
+            );
+            return;
+        }
+    };
+
+    // Success is the ABSENCE of an "error" key (RESULTS.md §4) — never inferred from the reply
+    // merely having arrived (fact 5). A failed kick still gets a well-formed reply.
+    if let Some(error) = value.get("error") {
+        tracing::error!(
+            subject = %subject,
+            cid = target.cid,
+            nats_fp = %target.nats_fp,
+            matched_subject = %target.matched_subject,
+            server_error = %error,
+            "KICK request was answered but failed"
+        );
+        return;
+    }
+
+    tracing::info!(
+        subject = %subject,
+        cid = target.cid,
+        nats_fp = %target.nats_fp,
+        matched_subject = %target.matched_subject,
+        "kicked a revoked connection"
+    );
 }
 
 /// Publishes one `host.<hfp>.presence` delta (DESIGN.md §A6: "push deltas `{host_fp, state,

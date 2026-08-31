@@ -54,8 +54,10 @@
 //! touches an actual NATS publish; this module just computes the delta.
 //!
 //! # Out of scope (DESIGN.md items this module deliberately does not implement)
-//! Kick relay (`device_fp -> (server_id, cid)`, §A3); the "two daemons with the same restored
-//! host key" split-brain newest-wins policy (§A6); multi-server `CONNZ` reply aggregation (§A6
+//! Kick relay (§A3) — now implemented, see [`crate::kick`] (keyed by `nats_fp`, not `device_fp`;
+//! that module's own doc comment explains the deviation from §A3's literal key shape); the "two
+//! daemons with the same restored host key" split-brain newest-wins policy (§A6); multi-server
+//! `CONNZ` reply aggregation (§A6
 //! defers this explicitly — "confirmed by S1's negative-test suite" language aside, HA is S8's
 //! job, and `src/bin/helper.rs`'s CONNZ-seeding step takes only the first reply); leader-only
 //! delta publishing (A10.23 — today there is exactly one helper binary, so every helper instance

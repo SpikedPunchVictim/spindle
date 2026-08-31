@@ -85,6 +85,7 @@
 
 pub mod auth_token;
 pub mod authz;
+pub mod kick;
 pub mod memory_store;
 pub mod natsjwt;
 pub mod permissions;
