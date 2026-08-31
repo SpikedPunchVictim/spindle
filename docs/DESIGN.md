@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.17) + Execution Plan
+# Spindle — System Design Document (draft v0.9.18) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -40,6 +40,9 @@
 > client's real NATS reply subject into signed material, checked by the host after decryption; deciding it exposed
 > and fixed a latent defect where the signed `inbox` never matched the reply subject the client actually listened on.
 > Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and the **[DEFAULT]**-flagged rows in A10.
+> v0.9.18: root-signed self-revocations routed via a new `helper.revoke.<nfp>` subject and a distinct
+> `spindle-self-rev-v1` artifact; session record gains `device_fp`; §A4's kick payload corrected to `{cid}` on live
+> evidence (2026-08-31).
 
 ---
 
@@ -316,12 +319,19 @@ change = hard, non-dismissable wall. Safety numbers optional.
 
 **Revocation**: host revokes a member (root) or a device → bumps epoch and publishes a **host-signed revocation
 record** `{host_fp, epoch, revoked: [root_fp|device_fp], ts, sig_host_op}` to `registry.revoke`; the helper stores it
-durably, kicks live connections (`$SYS.REQ.SERVER.<id>.KICK {id: cid}` via its connection map), and refuses the
-cap on re-auth; the host rejects envelopes/VFS requests from revoked keys **per request** (authoritative); live VFS
-sessions are dropped. Cut-off target < 5 s (S9). A person revokes a lost device with a **root-signed** revocation,
+durably, kicks live connections (`$SYS.REQ.SERVER.<id>.KICK {cid}` via its connection map — **[corrected v0.9.18]**
+the payload field is `cid`, not `id`; `{id: …}` returns a 500 "no such client or leafnode id" and kicks nothing, and
+there is no `PING.KICK` broadcast form, so a concrete `server.id` is always required (spikes/s9-revoke-kick)), and
+refuses the cap on re-auth; the host rejects envelopes/VFS requests from revoked keys **per request** (authoritative);
+live VFS sessions are dropped. Cut-off target < 5 s (S9). A kicked client reconnects on its own, so KICK alone cuts
+nobody off — the cut-off holds only because the callout refuses the reconnect, making the helper's durable revocation
+store part of the cut-off path, not a backstop. A person revokes a lost device with a **root-signed** revocation,
 delivered to each host on next contact *and* deposited at the helper so the callout refuses it even while hosts are
-offline (S14). **Root rotation**: `sig_old_root(new_root_pk)` where `hash(new_root_pk)` matches the pre-committed
-value; hosts accept without the wall; owner can also revoke a root out-of-band from the host UI. **Recovery**:
+offline (S14). The self-revocation is a `spindle-self-rev-v1` record deposited via the request/reply subject
+`helper.revoke.<nfp>`; the helper accepts it only if its signer is the `root_fp` in the caller's session record, so a
+device can only ever revoke keys under its own root. **Root rotation**: `sig_old_root(new_root_pk)` where
+`hash(new_root_pk)` matches the pre-committed value; hosts accept without the wall; owner can also revoke a root
+out-of-band from the host UI. **Recovery**:
 recovery phrase restores the root onto a new primary device (decided A10.4); if the root is lost, the documented
 fallback is per-host owner **re-invite** (member record migrates to the new root) — not a disaster, a normal flow.
 
@@ -398,6 +408,7 @@ Photos because they're in Family") derived directly from the union model.
 | `registry.devcert.<hfp>` | host `hfp` only | broker helper | host-signed device certificate (durable; helper asserts subject token == the cert's `host_fp`; per-host token bucket) |
 | `helper.turn.get.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply TURN credentials; caller identity = the subject token (callout-granted), never the payload; helper authorizes via the session record for `nfp` (below) |
 | `helper.devcert.get.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply fetch of a host device certificate; **caller identity = the subject token (callout-granted), never the payload**; the payload names the target `host_fp`, and the helper serves it only if that host is in the caller's session record (`nats_fp → {root_fp, host_fps, ...}`) — so it cannot be used to enumerate hosts the caller holds no cap for. This mirrors the v0.9.7/v0.9.8 parametrization precedent. |
+| `helper.revoke.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply deposit of a **root-signed** `spindle-self-rev-v1` self-revocation (A4/S14); caller identity = the subject token (callout-granted), never the payload; the helper accepts the record only if its signer is the `root_fp` in the caller's session record, so a device can only revoke keys under its own root; durable; per-root token bucket. |
 | `registry.admin.>` | operator (mTLS + operator cert) | broker helper | signed admin commands (A3b); replies via `allow_responses` |
 | `_INBOX_<dfp>.>` | host via `allow_responses` after prefix check | owning device | private inbox prefix |
 
@@ -405,12 +416,14 @@ Photos because they're in Family") derived directly from the union model.
 - Host: `sub host.<own>.>`, `pub host.<own>.sess.*.*.h2c`, `pub registry.revoke`,
   `allow_responses {max:1, expires:"2m"}`; explicit deny of `_INBOX.>`, `$SYS.>`, `$JS.>`.
 - Client, for each host `h` in its verified caps: `pub host.<h>.connect`, `pub host.<h>.sess.<own>.*.c2h`,
-  `sub host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus `sub _INBOX_<own>.>`, `pub helper.presence.get.<own nfp>`,
-  `pub helper.turn.get.<own nfp>`, `pub helper.devcert.get.<own nfp>`. Invite-only and stale-cap connections get just
-  `pub host.<h>.connect` + inbox. Max 32 hosts per connection (A10.5). **Session record**: on each successful auth the callout writes
-  `nats_fp → {root_fp, host_fps, quota_profile, exp}` to the helper store, so the helper can authorize non-callout
-  requests (`helper.presence.get.<nfp>`, `helper.turn.get.<nfp>` — keyed by the subject token) — cleaned up on
-  DISCONNECT/expiry.
+  `sub host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus `sub _INBOX_<own>.>`,
+  `pub helper.presence.get.<own nfp>`, `pub helper.turn.get.<own nfp>`, `pub helper.devcert.get.<own nfp>`,
+  `pub helper.revoke.<own nfp>`. Invite-only and stale-cap connections get just `pub host.<h>.connect` + inbox. Max 32
+  hosts per connection (A10.5). **Session record**: on each successful auth the callout writes
+  `nats_fp → {root_fp, device_fp, host_fps, quota_profile, exp}` to the helper store — **[amended v0.9.18]**
+  `device_fp` is added so the kick relay can resolve a device-scoped revocation to a live connection (§A3 keys it
+  `device_fp -> (server_id, cid)`) — so the helper can authorize non-callout requests (`helper.presence.get.<nfp>`,
+  `helper.turn.get.<nfp>`, `helper.revoke.<nfp>` — keyed by the subject token) — cleaned up on DISCONNECT/expiry.
   **Account topology (A10.15)**: one application account + a dedicated AUTH (callout) account + system account
   **[amended v0.9.9 — the S1-era config already carried the AUTH account; recorded now]**; every cross-boundary
   subject (`$SYS.REQ.USER.AUTH`, `$SYS` events, `helper.*`, `registry.*`) gets an explicit export/import row in
@@ -539,24 +552,27 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 | Member/invite cap | `spindle-cap-v1` | host op key (chained: embedded root-signed HostOpKeyCert) [amended v0.9.5] | `exp` (no `nbf`; schema-of-record carries none [amended v0.9.4]) | invite: nonce burn (idempotent replay of result); member: n/a |
 | Admission token | `spindle-adm-v1` | operator key | `exp` days | nonce burn at helper (CAS, idempotent) |
 | Device certificate | `spindle-dev-cert-v1` | identity root | `exp` 1 y; re-sign on contact | n/a (revocable) |
-| Revocation record | `spindle-rev-v1` | host op key / identity root | none (permanent) | **max-wins, never decreases**; old records cannot roll back |
+| Revocation record | `spindle-rev-v1` | host op key [amended v0.9.18] | none (permanent) | **max-wins, never decreases**; old records cannot roll back |
+| Self-revocation record | `spindle-self-rev-v1` | identity root | none (permanent) | **max-wins per root**, never decreases |
 | Admin command | `spindle-adm-cmd-v1` | operator key | `ts` ±2 min | per-signer monotonic `seq` + nonce; idempotent execution |
 | Host op-key cert | `spindle-host-cert-v1` | host root | `exp` 90 d | n/a (rotation) |
 | Host device cert | `spindle-host-dev-cert-v1` | host op key | `exp` 90 d | n/a (rotation) |
 
-Root keys sign two artifact types (device certs, self-revocations) — the distinct tags prevent cross-artifact
-signature confusion. Host and helper both use helper server time for `exp`/`nbf` checks (single authority; ±2 min).
+Root keys sign two artifact types (`spindle-dev-cert-v1`, `spindle-self-rev-v1`) — the distinct tags prevent
+cross-artifact signature confusion. Host and helper both use helper server time for `exp`/`nbf` checks (single
+authority; ±2 min).
 
 **Schema-of-record**: the canonical CBOR field-level schema for every artifact above now lives in
 `crates/spindle-proto/src/lib.rs` (Stage 2 implementation), superseding this table for field-level detail. Two
 clarifications resolved during implementation: (1) **Device certificate carries no `label` field** — A4's "labels
 never baked into certificates" rule supersedes the older inline notation that listed `label`; (2) only **Envelope**,
-**Member/invite cap** (Capability), and **Admin command** carry an explicit `v` field — for the other five artifacts
-(Admission token, Device certificate, Revocation record, Host op-key cert, Host device cert) the A7b domain tag above
-is itself the version discriminant; (3) the Capability artifact carries no `nbf` field — `exp` is the sole time bound;
-(4) the pre-committed root-rotation record (`sig_old_root(new_root_pk)`, §A4) is not one of the eight cataloged wire
-artifacts — v1 implements it crate-locally in spindle-core with its own domain tag; promoting it to a spindle-proto
-wire type (with golden vectors) is flagged for when rotation records first cross the wire (device↔host sync); (5)
+**Member/invite cap** (Capability), and **Admin command** carry an explicit `v` field — for the other six artifacts
+(Admission token, Device certificate, Revocation record, Self-revocation record, Host op-key cert, Host device cert)
+the A7b domain tag above is itself the version discriminant; (3) the Capability artifact carries no `nbf` field —
+`exp` is the sole time bound; (4) the pre-committed root-rotation record (`sig_old_root(new_root_pk)`, §A4) is not one
+of the nine cataloged wire artifacts — v1 implements it crate-locally in spindle-core with its own domain tag;
+promoting it to a spindle-proto wire type (with golden vectors) is flagged for when rotation records first cross the
+wire (device↔host sync); (5)
 **[amended v0.9.5, A10.30]** the Capability now embeds the HostOpKeyCert (complete canonical encoding, a byte-string
 field) and is op-key signed rather than host-root signed; `host_fp` is always root-derived — resolving the
 S1-discovered divergence between op-key-signed caps and the root-derived `host_fp` that §A4/§A5 pin and scope by; (6)
@@ -1023,6 +1039,28 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.18 (2026-08-31)** — Four changes. (1) §A4's kick payload corrected: `$SYS.REQ.SERVER.<id>.KICK` takes
+  `{cid}`, not `{id}` — probed live against the composed stack's nats-server 2.10.29
+  (`spikes/s9-revoke-kick/RESULTS.md`, commit bc4f2bb) because `{id: cid}` returns a *reply*, not a transport-level
+  error (`{"error":{"code":500,"description":"no such client or leafnode id"}}`, connection still up) — an
+  implementation that trusted the reply's mere arrival rather than reading its content would have reported kicks that
+  never happened, which is why this was probed before being built rather than assumed from the design text. Also
+  established: there is no `PING.KICK` broadcast form, so a concrete `server.id` (found at `server.id` in every
+  advisory) is always required; and a kicked client reconnects on its own, so KICK alone does not hold anyone off —
+  the cut-off holds only because the callout refuses the reconnect. (2) Root-signed self-revocations get a delivery
+  route: §A5 gave clients no subject to publish one on, so a new **`helper.revoke.<nfp>`** request/reply subject is
+  added, following the `helper.presence.get.<nfp>` (v0.9.8) / `helper.turn.get.<nfp>` (v0.9.7) /
+  `helper.devcert.get.<nfp>` parametrization precedent — caller identity is the callout-granted subject token, never
+  the payload; the helper accepts the record only if its signer is the `root_fp` in the caller's session record, so a
+  device can only ever revoke keys under its own root. (3) Self-revocations get their own artifact,
+  **`spindle-self-rev-v1`** (`{root_fp, epoch, revoked: [device_fp], ts, sig_root}`; `epoch` a per-root monotonic
+  counter maintained by the primary device) — the existing `spindle-rev-v1` requires a `host_fp` and scopes `epoch` to
+  a host's `cap_epoch`, neither of which means anything for a revocation not scoped to one host, and a host receiving
+  a delivered record whose `host_fp` field held a person's `root_fp` would have no discriminator telling it which
+  flavour it had; §A7b's Revocation record row is narrowed to `host op key` alone. (4) The session record gains
+  `device_fp`: §A3 keys the kick relay `device_fp -> (server_id, cid)`, but the session record carried no `device_fp`,
+  so the relay could not resolve a device-scoped revocation to a live connection — `decide_device_connect` already has
+  `device_fp` in hand when it builds the record.
 - **v0.9.17 (2026-08-31)** — A10.36 decided: the connect offer's `inbox` field is a **binding** of the NATS reply
   subject into signed material. The client MUST set `inbox` to the exact reply subject it listens on — subscribing to
   its own inbox and publishing with an explicit reply, rather than letting the NATS client mint one internally — and
