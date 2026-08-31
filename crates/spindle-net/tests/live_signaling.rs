@@ -30,6 +30,42 @@
 //!
 //! `NATS_URL` overrides the stack's TCP listener (default `nats://127.0.0.1:4222`).
 //!
+//! # Rebuild the helper image after any A7b wire-schema change
+//!
+//! The helper runs as a prebuilt container image, not as source the test stack recompiles on
+//! each run. Any change to an A7b artifact's wire schema — a `DeviceCertificate`, a `Capability`,
+//! a `HostOpKeyCert`, anything `spindle_proto::canonical` serializes — or to `spindle-helper`
+//! itself requires rebuilding that image. Skip the rebuild and these tests fail as an
+//! authentication error that looks entirely unrelated to the change that caused it:
+//!
+//! ```text
+//! docker compose -f deploy/docker-compose.yml build helper
+//! docker compose -f deploy/docker-compose.yml up -d --no-deps helper
+//! ```
+//!
+//! **The 2026-08-31 incident.** Every live test began failing at device CONNECT
+//! (`connect_device`, the panic at the `.unwrap_or_else` on `.connect(url)`), before any
+//! signaling code ran, with `authorization violation: nats: authorization violation`. The NATS
+//! server log gave the real reason: `[WRN] Auth callout service returned an error: authentication
+//! refused` — the helper was actively refusing the callout, not timing out or unreachable. Root
+//! cause: the helper container image was still running a binary built before commit `03fc885`
+//! (A10.34), which changed `DeviceCertificate`'s canonical-CBOR wire map from 5 to 8 fields
+//! (signing input a4->a7, adding `alg_id`/`sign_pk`/`agree_pk`). This file's [`fixtures`] build
+//! the new 8-field certificate; the old helper binary rejected it. Rebuilding the image (the two
+//! commands above) fixed both live tests. A red herring worth naming so the next person skips it:
+//! postgres was simultaneously degraded (a `DELETE FROM session_records` taking 17s, pool acquire
+//! >16s). Restarting postgres and helper did **not** fix it — only rebuilding the image did.
+//!
+//! When device CONNECT fails, check which side of the callout the failure is on before touching
+//! the fixtures:
+//!
+//! ```text
+//! docker compose -f deploy/docker-compose.yml logs nats | grep -i callout
+//! ```
+//!
+//! That line distinguishes "helper refused the credentials" from "helper never answered" — which
+//! is what tells you whether to suspect the fixtures or the stack.
+//!
 //! # The callout bootstrap recipe
 //!
 //! [`fixtures`] below rebuilds `spikes/s1-callout`'s `fixtures` module against this workspace's

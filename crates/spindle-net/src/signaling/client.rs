@@ -217,7 +217,12 @@ impl SignalingClient {
             )
             .await
             .map_err(|e| SignalingError::Nats(e.to_string()))?;
-        // `publish_with_reply` only buffers; `request` used to flush for us.
+        // Flush so the offer is actually on the wire before `answer_timeout` starts counting --
+        // otherwise the timeout would partly measure our own send buffer draining rather than the
+        // host's response. This is a deliberate addition, not a reproduction of what
+        // `Client::request` did: async-nats' own explicit-inbox request path does not flush.
+        // Ordering does not depend on this -- `subscribe` and `publish_with_reply` share one
+        // ordered command channel on the same connection, so the SUB always precedes the PUB.
         self.nats
             .flush()
             .await
