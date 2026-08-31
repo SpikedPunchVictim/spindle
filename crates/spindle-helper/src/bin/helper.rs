@@ -25,8 +25,10 @@
 //! - `app_client` — on the application account, authenticated with `APP_CONN_SEED` (a second
 //!   exempted nkey, distinct from `APP_ACCOUNT_SEED`, which is the account's own *signing* key
 //!   used to sign User JWTs and is never used to open a connection). Answers `helper.turn.get.
-//!   <nfp>` and `helper.presence.get.<nfp>` and publishes `host.<hfp>.presence` deltas.
-//!   `registry.*` request/reply remains later work. Optional: if `APP_CONN_SEED` is unset, this
+//!   <nfp>` and `helper.presence.get.<nfp>`, publishes `host.<hfp>.presence` deltas, and ingests
+//!   `registry.revoke.<hfp>` publishes (leg 2 of DESIGN.md §A4's revoke -> kick -> reject chain —
+//!   see `spindle_helper::revoke`'s module doc; this subject is publish-only, no reply). The rest
+//!   of `registry.*` request/reply remains later work. Optional: if `APP_CONN_SEED` is unset, this
 //!   binary logs a warning per degraded feature and runs with the callout connection only.
 //!
 //! # Presence (DESIGN.md §A3/§A6, subject parametrized in v0.9.8 the same way `helper.turn.get`
@@ -71,6 +73,7 @@ use spindle_helper::natsjwt::{self, NatsJwtError};
 use spindle_helper::permissions::{Limits, SubjectPermissions};
 use spindle_helper::pg_store::PgStore;
 use spindle_helper::presence;
+use spindle_helper::revoke;
 use spindle_helper::session::SessionRecord;
 use spindle_helper::turn::{self, TurnConfig};
 use std::env;
@@ -628,6 +631,17 @@ async fn run(config: Config) -> anyhow::Result<()> {
         None => None,
     };
 
+    // `registry.revoke.*` — DESIGN.md §A5: the subject is parametrized by the publishing host's
+    // own `host_fp` (the callout only ever grants a host `pub registry.revoke.<own_host_fp>`, see
+    // `permissions::host_permissions`), so this subscription wildcards the final token and
+    // `revoke::ingest_revocation` recovers `<hfp>` from `msg.subject` itself and checks it against
+    // the decoded record's own `host_fp` field (see that module's doc comment). Publish-only: no
+    // reply is ever sent on this subject.
+    let mut revoke_sub: Option<async_nats::Subscriber> = match &app_client {
+        Some(client) => Some(client.subscribe("registry.revoke.*").await?),
+        None => None,
+    };
+
     let mut presence_map = seed_presence_map(sys_ref, &mut store, now_secs()).await;
 
     // Periodic best-effort cleanup of expired session records (DESIGN.md §A9b: "a cleanup path
@@ -710,6 +724,33 @@ async fn run(config: Config) -> anyhow::Result<()> {
                         tracing::error!(error = %e, "failed to publish helper.presence.get.<nfp> response");
                     }
                     let _ = client.flush().await;
+                }
+            }
+            msg = next_or_pending(&mut revoke_sub) => {
+                let Some(msg) = msg else {
+                    tracing::warn!("registry.revoke.* subscription ended unexpectedly");
+                    revoke_sub = None;
+                    continue;
+                };
+                // Publish-only subject (DESIGN.md §A5's subject table lists no reply) — an
+                // unparseable or hostile message here never takes the responder down, and there
+                // is nothing to publish back either way.
+                match revoke::ingest_revocation(msg.subject.as_str(), &msg.payload, &mut store) {
+                    revoke::RevokeOutcome::Accepted { host_fp, epoch, revoked_count } => {
+                        tracing::info!(
+                            %host_fp,
+                            epoch,
+                            revoked_count,
+                            "registry.revoke.<hfp> record accepted"
+                        );
+                    }
+                    revoke::RevokeOutcome::Rejected(reason) => {
+                        tracing::warn!(
+                            subject = %msg.subject,
+                            reason = %reason,
+                            "registry.revoke.<hfp> record rejected"
+                        );
+                    }
                 }
             }
             msg = next_or_pending(&mut connect_sub) => {

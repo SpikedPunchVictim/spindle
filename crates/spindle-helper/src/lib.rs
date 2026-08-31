@@ -57,11 +57,18 @@
 //!   `helper.presence.get.<nfp>` snapshots and computing `host.<hfp>.presence` push deltas. See
 //!   that module's own doc comment for the wire-schema detail and for why `unresponsive` (§A6/§A9)
 //!   isn't tracked here.
+//! - [`revoke`] — [`revoke::ingest_revocation`] (leg 2 of DESIGN.md §A4's revoke -> kick -> reject
+//!   chain, S9/S14): `registry.revoke.<hfp>` ingestion, admitting a host-signed
+//!   `RevocationRecord` into the durable store via [`authz::HelperView::record_revocation`] once
+//!   the subject token is checked to equal the record's own `host_fp`. See that module's own doc
+//!   comment for why that equality check — not a signature check — is deliberately the whole of
+//!   this admission rule, and for the per-host token-bucket rate limiting it deliberately leaves
+//!   unimplemented.
 //!
 //! **Still out of scope** (later slices): the admin-command verifier (`registry.admin.>`), the
 //! kick relay, split-brain newest-wins policy, multi-server `CONNZ` aggregation, and leader-only
 //! delta publishing (A10.23) — see `presence.rs`'s module doc for the presence-specific subset of
-//! this list.
+//! this list, and `revoke.rs`'s module doc for its own out-of-scope list (rate limiting).
 //!
 //! # Design notes and ambiguities (reported, not silently resolved)
 //!
@@ -83,6 +90,7 @@ pub mod natsjwt;
 pub mod permissions;
 pub mod pg_store;
 pub mod presence;
+pub mod revoke;
 pub mod session;
 pub mod turn;
 
