@@ -13,6 +13,7 @@ members = [
     "spikes/s19-quic-transport",
     "spikes/s5-presence",
     "spikes/s2-signaling",
+    "spikes/s9-revoke-kick",
 ]
 # apps/*/src-tauri join this workspace once the Tauri apps are initialized (IMPLEMENTATION_PLAN
 # Stage 7), e.g. "apps/host/src-tauri", "apps/client/src-tauri".
