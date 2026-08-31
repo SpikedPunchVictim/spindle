@@ -84,6 +84,16 @@ impl Harness {
             device_fp: None,
         }
     }
+
+    /// Like [`Self::ctx`], but carries a `device_fp` — for tests exercising device-level
+    /// revocation specifically. A separate helper rather than a parameter on `ctx` so the ~20
+    /// existing tests that call `ctx` (and rely on `device_fp: None`) are untouched.
+    fn ctx_with_device(&self, member_id: MemberId, device_fp: Fingerprint) -> SessionContext {
+        SessionContext {
+            member_id,
+            device_fp: Some(device_fp),
+        }
+    }
 }
 
 fn envelope(v: u8, request: VfsRequest) -> VfsRequestEnvelope {
@@ -385,6 +395,91 @@ fn revoked_member_is_denied_on_the_very_next_request_without_any_grants_version_
          crate's grants cache keys off moved — proving member liveness is checked fresh every \
          request, never served from the grants_version/cap_epoch-keyed cache (see \
          spindle_host_core's cache module doc comment)"
+    );
+}
+
+// =================================================================================================
+// Revoked device mid-session (member stays Active — DESIGN.md §A4: a revocation names
+// `root_fp | device_fp`, so device-level revocation must be enforced independently of
+// member-level revocation)
+// =================================================================================================
+
+#[test]
+fn revoked_device_is_denied_on_the_very_next_request_while_its_member_stays_active() {
+    let h = Harness::new();
+    let member_id = h.add_active_member("Alex");
+    let device_fp = Fingerprint::of_parts(&[b"Alex's iPhone"]);
+    h.store
+        .add_device(member_id, device_fp, "Alex's iPhone", 0, None)
+        .expect("add device");
+    let share_id = h.add_share("Photos", "Photos", ShareFlags::default());
+    let root = h.share_real_root(share_id);
+    std::fs::write(root.join("a.jpg"), b"hello").expect("write a.jpg");
+    h.grant(member_id, share_id, "", Perms::BROWSE | Perms::DOWNLOAD);
+
+    let server = h.server();
+    let ctx = h.ctx_with_device(member_id, device_fp);
+
+    let before = server.handle(
+        &ctx,
+        1,
+        envelope(
+            1,
+            VfsRequest::Stat {
+                path: "Photos/a.jpg".to_string(),
+            },
+        ),
+    );
+    assert!(
+        matches!(before, VfsReply::Stat { .. }),
+        "must succeed while the device is still un-revoked"
+    );
+
+    let grants_version_before = h.store.grants_version().expect("grants_version");
+    let cap_epoch_before = h.store.cap_epoch().expect("cap_epoch");
+
+    h.store.revoke_device(device_fp).expect("revoke device");
+
+    assert_eq!(
+        h.store.grants_version().expect("grants_version"),
+        grants_version_before,
+        "revoking a device must not bump grants_version — this test would be meaningless \
+         against a store that did"
+    );
+    assert_eq!(
+        h.store.cap_epoch().expect("cap_epoch"),
+        cap_epoch_before,
+        "revoking a device alone (no explicit bump_cap_epoch call) must not move cap_epoch either"
+    );
+    assert_eq!(
+        h.store
+            .get_member(member_id)
+            .expect("get_member")
+            .expect("member exists")
+            .status,
+        MemberStatus::Active,
+        "the member itself must still be Active — this test isolates device revocation \
+         specifically, not member revocation"
+    );
+
+    let after = server.handle(
+        &ctx,
+        2,
+        envelope(
+            1,
+            VfsRequest::Stat {
+                path: "Photos/a.jpg".to_string(),
+            },
+        ),
+    );
+    assert_eq!(
+        after,
+        not_found(),
+        "the very next request after device revocation must be denied, even though the member \
+         is still Active and neither counter this crate's grants cache keys off moved — proving \
+         device liveness is checked fresh every request (DESIGN.md §A4: the host rejects \
+         envelopes/VFS requests from revoked keys per request, where a revocation names \
+         `root_fp | device_fp`)"
     );
 }
 

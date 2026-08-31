@@ -246,6 +246,54 @@ impl<'s> VfsRpcServer<'s> {
             };
         }
 
+        // Step 2b: device active? DESIGN.md §A4: "the host rejects envelopes/VFS requests from
+        // revoked keys per request (authoritative)", where a revocation names `root_fp |
+        // device_fp` — i.e. device-level revocation is a distinct, independently-enforced half of
+        // §A4, not implied by the member-active check above (a still-Active member can have one
+        // revoked device among several). `member.devices` is part of the same fresh
+        // `store.get_member` read as the status check just above, so this costs no extra store
+        // round-trip and is checked fresh every request for the same reason member liveness is
+        // (never served from the grants_version/cap_epoch-keyed cache; see `crate::cache`'s module
+        // doc comment). `ctx.device_fp` is documented as optional (this struct's doc comment:
+        // wiring a real per-session device identity is `spindle-net`'s job, a later slice) — `None`
+        // is deliberately left passing here rather than tightened to a denial, both because that
+        // would be a scope decision belonging to whoever wires transport-level session identity,
+        // and because ~20 existing tests in this suite construct contexts with `device_fp: None`
+        // and must keep passing.
+        if let Some(device_fp) = ctx.device_fp {
+            match member.devices.iter().find(|d| d.device_fp == device_fp) {
+                Some(d) if d.revoked => {
+                    self.audit(
+                        ts,
+                        Some(member.root_fp),
+                        ctx.device_fp,
+                        op_name(&env.request),
+                        request_path(&env.request),
+                        None,
+                        "denied:device_revoked",
+                    );
+                    return VfsReply::Error {
+                        code: VfsErrorCode::NotFound,
+                    };
+                }
+                Some(_) => {}
+                None => {
+                    self.audit(
+                        ts,
+                        Some(member.root_fp),
+                        ctx.device_fp,
+                        op_name(&env.request),
+                        request_path(&env.request),
+                        None,
+                        "denied:unknown_device",
+                    );
+                    return VfsReply::Error {
+                        code: VfsErrorCode::NotFound,
+                    };
+                }
+            }
+        }
+
         match &env.request {
             VfsRequest::Whoami => self.handle_whoami(ts, ctx, &member),
             VfsRequest::List {
