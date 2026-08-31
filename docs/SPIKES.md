@@ -218,7 +218,14 @@ CI against the real implementation, not just the Stage 1 spike"). Validates **AD
 entitlements — the confinement rules live in §A4b). Per §A9b, this suite graduates into permanent
 CI.
 
-**Status**: Run 2026-08-23 on macOS — 12/12 blocked; Linux/Windows pending.
+**Status**: **PASS — macOS 2026-08-23 (12/12 blocked); Linux + Windows green in CI 2026-08-30.** The
+suite has graduated into permanent CI per §A9b, satisfying Stage 6's "S11's full negative-test suite runs in CI
+against the real implementation" criterion — CI run 33101311525 on commit 85459aa, green on all three OSes.
+Windows was the load-bearing leg: it had never actually executed the `spindle-vfs` test binary before (cargo
+aborted earlier in the build), and turning it on surfaced **two real production bugs**, not test flakes — the
+§A4b directory-handle defect fixed in v0.9.13, and a handle-retention defect in which `FileIdentity` held an open
+`File` that `IdentityCache` then retained indefinitely, pinning a delete-denying handle on every served file
+(fixed in 85459aa by making file identity a plain `(u64, u64)` value).
 - Empirical finding: `cap-std` structurally guarantees only `..`-traversal, absolute-path, and
   symlink-escape blocking; the hardlink `nlink` rule, overlapping-root rejection, case/Unicode-
   collision detection, and TOCTOU identity checks are entirely Spindle-side (prototype helpers
@@ -253,21 +260,46 @@ CI.
 success criteria require this bar met. Validates **ADR-002** (NATS signaling, §A6 flows) and
 **ADR-005** (transport).
 
-**Status**: Leg A (native↔native QUIC signaling, Stage 5) — not run. Leg B (real browser peer,
-Stage 8) — not run. Leg A must answer:
-- Does a full A7-envelope connect handshake complete over the composed stack under S1's
-  callout-scoped permissions — `host.<h>.connect` request/reply with `_INBOX` prefix validation,
-  then trickle ICE on `host.<h>.sess.<c>.<sid>.c2h` / `.h2c` (S1 proved the callout loop and §A5
-  scoping generally, but never these subjects)?
-- What is the measured median connect latency, LAN and across NATs (no number exists yet)?
-- Does the envelope-carried QUIC certificate fingerprint feed the existing
-  `QuicServer::bind`/`QuicClient::connect` seam unchanged, or does the seam need a different
-  shape?
-- Does trickle ICE converge with `rtc-ice`'s sans-io agent when candidates arrive asynchronously
-  over NATS, rather than out-of-band as in S19 leg 2?
-- Does the `seq` discipline survive real reordering/retry (the §A6/§A7 ambiguity noted in
-  `IMPLEMENTATION_PLAN.md` Stage 5)?
-- Does no-responders on `connect` actually yield the instant "host is offline" §A6 requires?
+**Status**: **Leg A steps A + B PASS — run 2026-08-30.** Leg B (real browser peer, Stage 8) — not run.
+Step A: 8/8 checks green against the composed stack (full A7-envelope `connect` handshake over the live callout,
+`_INBOX` prefix validation, trickle-ICE subject round trip, no-responders instant, cross-session publish refused).
+Step B: trickle ICE carried in A7 envelopes drives a real `rtc-ice` agent to a selected pair, and the punched
+socket completes a `quinn` handshake pinned to the fingerprint extracted from the **verified answer envelope**.
+Measured medians, n=7 on loopback: offer→answer verified **14.65 ms**; answer→ICE selected pair **7.15 ms**;
+selected pair→QUIC handshake complete **3.62 ms**; **total offer→usable stream 28.91 ms** — against a < 2 s LAN
+bar. Fingerprint pinning proven in both directions (a one-byte-corrupted fingerprint is rejected at the QUIC
+layer). See `spikes/s2-signaling/RESULTS.md`.
+- **Still open**: the across-NATs half of the pass criterion (< 5 s) has **no measured number** — step B ran on
+  loopback only, with no NAT and no RTT in the path.
+- **Honest caveat on the seq-drop count**: step B recorded 0/16 ICE envelopes dropped for non-monotonic `seq`,
+  but that zero measures the harness, not the design — it sends two envelopes per direction on loopback and never
+  produces real reordering. The reordering risk §A7 accepts (v0.9.14) remains unexercised in the field; step A's
+  check 6 does demonstrate the mechanism directly (a reordered `seq` and a byte-identical retry are both dropped).
+
+Leg A's questions — **answered by steps A + B**:
+- *Does a full A7-envelope connect handshake complete over the composed stack under S1's
+  callout-scoped permissions — `host.<h>.connect` request/reply with `_INBOX` prefix validation, then
+  trickle ICE on `host.<h>.sess.<c>.<sid>.c2h` / `.h2c`?* **Yes** — step A, 8/8, against the real
+  callout. S1 had proved the callout loop and §A5 scoping generally but never these subjects.
+- *Does the envelope-carried QUIC certificate fingerprint feed the existing
+  `QuicServer::bind`/`QuicClient::connect` seam unchanged, or does the seam need a different shape?*
+  **The seam needs a different shape.** Both constructors bind their own UDP socket internally, but ICE
+  hands the caller an already-punched socket, so step B had to bypass `spindle-net` entirely and call
+  `quinn::Endpoint::new` directly. `from_socket`-style constructors are the required addition.
+- *Does trickle ICE converge with `rtc-ice`'s sans-io agent when candidates arrive asynchronously over
+  NATS, rather than out-of-band as in S19 leg 2?* **Yes** — 12/14 runs consumed the NATS-carried
+  candidate. In 2/14 the agent reached a selected pair via peer-reflexive discovery (RFC 8445 §5.1.2.2)
+  before the trickled candidate landed — a genuine sub-millisecond loopback race, not a trickle defect.
+- *Does no-responders on `connect` actually yield the instant "host is offline" §A6 requires?* **Yes** —
+  step A measured 1.8 ms to a `NoResponders` error.
+
+Leg A's questions — **still open**:
+- What is the measured median connect latency **across NATs** (< 5 s bar)? The LAN half is answered
+  above (28.91 ms median, loopback); no across-NATs number exists yet.
+- Does the `seq` discipline survive **real** reordering/retry? Only half-answered. Step A's check 6
+  demonstrates the mechanism directly — a reordered `seq` and a byte-identical retry are both dropped,
+  which is what §A7 (v0.9.14) specifies — but step B's 0/16 drop count came from a harness that never
+  reorders, so the field behaviour remains unmeasured.
 
 ---
 
@@ -682,4 +714,21 @@ that S3 is done (see S3's 2026-08-24 completion note above). Also validates the 
 of DESIGN.md §A9's UX bar ("native↔native ≥ 50 MB/s LAN and ≥ 15 MB/s at 50 ms RTT (QUIC, S19
 verifies)").
 
-**Status**: Not run.
+**Status**: **Legs 1–3 complete — run 2026-08-25. Leg 4 (real two hosts) not run.** Leg 1 (container netem
+throughput matrix, 0/20/50/100 ms × {cubic, bbr}): all 8 cells completed with zero netem packet drops, and the
+≥ 15 MB/s @ 50 ms clause is cleared by both congestion controllers — cubic held **19.652 MB/s** on a 256 MiB
+steady-state re-run, 31% above the floor. Leg 2 (ICE↔quinn adapter): the sans-I/O `rtc_ice::agent::Agent` hands
+its punched `std::net::UdpSocket` straight to `quinn::Endpoint::new` with no custom `AsyncUdpSocket` impl needed,
+and costs nothing measurable — **19.289 MB/s** against leg 1's direct-mode **19.652 MB/s** at 50 ms/cubic.
+Leg 3 (TURN relay fallback): the symmetric:symmetric cell that failed 12/12 via punching completes end to end
+over self-hosted coturn at **92.009 MB/s** unshaped. See `spikes/s19-quic-transport/RESULTS.md`.
+- **The punch-rate finding is an environment result, not a clean pass.** Cone-NAT punching succeeds with full
+  QUIC transfers completing (up to **333.8 MB/s** unshaped) but in only **~20–25% of trials** in this specific
+  nested-virtualization environment (Docker Desktop's `linuxkit` VM on macOS) — root-caused via `conntrack -L`
+  to the kernel's NAT/conntrack layer not reliably preserving the endpoint-independent port mapping cone-NAT
+  punching depends on, not to a defect in the adapter or topology. Symmetric-NAT combos failed **12/12**, exactly
+  as ICE theory predicts; leg 3's relay is the designed answer and closes that combo.
+- With leg 3 in place the pass bar's "punch or relay success on all tested NAT combos" clause is met: every
+  tested combo now succeeds via punch, relay, or both. **Leg 4 remains the external-validity gate** — every
+  number above is netem-on-loopback inside one container, the exact caveat leg 4 exists to retire. ADR-005
+  therefore stays Proposed.

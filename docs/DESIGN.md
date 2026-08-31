@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.14) + Execution Plan
+# Spindle — System Design Document (draft v0.9.15) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -27,7 +27,10 @@
 > A9c manifest amended — cap-fs-ext). v0.9.14: spike S2 leg A replaced §A7's single session key with a two-key
 > schedule — offer under ephemeral-static `k0`, answer onward under ephemeral-ephemeral `k1` — and withdrew the
 > blanket forward-secrecy claim for the offer; "retried" clarified as a new envelope with a fresh `seq`
-> (2026-08-30; user decisions). Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), A10.34–36
+> (2026-08-30; user decisions). v0.9.15: A9c manifest completed — `same-file` and `winapi-util` recorded as the
+> Windows-only direct dependencies of spindle-vfs that back §A4b's file-identity check; they had been in the tree
+> and CI-green since before v0.9.13 but were never listed (2026-08-30). Remaining **[USER DECISION]** items:
+> A10.6–9, A10.24 (license), A10.34–36
 > (device agreement-key distribution, host device identity, `inbox` semantics), and the **[DEFAULT]**-flagged
 > rows in A10.
 
@@ -727,7 +730,7 @@ spindle/
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
 | Encoding | hand-rolled zero-dep canonical codec in spindle-proto (strict non-canonical rejection; minicbor rejected — decoder abstracts the raw bytes) | own canonical encoder in @spindle/proto |
 | Storage | rusqlite (bundled) host-side; sqlx/Postgres helper-side | IndexedDB (caps, resume manifests) |
-| Confinement | cap-std ≥3.4.1 + rustix (unix) / windows-sys (windows) free-space probe — already-transitive, promoted direct + cap-fs-ext (maybe_dir directory opens — Windows FILE_FLAG_BACKUP_SEMANTICS) | — (browser sandbox) |
+| Confinement | cap-std ≥3.4.1 + rustix (unix) / windows-sys (windows) free-space probe — already-transitive, promoted direct + cap-fs-ext (maybe_dir directory opens — Windows FILE_FLAG_BACKUP_SEMANTICS) + same-file & winapi-util (Windows-only direct deps of spindle-vfs: `GetFileInformationByHandle` for the §A4b `(volume_serial_number, file_index)` file identity — **not** transitive via cap-std, spindle-vfs is their only consumer) | — (browser sandbox) |
 | OS / shell | keyring, tauri 2 + plugins (tray, autostart, single-instance, updater), qrcode | @tauri-apps/api |
 | UI | — | React, Vite, @spindle/ui |
 | CLI | — | commander |
@@ -983,6 +986,14 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.15 (2026-08-30)** — Documentation-debt sweep, no design change. A9c manifest completed: `same-file` and
+  `winapi-util` are recorded as Windows-only direct dependencies of spindle-vfs, backing §A4b's
+  `(volume_serial_number, file_index)` identity via `GetFileInformationByHandle`. Unlike the rustix/windows-sys
+  row they are **not** already-transitive through cap-std — spindle-vfs is their only consumer in the graph — so
+  the earlier omission understated the workspace's direct dependency surface. They shipped in 85459aa and have
+  been CI-green on all three OSes since; nothing about the code changes here, only the record. Spike statuses in
+  docs/SPIKES.md brought current in the same pass (S11 green in CI on all three OSes; S2 leg A steps A+B measured;
+  S19 legs 1–3 complete with leg 4 outstanding).
 - **v0.9.14 (2026-08-30)** — Spike S2 leg A step A (envelope-over-NATS, 8/8 against the composed stack;
   spikes/s2-signaling/RESULTS.md) surfaced four design gaps; two resolved by user decision, two recorded as open.
   §A7's single session key is replaced by a **two-key schedule**: the connect offer is sealed under `k0`
