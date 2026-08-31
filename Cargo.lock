@@ -3323,8 +3323,10 @@ name = "spindle-net"
 version = "0.1.0"
 dependencies = [
  "async-nats",
+ "base64",
  "bytes",
  "futures-util",
+ "nkeys",
  "quinn",
  "rand 0.8.7",
  "rcgen 0.13.2",

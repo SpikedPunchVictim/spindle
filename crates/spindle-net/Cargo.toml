@@ -92,7 +92,24 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # spike-local precedent.
 rcgen = "0.13"
 
-# No dev-dependencies: this crate's own unit tests (framing round-trip/split-read/oversize,
-# quic mutual-pinning handshake) exercise `tokio` (already a normal dependency, `features =
-# ["full"]` from the workspace pin includes `#[tokio::test]`), `quinn`, and `rustls` directly —
-# no test-only crate needed.
+# This crate's own unit tests (framing round-trip/split-read/oversize, quic mutual-pinning
+# handshake, every `signaling::*` receiver check) need no test-only crate at all: they exercise
+# `tokio` (already a normal dependency, `features = ["full"]` from the workspace pin includes
+# `#[tokio::test]`), `quinn`, and `rustls` directly.
+#
+# The two crates below exist solely for `tests/live_signaling.rs`, the `#[ignore]`d live
+# integration test that drives `signaling` against `deploy/docker-compose.yml`'s real NATS Auth
+# Callout. Bootstrapping a callout-authenticated connection is the only thing that needs them, and
+# it is exactly the thing that cannot be faked without making the test's permission-scoping
+# evidence vacuous. Both are already in this workspace's Cargo.lock (`spindle-helper` and
+# `spikes/s1-callout` carry the identical pins for the identical reasons), so neither adds a new
+# dependency *version* to the tree.
+[dev-dependencies]
+# Generates the per-connection session nkey (ed25519) each NATS CONNECT presents, and decodes an
+# nkey-encoded public key back to its raw 32 bytes so the test can compute `nats_fp = hash(nats_pk)`
+# (DESIGN.md §A4) — the value the device/host certificate must be bound to.
+nkeys = "0.4"
+# The CONNECT `auth_token` is "compact CBOR ... base64url" (DESIGN.md §A4); `spindle_helper::
+# auth_token` only decodes that envelope, so the test builds the encode half itself and needs the
+# same `URL_SAFE_NO_PAD` alphabet the helper decodes with.
+base64 = "0.22"

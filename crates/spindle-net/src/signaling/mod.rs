@@ -71,6 +71,14 @@ use subject::IceDirection;
 /// both [`client`] and [`host`] — the bridging logic (decode -> verify -> advance the seq floor ->
 /// forward) does not differ between the two roles, only which side of the session they are.
 ///
+/// `expected_host_fp`/`expected_client_fp` are the **NATS subject** tokens (the host's root
+/// fingerprint and the client's device fingerprint — the two `<...>` slots in
+/// `host.<h>.sess.<c>.<sid>.<dir>`), while `self_fp`/`peer_fp` are the **envelope** `to_fp`/
+/// `from_fp` this side expects. For the client those two roles coincide (`expected_client_fp ==
+/// self_fp`); for the host they never do, because a host's subject-scoping fingerprint and its
+/// envelope device fingerprint are different keys entirely — see [`client::HostIdentity`]'s doc
+/// comment.
+///
 /// Every rejected envelope is a soft failure (`tracing::warn!` + continue, never a fatal error
 /// propagated up): DESIGN.md §A5's uniform-silent-drop philosophy applies here exactly as it does
 /// to the connect offer itself — a single malformed or replayed trickled candidate must not abort

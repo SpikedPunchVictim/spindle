@@ -78,12 +78,22 @@ impl Default for HostOptions {
 }
 
 /// The host role's connect flow. Holds the caller-owned NATS client (never connects one itself —
-/// see [`super`]'s module doc comment), this device's own identity, the injected
+/// see [`super`]'s module doc comment), this host's two identities, the injected
 /// [`ConnectAuthorizer`], and the injected [`SessionHandler`].
+///
+/// # Two fingerprints, not one
+///
+/// `host_fp` (`SHA-256(host_root_pk)`) and `device_fp` (this host's envelope [`DeviceKey`]) are
+/// different values and are used for different things — see [`super::client::HostIdentity`]'s doc
+/// comment for the full statement of why they cannot be collapsed, and what happens live when they
+/// are (`tests/live_signaling.rs` caught exactly that: `Permissions Violation for Subscription to
+/// "host.<device_fp>.connect"`, because the Auth Callout grants `sub host.<host_fp>.>`).
 pub struct SignalingHost<A, H> {
     nats: async_nats::Client,
     device: DeviceKey,
     device_fp: Fingerprint,
+    /// The host's root fingerprint — the NATS subject-scoping token only, never an envelope field.
+    host_fp: Fingerprint,
     authorizer: A,
     handler: H,
 }
@@ -137,19 +147,35 @@ where
     A: ConnectAuthorizer + Send + Sync + 'static,
     H: SessionHandler + Send + Sync + 'static,
 {
-    pub fn new(nats: async_nats::Client, device: DeviceKey, authorizer: A, handler: H) -> Self {
+    /// `device` is this host's **envelope** identity (§A7 `to_fp`/`from_fp`, and the X25519 half
+    /// `k0`/`k1` are derived from); `host_fp` is its **root** fingerprint, the token every §A5 NATS
+    /// subject is scoped by. See this type's doc comment for why both are required.
+    pub fn new(
+        nats: async_nats::Client,
+        device: DeviceKey,
+        host_fp: Fingerprint,
+        authorizer: A,
+        handler: H,
+    ) -> Self {
         let device_fp = device.device_fp();
         Self {
             nats,
             device,
             device_fp,
+            host_fp,
             authorizer,
             handler,
         }
     }
 
+    /// This host's envelope device fingerprint — what a client seals its offer's `to_fp` to.
     pub fn device_fp(&self) -> Fingerprint {
         self.device_fp
+    }
+
+    /// This host's root fingerprint — the `<hfp>` token in every `host.<hfp>.*` subject.
+    pub fn host_fp(&self) -> Fingerprint {
+        self.host_fp
     }
 
     /// Subscribes on `host.<self>.connect` and handles connect offers for as long as the
@@ -161,7 +187,7 @@ where
 
         let mut sub = self
             .nats
-            .subscribe(connect_subject(&self.device_fp))
+            .subscribe(connect_subject(&self.host_fp))
             .await
             .map_err(|e| SignalingError::Nats(e.to_string()))?;
 
@@ -209,26 +235,32 @@ where
         let (session_key, answer_env) =
             opened.seal_answer(&self.device, self.device_fp, &answer_payload);
 
-        self.nats
-            .publish(reply_subject, answer_env.to_canonical_bytes().into())
-            .await
-            .map_err(|e| SignalingError::Nats(e.to_string()))?;
-
+        // Subjects are scoped by the host's *root* fingerprint (§A5's subject table), never by its
+        // envelope device fingerprint -- see this type's doc comment.
         let h2c_subject = session_subject(
-            &self.device_fp,
+            &self.host_fp,
             &opened.from_fp,
             &opened.sid,
             IceDirection::HostToClient,
         );
         let c2h_subject = session_subject(
-            &self.device_fp,
+            &self.host_fp,
             &opened.from_fp,
             &opened.sid,
             IceDirection::ClientToHost,
         );
+        // Subscribe to the client's trickled ICE *before* publishing the answer, for the same
+        // reason `client::SignalingClient::connect` subscribes before publishing its offer: the
+        // client starts trickling the instant the answer lands, and a subscription created after
+        // that point can silently miss the candidate that would have completed the punch.
         let c2h_sub = self
             .nats
             .subscribe(c2h_subject)
+            .await
+            .map_err(|e| SignalingError::Nats(e.to_string()))?;
+
+        self.nats
+            .publish(reply_subject, answer_env.to_canonical_bytes().into())
             .await
             .map_err(|e| SignalingError::Nats(e.to_string()))?;
 
@@ -273,12 +305,14 @@ where
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let bridge = tokio::spawn(bridge_incoming_ice(
             c2h_sub,
-            self.device_fp,
+            // Subject tokens (host root fp, client device fp) ...
+            self.host_fp,
             opened.from_fp,
             opened.sid.clone(),
             IceDirection::ClientToHost,
             session_key,
             opened.sender_sign_pk,
+            // ... and envelope fingerprints (this host's envelope identity, the client's).
             self.device_fp,
             opened.from_fp,
             tx,
@@ -287,6 +321,11 @@ where
         let (remote_addr, _stats) = drive_ice_agent_trickle(
             &mut local_ice.agent,
             &local_ice.socket,
+            // The host is never the controlling side; the peer's credentials come from the offer
+            // this side just opened.
+            false,
+            &opened.offer.ufrag,
+            &opened.offer.pwd,
             rx,
             opts.ice_timeout,
         )

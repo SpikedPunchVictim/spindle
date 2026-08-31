@@ -3,7 +3,7 @@
 //! from `spikes/s2-signaling/src/bin/s2-connect.rs`'s client leg (`run_client`).
 
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use spindle_core::identity::DeviceKey;
 use spindle_core::{Fingerprint, VerifyingKey};
@@ -21,10 +21,58 @@ use super::wire::{new_offer_context, open_answer, seal_ice, seal_offer};
 /// The host's identity, resolved by the caller before dialing (DESIGN.md §A5's directory/admission
 /// flow is out of scope for this crate — by the time [`SignalingClient::connect`] is called, the
 /// caller already knows who it means to reach and has pinned that host's keys).
+///
+/// # Two fingerprints, not one
+///
+/// A host has two distinct fingerprints and they can never be equal — collapsing them was a real
+/// defect this struct's first shape carried, caught by `tests/live_signaling.rs` against the live
+/// composed stack (the callout scopes subjects by `host_fp`, so a client publishing to
+/// `host.<host_device_fp>.connect` gets `Permissions Violation for Publish`, and the host is
+/// equally unable to subscribe there):
+///
+/// - [`Self::host_fp`] — `SHA-256(host_root_pk)`, the host's **Ed25519-only** root identity. Every
+///   NATS subject in DESIGN.md §A5's table is scoped by this token (`host.<hfp>.connect`,
+///   `host.<hfp>.sess.<cfp>.<sid>.<c2h|h2c>`), and it is exactly what
+///   `spindle_helper::permissions::host_permissions` / `client_member_permissions` grant on.
+/// - [`Self::device_fp`] — the host's envelope [`DeviceKey`] fingerprint. §A7's `k0`/`k1` schedule
+///   needs an X25519 agreement half, which a root key does not have, so the host's envelope
+///   identity is structurally forced to be a separate keypair. This is the `to_fp` an offer is
+///   sealed to and the `from_fp` its answer arrives under.
+///
+/// `spikes/s2-signaling` kept the two apart from the start (`HostState { host_fp, host_device_fp,
+/// .. }`); DESIGN.md never spells the relationship out, which is how the two came to be merged
+/// during graduation.
 pub struct HostIdentity {
+    /// The host's root fingerprint — the NATS subject-scoping token only. Never an envelope field.
     pub host_fp: Fingerprint,
+    /// The host's envelope device fingerprint — the offer's `to_fp` and the answer's `from_fp`.
+    /// Never appears in a NATS subject.
+    pub device_fp: Fingerprint,
     pub sign_pk: VerifyingKey,
     pub agree_pk: X25519PublicKey,
+}
+
+/// Wall-clock breakdown of one [`SignalingClient::connect_timed`] attempt, in the same four phases
+/// `spikes/s2-signaling`'s `s2-connect.rs` reported, so a graduated run's numbers are directly
+/// comparable to that spike's recorded ones.
+///
+/// Every phase is measured from the moment the offer is actually published — deliberately *not*
+/// from entry into `connect`, which would fold this side's own ICE gathering and per-session
+/// certificate generation (work that happens before a single byte is on the wire) into the
+/// offer→answer figure. Same t0 the spike chose, for the same reason.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectTimings {
+    /// Offer published -> answer received *and* fully verified/decrypted (§A7 receiver checks
+    /// included).
+    pub offer_to_answer: Duration,
+    /// Answer verified -> ICE connectivity checks selected a candidate pair.
+    pub answer_to_ice_selected: Duration,
+    /// Candidate pair selected -> QUIC handshake complete on the punched socket, mutually
+    /// fingerprint-pinned (A10.32).
+    pub ice_selected_to_quic: Duration,
+    /// Offer published -> QUIC handshake complete. The sum of the three phases above; a caller
+    /// measuring "offer -> usable stream" adds its own first round trip on top.
+    pub offer_to_quic_complete: Duration,
 }
 
 /// Tunable knobs for one connect attempt.
@@ -76,6 +124,17 @@ impl SignalingClient {
         host: &HostIdentity,
         opts: ConnectOptions,
     ) -> Result<ControlStream, SignalingError> {
+        self.connect_timed(host, opts).await.map(|(c, _)| c)
+    }
+
+    /// [`Self::connect`], plus the phase-by-phase [`ConnectTimings`] for the attempt. Separate
+    /// entry point rather than a changed return type so the common case stays a one-value
+    /// `Result`; the connect flow itself is identical (`connect` is a thin wrapper over this).
+    pub async fn connect_timed(
+        &self,
+        host: &HostIdentity,
+        opts: ConnectOptions,
+    ) -> Result<(ControlStream, ConnectTimings), SignalingError> {
         let cert = SessionCert::generate()?;
         // The client is always the ICE-controlling side (matches `s2-connect.rs`'s convention:
         // the offerer controls).
@@ -110,15 +169,18 @@ impl SignalingClient {
             pwd: local_ice.pwd.clone(),
             cert_fp: cert.fingerprint(),
         };
+        // `host.device_fp` seals the envelope, `host.host_fp` scopes the subject -- see
+        // `HostIdentity`'s doc comment for why these are two different values.
         let offer_env = seal_offer(
             &ctx,
             &self.device,
             self.device_fp,
-            host.host_fp,
+            host.device_fp,
             &host.agree_pk,
             &offer_payload,
         );
 
+        let offer_sent = Instant::now();
         let reply = self
             .nats
             .request(
@@ -134,13 +196,14 @@ impl SignalingClient {
             &ctx,
             &self.device,
             self.device_fp,
-            host.host_fp,
+            host.device_fp,
             &host.sign_pk,
             &host.agree_pk,
         )?;
         if answer.transport != Transport::Quic {
             return Err(SignalingError::UnsupportedTransport(answer.transport));
         }
+        let answer_opened = Instant::now();
 
         // Trickle this side's own (single, loopback/LAN) candidate to the host, then mark
         // end-of-candidates -- both as their own separately-signed/sealed KIND_ICE envelopes
@@ -156,7 +219,7 @@ impl SignalingClient {
             &session_key,
             &self.device,
             self.device_fp,
-            host.host_fp,
+            host.device_fp,
             &ctx.sid,
             seq,
             &IcePayload {
@@ -176,7 +239,7 @@ impl SignalingClient {
             &session_key,
             &self.device,
             self.device_fp,
-            host.host_fp,
+            host.device_fp,
             &ctx.sid,
             seq,
             &IcePayload {
@@ -194,29 +257,45 @@ impl SignalingClient {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let bridge = tokio::spawn(bridge_incoming_ice(
             h2c_sub,
+            // Subject tokens (host root fp, client device fp) ...
             host.host_fp,
             self.device_fp,
             ctx.sid.clone(),
             IceDirection::HostToClient,
             session_key,
             host.sign_pk,
+            // ... and envelope fingerprints (this device, the host's *envelope* identity).
             self.device_fp,
-            host.host_fp,
+            host.device_fp,
             tx,
         ));
 
         let (remote_addr, _stats) = drive_ice_agent_trickle(
             &mut local_ice.agent,
             &local_ice.socket,
+            // The offerer is the ICE-controlling side; the peer's credentials come from the
+            // answer this side just verified.
+            true,
+            &answer.ufrag,
+            &answer.pwd,
             rx,
             opts.ice_timeout,
         )
         .await?;
         bridge.abort();
+        let ice_selected = Instant::now();
 
         let std_socket = local_ice.socket.into_std()?;
         let control =
             QuicClient::from_socket(std_socket, remote_addr, answer.cert_fp, &cert).await?;
-        Ok(control)
+        let quic_complete = Instant::now();
+
+        let timings = ConnectTimings {
+            offer_to_answer: answer_opened.duration_since(offer_sent),
+            answer_to_ice_selected: ice_selected.duration_since(answer_opened),
+            ice_selected_to_quic: quic_complete.duration_since(ice_selected),
+            offer_to_quic_complete: quic_complete.duration_since(offer_sent),
+        };
+        Ok((control, timings))
     }
 }

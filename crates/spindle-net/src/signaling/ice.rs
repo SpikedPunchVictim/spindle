@@ -102,17 +102,40 @@ pub struct TrickleStats {
     pub bad_candidates_seen: u32,
 }
 
-/// Drives `agent` to a selected candidate pair. `candidate_rx` is a third `tokio::select!` branch
-/// alongside the UDP socket and the agent's own timers: candidates arrive asynchronously, one
-/// envelope at a time, and are fed into `agent.add_remote_candidate` the moment they're decoded —
-/// this is the trickle mechanic itself. Once a pair is selected, this returns immediately; any
-/// not-yet-arrived candidate is simply never applied (harmless — a pair is already selected).
+/// Starts connectivity checks against the peer's `(remote_ufrag, remote_pwd)` — learned from the
+/// offer/answer round trip, the only place they can come from — and then drives `agent` to a
+/// selected candidate pair.
+///
+/// **Starting the checks is this function's job, not the caller's.** `spikes/s2-signaling` did it
+/// at both call sites instead (`s2-connect.rs`'s host and client legs each call
+/// `agent.start_connectivity_checks(..)` just before their drive loop), and that split is exactly
+/// what got lost in graduation: [`start_local_ice`] gathers but deliberately does *not* start
+/// checks (it cannot — the remote credentials do not exist yet), so an agent that is only ever
+/// gathered and driven sends no binding requests at all and can never select a pair. Every ICE
+/// attempt then fails with [`SignalingError::Timeout`], on both sides, every time; no unit test in
+/// this crate drives a real agent, so nothing caught it until `tests/live_signaling.rs` ran against
+/// the live stack. Folding the call in here makes the two steps impossible to separate again.
+///
+/// `candidate_rx` is a third `tokio::select!` branch alongside the UDP socket and the agent's own
+/// timers: candidates arrive asynchronously, one envelope at a time, and are fed into
+/// `agent.add_remote_candidate` the moment they're decoded — this is the trickle mechanic itself.
+/// Once a pair is selected, this returns immediately; any not-yet-arrived candidate is simply never
+/// applied (harmless — a pair is already selected).
 pub async fn drive_ice_agent_trickle(
     agent: &mut IceAgent,
     socket: &tokio::net::UdpSocket,
+    is_controlling: bool,
+    remote_ufrag: &str,
+    remote_pwd: &str,
     mut candidate_rx: mpsc::UnboundedReceiver<TrickleEvent>,
     timeout: Duration,
 ) -> Result<(SocketAddr, TrickleStats), SignalingError> {
+    agent.start_connectivity_checks(
+        is_controlling,
+        remote_ufrag.to_string(),
+        remote_pwd.to_string(),
+    )?;
+
     let local_addr = socket.local_addr()?;
     let mut buf = vec![0u8; 2048];
     let deadline = Instant::now() + timeout;
