@@ -47,3 +47,20 @@ export {
   VfsReply,
 } from "./vfsRpc.js";
 export type { VfsRequest } from "./vfsRpc.js";
+
+export {
+  CERT_FP_LEN,
+  MAX_UFRAG_LEN,
+  MAX_PWD_LEN,
+  MAX_CANDIDATE_LEN,
+  MAX_INBOX_LEN,
+  KIND_OFFER,
+  KIND_ANSWER,
+  KIND_ICE,
+  SignalingError,
+  Transport,
+  OfferPayload,
+  AnswerPayload,
+  IcePayload,
+} from "./signaling.js";
+export type { SignalingErrorKind } from "./signaling.js";

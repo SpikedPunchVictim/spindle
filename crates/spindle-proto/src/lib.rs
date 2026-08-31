@@ -16,6 +16,9 @@
 //!   for `list`/`stat`/`read`/`mkdir`/`delete`/`whoami` and the typed VFS error-code model. Not
 //!   one of the seven A7b signed artifacts (no domain tag, no `sig`) — see that module's doc
 //!   comment for why.
+//! - [`signaling`] — the connect/answer/trickle-ICE payload wire types (DESIGN.md §A6/§A7,
+//!   §A10.31/32), promoted from `spikes/s2-signaling`'s crate-local types. Also not one of the
+//!   seven A7b signed artifacts — see that module's doc comment for why.
 //!
 //! # Schema choices
 //!
@@ -53,6 +56,7 @@
 
 pub mod artifacts;
 pub mod canonical;
+pub mod signaling;
 pub mod tags;
 pub mod vfs_rpc;
 
@@ -61,6 +65,10 @@ pub use artifacts::{
     ProtoError, RevocationRecord,
 };
 pub use canonical::{canonical_decode, canonical_encode, CborError, CborValue};
+pub use signaling::{
+    AnswerPayload, IcePayload, OfferPayload, SignalingError, Transport, CERT_FP_LEN, KIND_ANSWER,
+    KIND_ICE, KIND_OFFER, MAX_CANDIDATE_LEN, MAX_INBOX_LEN, MAX_PWD_LEN, MAX_UFRAG_LEN,
+};
 pub use vfs_rpc::{
     DirEntry, EntryKind, VfsErrorCode, VfsPerms, VfsReply, VfsRequest, VfsRequestEnvelope,
     CURRENT_PROTOCOL_VERSION, MAX_LIST_PAGE, MAX_READ_CHUNK, MAX_UPLOAD_CHUNK,

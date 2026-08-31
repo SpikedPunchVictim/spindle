@@ -16,6 +16,7 @@ use spindle_proto::artifacts::{
     RevocationRecord,
 };
 use spindle_proto::canonical::{canonical_encode, CborValue};
+use spindle_proto::signaling::{AnswerPayload, IcePayload, OfferPayload, Transport};
 use spindle_proto::tags;
 use spindle_proto::vfs_rpc::{
     DirEntry, EntryKind, VfsErrorCode, VfsPerms, VfsReply, VfsRequest, VfsRequestEnvelope,
@@ -216,6 +217,13 @@ fn rep(byte: u8, len: usize) -> Vec<u8> {
     vec![byte; len]
 }
 
+/// Same repeated-byte pattern as [`rep`], fixed at 32 bytes — for `signaling::OfferPayload`/
+/// `AnswerPayload`'s `cert_fp: [u8; 32]` field, which (unlike every other fingerprint-shaped field
+/// in this file) is a fixed-size array, not a `Vec<u8>`.
+fn rep32(byte: u8) -> [u8; 32] {
+    [byte; 32]
+}
+
 fn main() {
     let vectors_dir = vectors_dir();
 
@@ -248,6 +256,7 @@ fn main() {
         canonical_cbor_vectors(),
     );
     write_vector_file(&vectors_dir, "vfs-rpc.json", vfs_rpc_vectors());
+    write_vector_file(&vectors_dir, "signaling.json", signaling_vectors());
 }
 
 fn vectors_dir() -> PathBuf {
@@ -1131,5 +1140,160 @@ fn vfs_rpc_vectors() -> Json {
         ),
         ("requests", Json::Arr(requests)),
         ("replies", Json::Arr(replies)),
+    ])
+}
+
+// ---- Signaling (DESIGN.md §A6/§A7, §A10.31/32) ----
+//
+// Not A7b signed artifacts (see `spindle_proto::signaling`'s module doc comment) — no domain tag,
+// no signing input, so each case here is `{name, description, decoded, canonical_cbor_hex}`,
+// exactly mirroring `vfs-rpc.json`'s shape for the same reason (payloads carried inside an
+// already-signed, already-encrypted `Envelope`'s ciphertext, never signed independently).
+
+fn signaling_case(name: &'static str, description: &'static str, cbor: CborValue) -> Json {
+    let bytes = canonical_encode(&cbor);
+    Json::Obj(vec![
+        ("name", Json::Str(name.into())),
+        ("description", Json::Str(description.into())),
+        ("decoded", cbor_to_json(&cbor)),
+        ("canonical_cbor_hex", Json::hex(&bytes)),
+    ])
+}
+
+fn signaling_vectors() -> Json {
+    let offers = vec![
+        signaling_case(
+            "offer_quic",
+            "Client connect offer negotiating the native↔native QUIC transport (DESIGN.md \
+             §A10.31/32): inbox reply subject, ICE short-term credentials (RFC 8445 §5.3), and \
+             the client's per-session QUIC certificate fingerprint (SHA-256, 32 bytes).",
+            OfferPayload {
+                inbox: "_INBOX_c1a2b3c4.x".to_string(),
+                transport: Transport::Quic,
+                ufrag: "8hgS".to_string(),
+                pwd: "asd88fgpdd777uzjYhagZg".to_string(),
+                cert_fp: rep32(0xaa),
+            }
+            .to_cbor(),
+        ),
+        signaling_case(
+            "offer_webrtc",
+            "Client connect offer negotiating WebRTC (DESIGN.md §A6: \"browser peers always use \
+             WebRTC\") — same field shape as the QUIC case, different `transport` discriminant.",
+            OfferPayload {
+                inbox: "_INBOX_d5e6f7a8.x".to_string(),
+                transport: Transport::WebRtc,
+                ufrag: "4ZcD".to_string(),
+                pwd: "7hjK29fpQwltxRzC4mNsdEaB".to_string(),
+                cert_fp: rep32(0xbb),
+            }
+            .to_cbor(),
+        ),
+        signaling_case(
+            "offer_boundary_length_fields",
+            "Edge case: `inbox`/`ufrag`/`pwd` each at exactly their decoder-enforced byte-length \
+             cap (256/256/256 — see MAX_INBOX_LEN/MAX_UFRAG_LEN/MAX_PWD_LEN) — the strict decoder \
+             must accept these, and reject anything one byte longer.",
+            OfferPayload {
+                inbox: "i".repeat(256),
+                transport: Transport::Quic,
+                ufrag: "u".repeat(256),
+                pwd: "p".repeat(256),
+                cert_fp: rep32(0xcc),
+            }
+            .to_cbor(),
+        ),
+    ];
+
+    let answers = vec![
+        signaling_case(
+            "answer_quic",
+            "Host connect answer for a native↔native QUIC session — mirrors the offer's \
+             transport/ufrag/pwd/cert_fp shape, minus `inbox` (the answer travels as the \
+             `connect` request's own reply, needing no reply-subject of its own).",
+            AnswerPayload {
+                transport: Transport::Quic,
+                ufrag: "9pQr".to_string(),
+                pwd: "zL4mNq82vwTsYbXeR1oPdCkH".to_string(),
+                cert_fp: rep32(0xdd),
+            }
+            .to_cbor(),
+        ),
+        signaling_case(
+            "answer_webrtc",
+            "Host connect answer for a WebRTC session.",
+            AnswerPayload {
+                transport: Transport::WebRtc,
+                ufrag: "2FgH".to_string(),
+                pwd: "vB6nKq93wRtYcXsE2pQdAjLm".to_string(),
+                cert_fp: rep32(0xee),
+            }
+            .to_cbor(),
+        ),
+    ];
+
+    let ice = vec![
+        signaling_case(
+            "ice_host_candidate",
+            "A trickled host-type ICE candidate line (RFC 8839 §5.1) — `end_of_candidates` false.",
+            IcePayload {
+                candidate: Some("candidate:1 1 UDP 2130706431 10.0.0.5 54400 typ host".to_string()),
+                end_of_candidates: false,
+            }
+            .to_cbor(),
+        ),
+        signaling_case(
+            "ice_srflx_candidate_with_raddr",
+            "A trickled server-reflexive candidate line carrying the `raddr`/`rport` extension \
+             attributes (RFC 8839 §5.1).",
+            IcePayload {
+                candidate: Some(
+                    "candidate:2 1 UDP 1694498815 203.0.113.9 61200 typ srflx raddr 10.0.0.5 \
+                     rport 54400"
+                        .to_string(),
+                ),
+                end_of_candidates: false,
+            }
+            .to_cbor(),
+        ),
+        signaling_case(
+            "ice_end_of_candidates",
+            "The end-of-candidates signal (RFC 8445 §8.2.7, restated at the payload level): no \
+             candidate line, marker set. `candidate` is omitted entirely (key omission), not \
+             encoded as CBOR null.",
+            IcePayload {
+                candidate: None,
+                end_of_candidates: true,
+            }
+            .to_cbor(),
+        ),
+        signaling_case(
+            "ice_boundary_length_candidate",
+            "Edge case: `candidate` at exactly its decoder-enforced byte-length cap (1024 — see \
+             MAX_CANDIDATE_LEN) — the strict decoder must accept this, and reject anything one \
+             byte longer.",
+            IcePayload {
+                candidate: Some("c".repeat(1024)),
+                end_of_candidates: false,
+            }
+            .to_cbor(),
+        ),
+    ];
+
+    Json::Obj(vec![
+        (
+            "description",
+            Json::Str(
+                "Signaling payload wire types (DESIGN.md §A6/§A7, §A10.31/32), promoted from \
+                 `spikes/s2-signaling`: the connect offer, connect answer, and trickled-ICE \
+                 payloads carried as the plaintext of an already-signed, already-encrypted \
+                 `Envelope` (kind = KIND_OFFER/KIND_ANSWER/KIND_ICE = 1/2/3). Not A7b signed \
+                 artifacts — no domain tag, no signing input."
+                    .to_string(),
+            ),
+        ),
+        ("offers", Json::Arr(offers)),
+        ("answers", Json::Arr(answers)),
+        ("ice", Json::Arr(ice)),
     ])
 }

@@ -1,0 +1,399 @@
+{
+  "description": "Signaling payload wire types (DESIGN.md §A6/§A7, §A10.31/32), promoted from `spikes/s2-signaling`: the connect offer, connect answer, and trickled-ICE payloads carried as the plaintext of an already-signed, already-encrypted `Envelope` (kind = KIND_OFFER/KIND_ANSWER/KIND_ICE = 1/2/3). Not A7b signed artifacts — no domain tag, no signing input.",
+  "offers": [
+    {
+      "name": "offer_quic",
+      "description": "Client connect offer negotiating the native↔native QUIC transport (DESIGN.md §A10.31/32): inbox reply subject, ICE short-term credentials (RFC 8445 §5.3), and the client's per-session QUIC certificate fingerprint (SHA-256, 32 bytes).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "inbox"
+            },
+            "value": {
+              "type": "text",
+              "value": "_INBOX_c1a2b3c4.x"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "transport"
+            },
+            "value": {
+              "type": "uint",
+              "value": 0
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "ufrag"
+            },
+            "value": {
+              "type": "text",
+              "value": "8hgS"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "pwd"
+            },
+            "value": {
+              "type": "text",
+              "value": "asd88fgpdd777uzjYhagZg"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cert_fp"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a5637077647661736438386667706464373737757a6a596861675a6765696e626f78715f494e424f585f63316132623363342e78657566726167643868675367636572745f66705820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa697472616e73706f727400"
+    },
+    {
+      "name": "offer_webrtc",
+      "description": "Client connect offer negotiating WebRTC (DESIGN.md §A6: \"browser peers always use WebRTC\") — same field shape as the QUIC case, different `transport` discriminant.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "inbox"
+            },
+            "value": {
+              "type": "text",
+              "value": "_INBOX_d5e6f7a8.x"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "transport"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "ufrag"
+            },
+            "value": {
+              "type": "text",
+              "value": "4ZcD"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "pwd"
+            },
+            "value": {
+              "type": "text",
+              "value": "7hjK29fpQwltxRzC4mNsdEaB"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cert_fp"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a563707764781837686a4b3239667051776c7478527a43346d4e736445614265696e626f78715f494e424f585f64356536663761382e7865756672616764345a634467636572745f66705820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb697472616e73706f727401"
+    },
+    {
+      "name": "offer_boundary_length_fields",
+      "description": "Edge case: `inbox`/`ufrag`/`pwd` each at exactly their decoder-enforced byte-length cap (256/256/256 — see MAX_INBOX_LEN/MAX_UFRAG_LEN/MAX_PWD_LEN) — the strict decoder must accept these, and reject anything one byte longer.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "inbox"
+            },
+            "value": {
+              "type": "text",
+              "value": "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "transport"
+            },
+            "value": {
+              "type": "uint",
+              "value": 0
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "ufrag"
+            },
+            "value": {
+              "type": "text",
+              "value": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "pwd"
+            },
+            "value": {
+              "type": "text",
+              "value": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cert_fp"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a5637077647901007070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707065696e626f78790100696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696969696575667261677901007575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757567636572745f66705820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc697472616e73706f727400"
+    }
+  ],
+  "answers": [
+    {
+      "name": "answer_quic",
+      "description": "Host connect answer for a native↔native QUIC session — mirrors the offer's transport/ufrag/pwd/cert_fp shape, minus `inbox` (the answer travels as the `connect` request's own reply, needing no reply-subject of its own).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "transport"
+            },
+            "value": {
+              "type": "uint",
+              "value": 0
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "ufrag"
+            },
+            "value": {
+              "type": "text",
+              "value": "9pQr"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "pwd"
+            },
+            "value": {
+              "type": "text",
+              "value": "zL4mNq82vwTsYbXeR1oPdCkH"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cert_fp"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a46370776478187a4c346d4e713832767754735962586552316f5064436b48657566726167643970517267636572745f66705820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd697472616e73706f727400"
+    },
+    {
+      "name": "answer_webrtc",
+      "description": "Host connect answer for a WebRTC session.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "transport"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "ufrag"
+            },
+            "value": {
+              "type": "text",
+              "value": "2FgH"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "pwd"
+            },
+            "value": {
+              "type": "text",
+              "value": "vB6nKq93wRtYcXsE2pQdAjLm"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cert_fp"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a46370776478187642366e4b713933775274596358734532705164416a4c6d657566726167643246674867636572745f66705820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee697472616e73706f727401"
+    }
+  ],
+  "ice": [
+    {
+      "name": "ice_host_candidate",
+      "description": "A trickled host-type ICE candidate line (RFC 8839 §5.1) — `end_of_candidates` false.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "candidate"
+            },
+            "value": {
+              "type": "text",
+              "value": "candidate:1 1 UDP 2130706431 10.0.0.5 54400 typ host"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "end_of_candidates"
+            },
+            "value": {
+              "type": "bool",
+              "value": false
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a26963616e646964617465783463616e6469646174653a3120312055445020323133303730363433312031302e302e302e352035343430302074797020686f737471656e645f6f665f63616e64696461746573f4"
+    },
+    {
+      "name": "ice_srflx_candidate_with_raddr",
+      "description": "A trickled server-reflexive candidate line carrying the `raddr`/`rport` extension attributes (RFC 8839 §5.1).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "candidate"
+            },
+            "value": {
+              "type": "text",
+              "value": "candidate:2 1 UDP 1694498815 203.0.113.9 61200 typ srflx raddr 10.0.0.5 rport 54400"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "end_of_candidates"
+            },
+            "value": {
+              "type": "bool",
+              "value": false
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a26963616e646964617465785363616e6469646174653a322031205544502031363934343938383135203230332e302e3131332e3920363132303020747970207372666c782072616464722031302e302e302e352072706f727420353434303071656e645f6f665f63616e64696461746573f4"
+    },
+    {
+      "name": "ice_end_of_candidates",
+      "description": "The end-of-candidates signal (RFC 8445 §8.2.7, restated at the payload level): no candidate line, marker set. `candidate` is omitted entirely (key omission), not encoded as CBOR null.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "end_of_candidates"
+            },
+            "value": {
+              "type": "bool",
+              "value": true
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a171656e645f6f665f63616e64696461746573f5"
+    },
+    {
+      "name": "ice_boundary_length_candidate",
+      "description": "Edge case: `candidate` at exactly its decoder-enforced byte-length cap (1024 — see MAX_CANDIDATE_LEN) — the strict decoder must accept this, and reject anything one byte longer.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "candidate"
+            },
+            "value": {
+              "type": "text",
+              "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "end_of_candidates"
+            },
+            "value": {
+              "type": "bool",
+              "value": false
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a26963616e6469646174657904006363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636371656e645f6f665f63616e64696461746573f4"
+    }
+  ]
+}
