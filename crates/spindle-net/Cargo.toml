@@ -4,20 +4,69 @@ version.workspace = true
 edition.workspace = true
 
 # Crate layering law (A9c boundary rule 3 / DESIGN.md §A9c: proto ← core ← {net, vfs} ← {host-core,
-# client-core}): Stage 6 slice 5 gives this crate its first real dependencies, all confined to the
-# QUIC control-stream transport (DESIGN.md §A8/A10.32) graduated from spikes/s19-quic-transport.
-# `spindle-proto`/`spindle-core` are taken directly per the layering law (this crate sits directly
-# above `core`); `spindle-vfs`/`spindle-host-core` are deliberately NOT dependencies here (the
-# layering law forbids `net` from depending on either — the direction is host-core -> net, not the
-# reverse). NATS/WebRTC/ICE/the transfer manager remain future additions (Stage 5, unscheduled as
-# of this slice) — see this crate's `lib.rs` module doc comment.
+# client-core}): Stage 6 slice 5 gave this crate its first real dependencies, confined to the QUIC
+# control-stream transport (DESIGN.md §A8/A10.32) graduated from spikes/s19-quic-transport. Stage 5
+# slice 3 adds NATS-mediated signaling (DESIGN.md §A6/§A7), graduated from spikes/s2-signaling —
+# both peer roles' offer/answer/trickle-ICE exchange, wired to the QUIC seam above. `spindle-proto`/
+# `spindle-core` are taken directly per the layering law (this crate sits directly above `core`);
+# `spindle-vfs`/`spindle-host-core`/`spindle-client-core` are deliberately NOT dependencies here
+# (the layering law forbids `net` from depending on any of them — the direction is
+# host-core/client-core -> net, not the reverse). This is why the host role's membership/
+# authorization decision ("is this sender an active, non-revoked member device?", DESIGN.md §A5)
+# is an injected trait (`signaling::ConnectAuthorizer`) rather than an inline registry lookup: that
+# registry lives in `spindle-host-core`, which this crate must never depend on. The WebRTC
+# data-channel transport (browser peers) and the client-side transfer manager remain future
+# additions — see this crate's `lib.rs` module doc comment.
 [dependencies]
 spindle-core = { path = "../spindle-core" }
 spindle-proto = { path = "../spindle-proto" }
 thiserror = { workspace = true }
 sha2 = { workspace = true } # cert fingerprint (SHA-256 of the DER) — same derivation as A10.32/S19
+# One soft-failure case in `signaling::ice` (a malformed trickled candidate line, e.g. from a
+# future peer's extension this agent doesn't parse yet) is worth an operator's attention without
+# being fatal to the connect attempt (matching `spikes/s2-signaling`'s own warn-and-continue
+# precedent) — `tracing` is this workspace's logging facade everywhere else, so this crate's first
+# use of it follows the same convention rather than inventing its own.
+tracing = { workspace = true }
 
 tokio = { workspace = true } # workspace already declares features = ["full"]
+
+# NATS-mediated signaling transport (DESIGN.md §A6): the caller owns/connects the client (see
+# `signaling`'s module doc comment — "the NATS client is passed in, not owned" is a brief
+# constraint, not this crate's default preference either way), this crate only publishes/
+# subscribes on it.
+async-nats = { workspace = true }
+# `async_nats::Subscriber` is a `futures_core::Stream`; `StreamExt::next()` is the standard,
+# minimal way to drive it in a `while let` loop (`signaling::host::SignalingHost::run`'s connect
+# subscription, and `signaling::bridge_incoming_ice`'s per-session trickle-ICE subscription).
+# `spindle-helper`'s own Cargo.toml carries the identical dependency for the identical reason —
+# see that crate's manifest comment: this resolves to a version already present in the workspace's
+# Cargo.lock (a transitive dep of async-nats/webrtc), so it adds no new dependency *version* to the
+# tree, only a direct edge to an existing one. A plain version pin (not `{ workspace = true }`)
+# matches `spindle-helper`'s own precedent, since `futures-util` is not in the root workspace
+# manifest's `[workspace.dependencies]` table.
+futures-util = "0.3"
+
+# The A7 envelope's ephemeral X25519 keys (`derive_bootstrap_key`/`derive_session_key`'s `eph_dh`
+# input) are typed as `x25519_dalek::PublicKey`/`StaticSecret` by `spindle_core::identity::DeviceKey`
+# (`diffie_hellman`/`agree_public_key`), and `spindle-core` does not re-export that crate the way it
+# re-exports `ed25519-dalek`'s `VerifyingKey`/`SigningKey` (see that crate's `lib.rs`) — so a caller
+# of `DeviceKey::diffie_hellman` needs its own direct dependency to name the type at all. `signaling`
+# is the first thing in this crate to call that API (`quic`/`framing` never touch envelope crypto).
+x25519-dalek = { workspace = true }
+# Session ids (16 random bytes per connect, DESIGN.md §A6) and ephemeral X25519 keypair generation
+# (`StaticSecret::random_from_rng(OsRng)`) both need a CSPRNG source.
+rand = { workspace = true }
+
+# Standalone ICE punching (DESIGN.md §A8/A10.32), graduated from `spikes/s2-signaling`'s
+# `s2-connect.rs` (itself built on `spikes/s19-quic-transport`'s leg 2) — see the root workspace
+# manifest's `[workspace.dependencies]` entries for the why-`rtc-ice`-not-`webrtc-ice`/why-sans-I/O/
+# why-`ring` rationale (condensed there rather than repeated per-crate).
+rtc-ice = { workspace = true }
+rtc-stun = { workspace = true }
+rtc-shared = { workspace = true }
+sansio = { workspace = true }
+bytes = { workspace = true }
 
 # Exact S19 recipe (spikes/s19-quic-transport/Cargo.toml), reused verbatim rather than
 # re-litigated: `default-features = false` + `["runtime-tokio", "rustls-ring"]` keeps this crate's

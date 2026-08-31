@@ -14,24 +14,32 @@
 //! - [`quic`] — [`quic::SessionCert`] (per-session self-signed cert + SHA-256 fingerprint),
 //!   [`quic::QuicServer`]/[`quic::QuicClient`] (mutual fingerprint-pinned QUIC connections, one
 //!   bidirectional control stream per session, ALPN [`quic::ALPN`]).
+//! - [`signaling`] — NATS-mediated signaling (DESIGN.md §A6/§A7), graduated from
+//!   `spikes/s2-signaling`: both peer roles' offer/answer/trickle-ICE exchange, wired to
+//!   [`quic::QuicClient::from_socket`]/[`quic::QuicServer::from_socket`] above. See that module's
+//!   own doc comment for its submodule map and the two injected traits its layering requires.
 //!
 //! # Scope
 //!
-//! **In** (this slice): binding the VFS RPC control stream to a real QUIC transport — framing,
-//! per-session cert generation, mutual pinning, the control-stream handshake. The actual VFS RPC
-//! read/decode/dispatch/write loop that runs *over* this transport lives in
-//! `spindle-host-core::serve` (that crate depends on this one, not the reverse).
+//! **In**: binding the VFS RPC control stream to a real QUIC transport — framing, per-session cert
+//! generation, mutual pinning, the control-stream handshake (`quic`); and, as of Stage 5 slice 3,
+//! the NATS-mediated connect/trickle-ICE exchange that gets both peers to the point of calling
+//! `from_socket` in the first place (`signaling`). The actual VFS RPC read/decode/dispatch/write
+//! loop that runs *over* the resulting control stream lives in `spindle-host-core::serve` (that
+//! crate depends on this one, not the reverse) — `signaling::host::SessionHandler` is this crate's
+//! injection point for that loop.
 //!
-//! **Out** (future, Stage 5 — unscheduled as of this slice): the NATS client + Auth Callout
-//! credential presentation, the browser-peer WebRTC data-channel transport (`webrtc-rs`, needed
-//! only when a browser peer is on the other end — DESIGN.md §A8), trickle ICE (standalone,
-//! reused to punch the NAT for QUIC per §A8, not yet wired here), and the client-side transfer
-//! manager. Envelope integration (both peers' QUIC certificate fingerprints traveling inside the
-//! A7-verified `connect` envelope, per §A6) is likewise deferred — see [`quic`]'s module doc
-//! comment's "Envelope integration (deferred)" section for exactly what this slice does instead.
+//! **Out** (future, unscheduled as of this slice): the NATS client's own connection/credential
+//! setup (Auth Callout presentation) — this crate only ever takes an already-connected
+//! `async_nats::Client` as a parameter, never connects one itself (see [`signaling`]'s module doc
+//! comment); the browser-peer WebRTC data-channel transport (`webrtc-rs`, needed only when a
+//! browser peer is on the other end — DESIGN.md §A8); STUN/TURN candidate gathering beyond
+//! loopback/LAN host candidates (see [`signaling::ice`]'s module doc comment); and the client-side
+//! transfer manager.
 
 pub mod framing;
 pub mod quic;
+pub mod signaling;
 
 #[cfg(test)]
 mod tests {

@@ -39,6 +39,35 @@ async-nats = "0.35"
 # WebRTC (DESIGN.md A9c: webrtc >=0.20; datachannel-rs is the S3 fallback if it fails)
 webrtc = ">=0.20"
 
+# Standalone ICE (native<->native NAT punching, DESIGN.md §A8/A10.32), graduated from
+# spikes/s19-quic-transport's proven leg 2 / spikes/s2-signaling's s2-connect.rs (see that spike's
+# module doc comment for the full empirical groundwork; condensed here to why-not-alternatives):
+# `rtc-ice` (not the older standalone `webrtc-ice`) is what `webrtc` 0.20.3 actually uses for ICE
+# -- confirmed via Cargo.lock/`cargo tree`, and it resolves and builds standalone with no other
+# part of `webrtc`/`rtc` pulled in. It is sans-I/O: `rtc_ice::agent::Agent` "owns no sockets and no
+# clock" (its own doc comment) -- the caller feeds it inbound datagrams and sends whatever it
+# emits, then hands the winning `std::net::UdpSocket` straight to quinn once a pair is selected
+# (zero custom `AsyncUdpSocket` adapter needed, unlike the TURN-relay path). `default-features =
+# false` + `["ring"]` matches quinn/rustls's own crypto-provider choice in spindle-net's existing
+# QUIC dependencies (`crates/spindle-net/Cargo.toml`) -- `aws-lc-rs` needs a cmake+C toolchain this
+# workspace avoids everywhere else.
+rtc-ice = { version = "0.20.3", default-features = false, features = ["ring"] }
+# Server-reflexive candidate gathering: hand-rolled against this crate because
+# `rtc_ice::AgentConfig.urls` is accepted but not wired to any gathering logic in rtc-ice 0.20.3.
+# Version pinned to match `rtc-ice` 0.20.3's own dependency exactly (same release train).
+rtc-stun = "0.20.3"
+# `TaggedBytesMut`/`TransportContext`/`TransportProtocol` -- the message/context types
+# `rtc_ice::agent::Agent`'s `sansio::Protocol` impl reads and writes; not re-exported by `rtc-ice`
+# itself, so declared directly. Version pinned to match `rtc-ice` 0.20.3's own dependency exactly.
+rtc-shared = "0.20.3"
+# The `sansio::Protocol` trait itself (`handle_read`/`poll_write`/`poll_event`/`poll_timeout`/
+# `handle_timeout`) -- `rtc_ice::agent::Agent` implements it; the trait must be in scope to call
+# those methods. Version pinned to match what `rtc-ice` 0.20.3 itself depends on.
+sansio = "1.0.1"
+# `BytesMut` for `TaggedBytesMut`'s message field (the ICE driving loop). Already resolves
+# transitively via `rtc-ice`; declared directly since callers construct `BytesMut` values by hand.
+bytes = "1.12.1"
+
 # Crypto
 ed25519-dalek = "2"
 x25519-dalek = "2"

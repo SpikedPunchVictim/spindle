@@ -118,7 +118,7 @@ offline; callout refuses before host returns) met; S18 (cap lifecycle: expiry→
 re-issue; device bootstrap; no lockout in any path) met; S19 (quinn-over-punched-ICE
 native↔native: ≥ 15 MB/s @ 50 ms, NAT-combination punch/relay success) met for the QUIC path.
 **Tests**: S2/S5/S9/S14/S18/S19 automated suites graduated into CI.
-**Status**: Not Started
+**Status**: In Progress
 **Note**: S5 spike: **PASS** (2026-08-25/26, 15/15 automated checks against the composed
 `deploy/docker-compose.yml` stack; `spikes/s5-presence/RESULTS.md`) — presence's bar met live
 (0.01 s clean / 42.36 s dead vs. the 5 s/60 s bar); two live-only bugs found and fixed (SYS-account
@@ -149,6 +149,33 @@ says ICE losses are "tolerated/retried" — a retried ICE envelope either reuses
 a receiver must reject as replay) or burns a new one (making the retry a different envelope);
 gaps are permitted by "strictly increasing" but reordering is not. This likely needs a §A6/§A7
 amendment once the spike settles it.
+**Note**: 2026-08-31 slice progress. Slices 1-3 are complete; slice 4 has not started.
+- **Slice 1 (spike S2)** — done. Leg A steps A and B both ran against the composed stack:
+  step A 8/8 checks, step B a full trickle-ICE-to-QUIC connect with medians (n=7, loopback)
+  of 14.65 ms offer->answer, 7.15 ms answer->ICE-selected, 3.62 ms selected->QUIC-complete,
+  **28.91 ms offer->usable stream** against S2's < 2 s LAN bar. It also settled the `seq`
+  ambiguity this stage's earlier note flagged, which became the DESIGN v0.9.14 amendment
+  (a retry is a new envelope with a fresh `seq`, never a byte-identical retransmit).
+- **Slice 2 (wire types)** — done. `spindle_proto::signaling` carries `OfferPayload`,
+  `AnswerPayload`, `IcePayload`, a closed `Transport` enum and `KIND_OFFER`/`KIND_ANSWER`/
+  `KIND_ICE`, with golden vectors and a TypeScript twin. Four spike shortcuts were fixed on
+  promotion rather than frozen: `cert_fp` is `[u8; 32]` as a CBOR byte string (not a hex
+  string), `transport` is a closed enum (not free text), strings carry explicit caps, and
+  decoding is strict closed-schema.
+- **Slice 3 (signaling in `spindle-net`)** — done. `spindle-net::signaling` implements both
+  peer roles over NATS, using the promoted wire types and `spindle-core`'s envelope crypto,
+  terminating in the `QuicServer::from_socket` / `QuicClient::from_socket` seam added for
+  the ICE-punched socket. Membership authorization enters as an injected `ConnectAuthorizer`
+  trait and session handling as a `SessionHandler` trait, since A9c boundary rule 3 forbids
+  `spindle-net` from depending on `spindle-host-core`.
+- **Prerequisite closed along the way**: DESIGN v0.9.14's two-key schedule existed only in
+  the spike; `spindle-core` still had the single-key formula. `derive_bootstrap_key` (`k0`)
+  now sits alongside `derive_session_key` (`k1`) in `spindle-core`, with golden vectors and
+  a TypeScript twin.
+- **Not yet proven end to end**: slice 3's NATS wiring and its ICE punch have unit coverage
+  only. The live composed-stack evidence for that path is the spike's, not the graduated
+  code's — a live run of `spindle-net::signaling` itself remains outstanding, alongside
+  slice 4 and S2's across-NATs number (no measurement exists; loopback only).
 
 ## Stage 6: spindle-vfs + host-core
 **Goal**: Implement the shares/groups/entitlements engine and the VFS RPC server in
