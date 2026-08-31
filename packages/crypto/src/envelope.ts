@@ -1,14 +1,28 @@
-// The A7 end-to-end signaling envelope (DESIGN.md §A7, ADR-004): session-key derivation,
-// `seal`/`open`, and every receiver MUST-check — the TypeScript twin of
-// `crates/spindle-core/src/envelope.rs`.
+// The A7 end-to-end signaling envelope (DESIGN.md §A7, ADR-004): the two-key signaling schedule
+// (DESIGN.md §A7 "Key schedule", amended v0.9.14), `seal`/`open`, and every receiver MUST-check —
+// the TypeScript twin of `crates/spindle-core/src/envelope.rs`.
 //
 // ```text
 // Envelope { v, alg_id, from_fp, to_fp, sid, kind, seq, ts, eph_pk?, ciphertext, sig }
-// Session key:  k = HKDF-SHA256(X25519(eph_self, eph_peer) || X25519(dev_self, dev_agree_peer),
-//                                info = "spindle-sess-v1" || sid || from_fp || to_fp)
+// Key schedule: two keys per session — the offer is the first message and the client has no
+// peer ephemeral yet.
+//   k0 (offer only)  = HKDF-SHA256(X25519(eph_c, dev_agree_h) || X25519(dev_agree_c, dev_agree_h),
+//                                  info = "spindle-sess-boot-v1" || sid || from_fp || to_fp)
+//   k1 (all others)  = HKDF-SHA256(X25519(eph_self, eph_peer) || X25519(dev_self, dev_agree_peer),
+//                                  info = "spindle-sess-v1" || sid || from_fp || to_fp)
 // AEAD:         AES-256-GCM, nonce = direction(1) || seq(11); AAD = canonical header
 // sig:          Ed25519(dev_sign_from, "spindle-env-v1" || canonical(header) || ciphertext)
 // ```
+//
+// **Two-key rationale**: the connect offer is sealed under `k0` because the client cannot know
+// the host's ephemeral public key before the host replies — `k0`'s first DH term binds the
+// client's ephemeral to the host's *static* agreement key instead of the host's ephemeral. From
+// the host's answer onward, both directions use `k1`, a full ephemeral-ephemeral hybrid. The two
+// `info` labels (`BOOT_KEY_INFO_DOMAIN` / `SESSION_KEY_INFO_DOMAIN`) are the *only* difference
+// between `deriveBootstrapKey` and `deriveSessionKey` and are mandatory domain separation:
+// without them the two keys would collapse onto the same derivation for the same `(sid, fromFp,
+// toFp)`. A receiver decrypts `kind = offer` under `k0` and every other `kind` under `k1` — never
+// both.
 //
 // **Session-role convention** (documented in `envelope.rs`'s module docs, reproduced here
 // verbatim since it is the load-bearing interpretation this module follows): the `fromFp`/`toFp`
@@ -26,6 +40,10 @@ import { aesGcmOpen, aesGcmSeal, hkdfSha256 } from "./primitives.js";
 /** KDF `info` domain prefix (DESIGN.md §A7). */
 export const SESSION_KEY_INFO_DOMAIN = new TextEncoder().encode("spindle-sess-v1");
 
+/** KDF `info` domain for `k0`, the offer-only bootstrap key (DESIGN.md §A7, amended v0.9.14). See
+ * `deriveBootstrapKey`. */
+export const BOOT_KEY_INFO_DOMAIN = new TextEncoder().encode("spindle-sess-boot-v1");
+
 /** `|ts - now| <= 2 min` (DESIGN.md §A7b). */
 export const CLOCK_SKEW_SECS = 120n;
 
@@ -38,10 +56,13 @@ export const CLOCK_SKEW_SECS = 120n;
  */
 export type SessionKey = Uint8Array;
 
-/** `k = HKDF-SHA256(eph_dh || dev_dh, info = "spindle-sess-v1" || sid || from_fp || to_fp)`
- * (DESIGN.md §A7). `ephDh`/`devDh` are the two X25519 shared secrets (ephemeral-ephemeral and
- * device-device); see the module docs for the `fromFp`/`toFp` session-role convention. */
-export async function deriveSessionKey(
+// Shared HKDF-SHA256 derivation body for both `deriveSessionKey` and `deriveBootstrapKey` — the
+// two functions differ *only* in which `info` domain they pass here. Deliberately factored into
+// one implementation: two independent copies of this body could drift, and a drift that silently
+// made the two domains equal would destroy the domain separation DESIGN.md §A7 (v0.9.14) depends
+// on to keep `k0`/`k1` distinct.
+async function deriveKey(
+  domain: Uint8Array,
   ephDh: Uint8Array,
   devDh: Uint8Array,
   sid: Uint8Array,
@@ -52,10 +73,10 @@ export async function deriveSessionKey(
   ikm.set(ephDh, 0);
   ikm.set(devDh, ephDh.length);
 
-  const info = new Uint8Array(SESSION_KEY_INFO_DOMAIN.length + sid.length + fromFp.length + toFp.length);
+  const info = new Uint8Array(domain.length + sid.length + fromFp.length + toFp.length);
   let offset = 0;
-  info.set(SESSION_KEY_INFO_DOMAIN, offset);
-  offset += SESSION_KEY_INFO_DOMAIN.length;
+  info.set(domain, offset);
+  offset += domain.length;
   info.set(sid, offset);
   offset += sid.length;
   info.set(fromFp, offset);
@@ -63,6 +84,38 @@ export async function deriveSessionKey(
   info.set(toFp, offset);
 
   return hkdfSha256(ikm, info, 32);
+}
+
+/** `k1 = HKDF-SHA256(eph_dh || dev_dh, info = "spindle-sess-v1" || sid || from_fp || to_fp)`
+ * (DESIGN.md §A7, amended v0.9.14): the key used for the host's answer and every message after
+ * it, in both directions. `ephDh`/`devDh` are the two X25519 shared secrets (ephemeral-ephemeral
+ * and device-device); see the module docs for the `fromFp`/`toFp` session-role convention, and
+ * `deriveBootstrapKey` for `k0`, the offer-only sibling of this function. */
+export async function deriveSessionKey(
+  ephDh: Uint8Array,
+  devDh: Uint8Array,
+  sid: Uint8Array,
+  fromFp: Uint8Array,
+  toFp: Uint8Array,
+): Promise<SessionKey> {
+  return deriveKey(SESSION_KEY_INFO_DOMAIN, ephDh, devDh, sid, fromFp, toFp);
+}
+
+/** `k0 = HKDF-SHA256(eph_dh || dev_dh, info = "spindle-sess-boot-v1" || sid || from_fp || to_fp)`
+ * (DESIGN.md §A7, amended v0.9.14): the key used to seal the connect offer only. The client
+ * cannot know the host's ephemeral public key before the host replies, so the caller is expected
+ * to pass an ephemeral-static X25519 shared secret as `ephDh` here (not the ephemeral-ephemeral
+ * secret `deriveSessionKey` expects) — this function does no X25519 of its own, it only differs
+ * from `deriveSessionKey` in the `info` domain (mandatory domain separation; see `deriveKey`'s
+ * comment for why that must never drift). */
+export async function deriveBootstrapKey(
+  ephDh: Uint8Array,
+  devDh: Uint8Array,
+  sid: Uint8Array,
+  fromFp: Uint8Array,
+  toFp: Uint8Array,
+): Promise<SessionKey> {
+  return deriveKey(BOOT_KEY_INFO_DOMAIN, ephDh, devDh, sid, fromFp, toFp);
 }
 
 function compareBytes(a: Uint8Array, b: Uint8Array): number {

@@ -11,6 +11,7 @@ import {
   CLOCK_SKEW_SECS,
   type OpenParams,
   type SealParams,
+  deriveBootstrapKey,
   deriveSessionKey,
   directionByte,
   open,
@@ -227,5 +228,88 @@ describe("MUST-check negatives (one per EnvelopeError kind)", () => {
     env.ciphertext = env.ciphertext.slice();
     env.ciphertext[0] ^= 0xff;
     await expect(open(baseOpenParams(fx, 1000n), env)).rejects.toMatchObject({ kind: "BadSignature" });
+  });
+});
+
+describe("k0/k1 two-key schedule (DESIGN.md §A7, amended v0.9.14)", () => {
+  it("bootstrap_and_session_keys_differ_for_identical_inputs", async () => {
+    // The load-bearing domain-separation guarantee: if someone later makes BOOT_KEY_INFO_DOMAIN
+    // equal to SESSION_KEY_INFO_DOMAIN, or drops the domain parameter, this must fail.
+    const devA = await buildDevice(0x10, 0x11);
+    const devB = await buildDevice(0x20, 0x21);
+    const ephASeed = new Uint8Array(32).fill(0x30);
+    const ephBSeed = new Uint8Array(32).fill(0x40);
+    const ephBPk = await x25519PublicKeyFromSeed(ephBSeed);
+    const ephDh = await x25519SharedSecret(ephASeed, ephBPk);
+    const devDh = await x25519SharedSecret(devA.agreeSeed, devB.agreePk);
+    const sid = new Uint8Array(16).fill(0x99);
+
+    const k1 = await deriveSessionKey(ephDh, devDh, sid, devA.fp, devB.fp);
+    const k0 = await deriveBootstrapKey(ephDh, devDh, sid, devA.fp, devB.fp);
+    expect(Array.from(k0)).not.toEqual(Array.from(k1));
+  });
+
+  it("k0_sealed_envelope_does_not_open_under_k1_and_vice_versa", async () => {
+    const fx = await buildFixture();
+    const ephASeed = new Uint8Array(32).fill(0x30);
+    const ephBSeed = new Uint8Array(32).fill(0x40);
+    const ephBPk = await x25519PublicKeyFromSeed(ephBSeed);
+    const ephDh = await x25519SharedSecret(ephASeed, ephBPk);
+    const devDh = await x25519SharedSecret(fx.devA.agreeSeed, fx.devB.agreePk);
+
+    const k1 = await deriveSessionKey(ephDh, devDh, fx.sid, fx.devA.fp, fx.devB.fp);
+    const k0 = await deriveBootstrapKey(ephDh, devDh, fx.sid, fx.devA.fp, fx.devB.fp);
+
+    const envK0 = await seal({
+      sessionKey: k0,
+      signSeed: fx.devA.signSeed,
+      v: 1,
+      algId: 1,
+      fromFp: fx.devA.fp,
+      toFp: fx.devB.fp,
+      sid: fx.sid,
+      kind: 0,
+      seq: 0n,
+      ts: 1000n,
+      plaintext: new TextEncoder().encode("offer"),
+    });
+    const envK1 = await seal({
+      sessionKey: k1,
+      signSeed: fx.devA.signSeed,
+      v: 1,
+      algId: 1,
+      fromFp: fx.devA.fp,
+      toFp: fx.devB.fp,
+      sid: fx.sid,
+      kind: 0,
+      seq: 0n,
+      ts: 1000n,
+      plaintext: new TextEncoder().encode("answer-or-later"),
+    });
+
+    const baseParamsForKind0 = {
+      pinnedSenderKey: fx.devA.signPk,
+      selfFp: fx.devB.fp,
+      expectedSid: fx.sid,
+      now: 1000n,
+      minV: 1,
+      minAlgId: 1,
+      expectedKind: 0,
+      senderRevoked: false,
+    };
+
+    // k0-sealed envelope: fails under k1, succeeds under k0.
+    await expect(open({ ...baseParamsForKind0, sessionKey: k1 }, envK0)).rejects.toMatchObject({
+      kind: "DecryptFailed",
+    });
+    const openedK0 = await open({ ...baseParamsForKind0, sessionKey: k0 }, envK0);
+    expect(new TextDecoder().decode(openedK0)).toBe("offer");
+
+    // k1-sealed envelope: fails under k0, succeeds under k1.
+    await expect(open({ ...baseParamsForKind0, sessionKey: k0 }, envK1)).rejects.toMatchObject({
+      kind: "DecryptFailed",
+    });
+    const openedK1 = await open({ ...baseParamsForKind0, sessionKey: k1 }, envK1);
+    expect(new TextDecoder().decode(openedK1)).toBe("answer-or-later");
   });
 });

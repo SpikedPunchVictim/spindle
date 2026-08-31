@@ -21,9 +21,11 @@ export { FINGERPRINT_LEN, base32EncodeNoPad, deviceFpOf, rootFpOf } from "./fing
 
 export type { EnvelopeErrorKind, OpenParams, SealParams, SessionKey } from "./envelope.js";
 export {
+  BOOT_KEY_INFO_DOMAIN,
   CLOCK_SKEW_SECS,
   EnvelopeError,
   SESSION_KEY_INFO_DOMAIN,
+  deriveBootstrapKey,
   deriveSessionKey,
   directionByte,
   open,

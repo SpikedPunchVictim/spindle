@@ -20,10 +20,13 @@ use spindle_core::artifacts::{
     verify_capability, verify_device_certificate, verify_host_op_key_cert,
     verify_revocation_record,
 };
-use spindle_core::envelope::{derive_session_key, open, seal, OpenParams, SealParams};
+use spindle_core::envelope::{
+    derive_bootstrap_key, derive_session_key, open, seal, OpenParams, SealParams,
+};
 use spindle_core::{DeviceKey, Fingerprint, RootKey};
 use spindle_proto::artifacts::CapKind;
 use spindle_proto::canonical::CborValue;
+use spindle_proto::signaling::KIND_OFFER;
 use std::fs;
 use std::path::{Path, PathBuf};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -819,6 +822,19 @@ fn envelope_vectors() -> Json {
     let sid = vec![0xAB; 16];
     let session_key = derive_session_key(&eph_dh, &dev_dh, &sid, &a.fp, &b.fp);
 
+    // DESIGN.md §A7 (amended v0.9.14): `bootstrap_key` (k0) is derived from the *exact same*
+    // (eph_dh, dev_dh, sid, from_fp, to_fp) inputs as `session_key` (k1) above, purely to make the
+    // domain-separation property visible in this vector file: identical inputs, two different info
+    // domains, two different keys. A real offer's k0 uses a different `eph_dh` (ephemeral-static, not
+    // ephemeral-ephemeral — see envelope.rs's `derive_bootstrap_key` doc comment) but reusing the
+    // already-computed DH terms here keeps this vector focused on the one property it needs to prove.
+    let bootstrap_key = derive_bootstrap_key(&eph_dh, &dev_dh, &sid, &a.fp, &b.fp);
+    assert_ne!(
+        session_key.as_bytes(),
+        bootstrap_key.as_bytes(),
+        "k0 and k1 must differ for identical inputs"
+    );
+
     let ts = 1_755_907_200;
     let plaintext = b"spindle envelope vector plaintext".to_vec();
 
@@ -921,6 +937,74 @@ fn envelope_vectors() -> Json {
         false,
     );
 
+    // Offer-shaped case (DESIGN.md §A7 v0.9.14): demonstrates an envelope sealed under k0 instead of
+    // k1. Uses `kind: KIND_OFFER` (spindle_proto::signaling), the named wire constant for an offer
+    // payload's envelope kind — not a bare marker literal. Kept as its own top-level `offer_case`
+    // field, NOT appended to the `cases` array:
+    // `crates/spindle-core/tests/vectors.rs`'s generic per-case loop assumes every entry in `cases`
+    // opens under the single k1 `session_key` with kind=1 in the A->B direction, so mixing a
+    // k0-sealed case into that array would break that loop's generic assumption rather than exercise
+    // anything new — this vector's k0/k1 conformance is instead consumed directly by
+    // `packages/crypto`'s TS tests, which read `offer_case` explicitly.
+    let offer_plaintext = b"spindle connect offer vector plaintext".to_vec();
+    let offer_env = seal(SealParams {
+        session_key: &bootstrap_key,
+        signer: &a.device,
+        v: 1,
+        alg_id: 1,
+        from_fp: a.fp,
+        to_fp: b.fp,
+        sid: sid.clone(),
+        kind: KIND_OFFER,
+        seq: 0,
+        ts,
+        eph_pk: Some(a.eph_pk.as_bytes().to_vec()),
+        plaintext: &offer_plaintext,
+    });
+
+    let offer_opened = open(
+        OpenParams {
+            session_key: &bootstrap_key,
+            pinned_sender_key: &a.sign_pk,
+            self_fp: &b.fp,
+            expected_sid: &sid,
+            bound_from_fp: None,
+            min_seq_exclusive: None,
+            now: ts,
+            min_v: 1,
+            min_alg_id: 1,
+            expected_kind: KIND_OFFER,
+            sender_revoked: false,
+        },
+        &offer_env,
+    )
+    .expect("offer envelope opens under k0");
+    assert_eq!(offer_opened, offer_plaintext);
+
+    let offer_direction = spindle_core::direction_byte(&a.fp, &b.fp);
+    let mut offer_nonce = [0u8; 12];
+    offer_nonce[0] = offer_direction;
+    offer_nonce[4..12].copy_from_slice(&0u64.to_be_bytes());
+    let offer_aad = offer_env.header_canonical_bytes();
+
+    let offer_case = envelope_case(
+        "offer_sealed_under_k0",
+        "Offer-shaped envelope sealed under k0 (derive_bootstrap_key), not k1; carries \
+         kind = KIND_OFFER. Opens only under k0 — see bootstrap_key_hex.",
+        offer_direction,
+        0,
+        ts,
+        &offer_nonce,
+        &offer_aad,
+        &offer_plaintext,
+        &offer_env.ciphertext,
+        &offer_env.to_canonical_bytes(),
+        &offer_env.signing_input(),
+        &offer_env.sig,
+        true,
+        true,
+    );
+
     Json::Obj(vec![
         ("artifact", Json::Str("Envelope".into())),
         (
@@ -931,6 +1015,8 @@ fn envelope_vectors() -> Json {
         ("device_b", device_fixture_json(&b)),
         ("sid_hex", Json::hex(&sid)),
         ("session_key_hex", Json::hex(session_key.as_bytes())),
+        ("bootstrap_key_hex", Json::hex(bootstrap_key.as_bytes())),
         ("cases", Json::Arr(vec![valid_case, tampered_case])),
+        ("offer_case", offer_case),
     ])
 }

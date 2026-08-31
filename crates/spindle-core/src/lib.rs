@@ -41,8 +41,8 @@ pub mod identity;
 mod base32;
 
 pub use envelope::{
-    derive_session_key, direction_byte, open, seal, EnvelopeError, OpenParams, SealParams,
-    SessionKey,
+    derive_bootstrap_key, derive_session_key, direction_byte, open, seal, EnvelopeError,
+    OpenParams, SealParams, SessionKey,
 };
 pub use fingerprint::{Fingerprint, FingerprintError, FINGERPRINT_LEN};
 pub use identity::{

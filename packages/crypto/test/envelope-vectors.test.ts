@@ -4,11 +4,11 @@
 // and checks each intermediate value byte-for-byte against the vector before decrypting,
 // verifying the real signature, and round-tripping `seal`.
 
-import { Envelope, bytesToHex, hexToBytes } from "@spindle/proto";
+import { Envelope, KIND_OFFER, bytesToHex, hexToBytes } from "@spindle/proto";
 import { describe, expect, it } from "vitest";
 
 import { ed25519PublicKeyFromSeed, ed25519Verify, x25519PublicKeyFromSeed, x25519SharedSecret } from "../src/backend.js";
-import { deriveSessionKey, directionByte, open, seal } from "../src/envelope.js";
+import { deriveBootstrapKey, deriveSessionKey, directionByte, open, seal } from "../src/envelope.js";
 import { deviceFpOf } from "../src/fingerprint.js";
 import { aesGcmOpen } from "../src/primitives.js";
 import { loadSignedVectorFile } from "./helpers.js";
@@ -55,6 +55,84 @@ describe("envelope.json", () => {
     const devDh = await x25519SharedSecret(a.agreeSeed, b.agreePk);
     const sessionKey = await deriveSessionKey(ephDh, devDh, sid, a.fp, b.fp);
     expect(bytesToHex(sessionKey)).toBe(doc.session_key_hex);
+  });
+
+  it("re-derives the bootstrap key (k0) and confirms it differs from the session key (k1)", async () => {
+    const a = await loadDeviceFixture(doc.device_a);
+    const b = await loadDeviceFixture(doc.device_b);
+    const sid = hexToBytes(doc.sid_hex);
+
+    const ephDh = await x25519SharedSecret(a.ephSeed, b.ephPk);
+    const devDh = await x25519SharedSecret(a.agreeSeed, b.agreePk);
+    const bootstrapKey = await deriveBootstrapKey(ephDh, devDh, sid, a.fp, b.fp);
+    expect(bytesToHex(bootstrapKey)).toBe(doc.bootstrap_key_hex);
+    expect(doc.bootstrap_key_hex).not.toBe(doc.session_key_hex);
+  });
+
+  it("offer_case: reproduces nonce/AAD/ciphertext, decrypts under k0, verifies signature, and rejects under k1", async () => {
+    const a = await loadDeviceFixture(doc.device_a);
+    const b = await loadDeviceFixture(doc.device_b);
+    const sid = hexToBytes(doc.sid_hex);
+    const bootstrapKey = hexToBytes(doc.bootstrap_key_hex);
+    const sessionKey = hexToBytes(doc.session_key_hex);
+
+    const c = doc.offer_case;
+
+    const direction = directionByte(a.fp, b.fp);
+    expect(direction).toBe(c.direction_byte);
+
+    const env = Envelope.fromCanonicalBytes(hexToBytes(c.envelope_canonical_cbor_hex));
+    const aad = Envelope.headerCanonicalBytes(env);
+    expect(bytesToHex(aad)).toBe(c.aad_hex);
+
+    const nonce = new Uint8Array(12);
+    nonce[0] = direction;
+    // seq = 0 for this case, so the big-endian seq bytes are already zero.
+    expect(bytesToHex(nonce)).toBe(c.nonce_hex);
+
+    expect(bytesToHex(env.ciphertext)).toBe(c.ciphertext_hex);
+    const plaintext = await aesGcmOpen(bootstrapKey, nonce, aad, env.ciphertext);
+    expect(bytesToHex(plaintext)).toBe(c.plaintext_hex);
+
+    expect(bytesToHex(Envelope.signingInput(env))).toBe(c.signing_input_hex);
+    expect(bytesToHex(env.sig)).toBe(c.signature_hex);
+    const sigValid = await ed25519Verify(a.signPk, Envelope.signingInput(env), env.sig);
+    expect(sigValid).toBe(true);
+
+    // Full `open()` round-trip under k0 (bootstrap key) succeeds.
+    const opened = await open(
+      {
+        sessionKey: bootstrapKey,
+        pinnedSenderKey: a.signPk,
+        selfFp: b.fp,
+        expectedSid: sid,
+        now: env.ts,
+        minV: 1,
+        minAlgId: 1,
+        expectedKind: KIND_OFFER,
+        senderRevoked: false,
+      },
+      env,
+    );
+    expect(bytesToHex(opened)).toBe(c.plaintext_hex);
+
+    // Opening the same offer envelope under k1 (session key) instead must fail decryption.
+    await expect(
+      open(
+        {
+          sessionKey,
+          pinnedSenderKey: a.signPk,
+          selfFp: b.fp,
+          expectedSid: sid,
+          now: env.ts,
+          minV: 1,
+          minAlgId: 1,
+          expectedKind: KIND_OFFER,
+          senderRevoked: false,
+        },
+        env,
+      ),
+    ).rejects.toMatchObject({ kind: "DecryptFailed" });
   });
 
   it("reproduces nonce/AAD/ciphertext, decrypts, and verifies the real signature (a_to_b_first_message)", async () => {

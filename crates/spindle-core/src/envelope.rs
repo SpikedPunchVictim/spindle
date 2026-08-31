@@ -1,13 +1,27 @@
-//! The A7 end-to-end signaling envelope (DESIGN.md §A7, ADR-004): session-key derivation,
-//! `seal`/`open`, and every receiver MUST-check.
+//! The A7 end-to-end signaling envelope (DESIGN.md §A7, ADR-004): the two-key signaling schedule
+//! (DESIGN.md §A7 "Key schedule", amended v0.9.14), `seal`/`open`, and every receiver MUST-check.
 //!
 //! ```text
 //! Envelope { v, alg_id, from_fp, to_fp, sid, kind, seq, ts, eph_pk?, ciphertext, sig }
-//! Session key:  k = HKDF-SHA256(X25519(eph_self, eph_peer) || X25519(dev_self, dev_agree_peer),
-//!                               info = "spindle-sess-v1" || sid || from_fp || to_fp)
+//! Key schedule: two keys per session — the offer is the first message and the client has no
+//! peer ephemeral yet.
+//!   k0 (offer only)  = HKDF-SHA256(X25519(eph_c, dev_agree_h) || X25519(dev_agree_c, dev_agree_h),
+//!                                  info = "spindle-sess-boot-v1" || sid || from_fp || to_fp)
+//!   k1 (all others)  = HKDF-SHA256(X25519(eph_self, eph_peer) || X25519(dev_self, dev_agree_peer),
+//!                                  info = "spindle-sess-v1" || sid || from_fp || to_fp)
 //! AEAD:         AES-256-GCM, nonce = direction(1) || seq(11); AAD = canonical header
 //! sig:          Ed25519(dev_sign_from, "spindle-env-v1" || canonical(header) || ciphertext)
 //! ```
+//!
+//! **Two-key rationale**: the connect offer is sealed under `k0` because the client cannot know
+//! the host's ephemeral public key before the host replies — `k0`'s first DH term binds the
+//! client's ephemeral to the host's *static* agreement key instead of the host's ephemeral. From
+//! the host's answer onward, both directions use `k1`, a full ephemeral-ephemeral hybrid. The two
+//! `info` labels ([`BOOT_KEY_INFO_DOMAIN`] / [`SESSION_KEY_INFO_DOMAIN`]) are the *only*
+//! difference between [`derive_bootstrap_key`] and [`derive_session_key`] and are mandatory
+//! domain separation: without them the two keys would collapse onto the same derivation for the
+//! same `(sid, from_fp, to_fp)`. A receiver decrypts `kind = offer` under `k0` and every other
+//! `kind` under `k1` — never both.
 //!
 //! **Session-role convention (not spelled out verbatim in DESIGN.md, documented here as the
 //! interpretation this crate follows)**: the `from_fp`/`to_fp` fed into the session-key `info`
@@ -34,6 +48,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// KDF `info` domain prefix (DESIGN.md §A7).
 pub const SESSION_KEY_INFO_DOMAIN: &[u8] = b"spindle-sess-v1";
 
+/// KDF `info` domain prefix for `k0`, the offer-only bootstrap key (DESIGN.md §A7, amended
+/// v0.9.14). See [`derive_bootstrap_key`].
+pub const BOOT_KEY_INFO_DOMAIN: &[u8] = b"spindle-sess-boot-v1";
+
 /// `|ts - now| <= 2 min` (DESIGN.md §A7b).
 pub const CLOCK_SKEW_SECS: u64 = 120;
 
@@ -50,10 +68,15 @@ impl SessionKey {
     }
 }
 
-/// `k = HKDF-SHA256(eph_dh || dev_dh, info = "spindle-sess-v1" || sid || from_fp || to_fp)`
-/// (DESIGN.md §A7). `eph_dh`/`dev_dh` are the two X25519 shared secrets (ephemeral-ephemeral and
-/// device-device); see the module docs for the `from_fp`/`to_fp` session-role convention.
-pub fn derive_session_key(
+/// Shared HKDF-SHA256 derivation body for both [`derive_session_key`] and
+/// [`derive_bootstrap_key`] — the two functions differ *only* in which `info` domain they pass
+/// here. Deliberately factored into one implementation: two independent copies of this body could
+/// drift, and a drift that silently made the two domains equal would destroy the domain
+/// separation DESIGN.md §A7 (v0.9.14) depends on to keep `k0`/`k1` distinct — with no visible
+/// symptom short of a test like `bootstrap_and_session_keys_differ_for_identical_inputs` below
+/// failing.
+fn derive_key(
+    domain: &[u8],
     eph_dh: &[u8; 32],
     dev_dh: &[u8; 32],
     sid: &[u8],
@@ -64,8 +87,8 @@ pub fn derive_session_key(
     ikm[..32].copy_from_slice(eph_dh);
     ikm[32..].copy_from_slice(dev_dh);
 
-    let mut info = Vec::with_capacity(SESSION_KEY_INFO_DOMAIN.len() + sid.len() + 64);
-    info.extend_from_slice(SESSION_KEY_INFO_DOMAIN);
+    let mut info = Vec::with_capacity(domain.len() + sid.len() + 64);
+    info.extend_from_slice(domain);
     info.extend_from_slice(sid);
     info.extend_from_slice(from_fp.as_bytes());
     info.extend_from_slice(to_fp.as_bytes());
@@ -76,6 +99,38 @@ pub fn derive_session_key(
         .expect("HKDF-SHA256 output length 32 is always valid");
     ikm.zeroize();
     SessionKey(okm)
+}
+
+/// `k1 = HKDF-SHA256(eph_dh || dev_dh, info = "spindle-sess-v1" || sid || from_fp || to_fp)`
+/// (DESIGN.md §A7, amended v0.9.14): the key used for the host's answer and every message after
+/// it, in both directions. `eph_dh`/`dev_dh` are the two X25519 shared secrets (ephemeral-
+/// ephemeral and device-device); see the module docs for the `from_fp`/`to_fp` session-role
+/// convention, and [`derive_bootstrap_key`] for `k0`, the offer-only sibling of this function.
+pub fn derive_session_key(
+    eph_dh: &[u8; 32],
+    dev_dh: &[u8; 32],
+    sid: &[u8],
+    from_fp: &Fingerprint,
+    to_fp: &Fingerprint,
+) -> SessionKey {
+    derive_key(SESSION_KEY_INFO_DOMAIN, eph_dh, dev_dh, sid, from_fp, to_fp)
+}
+
+/// `k0 = HKDF-SHA256(eph_dh || dev_dh, info = "spindle-sess-boot-v1" || sid || from_fp || to_fp)`
+/// (DESIGN.md §A7, amended v0.9.14): the key used to seal the connect offer only. The client
+/// cannot know the host's ephemeral public key before the host replies, so the caller is expected
+/// to pass an ephemeral-static X25519 shared secret as `eph_dh` here (not the ephemeral-ephemeral
+/// secret [`derive_session_key`] expects) — this function does no X25519 of its own, it only
+/// differs from [`derive_session_key`] in the `info` domain (mandatory domain separation; see
+/// `derive_key`'s doc comment for why that must never drift).
+pub fn derive_bootstrap_key(
+    eph_dh: &[u8; 32],
+    dev_dh: &[u8; 32],
+    sid: &[u8],
+    from_fp: &Fingerprint,
+    to_fp: &Fingerprint,
+) -> SessionKey {
+    derive_key(BOOT_KEY_INFO_DOMAIN, eph_dh, dev_dh, sid, from_fp, to_fp)
 }
 
 /// `direction(1) || seq(11)` nonce construction (DESIGN.md §A7). `direction` is derived from the
@@ -579,5 +634,121 @@ mod tests {
         let env = seal_a_to_b(&fx, 0, 1_000);
         let params = base_open_params(&fx, 1_000); // min_seq_exclusive: None
         assert!(open(params, &env).is_ok());
+    }
+
+    // ---- k0/k1 two-key schedule (DESIGN.md §A7, amended v0.9.14) ----
+
+    #[test]
+    fn bootstrap_and_session_keys_differ_for_identical_inputs() {
+        // The load-bearing domain-separation guarantee: if someone later makes
+        // BOOT_KEY_INFO_DOMAIN equal to SESSION_KEY_INFO_DOMAIN, or drops the domain parameter,
+        // this must fail.
+        let dev_a = DeviceKey::from_seeds([0x10; 32], [0x11; 32]);
+        let dev_b = DeviceKey::from_seeds([0x20; 32], [0x21; 32]);
+        let eph_a = StaticSecret::from([0x30; 32]);
+        let eph_b = StaticSecret::from([0x40; 32]);
+        let eph_b_pk = X25519PublicKey::from(&eph_b);
+        let eph_dh = *eph_a.diffie_hellman(&eph_b_pk).as_bytes();
+        let dev_dh = dev_a.diffie_hellman(&dev_b.agree_public_key());
+        let dev_a_fp = dev_a.device_fp();
+        let dev_b_fp = dev_b.device_fp();
+        let sid = vec![0x99; 16];
+
+        let k1 = derive_session_key(&eph_dh, &dev_dh, &sid, &dev_a_fp, &dev_b_fp);
+        let k0 = derive_bootstrap_key(&eph_dh, &dev_dh, &sid, &dev_a_fp, &dev_b_fp);
+        assert_ne!(k0.as_bytes(), k1.as_bytes());
+    }
+
+    #[test]
+    fn k0_sealed_envelope_does_not_open_under_k1_and_vice_versa() {
+        let fx = build_fixture();
+        let eph_a = StaticSecret::from([0x30; 32]);
+        let eph_b = StaticSecret::from([0x40; 32]);
+        let eph_b_pk = X25519PublicKey::from(&eph_b);
+        let eph_dh = *eph_a.diffie_hellman(&eph_b_pk).as_bytes();
+        let dev_dh = fx.dev_a.diffie_hellman(&fx.dev_b.agree_public_key());
+
+        let k1 = derive_session_key(&eph_dh, &dev_dh, &fx.sid, &fx.dev_a_fp, &fx.dev_b_fp);
+        let k0 = derive_bootstrap_key(&eph_dh, &dev_dh, &fx.sid, &fx.dev_a_fp, &fx.dev_b_fp);
+
+        let env_k0 = seal(SealParams {
+            session_key: &k0,
+            signer: &fx.dev_a,
+            v: 1,
+            alg_id: 1,
+            from_fp: fx.dev_a_fp,
+            to_fp: fx.dev_b_fp,
+            sid: fx.sid.clone(),
+            kind: 0,
+            seq: 0,
+            ts: 1_000,
+            eph_pk: None,
+            plaintext: b"offer",
+        });
+        let env_k1 = seal(SealParams {
+            session_key: &k1,
+            signer: &fx.dev_a,
+            v: 1,
+            alg_id: 1,
+            from_fp: fx.dev_a_fp,
+            to_fp: fx.dev_b_fp,
+            sid: fx.sid.clone(),
+            kind: 0,
+            seq: 0,
+            ts: 1_000,
+            eph_pk: None,
+            plaintext: b"answer-or-later",
+        });
+
+        // k0-sealed envelope: fails under k1, succeeds under k0.
+        let mut p = base_open_params(&fx, 1_000);
+        p.expected_kind = 0;
+        p.session_key = &k1;
+        let err = open(p, &env_k0).unwrap_err();
+        assert_eq!(err, EnvelopeError::DecryptFailed);
+
+        let mut p = base_open_params(&fx, 1_000);
+        p.expected_kind = 0;
+        p.session_key = &k0;
+        let opened = open(p, &env_k0).expect("k0-sealed envelope opens under k0");
+        assert_eq!(opened, b"offer");
+
+        // k1-sealed envelope: fails under k0, succeeds under k1.
+        let mut p = base_open_params(&fx, 1_000);
+        p.expected_kind = 0;
+        p.session_key = &k0;
+        let err = open(p, &env_k1).unwrap_err();
+        assert_eq!(err, EnvelopeError::DecryptFailed);
+
+        let mut p = base_open_params(&fx, 1_000);
+        p.expected_kind = 0;
+        p.session_key = &k1;
+        let opened = open(p, &env_k1).expect("k1-sealed envelope opens under k1");
+        assert_eq!(opened, b"answer-or-later");
+    }
+
+    #[test]
+    fn derive_bootstrap_key_known_answer() {
+        let dev_a = DeviceKey::from_seeds([0xAA; 32], [0xAB; 32]);
+        let dev_b = DeviceKey::from_seeds([0xCC; 32], [0xCD; 32]);
+        let eph_a = StaticSecret::from([0xEE; 32]);
+        let eph_b = StaticSecret::from([0xFF; 32]);
+        let eph_b_pk = X25519PublicKey::from(&eph_b);
+        let eph_dh = *eph_a.diffie_hellman(&eph_b_pk).as_bytes();
+        let dev_dh = dev_a.diffie_hellman(&dev_b.agree_public_key());
+        let dev_a_fp = dev_a.device_fp();
+        let dev_b_fp = dev_b.device_fp();
+        let sid = vec![0x77; 16];
+
+        let k0 = derive_bootstrap_key(&eph_dh, &dev_dh, &sid, &dev_a_fp, &dev_b_fp);
+        let hex_out = k0
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex_out,
+            "e79afba21092d191e44a6cf1468c7389737356ffd48baf4f7d89ef589e2a9c82"
+        );
     }
 }
