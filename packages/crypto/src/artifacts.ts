@@ -27,7 +27,11 @@ import {
 } from "@spindle/proto";
 
 import { type BackendOption, ed25519Verify } from "./backend.js";
-import { rootFpOf } from "./fingerprint.js";
+import { deviceFpOf, rootFpOf } from "./fingerprint.js";
+
+/** The `alg_id` suite version byte (DESIGN.md §A4): `1` = Ed25519 / X25519 / AES-256-GCM. Mirrors
+ * `spindle-core::identity::ALG_ID_V1`. */
+const ALG_ID_V1 = 1;
 
 /** `|ts - now| <= 2 min` (DESIGN.md §A7b), same window as the envelope's clock-skew rule. */
 export const ADMIN_COMMAND_CLOCK_SKEW_SECS = 120n;
@@ -43,7 +47,9 @@ export type ArtifactErrorKind =
   | "TimestampSkew"
   | "HostFingerprintMismatch"
   | "RootFingerprintMismatch"
-  | "MalformedOpCert";
+  | "MalformedOpCert"
+  | "DeviceFingerprintMismatch"
+  | "UnsupportedAlgId";
 
 export class ArtifactError extends Error {
   readonly kind: ArtifactErrorKind;
@@ -83,6 +89,15 @@ export class ArtifactError extends Error {
       "MalformedOpCert",
       "capability's embedded op_cert does not decode as a valid HostOpKeyCert",
     );
+  }
+  static deviceFingerprintMismatch(): ArtifactError {
+    return new ArtifactError(
+      "DeviceFingerprintMismatch",
+      "device_fp does not match SHA-256(alg_id || sign_pk || agree_pk) — certificate is not self-verifying",
+    );
+  }
+  static unsupportedAlgId(): ArtifactError {
+    return new ArtifactError("UnsupportedAlgId", "alg_id is not a supported suite version");
   }
 }
 
@@ -125,9 +140,15 @@ async function verifySigOrThrow(
   if (!ok) throw ArtifactError.badSignature();
 }
 
-/** Verifies a device certificate chains to `expectedRootFp` under `rootPk`, that `sig_root` is
- * valid, and that `now` is within `exp` (A7b: `exp` 1 y, re-signed on contact; replay rule: n/a,
- * revocable). */
+/** Verifies a device certificate: `alg_id` is supported, `sign_pk`/`agree_pk` are the right
+ * length, the certificate's own `device_fp` matches the recomputed fingerprint of its
+ * `(alg_id, sign_pk, agree_pk)` (§A7b clarification 6 — the binding this v0.9.16 change exists to
+ * enforce), it chains to `expectedRootFp` under `rootPk`, `sig_root` is valid, and `now` is within
+ * `exp` (A7b time rule: `exp` 1 y, re-signed on contact; replay rule: n/a, revocable).
+ *
+ * Checks run cheap-structural-before-crypto (§A6): `alg_id` first (nothing else can even be
+ * interpreted if it's wrong), then key-length checks, then the `device_fp` binding recompute, and
+ * only then the root-fingerprint/signature/`exp` checks. */
 export async function verifyDeviceCertificate(
   cert: DeviceCertificate,
   rootPk: Uint8Array,
@@ -135,6 +156,13 @@ export async function verifyDeviceCertificate(
   now: bigint,
   opts?: BackendOption,
 ): Promise<void> {
+  if (cert.alg_id !== ALG_ID_V1) throw ArtifactError.unsupportedAlgId();
+  requirePublicKeyLen(cert.sign_pk);
+  requirePublicKeyLen(cert.agree_pk);
+
+  const recomputedDeviceFp = await deviceFpOf(cert.alg_id, cert.sign_pk, cert.agree_pk);
+  if (!bytesEqual(recomputedDeviceFp, cert.device_fp)) throw ArtifactError.deviceFingerprintMismatch();
+
   requirePublicKeyLen(rootPk);
   const rootFp = await rootFpOf(rootPk);
   if (!bytesEqual(rootFp, expectedRootFp)) throw ArtifactError.rootFingerprintMismatch();

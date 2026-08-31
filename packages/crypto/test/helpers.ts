@@ -62,6 +62,9 @@ export function parseAdmissionToken(d: any): AdmissionToken {
 export function parseDeviceCertificate(d: any): DeviceCertificate {
   return {
     device_fp: hexToBytes(d.device_fp),
+    alg_id: Number(d.alg_id),
+    sign_pk: hexToBytes(d.sign_pk),
+    agree_pk: hexToBytes(d.agree_pk),
     nats_fp: hexToBytes(d.nats_fp),
     ts: BigInt(d.ts),
     exp: BigInt(d.exp),

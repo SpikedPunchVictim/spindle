@@ -147,7 +147,16 @@ mod fixtures {
         }
 
         pub fn certificate(&self, nats_fp: Fingerprint, ts: u64, exp: u64) -> DeviceCertificate {
-            issue_device_certificate(&self.root, self.device_fp, nats_fp, ts, exp)
+            let device = self.device_key();
+            issue_device_certificate(
+                &self.root,
+                device.alg_id(),
+                &device.sign_public_key(),
+                &device.agree_public_key(),
+                nats_fp,
+                ts,
+                exp,
+            )
         }
     }
 

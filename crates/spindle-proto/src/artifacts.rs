@@ -504,7 +504,8 @@ impl AdmissionToken {
 // DeviceCertificate (A4)
 // ============================================================================================
 
-/// `DeviceCertificate { device_fp, nats_fp, ts, exp, sig_root }` (DESIGN.md §A4).
+/// `DeviceCertificate { device_fp, alg_id, sign_pk, agree_pk, nats_fp, ts, exp, sig_root }`
+/// (DESIGN.md §A4).
 ///
 /// **Label discrepancy (flagged per the task brief)**: A4's inline notation for the signature
 /// itself reads `sig_root(device_fp, nats_fp, ts, label)` — appearing to include `label` in the
@@ -515,21 +516,46 @@ impl AdmissionToken {
 /// into a signed, root-issued certificate would force a full re-sign (a root-key operation) on
 /// every rename, which the "never baked into certificates" rule is clearly written to avoid — so
 /// the omission is treated as the authoritative resolution rather than an oversight to preserve.
+///
+/// **[amended v0.9.16, A10.34]**: the certificate now also publishes `alg_id`/`sign_pk`/`agree_pk`
+/// — the exact preimage `device_fp` already commits to
+/// (`device_fp = base32(SHA-256("spindle-dev-v1" || alg_id || sign_pk || agree_pk))`, §A4). This
+/// gives A7's `X25519(dev_self, dev_agree_peer)` term a defined source at connect time. All three
+/// are signed material (present in [`DeviceCertificate::unsigned_entries`], not just
+/// [`DeviceCertificate::to_cbor`]) — a verifier is expected to recompute `device_fp` from them and
+/// reject on mismatch (§A7b clarification 6); this crate only carries the bytes structurally and
+/// does not itself perform that recomputation or any key-length/curve validation — that belongs to
+/// `spindle-core` (A9c boundary rule 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceCertificate {
     pub device_fp: Vec<u8>,
+    pub alg_id: u8,
+    pub sign_pk: Vec<u8>,
+    pub agree_pk: Vec<u8>,
     pub nats_fp: Vec<u8>,
     pub ts: u64,
     pub exp: u64,
     pub sig_root: Vec<u8>,
 }
 
-const DEVICE_CERT_FIELDS: &[&str] = &["device_fp", "nats_fp", "ts", "exp", "sig_root"];
+const DEVICE_CERT_FIELDS: &[&str] = &[
+    "device_fp",
+    "alg_id",
+    "sign_pk",
+    "agree_pk",
+    "nats_fp",
+    "ts",
+    "exp",
+    "sig_root",
+];
 
 impl DeviceCertificate {
     fn unsigned_entries(&self) -> Vec<(&str, CborValue)> {
         vec![
             ("device_fp", CborValue::bytes(self.device_fp.clone())),
+            ("alg_id", CborValue::uint(self.alg_id as u64)),
+            ("sign_pk", CborValue::bytes(self.sign_pk.clone())),
+            ("agree_pk", CborValue::bytes(self.agree_pk.clone())),
             ("nats_fp", CborValue::bytes(self.nats_fp.clone())),
             ("ts", CborValue::uint(self.ts)),
             ("exp", CborValue::uint(self.exp)),
@@ -555,6 +581,9 @@ impl DeviceCertificate {
         m.deny_unknown_fields(DEVICE_CERT_FIELDS)?;
         Ok(DeviceCertificate {
             device_fp: m.bytes("device_fp")?,
+            alg_id: m.u8("alg_id")?,
+            sign_pk: m.bytes("sign_pk")?,
+            agree_pk: m.bytes("agree_pk")?,
             nats_fp: m.bytes("nats_fp")?,
             ts: m.u64("ts")?,
             exp: m.u64("exp")?,
@@ -921,6 +950,9 @@ mod tests {
     fn device_certificate_round_trip_and_no_label_field() {
         let cert = DeviceCertificate {
             device_fp: fp(0x10),
+            alg_id: 1,
+            sign_pk: vec![0x12; 32],
+            agree_pk: vec![0x13; 32],
             nats_fp: fp(0x20),
             ts: 1_755_900_000,
             exp: 1_787_436_000,
@@ -1001,6 +1033,9 @@ mod tests {
         };
         let cert = DeviceCertificate {
             device_fp: fp(1),
+            alg_id: 1,
+            sign_pk: vec![1; 32],
+            agree_pk: vec![2; 32],
             nats_fp: fp(2),
             ts: 1,
             exp: 2,

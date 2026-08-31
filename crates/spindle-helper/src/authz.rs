@@ -582,7 +582,7 @@ mod tests {
     use spindle_core::artifacts::{
         issue_admission_token, issue_capability, issue_device_certificate, issue_host_op_key_cert,
     };
-    use spindle_core::identity::RootKey;
+    use spindle_core::identity::{DeviceKey, RootKey};
     use spindle_core::SigningKey;
     use std::cell::Cell;
     use std::collections::{HashMap, HashSet};
@@ -735,10 +735,21 @@ mod tests {
 
     fn device_setup() -> (RootKey, DeviceCertificate, Fingerprint) {
         let root = RootKey::from_seed([0x01; 32]);
-        let device_fp = fp(b"device-1");
+        // A10.34: `issue_device_certificate` derives device_fp from real device keys now, so a
+        // certificate that must pass its own binding check needs a genuine `DeviceKey` rather
+        // than a fabricated fingerprint.
+        let device = DeviceKey::from_seeds([0x02; 32], [0x03; 32]);
         let nats_fp = fp(b"nats-1");
-        let cert = issue_device_certificate(&root, device_fp, nats_fp, 1_000, 2_000_000);
-        (root, cert, device_fp)
+        let cert = issue_device_certificate(
+            &root,
+            device.alg_id(),
+            &device.sign_public_key(),
+            &device.agree_public_key(),
+            nats_fp,
+            1_000,
+            2_000_000,
+        );
+        (root, cert, device.device_fp())
     }
 
     fn member_cap(host: &TestHost, subject: Fingerprint, epoch: u64, exp: u64) -> Capability {

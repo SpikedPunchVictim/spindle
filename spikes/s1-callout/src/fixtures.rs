@@ -89,7 +89,15 @@ pub fn device_certificate(
     ts: u64,
     exp: u64,
 ) -> DeviceCertificate {
-    issue_device_certificate(&identity.root, identity.device_fp, nats_fp, ts, exp)
+    issue_device_certificate(
+        &identity.root,
+        identity.device.alg_id(),
+        &identity.device.sign_public_key(),
+        &identity.device.agree_public_key(),
+        nats_fp,
+        ts,
+        exp,
+    )
 }
 
 /// A test host identity: host root key + operating key.

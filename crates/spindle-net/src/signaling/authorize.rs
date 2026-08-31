@@ -21,9 +21,11 @@ pub enum ConnectDecision {
     /// ciphertext can be verified (DESIGN.md §A7): `sign_pk` verifies the envelope signature,
     /// `agree_pk` is the X25519 half `k0`/`k1` are derived from. Resolving these from `from_fp`
     /// needs a device registry, which is exactly the state `spindle-net` must not own — see this
-    /// module's doc comment, and `spikes/s2-signaling`'s RESULTS.md finding #2 ("no wire artifact
-    /// carries a device's raw public keys": `spindle_proto::artifacts::DeviceCertificate` carries
-    /// only a `device_fp`, a hash, never the keys behind it).
+    /// module's doc comment. As of DESIGN.md v0.9.16 (§A10.34),
+    /// `spindle_proto::artifacts::DeviceCertificate` does carry `alg_id`/`sign_pk`/`agree_pk`
+    /// directly, and a verifier recomputes `device_fp` from them to check the binding — but
+    /// mapping `from_fp` to the right certificate in the first place is still the registry lookup
+    /// this trait exists to inject rather than perform.
     Allow {
         sign_pk: spindle_core::VerifyingKey,
         agree_pk: X25519PublicKey,

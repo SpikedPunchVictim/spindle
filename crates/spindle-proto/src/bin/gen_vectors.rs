@@ -476,8 +476,16 @@ fn admission_token_vectors() -> Json {
 // ---- DeviceCertificate ----
 
 fn device_certificate_vectors() -> Json {
+    // alg_id/sign_pk/agree_pk are structural filler here, not a real preimage of device_fp: this
+    // crate has no crypto dependency (A9c boundary rule 3) and cannot compute
+    // SHA-256("spindle-dev-v1" || alg_id || sign_pk || agree_pk) itself. The recompute-and-compare
+    // binding check (A7b clarification 6) is exercised with real keys in
+    // `spindle-core`'s `gen-crypto-vectors` instead.
     let c1 = DeviceCertificate {
         device_fp: rep(0x71, 32),
+        alg_id: 1,
+        sign_pk: rep(0x77, 32),
+        agree_pk: rep(0x78, 32),
         nats_fp: rep(0x72, 32),
         ts: 1_755_907_200,
         exp: 1_787_443_200, // ts + 1 year
@@ -485,6 +493,9 @@ fn device_certificate_vectors() -> Json {
     };
     let c2 = DeviceCertificate {
         device_fp: rep(0x74, 32),
+        alg_id: 1,
+        sign_pk: rep(0x79, 32),
+        agree_pk: rep(0x7a, 32),
         nats_fp: rep(0x75, 32),
         ts: 1_756_000_000, // re-signed on contact, per A4
         exp: 1_787_536_000,
@@ -494,6 +505,9 @@ fn device_certificate_vectors() -> Json {
     fn decoded(c: &DeviceCertificate) -> Json {
         Json::Obj(vec![
             ("device_fp", Json::hex(&c.device_fp)),
+            ("alg_id", Json::UInt(c.alg_id as u64)),
+            ("sign_pk", Json::hex(&c.sign_pk)),
+            ("agree_pk", Json::hex(&c.agree_pk)),
             ("nats_fp", Json::hex(&c.nats_fp)),
             ("ts", Json::UInt(c.ts)),
             ("exp", Json::UInt(c.exp)),

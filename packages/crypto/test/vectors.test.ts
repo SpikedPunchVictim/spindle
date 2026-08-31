@@ -34,8 +34,8 @@ import {
   verifyHostOpKeyCert,
   verifyRevocationRecord,
 } from "../src/artifacts.js";
-import { ed25519PublicKeyFromSeed, ed25519Sign } from "../src/backend.js";
-import { rootFpOf } from "../src/fingerprint.js";
+import { ed25519PublicKeyFromSeed, ed25519Sign, x25519PublicKeyFromSeed } from "../src/backend.js";
+import { deviceFpOf, rootFpOf } from "../src/fingerprint.js";
 import {
   argsFromCanonicalCbor,
   loadSignedVectorFile,
@@ -86,6 +86,231 @@ describe("device-certificate.json", () => {
       }
     });
   }
+
+  // ---- Negative suite for the A10.34 device_fp/keys binding check (mirrors
+  // crates/spindle-core/src/artifacts/device_cert.rs's `mod tests`) ----
+  //
+  // These are locally-generated fixtures (no fixed expected bytes) — they only need internally
+  // self-consistent real Ed25519/X25519 keys, built with this package's own primitives.
+
+  interface TestDevice {
+    signSeed: Uint8Array;
+    agreeSeed: Uint8Array;
+    signPk: Uint8Array;
+    agreePk: Uint8Array;
+  }
+
+  async function makeDevice(signSeedFill: number, agreeSeedFill: number): Promise<TestDevice> {
+    const signSeed = new Uint8Array(32).fill(signSeedFill);
+    const agreeSeed = new Uint8Array(32).fill(agreeSeedFill);
+    const signPk = await ed25519PublicKeyFromSeed(signSeed);
+    const agreePk = await x25519PublicKeyFromSeed(agreeSeed);
+    return { signSeed, agreeSeed, signPk, agreePk };
+  }
+
+  async function issueTestDeviceCertificate(params: {
+    rootSeed: Uint8Array;
+    algId: number;
+    signPk: Uint8Array;
+    agreePk: Uint8Array;
+    natsFp: Uint8Array;
+    ts: bigint;
+    exp: bigint;
+  }): Promise<DeviceCertificate> {
+    const deviceFp = await deviceFpOf(params.algId, params.signPk, params.agreePk);
+    const unsigned: DeviceCertificate = {
+      device_fp: deviceFp,
+      alg_id: params.algId,
+      sign_pk: params.signPk,
+      agree_pk: params.agreePk,
+      nats_fp: params.natsFp,
+      ts: params.ts,
+      exp: params.exp,
+      sig_root: new Uint8Array(64),
+    };
+    const sig = await ed25519Sign(params.rootSeed, DeviceCertificate.signingInput(unsigned));
+    return { ...unsigned, sig_root: sig };
+  }
+
+  it("rejects a tampered device_fp", async () => {
+    const rootSeed = new Uint8Array(32).fill(0x02);
+    const rootPkLocal = await ed25519PublicKeyFromSeed(rootSeed);
+    const rootFpLocal = await rootFpOf(rootPkLocal);
+    const dev = await makeDevice(0x51, 0x52);
+    const cert = await issueTestDeviceCertificate({
+      rootSeed,
+      algId: 1,
+      signPk: dev.signPk,
+      agreePk: dev.agreePk,
+      natsFp: new Uint8Array(32).fill(0xaa),
+      ts: 1_000n,
+      exp: 2_000n,
+    });
+    // Tamper device_fp only — the recompute-and-compare check runs before the signature check, so
+    // this fails on DeviceFingerprintMismatch regardless of sig_root's (now-mismatched) validity.
+    cert.device_fp = new Uint8Array(cert.device_fp);
+    cert.device_fp[0] ^= 0xff;
+    await expectArtifactError(
+      () => verifyDeviceCertificate(cert, rootPkLocal, rootFpLocal, 1_500n),
+      "DeviceFingerprintMismatch",
+    );
+  });
+
+  it("rejects sign_pk swapped for another valid key", async () => {
+    const rootSeed = new Uint8Array(32).fill(0x03);
+    const rootPkLocal = await ed25519PublicKeyFromSeed(rootSeed);
+    const rootFpLocal = await rootFpOf(rootPkLocal);
+    const dev = await makeDevice(0x52, 0x53);
+    const other = await makeDevice(0x54, 0x55);
+    const cert = await issueTestDeviceCertificate({
+      rootSeed,
+      algId: 1,
+      signPk: dev.signPk,
+      agreePk: dev.agreePk,
+      natsFp: new Uint8Array(32).fill(0xaa),
+      ts: 1_000n,
+      exp: 2_000n,
+    });
+    // Swap in a different, perfectly valid Ed25519 key — device_fp is left alone, so it now
+    // commits to `dev`'s sign_pk while the certificate carries `other`'s.
+    cert.sign_pk = other.signPk;
+    await expectArtifactError(
+      () => verifyDeviceCertificate(cert, rootPkLocal, rootFpLocal, 1_500n),
+      "DeviceFingerprintMismatch",
+    );
+  });
+
+  it("rejects agree_pk swapped for another valid key", async () => {
+    const rootSeed = new Uint8Array(32).fill(0x04);
+    const rootPkLocal = await ed25519PublicKeyFromSeed(rootSeed);
+    const rootFpLocal = await rootFpOf(rootPkLocal);
+    const dev = await makeDevice(0x56, 0x57);
+    const other = await makeDevice(0x58, 0x59);
+    const cert = await issueTestDeviceCertificate({
+      rootSeed,
+      algId: 1,
+      signPk: dev.signPk,
+      agreePk: dev.agreePk,
+      natsFp: new Uint8Array(32).fill(0xaa),
+      ts: 1_000n,
+      exp: 2_000n,
+    });
+    cert.agree_pk = other.agreePk;
+    await expectArtifactError(
+      () => verifyDeviceCertificate(cert, rootPkLocal, rootFpLocal, 1_500n),
+      "DeviceFingerprintMismatch",
+    );
+  });
+
+  /** The three tests above all mutate a certificate *after* `issueTestDeviceCertificate` signed
+   * it. In every one of those, `sig_root` still covers the pre-mutation bytes, so
+   * `verifyDeviceCertificate` would reject them on the signature check alone even if the
+   * `device_fp` recompute-and-compare in `verifyDeviceCertificate` were deleted entirely. They
+   * exercise the signature check, not the binding check, and give no coverage of the latter.
+   *
+   * This test isolates the binding check: it builds a `DeviceCertificate` whose `device_fp` names
+   * device A while `(alg_id, sign_pk, agree_pk)` are device B's, and then signs *that* exact,
+   * internally-inconsistent content with a real root key — exactly as `issueTestDeviceCertificate`
+   * would sign genuine content. `sig_root` is therefore completely valid over the certificate's
+   * bytes; the only thing wrong with the certificate is the device_fp/key binding. The issuing
+   * helper above can never produce this shape (it derives `device_fp` from the keys itself), so
+   * the literal must be constructed by hand here.
+   *
+   * Why it matters: envelope verification pins peers by `device_fp`. A root that is malicious, or
+   * merely buggy, could issue exactly this certificate. Without the recompute check, device B
+   * would present device A's `device_fp` and be accepted as device A — full impersonation — while
+   * still holding and using its own (B's) signing and agreement keys. */
+  it("rejects a correctly-signed but internally-inconsistent certificate (device_fp names device A, keys are device B's)", async () => {
+    const rootSeed = new Uint8Array(32).fill(0x05);
+    const rootPkLocal = await ed25519PublicKeyFromSeed(rootSeed);
+    const rootFpLocal = await rootFpOf(rootPkLocal);
+    const deviceA = await makeDevice(0x5c, 0x5d);
+    const deviceB = await makeDevice(0x5d, 0x5e);
+    const deviceAFp = await deviceFpOf(1, deviceA.signPk, deviceA.agreePk);
+
+    const unsigned: DeviceCertificate = {
+      device_fp: deviceAFp,
+      alg_id: 1,
+      sign_pk: deviceB.signPk,
+      agree_pk: deviceB.agreePk,
+      nats_fp: new Uint8Array(32).fill(0xaa),
+      ts: 1_000n,
+      exp: 2_000n,
+      sig_root: new Uint8Array(64),
+    };
+    // Sign the exact (inconsistent) content above, the same way issueTestDeviceCertificate does —
+    // sig_root is therefore genuinely valid over this certificate's bytes.
+    const sig = await ed25519Sign(rootSeed, DeviceCertificate.signingInput(unsigned));
+    const cert: DeviceCertificate = { ...unsigned, sig_root: sig };
+
+    await expectArtifactError(
+      () => verifyDeviceCertificate(cert, rootPkLocal, rootFpLocal, 1_500n),
+      "DeviceFingerprintMismatch",
+    );
+  });
+
+  it("rejects an unsupported alg_id", async () => {
+    const rootSeed = new Uint8Array(32).fill(0x06);
+    const rootPkLocal = await ed25519PublicKeyFromSeed(rootSeed);
+    const rootFpLocal = await rootFpOf(rootPkLocal);
+    const dev = await makeDevice(0x5a, 0x5b);
+    const cert = await issueTestDeviceCertificate({
+      rootSeed,
+      algId: 1,
+      signPk: dev.signPk,
+      agreePk: dev.agreePk,
+      natsFp: new Uint8Array(32).fill(0xaa),
+      ts: 1_000n,
+      exp: 2_000n,
+    });
+    cert.alg_id = 2;
+    await expectArtifactError(
+      () => verifyDeviceCertificate(cert, rootPkLocal, rootFpLocal, 1_500n),
+      "UnsupportedAlgId",
+    );
+  });
+
+  it("rejects a wrong-length sign_pk", async () => {
+    const rootSeed = new Uint8Array(32).fill(0x07);
+    const rootPkLocal = await ed25519PublicKeyFromSeed(rootSeed);
+    const rootFpLocal = await rootFpOf(rootPkLocal);
+    const dev = await makeDevice(0x5c, 0x5d);
+    const cert = await issueTestDeviceCertificate({
+      rootSeed,
+      algId: 1,
+      signPk: dev.signPk,
+      agreePk: dev.agreePk,
+      natsFp: new Uint8Array(32).fill(0xaa),
+      ts: 1_000n,
+      exp: 2_000n,
+    });
+    cert.sign_pk = new Uint8Array(31).fill(0x01); // one byte short
+    await expectArtifactError(
+      () => verifyDeviceCertificate(cert, rootPkLocal, rootFpLocal, 1_500n),
+      "InvalidPublicKey",
+    );
+  });
+
+  it("rejects a wrong-length agree_pk", async () => {
+    const rootSeed = new Uint8Array(32).fill(0x08);
+    const rootPkLocal = await ed25519PublicKeyFromSeed(rootSeed);
+    const rootFpLocal = await rootFpOf(rootPkLocal);
+    const dev = await makeDevice(0x5e, 0x5f);
+    const cert = await issueTestDeviceCertificate({
+      rootSeed,
+      algId: 1,
+      signPk: dev.signPk,
+      agreePk: dev.agreePk,
+      natsFp: new Uint8Array(32).fill(0xaa),
+      ts: 1_000n,
+      exp: 2_000n,
+    });
+    cert.agree_pk = new Uint8Array(33).fill(0x02); // one byte long
+    await expectArtifactError(
+      () => verifyDeviceCertificate(cert, rootPkLocal, rootFpLocal, 1_500n),
+      "InvalidPublicKey",
+    );
+  });
 });
 
 describe("capability.json", () => {

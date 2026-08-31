@@ -280,17 +280,33 @@ fn flip_last_byte(bytes: &[u8]) -> Vec<u8> {
 
 fn device_certificate_vectors() -> Json {
     let root = RootKey::from_seed(PERSON_ROOT_SEED);
-    let device_fp = Fingerprint::of_parts(&[b"gen-crypto-vectors:device-certificate:subject"]);
+    // A10.34: the certificate's device_fp is now derived from a real device identity's
+    // (alg_id, sign_pk, agree_pk) rather than fabricated directly — an inconsistent certificate is
+    // unconstructible through `issue_device_certificate` at all. Reuses `DEVICE_A_*` (the same
+    // device identity `envelope_vectors` already uses) so the vector files describe one
+    // consistent device.
+    let device = DeviceKey::from_seeds(DEVICE_A_SIGN_SEED, DEVICE_A_AGREE_SEED);
     let nats_fp = Fingerprint::of_parts(&[b"gen-crypto-vectors:device-certificate:nats"]);
     let ts = 1_755_907_200;
     let exp = 1_787_443_200; // ts + 1 year
 
-    let cert = issue_device_certificate(&root, device_fp, nats_fp, ts, exp);
+    let cert = issue_device_certificate(
+        &root,
+        device.alg_id(),
+        &device.sign_public_key(),
+        &device.agree_public_key(),
+        nats_fp,
+        ts,
+        exp,
+    );
     assert!(verify_device_certificate(&cert, &root.public_key(), &root.root_fp(), ts).is_ok());
 
     fn decoded(c: &spindle_proto::artifacts::DeviceCertificate) -> Json {
         Json::Obj(vec![
             ("device_fp", Json::hex(&c.device_fp)),
+            ("alg_id", Json::UInt(c.alg_id as u64)),
+            ("sign_pk", Json::hex(&c.sign_pk)),
+            ("agree_pk", Json::hex(&c.agree_pk)),
             ("nats_fp", Json::hex(&c.nats_fp)),
             ("ts", Json::UInt(c.ts)),
             ("exp", Json::UInt(c.exp)),

@@ -218,7 +218,9 @@ mod tests {
         let device = DeviceKey::from_seeds([0x02; 32], [0x03; 32]);
         let cert = issue_device_certificate(
             &root,
-            device.device_fp(),
+            device.alg_id(),
+            &device.sign_public_key(),
+            &device.agree_public_key(),
             Fingerprint::of_parts(&[b"nats"]),
             0,
             2_000_000,
@@ -239,7 +241,9 @@ mod tests {
         let device = DeviceKey::from_seeds([0x12; 32], [0x13; 32]);
         let cert = issue_device_certificate(
             &root,
-            device.device_fp(),
+            device.alg_id(),
+            &device.sign_public_key(),
+            &device.agree_public_key(),
             Fingerprint::of_parts(&[b"nats"]),
             0,
             2_000_000,

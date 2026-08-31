@@ -200,3 +200,18 @@ runArtifactSuite({
   fromCanonicalBytes: HostOpKeyCert.fromCanonicalBytes,
   signingInput: HostOpKeyCert.signingInput,
 });
+
+describe("device-certificate.json: label field", () => {
+  // Mirrors `device_certificate_round_trip_and_no_label_field` in
+  // crates/spindle-proto/src/artifacts.rs — a `label` key must be rejected outright (closed
+  // schema; see the discrepancy note on `DeviceCertificate`), not just any generically-unknown
+  // key ("bogus" is already covered by the generic mutation suite above).
+  it("rejects a `label` field", () => {
+    const doc = loadVectorFile("device-certificate.json") as ArtifactDoc;
+    const mapValue = canonicalDecode(hexToBytes(doc.cases[0].canonical_cbor_hex));
+    const mutated = addUnknownKey(mapValue, "label", CborValue.text("my-nas"));
+    const err = expectThrows(ProtoError, () => DeviceCertificate.fromCanonicalBytes(mutated));
+    expect(err.kind).toBe("UnknownField");
+    expect(err.field).toBe("label");
+  });
+});

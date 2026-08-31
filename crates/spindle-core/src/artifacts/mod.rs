@@ -54,6 +54,18 @@ pub enum ArtifactError {
     RootFingerprintMismatch,
     #[error("capability's embedded op_cert does not decode as a valid HostOpKeyCert")]
     MalformedOpCert,
+    /// [`device_cert::verify_device_certificate`] (§A7b clarification 6): `device_fp` recomputed
+    /// from the certificate's own `(alg_id, sign_pk, agree_pk)` does not equal the certificate's
+    /// `device_fp` field — the certificate is internally inconsistent.
+    #[error(
+        "device_fp does not match SHA-256 of the certificate's own (alg_id, sign_pk, agree_pk)"
+    )]
+    DeviceFingerprintMismatch,
+    /// [`device_cert::verify_device_certificate`]: `alg_id` is not a suite this crate knows how to
+    /// interpret `sign_pk`/`agree_pk` under (checked before any key parsing, per §A6 "cheap check
+    /// before crypto").
+    #[error("alg_id is not a supported device key suite")]
+    UnsupportedAlgId,
 }
 
 pub(crate) fn check_exp(now: u64, exp: u64) -> Result<(), ArtifactError> {

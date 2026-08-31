@@ -296,6 +296,9 @@ fn device_certificate_vectors_verify() {
     for case in doc.get("cases").as_arr() {
         let cert = DeviceCertificate {
             device_fp: case.get("decoded").get("device_fp").hex(),
+            alg_id: case.get("decoded").get("alg_id").as_u64() as u8,
+            sign_pk: case.get("decoded").get("sign_pk").hex(),
+            agree_pk: case.get("decoded").get("agree_pk").hex(),
             nats_fp: case.get("decoded").get("nats_fp").hex(),
             ts: case.get("decoded").get("ts").as_u64(),
             exp: case.get("decoded").get("exp").as_u64(),

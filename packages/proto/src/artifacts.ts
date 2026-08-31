@@ -493,25 +493,51 @@ export const AdmissionToken = {
 // DeviceCertificate (A4)
 // ============================================================================================
 
-/** `DeviceCertificate { device_fp, nats_fp, ts, exp, sig_root }` (DESIGN.md §A4).
+/** `DeviceCertificate { device_fp, alg_id, sign_pk, agree_pk, nats_fp, ts, exp, sig_root }`
+ * (DESIGN.md §A4).
  *
  * **Label discrepancy**: see the discrepancy note on `DeviceCertificate` in
  * `crates/spindle-proto/src/artifacts.rs` — `label` is intentionally omitted from the wire
- * schema entirely; a decoded map carrying a `label` key is rejected as an unknown field. */
+ * schema entirely; a decoded map carrying a `label` key is rejected as an unknown field.
+ *
+ * **[amended v0.9.16, A10.34]**: the certificate now also publishes `alg_id`/`sign_pk`/`agree_pk`
+ * — the exact preimage `device_fp` already commits to
+ * (`device_fp = base32(SHA-256("spindle-dev-v1" || alg_id || sign_pk || agree_pk))`, §A4). This
+ * gives A7's `X25519(dev_self, dev_agree_peer)` term a defined source at connect time. All three
+ * are signed material (present in `DeviceCertificate.unsignedEntries`, not just
+ * `DeviceCertificate.toCbor`) — a verifier is expected to recompute `device_fp` from them and
+ * reject on mismatch (§A7b clarification 6); this package only carries the bytes structurally and
+ * does not itself perform that recomputation or any key-length/curve validation — that belongs to
+ * `@spindle/crypto`. */
 export interface DeviceCertificate {
   device_fp: Uint8Array;
+  alg_id: number;
+  sign_pk: Uint8Array;
+  agree_pk: Uint8Array;
   nats_fp: Uint8Array;
   ts: bigint;
   exp: bigint;
   sig_root: Uint8Array;
 }
 
-const DEVICE_CERT_FIELDS = ["device_fp", "nats_fp", "ts", "exp", "sig_root"] as const;
+const DEVICE_CERT_FIELDS = [
+  "device_fp",
+  "alg_id",
+  "sign_pk",
+  "agree_pk",
+  "nats_fp",
+  "ts",
+  "exp",
+  "sig_root",
+] as const;
 
 export const DeviceCertificate = {
   unsignedEntries(cert: DeviceCertificate): Array<[string, CborValue]> {
     return [
       ["device_fp", CborValue.bytes(cert.device_fp)],
+      ["alg_id", CborValue.uint(cert.alg_id)],
+      ["sign_pk", CborValue.bytes(cert.sign_pk)],
+      ["agree_pk", CborValue.bytes(cert.agree_pk)],
       ["nats_fp", CborValue.bytes(cert.nats_fp)],
       ["ts", CborValue.uint(cert.ts)],
       ["exp", CborValue.uint(cert.exp)],
@@ -537,6 +563,9 @@ export const DeviceCertificate = {
     m.denyUnknownFields(DEVICE_CERT_FIELDS);
     return {
       device_fp: m.bytes("device_fp"),
+      alg_id: m.u8("alg_id"),
+      sign_pk: m.bytes("sign_pk"),
+      agree_pk: m.bytes("agree_pk"),
       nats_fp: m.bytes("nats_fp"),
       ts: m.u64("ts"),
       exp: m.u64("exp"),
