@@ -172,10 +172,23 @@ amendment once the spike settles it.
   the spike; `spindle-core` still had the single-key formula. `derive_bootstrap_key` (`k0`)
   now sits alongside `derive_session_key` (`k1`) in `spindle-core`, with golden vectors and
   a TypeScript twin.
-- **Not yet proven end to end**: slice 3's NATS wiring and its ICE punch have unit coverage
-  only. The live composed-stack evidence for that path is the spike's, not the graduated
-  code's — a live run of `spindle-net::signaling` itself remains outstanding, alongside
-  slice 4 and S2's across-NATs number (no measurement exists; loopback only).
+- **Slice 3 now proven live, and it was broken**:
+  `crates/spindle-net/tests/live_signaling.rs` (an `#[ignore]`d test that drives the real
+  `SignalingHost`/`SignalingClient` API over two callout-authenticated NATS connections
+  against `deploy/docker-compose.yml`) found that the graduated code at commit 6bf12c7
+  could never have connected, under a fully green 483-test suite. Two defects, both fixed
+  in c7528af: (1) the host's root fingerprint and its envelope device fingerprint were
+  collapsed into one, so the host could not even subscribe to its own front door — verbatim
+  symptom `Permissions Violation for Subscription to "host.<device_fp>.connect"`, since the
+  Auth Callout grants `sub host.<host_fp>.>`; (2) `Agent::start_connectivity_checks` was
+  called from nowhere in the crate (`git show 6bf12c7:...ice.rs | grep -c` returned 0), so
+  neither peer ever sent a binding request and no candidate pair could ever be selected.
+  Measured (n=5, loopback): 5.30 ms offer->answer, 4.40 ms answer->ICE-selected, 3.27 ms
+  selected->QUIC-complete, **13.40 ms offer->usable stream** — medians, comparable to slice
+  1's step-B numbers because it is the same loopback rig.
+- **Still unproven**: ICE is loopback-only (coturn is up in the compose stack but unused,
+  so no NAT is traversed); S2's across-NATs number still does not exist; `seq` under real
+  reordering is still unmeasured; and slice 4 has not started.
 
 ## Stage 6: spindle-vfs + host-core
 **Goal**: Implement the shares/groups/entitlements engine and the VFS RPC server in
