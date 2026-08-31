@@ -131,6 +131,23 @@ impl HelperView for InMemoryHelperView {
         self.sessions.remove(nats_fp);
     }
 
+    /// Real implementation, not `unimplemented!()`: `self.sessions` already holds exactly the
+    /// state this needs (same `HashMap<Fingerprint, SessionRecord>` `put_session_record`/
+    /// `session_record` above already read and write), so answering "which live sessions does
+    /// `subject` cover" honestly costs nothing extra and drags in no state this spike doesn't
+    /// already model. Mirrors `spindle_helper::authz::HelperView::sessions_for_subject`'s
+    /// contract exactly: `root_fp`-or-`device_fp` match, `exp > now` for liveness — the same
+    /// semantics `spindle_helper::memory_store::InMemoryHelperView` and `PgStore` implement. S1
+    /// still has no call site that exercises this (predates the kick relay entirely), but a
+    /// method that can silently answer "nobody" is worse than one that's merely unexercised.
+    fn sessions_for_subject(&mut self, subject: &Fingerprint, now: u64) -> Vec<SessionRecord> {
+        self.sessions
+            .values()
+            .filter(|r| r.exp > now && (r.root_fp == *subject || r.device_fp == Some(*subject)))
+            .cloned()
+            .collect()
+    }
+
     fn record_turn_issuance(
         &mut self,
         root_fp: &Fingerprint,

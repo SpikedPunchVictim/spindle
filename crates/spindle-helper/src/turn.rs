@@ -379,6 +379,7 @@ mod tests {
         s.put_session_record(SessionRecord::new(
             unrelated_nats_fp,
             fp(b"root-unrelated"),
+            None,
             vec![],
             "member".to_string(),
             10_000,
@@ -409,6 +410,7 @@ mod tests {
         s.put_session_record(SessionRecord::new(
             nats_fp,
             root_fp,
+            None,
             vec![fp(b"host-b")],
             "member".to_string(),
             10_000,
@@ -443,6 +445,7 @@ mod tests {
         s.put_session_record(SessionRecord::new(
             nats_fp,
             root_fp,
+            None,
             vec![],
             "member".to_string(),
             10_000,
@@ -470,6 +473,7 @@ mod tests {
         s.put_session_record(SessionRecord::new(
             nats_fp,
             root_fp,
+            None,
             vec![],
             "member".to_string(),
             10_000,
@@ -497,6 +501,7 @@ mod tests {
         s.put_session_record(SessionRecord::new(
             nats_fp,
             root_fp,
+            None,
             vec![],
             "member".to_string(),
             10_000,
@@ -538,6 +543,7 @@ mod tests {
         s.put_session_record(SessionRecord::new(
             nats_fp,
             root_fp,
+            None,
             vec![],
             "member".to_string(),
             10_000,
@@ -565,6 +571,7 @@ mod tests {
         s.put_session_record(SessionRecord::new(
             nats_fp,
             fp(b"root-d"),
+            None,
             vec![],
             "member".to_string(),
             500, // already expired at now=1_000

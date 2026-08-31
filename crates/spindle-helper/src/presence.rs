@@ -592,6 +592,7 @@ mod tests {
         s.put_session_record(SessionRecord::new(
             fp(b"nats-unrelated"),
             fp(b"root-unrelated"),
+            None,
             vec![fp(b"host-x")],
             "member".to_string(),
             10_000,
@@ -610,6 +611,7 @@ mod tests {
         s.put_session_record(SessionRecord::new(
             nats_fp,
             fp(b"root-empty-hosts"),
+            None,
             vec![],
             "member".to_string(),
             10_000,
@@ -633,6 +635,7 @@ mod tests {
         s.put_session_record(SessionRecord::new(
             nats_fp,
             fp(b"root-happy-path"),
+            None,
             vec![online_host, offline_host],
             "member".to_string(),
             10_000,
@@ -666,6 +669,7 @@ mod tests {
         s.put_session_record(SessionRecord::new(
             nats_fp,
             fp(b"root-expired"),
+            None,
             vec![],
             "member".to_string(),
             500, // already expired at now=1_000

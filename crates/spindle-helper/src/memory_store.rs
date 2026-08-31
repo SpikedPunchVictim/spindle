@@ -130,6 +130,14 @@ impl HelperView for InMemoryHelperView {
         self.sessions.remove(nats_fp);
     }
 
+    fn sessions_for_subject(&mut self, subject: &Fingerprint, now: u64) -> Vec<SessionRecord> {
+        self.sessions
+            .values()
+            .filter(|r| r.exp > now && (r.root_fp == *subject || r.device_fp == Some(*subject)))
+            .cloned()
+            .collect()
+    }
+
     fn record_turn_issuance(
         &mut self,
         root_fp: &Fingerprint,
@@ -257,20 +265,33 @@ mod tests {
         let record = SessionRecord::new(
             nats_fp,
             fp(b"root-a"),
+            Some(fp(b"device-a")),
             vec![fp(b"host-a")],
             "member".to_string(),
             2_000,
         );
         v.put_session_record(record.clone());
-        assert_eq!(v.session_record(&nats_fp, 1_000), Some(record));
+        let got = v.session_record(&nats_fp, 1_000);
+        assert_eq!(got, Some(record));
+        assert_eq!(
+            got.unwrap().device_fp,
+            Some(fp(b"device-a")),
+            "device_fp must round-trip through the store"
+        );
     }
 
     #[test]
     fn session_record_is_absent_once_expired() {
         let mut v = view(AdmissionMode::Open);
         let nats_fp = fp(b"nats-b");
-        let record =
-            SessionRecord::new(nats_fp, fp(b"root-b"), vec![], "member".to_string(), 1_000);
+        let record = SessionRecord::new(
+            nats_fp,
+            fp(b"root-b"),
+            None,
+            vec![],
+            "member".to_string(),
+            1_000,
+        );
         v.put_session_record(record);
         assert!(v.session_record(&nats_fp, 999).is_some());
         assert!(
@@ -286,6 +307,7 @@ mod tests {
         v.put_session_record(SessionRecord::new(
             nats_fp,
             fp(b"root-delete"),
+            None,
             vec![],
             "member".to_string(),
             2_000,
@@ -310,6 +332,7 @@ mod tests {
         v.put_session_record(SessionRecord::new(
             nats_fp,
             fp(b"root-old"),
+            None,
             vec![],
             "member".to_string(),
             1_000,
@@ -317,6 +340,7 @@ mod tests {
         v.put_session_record(SessionRecord::new(
             nats_fp,
             fp(b"root-new"),
+            None,
             vec![],
             "member".to_string(),
             2_000,
@@ -397,6 +421,7 @@ mod tests {
         v.put_session_record(SessionRecord::new(
             live_fp,
             fp(b"root"),
+            None,
             vec![],
             "member".to_string(),
             5_000,
@@ -404,6 +429,7 @@ mod tests {
         v.put_session_record(SessionRecord::new(
             expired_fp,
             fp(b"root"),
+            None,
             vec![],
             "member".to_string(),
             1_000,
@@ -411,6 +437,98 @@ mod tests {
         v.purge_expired_sessions(2_000);
         assert!(v.session_record(&live_fp, 0).is_some());
         assert!(!v.sessions.contains_key(&expired_fp));
+    }
+
+    // ---- sessions_for_subject (kick-relay prerequisite, DESIGN.md §A3/§A4/§A5 v0.9.18) --------
+
+    #[test]
+    fn sessions_for_subject_matches_on_root_fp() {
+        let mut v = view(AdmissionMode::Open);
+        let root_fp = fp(b"sfs-root-match");
+        v.put_session_record(SessionRecord::new(
+            fp(b"sfs-nats-1"),
+            root_fp,
+            Some(fp(b"sfs-device-1")),
+            vec![],
+            "member".to_string(),
+            10_000,
+        ));
+        let got = v.sessions_for_subject(&root_fp, 1_000);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].root_fp, root_fp);
+    }
+
+    #[test]
+    fn sessions_for_subject_matches_on_device_fp() {
+        let mut v = view(AdmissionMode::Open);
+        let device_fp = fp(b"sfs-device-match");
+        v.put_session_record(SessionRecord::new(
+            fp(b"sfs-nats-2"),
+            fp(b"sfs-root-2"),
+            Some(device_fp),
+            vec![],
+            "member".to_string(),
+            10_000,
+        ));
+        let got = v.sessions_for_subject(&device_fp, 1_000);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].device_fp, Some(device_fp));
+    }
+
+    #[test]
+    fn sessions_for_subject_excludes_an_expired_record() {
+        let mut v = view(AdmissionMode::Open);
+        let root_fp = fp(b"sfs-root-expired");
+        v.put_session_record(SessionRecord::new(
+            fp(b"sfs-nats-3"),
+            root_fp,
+            Some(fp(b"sfs-device-3")),
+            vec![],
+            "member".to_string(),
+            1_000, // expired at now=1_000 (exp is exclusive, matching session_record's filter)
+        ));
+        assert!(v.sessions_for_subject(&root_fp, 1_000).is_empty());
+        assert!(!v.sessions_for_subject(&root_fp, 999).is_empty());
+    }
+
+    /// The isolating test: revoking one device's device_fp must return ONLY that device's
+    /// session, never a sibling session that merely shares the same root_fp. This is the test
+    /// that proves the root_fp/device_fp OR in `sessions_for_subject` is not accidentally an
+    /// over-match (e.g. a bug that dropped the device_fp comparison and matched every session
+    /// sharing the root_fp instead).
+    #[test]
+    fn sessions_for_subject_by_device_fp_does_not_leak_sibling_sessions_on_the_same_root_fp() {
+        let mut v = view(AdmissionMode::Open);
+        let shared_root = fp(b"sfs-shared-root");
+        let device_a = fp(b"sfs-device-a");
+        let device_b = fp(b"sfs-device-b");
+        let nats_a = fp(b"sfs-nats-a");
+        let nats_b = fp(b"sfs-nats-b");
+        v.put_session_record(SessionRecord::new(
+            nats_a,
+            shared_root,
+            Some(device_a),
+            vec![],
+            "member".to_string(),
+            10_000,
+        ));
+        v.put_session_record(SessionRecord::new(
+            nats_b,
+            shared_root,
+            Some(device_b),
+            vec![],
+            "member".to_string(),
+            10_000,
+        ));
+
+        let got = v.sessions_for_subject(&device_a, 1_000);
+        assert_eq!(
+            got.len(),
+            1,
+            "revoking device_a must return exactly one session, not device_b's too"
+        );
+        assert_eq!(got[0].nats_fp, nats_a);
+        assert_eq!(got[0].device_fp, Some(device_a));
     }
 
     #[test]

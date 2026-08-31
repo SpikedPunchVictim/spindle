@@ -280,6 +280,31 @@ pub trait HelperView {
     /// real `DELETE`; [`crate::memory_store::InMemoryHelperView`] overrides it to bound its
     /// `HashMap`'s growth too.
     fn purge_expired_sessions(&mut self, _now: u64) {}
+
+    // ============================================================================================
+    // Added for the kick relay's prerequisite (DESIGN.md §A3/§A4, DESIGN.md v0.9.18 amendment to
+    // §A5's session-record schema). Not the kick relay itself — no `$SYS.REQ.SERVER.*.KICK` wiring
+    // exists yet, and none is added here; this is only the lookup a later slice's kick relay needs
+    // to have something to call.
+    // ============================================================================================
+
+    /// The live session records that a revocation naming `subject` must reach (DESIGN.md §A4: "a
+    /// revocation names `root_fp | device_fp`"). Matches every stored session record whose
+    /// `root_fp` equals `subject` **or** whose `device_fp` equals `subject` — both sides of the
+    /// OR, not either-or: revoking a person's `root_fp` must reach every one of their live device
+    /// sessions, while revoking a single `device_fp` must reach only that device's session, never
+    /// a sibling session that merely shares the same `root_fp`. Expired records (`exp <= now`) are
+    /// excluded, exactly like [`Self::session_record`]'s own on-read expiry filter.
+    ///
+    /// **No default implementation** — deliberately, unlike [`Self::purge_expired_sessions`]
+    /// above, whose no-op default is safe only because the on-read `exp` filter elsewhere still
+    /// enforces correctness. There is no equivalent backstop here: a default that silently
+    /// returned an empty `Vec` would make "no live sessions matched" indistinguishable from
+    /// "nobody implemented this," and for a revocation lookup that difference is exactly the
+    /// false-green class this crate treats as severity zero — a revocation that appears to succeed
+    /// while cutting nobody off. Every [`HelperView`] implementor, including
+    /// `spikes/s1-callout/src/bin/responder.rs`'s `InMemoryHelperView`, must provide its own.
+    fn sessions_for_subject(&mut self, subject: &Fingerprint, now: u64) -> Vec<SessionRecord>;
 }
 
 // ================================================================================================
@@ -449,6 +474,10 @@ pub fn decide_device_connect(
         session_record: SessionRecord::new(
             presented.nats_fp,
             root_fp,
+            // DESIGN.md §A5, amended v0.9.18: the device fingerprint, so a device-scoped
+            // revocation can resolve back to this live session (see session.rs's
+            // SessionRecord::device_fp doc comment).
+            Some(device_fp),
             host_fps,
             // DESIGN.md §A5's session-record schema has no described source for a client
             // session's quota_profile (see session.rs's doc comment) — fixed placeholder.
@@ -569,6 +598,10 @@ pub fn decide_host_connect(
             // See session.rs's doc comment: a host connection's "root_fp" field holds the
             // host's own host_fp, and "host_fps" holds just itself.
             host_fp,
+            // A host connection has no client device fingerprint (see session.rs's
+            // SessionRecord::device_fp doc comment) — None is the honest value, not a
+            // placeholder.
+            None,
             vec![host_fp],
             quota_profile,
             limits.exp,
@@ -660,6 +693,14 @@ mod tests {
 
         fn delete_session_record(&mut self, nats_fp: &Fingerprint) {
             self.sessions.remove(nats_fp);
+        }
+
+        fn sessions_for_subject(&mut self, subject: &Fingerprint, now: u64) -> Vec<SessionRecord> {
+            self.sessions
+                .values()
+                .filter(|r| r.exp > now && (r.root_fp == *subject || r.device_fp == Some(*subject)))
+                .cloned()
+                .collect()
         }
 
         fn record_turn_issuance(
@@ -1022,6 +1063,11 @@ mod tests {
         );
         assert_eq!(auth.session_record.root_fp, root_fp);
         assert_eq!(auth.session_record.host_fps, vec![host_fp]);
+        assert_eq!(
+            auth.session_record.device_fp,
+            Some(device_fp),
+            "decide_device_connect must populate device_fp in the session record it returns"
+        );
     }
 
     #[test]
@@ -1206,6 +1252,11 @@ mod tests {
         };
         assert_eq!(auth.session_record.quota_profile, "gold");
         assert_eq!(view.burn_calls, 1);
+        assert_eq!(
+            auth.session_record.device_fp, None,
+            "a host connection has no client device fingerprint — decide_host_connect must leave \
+             device_fp None, not invent a placeholder value"
+        );
 
         // Idempotent replay: same nonce, same host, presented again (e.g. a retried CONNECT
         // after a lost reply). Must not burn a second time and must yield the same record.

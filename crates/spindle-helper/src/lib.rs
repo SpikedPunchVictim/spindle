@@ -26,8 +26,8 @@
 //!   [`authz::AuthzDecision::Refused`] (with an internal-only [`authz::RefusalReason`]).
 //! - [`permissions`] — builds the exact §A5 permission sets (subject-pattern lists, limits,
 //!   jittered `exp`) as plain data.
-//! - [`session`] — [`session::SessionRecord`], the `nats_fp → {root_fp, host_fps, quota_profile,
-//!   exp}` record DESIGN.md §A5 describes.
+//! - [`session`] — [`session::SessionRecord`], the `nats_fp → {root_fp, device_fp, host_fps,
+//!   quota_profile, exp}` record DESIGN.md §A5 (amended v0.9.18) describes.
 //! - [`natsjwt`] — hand-rolled NATS v2 JWT claim encode/decode, graduated from the S1 spike with
 //!   every empirically-verified field-shape decision preserved (see its own module docs).
 //! - [`auth_token`] — decodes the CONNECT `auth_token` envelope (device cert + caps, or host op

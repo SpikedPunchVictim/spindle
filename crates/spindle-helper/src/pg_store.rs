@@ -18,7 +18,10 @@
 //!   documents.
 //! - `session_records` — plain upsert keyed by `nats_fp`; reads filter `exp > now` (expiry
 //!   enforced on read, not by eager deletion); [`PgStore::purge_expired_sessions`] additionally
-//!   `DELETE`s rows past `exp` so the table doesn't grow without bound.
+//!   `DELETE`s rows past `exp` so the table doesn't grow without bound. `device_fp` (`0002_*.sql`,
+//!   DESIGN.md §A5 v0.9.18 amendment) is nullable and round-trips through the same upsert;
+//!   [`HelperView::sessions_for_subject`] reads it back with `WHERE (root_fp = $1 OR device_fp =
+//!   $1) AND exp > $2`, backed by `0002_*.sql`'s two single-column indexes.
 //! - `turn_usage` — a check-and-increment counter keyed by `(root_fp, period)`: an `UPDATE ...
 //!   WHERE count < $quota RETURNING count` either succeeds (admitted, already incremented) or
 //!   returns no row (refused, left unchanged) — a single indexed row's `UPDATE` is atomic under
@@ -221,16 +224,18 @@ impl PgStore {
     async fn put_session_record_async(&self, record: SessionRecord) {
         let host_fps: Vec<Vec<u8>> = record.host_fps.iter().map(fp_bytes).collect();
         sqlx::query(
-            "INSERT INTO session_records (nats_fp, root_fp, host_fps, quota_profile, exp)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO session_records (nats_fp, root_fp, device_fp, host_fps, quota_profile, exp)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (nats_fp) DO UPDATE SET
                 root_fp = excluded.root_fp,
+                device_fp = excluded.device_fp,
                 host_fps = excluded.host_fps,
                 quota_profile = excluded.quota_profile,
                 exp = excluded.exp",
         )
         .bind(fp_bytes(&record.nats_fp))
         .bind(fp_bytes(&record.root_fp))
+        .bind(record.device_fp.as_ref().map(fp_bytes))
         .bind(host_fps)
         .bind(&record.quota_profile)
         .bind(record.exp as i64)
@@ -241,7 +246,7 @@ impl PgStore {
 
     async fn session_record_async(&self, nats_fp: &Fingerprint, now: u64) -> Option<SessionRecord> {
         sqlx::query(
-            "SELECT root_fp, host_fps, quota_profile, exp FROM session_records
+            "SELECT root_fp, device_fp, host_fps, quota_profile, exp FROM session_records
              WHERE nats_fp = $1 AND exp > $2",
         )
         .bind(fp_bytes(nats_fp))
@@ -254,11 +259,49 @@ impl PgStore {
             SessionRecord::new(
                 *nats_fp,
                 fp_from_row(row.get::<Vec<u8>, _>("root_fp").as_slice()),
+                row.get::<Option<Vec<u8>>, _>("device_fp")
+                    .as_deref()
+                    .map(fp_from_row),
                 host_fps_raw.iter().map(|b| fp_from_row(b)).collect(),
                 row.get("quota_profile"),
                 row.get::<i64, _>("exp") as u64,
             )
         })
+    }
+
+    /// The Postgres side of [`HelperView::sessions_for_subject`] (see that trait method's doc
+    /// comment for the match/exclusion semantics this query implements): `subject` matches either
+    /// `root_fp` or `device_fp`, and `exp > now` excludes expired rows exactly like
+    /// [`Self::session_record_async`] does.
+    async fn sessions_for_subject_async(
+        &self,
+        subject: &Fingerprint,
+        now: u64,
+    ) -> Vec<SessionRecord> {
+        sqlx::query(
+            "SELECT nats_fp, root_fp, device_fp, host_fps, quota_profile, exp FROM session_records
+             WHERE (root_fp = $1 OR device_fp = $1) AND exp > $2",
+        )
+        .bind(fp_bytes(subject))
+        .bind(now as i64)
+        .fetch_all(&self.pool)
+        .await
+        .expect("sessions_for_subject query")
+        .into_iter()
+        .map(|row| {
+            let host_fps_raw: Vec<Vec<u8>> = row.get("host_fps");
+            SessionRecord::new(
+                fp_from_row(row.get::<Vec<u8>, _>("nats_fp").as_slice()),
+                fp_from_row(row.get::<Vec<u8>, _>("root_fp").as_slice()),
+                row.get::<Option<Vec<u8>>, _>("device_fp")
+                    .as_deref()
+                    .map(fp_from_row),
+                host_fps_raw.iter().map(|b| fp_from_row(b)).collect(),
+                row.get("quota_profile"),
+                row.get::<i64, _>("exp") as u64,
+            )
+        })
+        .collect()
     }
 
     async fn delete_session_record_async(&self, nats_fp: &Fingerprint) {
@@ -422,6 +465,10 @@ impl HelperView for PgStore {
         run_blocking(self.delete_session_record_async(nats_fp))
     }
 
+    fn sessions_for_subject(&mut self, subject: &Fingerprint, now: u64) -> Vec<SessionRecord> {
+        run_blocking(self.sessions_for_subject_async(subject, now))
+    }
+
     fn record_turn_issuance(
         &mut self,
         root_fp: &Fingerprint,
@@ -579,12 +626,19 @@ mod tests {
         let record = SessionRecord::new(
             nats_fp,
             fp(b"pg-root-a"),
+            Some(fp(b"pg-device-a")),
             vec![fp(b"pg-host-x"), fp(b"pg-host-y")],
             "member".to_string(),
             2_000,
         );
         store.put_session_record(record.clone());
-        assert_eq!(store.session_record(&nats_fp, 1_000), Some(record));
+        let got = store.session_record(&nats_fp, 1_000);
+        assert_eq!(got, Some(record));
+        assert_eq!(
+            got.unwrap().device_fp,
+            Some(fp(b"pg-device-a")),
+            "device_fp must round-trip through Postgres"
+        );
         assert!(
             store.session_record(&nats_fp, 2_000).is_none(),
             "exp is exclusive: at/after exp the record must read as absent"
@@ -601,6 +655,7 @@ mod tests {
         store.put_session_record(SessionRecord::new(
             nats_fp,
             fp(b"pg-root-delete"),
+            None,
             vec![],
             "member".to_string(),
             2_000,
@@ -620,6 +675,7 @@ mod tests {
         let live = SessionRecord::new(
             fp(b"pg-nats-live"),
             fp(b"root"),
+            None,
             vec![],
             "member".to_string(),
             5_000,
@@ -627,6 +683,7 @@ mod tests {
         let expired = SessionRecord::new(
             fp(b"pg-nats-expired"),
             fp(b"root"),
+            None,
             vec![],
             "member".to_string(),
             1_000,
@@ -640,6 +697,63 @@ mod tests {
             .expect("purge succeeds");
         assert_eq!(deleted, 1);
         assert!(store.session_record_async(&live.nats_fp, 0).await.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sessions_for_subject_matches_root_or_device_and_excludes_expired() {
+        let _guard = TEST_LOCK.lock().await;
+        let Some(mut store) = test_store().await else {
+            return;
+        };
+        let shared_root = fp(b"pg-sfs-shared-root");
+        let device_a = fp(b"pg-sfs-device-a");
+        let device_b = fp(b"pg-sfs-device-b");
+        store.put_session_record(SessionRecord::new(
+            fp(b"pg-sfs-nats-a"),
+            shared_root,
+            Some(device_a),
+            vec![],
+            "member".to_string(),
+            10_000,
+        ));
+        store.put_session_record(SessionRecord::new(
+            fp(b"pg-sfs-nats-b"),
+            shared_root,
+            Some(device_b),
+            vec![],
+            "member".to_string(),
+            10_000,
+        ));
+        store.put_session_record(SessionRecord::new(
+            fp(b"pg-sfs-nats-expired"),
+            shared_root,
+            Some(fp(b"pg-sfs-device-expired")),
+            vec![],
+            "member".to_string(),
+            1_000, // expired at now=1_000
+        ));
+
+        let by_root = store.sessions_for_subject(&shared_root, 1_000);
+        assert_eq!(
+            by_root.len(),
+            2,
+            "root_fp must match both live sibling sessions"
+        );
+
+        let by_device = store.sessions_for_subject(&device_a, 1_000);
+        assert_eq!(
+            by_device.len(),
+            1,
+            "device_fp must match only its own session, not device_b's"
+        );
+        assert_eq!(by_device[0].device_fp, Some(device_a));
+
+        assert!(
+            store
+                .sessions_for_subject(&fp(b"pg-sfs-device-expired"), 1_000)
+                .is_empty(),
+            "an expired record must be excluded"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

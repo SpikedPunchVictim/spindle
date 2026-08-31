@@ -450,6 +450,17 @@ impl HelperView for Store {
         }
     }
 
+    fn sessions_for_subject(
+        &mut self,
+        subject: &spindle_core::Fingerprint,
+        now: u64,
+    ) -> Vec<SessionRecord> {
+        match self {
+            Store::Memory(s) => s.sessions_for_subject(subject, now),
+            Store::Pg(s) => s.sessions_for_subject(subject, now),
+        }
+    }
+
     fn record_turn_issuance(
         &mut self,
         root_fp: &spindle_core::Fingerprint,
