@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.16) + Execution Plan
+# Spindle — System Design Document (draft v0.9.17) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -36,8 +36,10 @@
 > carrier. Registry-minted agreement keys are rejected as a total break of §A7's stated "registry cannot read or forge
 > SDP/ICE" property. The live run of `spindle-net::signaling` proved the underlying gap was real, not theoretical: a
 > host that conflates `host_fp` with its envelope `device_fp` cannot subscribe to its own `host.<hfp>.connect`.
-> Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), A10.36 (`inbox` semantics), and the
-> **[DEFAULT]**-flagged rows in A10.
+> v0.9.17: A10.36 decided (2026-08-31; user decision) — the connect offer's `inbox` field is a **binding** of the
+> client's real NATS reply subject into signed material, checked by the host after decryption; deciding it exposed
+> and fixed a latent defect where the signed `inbox` never matched the reply subject the client actually listened on.
+> Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and the **[DEFAULT]**-flagged rows in A10.
 
 ---
 
@@ -387,7 +389,7 @@ Photos because they're in Family") derived directly from the union model.
 
 | Subject | Publisher | Subscriber | Notes |
 |---------|-----------|------------|-------|
-| `host.<hfp>.connect` | devices holding a cap for `hfp` | host | request/reply; envelope (A7) with client's inbox inside |
+| `host.<hfp>.connect` | devices holding a cap for `hfp` | host | request/reply; envelope (A7) with client's inbox inside, bound to the reply subject (A10.36) |
 | `host.<hfp>.sess.<cfp>.<sid>.c2h` | client `cfp` only | host | trickle ICE + session control |
 | `host.<hfp>.sess.<cfp>.<sid>.h2c` | host | client `cfp` only | trickle ICE + session control |
 | `host.<hfp>.presence` | broker helper (from `$SYS` events) | devices holding a cap for `hfp` | push deltas `{host_fp, state, last_seen}` only |
@@ -460,6 +462,12 @@ Client                          NATS                            Host
   │      DTLS handshake; compare remote DTLS fingerprint with a=fingerprint from the *verified* envelope
   │ ◄═══════════ DataChannel (DTLS/SCTP) → VFS RPC session bound to device_fp ═══════════► │
 ```
+- **[amended v0.9.17, A10.36]** The offer's `inbox` field is a **binding** of the NATS reply subject into signed
+  material, not a redundant copy of it. The client MUST set `inbox` to the exact reply subject it will listen on, and
+  the host MUST reject the offer unless the reply subject the transport reports equals the decrypted `inbox`. The
+  ordering is forced, not chosen: the `_INBOX_<c>.` prefix check runs first because it needs no key, while the
+  equality check is only possible once the ciphertext is open. A broker that substitutes a reply subject can then
+  only deny service — never silently redirect the answer to a subject the client never signed.
 - `connect` timeout covers the answer only (5 s, one retry); ICE streams independently; losses tolerated/retried.
   **[clarified v0.9.14]** "retried" always means a **new envelope with a fresh `seq`**, never a byte-identical
   retransmit — see §A7. Reordered envelopes are dropped, not buffered.
@@ -816,7 +824,7 @@ Docker is explicitly not the primary dev environment.
 | 33 | Signaling key schedule (offer bootstrap) | **DECIDED 2026-08-30:** two keys per session — offer under `k0` (ephemeral-static), answer and all later messages under `k1` (ephemeral-ephemeral); X3DH initial-message shape, no extra round trip; forward secrecy for the offer explicitly traded away (A7) |
 | 34 | Device agreement-key distribution | **DECIDED 2026-08-31:** the agreement key is published in the device certificate and reaches the peer over a self-verifying root→op→device signature chain, never by trusting the carrier (A7). Rejected: registry/helper-minted agreement keys — gives the registry both private halves of every static-static term in `k0`/`k1`, making it a passive full-session eavesdropper and destroying §A7's stated "registry cannot read or forge SDP/ICE" property; also rejected: the Ed25519→X25519 birational map. (S2 leg A step A finding, 2026-08-30.) |
 | 35 | Host device identity for E2E envelopes | **DECIDED 2026-08-31:** a host's envelope identity is a dedicated host device keypair (Ed25519 sign + X25519 agree) certified by the host **operating** key, chaining root→op→device. Rejected: the root signing directly (A10.30 keeps the root cold); the op key doubling up as the device key (forces an Ed25519→X25519 birational map). Interacts with A10.34. (S2 leg A step A finding, 2026-08-30.) |
-| 36 | Envelope `inbox` field semantics | **[USER DECISION]** §A6's connect envelope carries an `inbox` field whose relationship to the NATS reply subject (`_INBOX_<c>.x`) is unstated: redundant, authoritative, or a binding of the reply subject into the signed header (which would let the host detect reply-subject substitution). Wire-visible ⇒ expensive to reverse. (S2 leg A step A finding, 2026-08-30.) |
+| 36 | Envelope `inbox` field semantics | **DECIDED 2026-08-31:** binding. The client MUST set the offer's signed `inbox` to the exact NATS reply subject it listens on; the host MUST reject any offer whose decrypted `inbox` differs from the reply subject the transport reported. §A6's `_INBOX_<c>.` prefix check is unchanged and still runs first — it needs no key, whereas the equality check is only possible after decryption. Rejected: "redundant" (leaves the field decorative, and it had already drifted); "authoritative" (the host would publish to a client-asserted subject, would still need the prefix check, and would abandon NATS request/reply for no gain). Forced by a latent defect found while deciding it: the client minted `inbox` from a second `new_inbox()` call while `request()` generated its own reply subject internally, so the signed value never matched the real one — invisible because nothing read the field. (S2 leg A step A finding, 2026-08-30.) |
 
 ## A11. Alternatives considered
 
@@ -893,6 +901,7 @@ Docker is explicitly not the primary dev environment.
 | 45 | TURN quota griefing via self-declared identity in `turn.get` payload (A1) | A5 subject parametrization `helper.turn.get.<nfp>` — identity from the NATS permission, not the payload |
 | 46 | Cross-user host-list disclosure via self-declared identity in `presence.get` (A1) | A5 subject parametrization `helper.presence.get.<nfp>` — identity from the NATS permission, not the payload |
 | 47 | Registry substitutes or mints a host agreement key (A1/A2) | agreement key bound into `device_fp` and certified root→op→device (A10.34/35); the client pins `host_fp` and verifies the chain locally, so the helper can only withhold or serve a stale cert (bounded by `exp`) — never forge or substitute one |
+| 48 | Broker substitutes a connect reply subject (A1/A5) | A6/A10.36 `inbox` binding — the client's real reply subject is signed material and the host rejects any mismatch, so substitution becomes a counted rejection rather than a silent redirect (the answer is sealed to the client's device either way, so the residual risk is denial of service, not disclosure) |
 
 ## A13. Spikes (evidence before code) — ordered by risk
 
@@ -1014,6 +1023,18 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.17 (2026-08-31)** — A10.36 decided: the connect offer's `inbox` field is a **binding** of the NATS reply
+  subject into signed material. The client MUST set `inbox` to the exact reply subject it listens on — subscribing to
+  its own inbox and publishing with an explicit reply, rather than letting the NATS client mint one internally — and
+  the host MUST reject any offer whose decrypted `inbox` differs from the reply subject the transport reported. §A6's
+  `_INBOX_<c>.` prefix check is unchanged and still runs first: it needs no key, whereas the equality check is only
+  possible after decryption. Rejected: "redundant", which leaves the field decorative; and "authoritative", where the
+  host publishes to a client-asserted subject — it would still need the prefix check and would abandon NATS
+  request/reply for no gain. The decision was forced by a latent defect it exposed and this version fixes:
+  `spindle-net`'s client minted `inbox` from a second `new_inbox()` call while `request()` generated its own reply
+  subject, so the signed value never matched the one the client actually listened on. No test caught it because no
+  code read the field — the same shape as the `start_connectivity_checks` omission found in the live run (c7528af).
+  A12 #48.
 - **v0.9.16 (2026-08-31)** — A10.34 and A10.35 decided together. A host's A7 envelope identity is a **dedicated host
   device keypair** (Ed25519 sign + X25519 agree), certified by the host **operating** key
   (`sig_host_op(host_device_fp, alg_id, sign_pk, agree_pk, ts)`), chaining root→op→device; the agreement key is

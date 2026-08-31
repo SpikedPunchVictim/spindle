@@ -102,7 +102,10 @@ pub struct SignalingHost<A, H> {
 /// opened offer, without touching NATS/ICE/QUIC — the richest unit-testable surface for this half
 /// of the host flow (see this crate's report for what a live run still needs to prove beyond this).
 ///
-/// The reply-prefix check runs first — it is cheap and needs no crypto. The authorizer call runs
+/// The reply-prefix check runs first — it is cheap and needs no crypto. The §A10.36 `inbox`
+/// equality check is the third and last routing check, and is structurally forced to run after
+/// decryption for the reason given at this function's tail: `inbox` lives inside the ciphertext,
+/// so there is no key to read it with until `open_offer` has returned. The authorizer call runs
 /// next, but not for a performance reason: it runs before [`super::wire::open_offer`]'s signature
 /// verification and AEAD decryption because it is *structurally forced to*. `open_offer` needs the
 /// sender's `sign_pk`/`agree_pk` before it can verify anything, and the authorizer's
@@ -139,7 +142,18 @@ pub async fn process_offer<A: ConnectAuthorizer>(
         ConnectDecision::Deny => return Err(SignalingError::Denied),
     };
 
-    super::wire::open_offer(&env, host_device, host_device_fp, &sign_pk, &agree_pk)
+    let opened = super::wire::open_offer(&env, host_device, host_device_fp, &sign_pk, &agree_pk)?;
+
+    // DESIGN.md §A6/§A10.36: `inbox` is a *binding* of the reply subject into signed material, not
+    // a redundant copy. `reply_prefix_ok` above proved the reply subject is shaped like this
+    // sender's own inbox; this proves it is the *exact* subject the sender signed. It necessarily
+    // runs last: `inbox` lives inside the ciphertext, so there is no key to read it with until
+    // `open_offer` has returned.
+    if reply != Some(opened.offer.inbox.as_str()) {
+        return Err(SignalingError::ReplyInboxMismatch);
+    }
+
+    Ok(opened)
 }
 
 impl<A, H> SignalingHost<A, H>
@@ -365,9 +379,15 @@ mod tests {
         Peer { device, fp }
     }
 
-    fn sample_offer_payload() -> OfferPayload {
+    /// The reply subject a well-behaved client of fingerprint `fp` would both listen on and sign
+    /// into its offer's `inbox` (DESIGN.md §A10.36 -- the two are the same string by construction).
+    fn client_inbox(fp: &Fingerprint) -> String {
+        format!("_INBOX_{fp}.abc123")
+    }
+
+    fn sample_offer_payload(inbox: &str) -> OfferPayload {
         OfferPayload {
-            inbox: "_INBOX_client.x".to_string(),
+            inbox: inbox.to_string(),
             transport: Transport::Quic,
             ufrag: "clientufrag".to_string(),
             pwd: "clientpassword1234567890ab".to_string(),
@@ -429,7 +449,7 @@ mod tests {
         let client = peer(0x10, 0x11);
         let host = peer(0x20, 0x21);
         let ctx = wire::new_offer_context();
-        let payload = sample_offer_payload();
+        let payload = sample_offer_payload(&client_inbox(&client.fp));
         let offer_env = wire::seal_offer(
             &ctx,
             &client.device,
@@ -442,7 +462,7 @@ mod tests {
             sign_pk: client.device.sign_public_key(),
             agree_pk: client.device.agree_public_key(),
         };
-        let reply = format!("_INBOX_{}.abc123", client.fp);
+        let reply = client_inbox(&client.fp);
 
         let opened = process_offer(
             &offer_env.to_canonical_bytes(),
@@ -469,9 +489,9 @@ mod tests {
             client.fp,
             host.fp,
             &host.device.agree_public_key(),
-            &sample_offer_payload(),
+            &sample_offer_payload(&client_inbox(&client.fp)),
         );
-        let reply = format!("_INBOX_{}.abc123", client.fp);
+        let reply = client_inbox(&client.fp);
 
         let err = process_offer(
             &offer_env.to_canonical_bytes(),
@@ -499,7 +519,7 @@ mod tests {
             client.fp,
             host.fp,
             &host.device.agree_public_key(),
-            &sample_offer_payload(),
+            &sample_offer_payload(&client_inbox(&client.fp)),
         );
         let authorizer = KeyAuthorizer {
             sign_pk: client.device.sign_public_key(),
@@ -524,6 +544,84 @@ mod tests {
         );
     }
 
+    /// DESIGN.md §A10.36's *isolating* test. Everything about this offer is correct -- valid
+    /// signature, authorized sender, and an `inbox` that is a perfectly well-formed
+    /// `_INBOX_<from_fp>.` subject, so `reply_prefix_ok` passes -- except that the reply subject
+    /// the transport reports is a *different* inbox of the same sender's. That is precisely what a
+    /// substituting broker produces. Delete the `inbox` equality check and this offer is accepted:
+    /// this test then fails by *succeeding*, not by returning some other error.
+    #[tokio::test]
+    async fn process_offer_rejects_a_reply_subject_the_client_did_not_sign() {
+        let client = peer(0x3a, 0x3b);
+        let host = peer(0x4a, 0x4b);
+        let ctx = wire::new_offer_context();
+        let signed_inbox = client_inbox(&client.fp);
+        let offer_env = wire::seal_offer(
+            &ctx,
+            &client.device,
+            client.fp,
+            host.fp,
+            &host.device.agree_public_key(),
+            &sample_offer_payload(&signed_inbox),
+        );
+        let authorizer = KeyAuthorizer {
+            sign_pk: client.device.sign_public_key(),
+            agree_pk: client.device.agree_public_key(),
+        };
+        // A different, but still validly-prefixed, inbox of the same client's -- what a
+        // substituting broker would report as `msg.reply` instead of the signed `inbox`.
+        let reported_reply = format!("_INBOX_{}.zzz999", client.fp);
+        assert_ne!(signed_inbox, reported_reply);
+
+        let err = process_offer(
+            &offer_env.to_canonical_bytes(),
+            Some(reported_reply.as_str()),
+            &host.device,
+            host.fp,
+            &authorizer,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, SignalingError::ReplyInboxMismatch),
+            "expected SignalingError::ReplyInboxMismatch, got {err:?}"
+        );
+    }
+
+    /// The positive twin: reply subject and signed `inbox` agree, so the binding check passes.
+    #[tokio::test]
+    async fn process_offer_accepts_a_reply_subject_matching_the_signed_inbox() {
+        let client = peer(0x3c, 0x3d);
+        let host = peer(0x4c, 0x4d);
+        let ctx = wire::new_offer_context();
+        let signed_inbox = client_inbox(&client.fp);
+        let payload = sample_offer_payload(&signed_inbox);
+        let offer_env = wire::seal_offer(
+            &ctx,
+            &client.device,
+            client.fp,
+            host.fp,
+            &host.device.agree_public_key(),
+            &payload,
+        );
+        let authorizer = KeyAuthorizer {
+            sign_pk: client.device.sign_public_key(),
+            agree_pk: client.device.agree_public_key(),
+        };
+
+        let opened = process_offer(
+            &offer_env.to_canonical_bytes(),
+            Some(signed_inbox.as_str()),
+            &host.device,
+            host.fp,
+            &authorizer,
+        )
+        .await
+        .expect("a reply subject matching the signed inbox must be accepted");
+
+        assert_eq!(opened.offer, payload);
+    }
+
     #[tokio::test]
     async fn process_offer_rejects_a_missing_reply() {
         let client = peer(0x34, 0x35);
@@ -535,7 +633,7 @@ mod tests {
             client.fp,
             host.fp,
             &host.device.agree_public_key(),
-            &sample_offer_payload(),
+            &sample_offer_payload(&client_inbox(&client.fp)),
         );
         let authorizer = KeyAuthorizer {
             sign_pk: client.device.sign_public_key(),
@@ -575,13 +673,13 @@ mod tests {
             client.fp,
             host.fp,
             &host.device.agree_public_key(),
-            &sample_offer_payload(),
+            &sample_offer_payload(&client_inbox(&client.fp)),
         );
         let authorizer = KeyAuthorizer {
             sign_pk: impostor.device.sign_public_key(), // wrong pinned key
             agree_pk: client.device.agree_public_key(),
         };
-        let reply = format!("_INBOX_{}.abc123", client.fp);
+        let reply = client_inbox(&client.fp);
 
         let err = process_offer(
             &offer_env.to_canonical_bytes(),
@@ -612,7 +710,7 @@ mod tests {
             client.fp,
             host.fp,
             &host.device.agree_public_key(),
-            &sample_offer_payload(),
+            &sample_offer_payload(&client_inbox(&client.fp)),
         );
         let spy = SpyAuthorizer::default();
 

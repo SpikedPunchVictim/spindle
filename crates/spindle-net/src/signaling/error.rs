@@ -48,6 +48,22 @@ pub enum SignalingError {
     #[error("reply subject missing or does not start with the required _INBOX_<from_fp>. prefix")]
     BadReplyPrefix,
 
+    /// DESIGN.md §A6/§A10.36: the offer's **signed** `inbox` did not equal the NATS reply subject
+    /// the transport reported. [`SignalingError::BadReplyPrefix`] is the cheap pre-crypto *shape*
+    /// check (does this reply subject even belong to this sender?); this is the post-decryption
+    /// *binding* check (is it the exact subject the sender signed?). Only the latter catches a
+    /// broker swapping one validly-prefixed inbox of this sender's for another, which it can
+    /// therefore only turn into a counted denial of service, never a silent redirect.
+    #[error("offer's signed inbox does not match the NATS reply subject")]
+    ReplyInboxMismatch,
+
+    /// DESIGN.md §A6: nobody is subscribed to `host.<hfp>.connect` — NATS answers with a 503
+    /// no-responders status message on the reply subject rather than silence, which is what makes
+    /// "host is offline" *instant* instead of a timeout. `async_nats::Client::request` used to
+    /// recognise this for us; §A10.36's explicitly-owned reply inbox means this crate must.
+    #[error("host is offline: no responders on the connect subject")]
+    HostOffline,
+
     /// A trickled ICE envelope's NATS subject did not name the `(host_fp, client_fp, sid,
     /// direction)` the caller expected. This is the subject-level twin of
     /// `EnvelopeError::SidMismatch`/`SidBoundToDifferentSender`: NATS subject scoping and the

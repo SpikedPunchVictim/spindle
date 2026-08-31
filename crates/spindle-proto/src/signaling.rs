@@ -222,12 +222,18 @@ pub const KIND_ICE: u16 = 3;
 // OfferPayload
 // ================================================================================================
 
-/// The client's connect offer (DESIGN.md §A6: `env{eph_pk_c, offer, inbox, ...}`). `inbox` is the
-/// client's NATS reply subject; `transport`/`ufrag`/`pwd`/`cert_fp` are the client's own
-/// connectivity-negotiation fields — ICE short-term credentials (RFC 8445 §5.3) and, for a QUIC
-/// session, the client's per-session QUIC certificate fingerprint (DESIGN.md §A10.32). Candidates
-/// themselves are never embedded here; they are trickled separately as [`IcePayload`] envelopes
-/// (`kind = `[`KIND_ICE`]).
+/// The client's connect offer (DESIGN.md §A6: `env{eph_pk_c, offer, inbox, ...}`). `inbox` is a
+/// **binding** of the client's real NATS reply subject into signed material — the §A7 envelope
+/// signature covers the ciphertext, so the payload is signed. A conforming client MUST set
+/// `inbox` to the exact reply subject it listens on; a conforming host MUST reject any offer
+/// whose decrypted `inbox` differs from the reply subject the transport reported, in addition to
+/// §A6's cheaper `_INBOX_<c>.` prefix check (which stays first because it needs no key — the
+/// equality check is only possible after decryption). Consequence: a broker that substitutes a
+/// reply subject can only deny service, never silently redirect the answer (DESIGN.md
+/// §A6/§A10.36). `transport`/`ufrag`/`pwd`/`cert_fp` are the client's own connectivity-negotiation
+/// fields — ICE short-term credentials (RFC 8445 §5.3) and, for a QUIC session, the client's
+/// per-session QUIC certificate fingerprint (DESIGN.md §A10.32). Candidates themselves are never
+/// embedded here; they are trickled separately as [`IcePayload`] envelopes (`kind = `[`KIND_ICE`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfferPayload {
     pub inbox: String,

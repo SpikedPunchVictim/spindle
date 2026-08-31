@@ -490,6 +490,7 @@ fn client_opts() -> ConnectOptions {
         // literally `0.0.0.0` — unusable. Loopback, matching the spike's own choice.
         bind_ip: ICE_BIND_IP,
         ice_timeout: Duration::from_secs(10),
+        answer_timeout: Duration::from_secs(5),
     }
 }
 

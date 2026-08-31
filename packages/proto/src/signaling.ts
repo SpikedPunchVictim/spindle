@@ -165,8 +165,17 @@ function transportFromU64(v: bigint): Transport {
 // ================================================================================================
 
 /** The client's connect offer (DESIGN.md §A6: `env{eph_pk_c, offer, inbox, ...}`) — mirrors Rust's
- * `OfferPayload`. */
+ * `OfferPayload`. `inbox` is a **binding** of the client's real NATS reply subject into signed
+ * material — the §A7 envelope signature covers the ciphertext, so the payload is signed. A
+ * conforming client MUST set `inbox` to the exact reply subject it listens on; a conforming host
+ * MUST reject any offer whose decrypted `inbox` differs from the reply subject the transport
+ * reported, in addition to §A6's cheaper `_INBOX_<c>.` prefix check (which stays first because it
+ * needs no key — the equality check is only possible after decryption). Consequence: a broker
+ * that substitutes a reply subject can only deny service, never silently redirect the answer
+ * (DESIGN.md §A6/§A10.36). */
 export interface OfferPayload {
+  /** The client's real NATS reply subject, bound into signed material (DESIGN.md §A10.36) — see
+   * this interface's doc comment. */
   inbox: string;
   transport: Transport;
   ufrag: string;

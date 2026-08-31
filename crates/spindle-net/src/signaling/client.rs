@@ -83,6 +83,11 @@ pub struct ConnectOptions {
     pub bind_ip: IpAddr,
     /// How long to wait for ICE connectivity checks to select a candidate pair.
     pub ice_timeout: Duration,
+    /// How long to wait for the host's answer after publishing the offer (DESIGN.md §A6: "connect
+    /// timeout covers the answer only"). This used to be implicit in
+    /// `async_nats::Client::request`'s own default; §A10.36's switch to an explicitly-controlled
+    /// reply inbox makes it this crate's to set.
+    pub answer_timeout: Duration,
 }
 
 impl Default for ConnectOptions {
@@ -90,8 +95,21 @@ impl Default for ConnectOptions {
         Self {
             bind_ip: IpAddr::from([0, 0, 0, 0]),
             ice_timeout: Duration::from_secs(10),
+            answer_timeout: Duration::from_secs(5),
         }
     }
+}
+
+/// DESIGN.md §A6: NATS reports "nobody is subscribed to `host.<hfp>.connect`" as a 503
+/// no-responders status message on the reply subject, not as silence -- that is what makes "host
+/// is offline" instant rather than a timeout. `async_nats::Client::request` checked this
+/// internally; a free function (rather than inlining the check at its one call site) so it can be
+/// exercised without a live NATS server, since `async_nats::Message` is plain data.
+fn reject_no_responders(reply: &async_nats::Message) -> Result<(), SignalingError> {
+    if reply.status == Some(async_nats::StatusCode::NO_RESPONDERS) {
+        return Err(SignalingError::HostOffline);
+    }
+    Ok(())
 }
 
 /// The client role's connect flow. Holds the caller-owned NATS client (never connects one itself —
@@ -135,6 +153,8 @@ impl SignalingClient {
         host: &HostIdentity,
         opts: ConnectOptions,
     ) -> Result<(ControlStream, ConnectTimings), SignalingError> {
+        use futures_util::StreamExt;
+
         let cert = SessionCert::generate()?;
         // The client is always the ICE-controlling side (matches `s2-connect.rs`'s convention:
         // the offerer controls).
@@ -157,13 +177,21 @@ impl SignalingClient {
             .await
             .map_err(|e| SignalingError::Nats(e.to_string()))?;
 
+        // DESIGN.md §A10.36: the offer's `inbox` is a *binding* of the reply subject into signed
+        // material, so this client must own that subject rather than let `Client::request` mint one
+        // internally -- doing the latter is exactly the drift this decision found and fixed (the
+        // signed value and the real reply subject were two independent `new_inbox()` results that
+        // never matched, and nothing read the field, so nothing noticed). Subscribing before
+        // publishing also removes the race where the answer arrives first.
+        let inbox = self.nats.new_inbox();
+        let mut answer_sub = self
+            .nats
+            .subscribe(inbox.clone())
+            .await
+            .map_err(|e| SignalingError::Nats(e.to_string()))?;
+
         let offer_payload = OfferPayload {
-            // This offer's own reply is delivered as the NATS request's reply (see
-            // `AnswerPayload`'s doc comment) -- `inbox` here is the same value so the offer's
-            // *signed* envelope also asserts which subject the client will treat as authoritative,
-            // rather than relying solely on whatever `msg.reply` the transport reports (matching
-            // DESIGN.md §A6's `env{eph_pk_c, offer, inbox, ...}` shape).
-            inbox: self.nats.new_inbox(),
+            inbox: inbox.clone(),
             transport: Transport::Quic,
             ufrag: local_ice.ufrag.clone(),
             pwd: local_ice.pwd.clone(),
@@ -181,14 +209,32 @@ impl SignalingClient {
         );
 
         let offer_sent = Instant::now();
-        let reply = self
-            .nats
-            .request(
+        self.nats
+            .publish_with_reply(
                 connect_subject(&host.host_fp),
+                inbox,
                 offer_env.to_canonical_bytes().into(),
             )
             .await
             .map_err(|e| SignalingError::Nats(e.to_string()))?;
+        // `publish_with_reply` only buffers; `request` used to flush for us.
+        self.nats
+            .flush()
+            .await
+            .map_err(|e| SignalingError::Nats(e.to_string()))?;
+
+        let reply = tokio::time::timeout(opts.answer_timeout, answer_sub.next())
+            .await
+            .map_err(|_| SignalingError::Timeout("connect offer/answer"))?
+            .ok_or_else(|| {
+                SignalingError::Nats("answer subscription closed before the answer arrived".into())
+            })?;
+
+        // DESIGN.md §A6: "no-responders on connect -> instant 'host is offline'". `Client::request`
+        // used to check this for us; owning our own reply inbox (§A10.36) means we must check the
+        // 503 status NATS delivers on that inbox ourselves, before treating the message as an
+        // answer envelope.
+        reject_no_responders(&reply)?;
 
         let answer_env = spindle_proto::artifacts::Envelope::from_canonical_bytes(&reply.payload)?;
         let (session_key, answer) = open_answer(
@@ -297,5 +343,50 @@ impl SignalingClient {
             offer_to_quic_complete: quic_complete.duration_since(offer_sent),
         };
         Ok((control, timings))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_nats::StatusCode;
+
+    use super::*;
+
+    /// A minimal `async_nats::Message` for exercising [`reject_no_responders`] without a live NATS
+    /// server -- every field is plain public data, so this is real `Message` handling, not a fake.
+    fn message_with_status(status: Option<StatusCode>) -> async_nats::Message {
+        async_nats::Message {
+            subject: "_INBOX_test.abc123".into(),
+            reply: None,
+            payload: bytes::Bytes::new(),
+            headers: None,
+            status,
+            description: None,
+            length: 0,
+        }
+    }
+
+    #[test]
+    fn reject_no_responders_rejects_the_503_status() {
+        let reply = message_with_status(Some(StatusCode::NO_RESPONDERS));
+        let err = reject_no_responders(&reply).unwrap_err();
+        assert!(
+            matches!(err, SignalingError::HostOffline),
+            "expected SignalingError::HostOffline, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_no_responders_accepts_a_message_with_no_status() {
+        reject_no_responders(&message_with_status(None))
+            .expect("a message with no status must not be treated as no-responders");
+    }
+
+    #[test]
+    fn reject_no_responders_accepts_an_unrelated_status() {
+        // Any other status (e.g. a real answer never carries one, but this proves the check is
+        // specifically for 503, not "any status at all") must not be misread as no-responders.
+        reject_no_responders(&message_with_status(Some(StatusCode::OK)))
+            .expect("a non-503 status must not be treated as no-responders");
     }
 }
