@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.15) + Execution Plan
+# Spindle — System Design Document (draft v0.9.16) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -29,10 +29,15 @@
 > blanket forward-secrecy claim for the offer; "retried" clarified as a new envelope with a fresh `seq`
 > (2026-08-30; user decisions). v0.9.15: A9c manifest completed — `same-file` and `winapi-util` recorded as the
 > Windows-only direct dependencies of spindle-vfs that back §A4b's file-identity check; they had been in the tree
-> and CI-green since before v0.9.13 but were never listed (2026-08-30). Remaining **[USER DECISION]** items:
-> A10.6–9, A10.24 (license), A10.34–36
-> (device agreement-key distribution, host device identity, `inbox` semantics), and the **[DEFAULT]**-flagged
-> rows in A10.
+> and CI-green since before v0.9.13 but were never listed (2026-08-30). v0.9.16: A10.34 and A10.35 decided together
+> (2026-08-31; user decisions) — a host's A7 envelope identity is a dedicated host device keypair (Ed25519 sign +
+> X25519 agree) certified by the host operating key, not the op key doubling up and not the root; the agreement key
+> rides in the device certificate and reaches the peer over the root→op→device signature chain, never by trusting the
+> carrier. Registry-minted agreement keys are rejected as a total break of §A7's stated "registry cannot read or forge
+> SDP/ICE" property. The live run of `spindle-net::signaling` proved the underlying gap was real, not theoretical: a
+> host that conflates `host_fp` with its envelope `device_fp` cannot subscribe to its own `host.<hfp>.connect`.
+> Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), A10.36 (`inbox` semantics), and the
+> **[DEFAULT]**-flagged rows in A10.
 
 ---
 
@@ -215,13 +220,23 @@ signer, result).
 - *Device* = keypair generated on-device: Ed25519 (sign) + X25519 (agree); `alg_id` is a **suite version byte**
   (`1` = Ed25519/X25519/AES-256-GCM; no P-256 fallback — all target browsers ship Ed25519/X25519);
   `device_fp = base32(SHA-256("spindle-dev-v1" || alg_id || sign_pk || agree_pk))`. Carries a **device certificate
-  signed only by the root**: `sig_root(device_fp, nats_fp, ts, label)`. **Secondary devices cannot mint devices**
-  (a compromised secondary cannot amplify); browsers are never root holders. Adding a device = scan QR from the
+  signed only by the root**: `sig_root(device_fp, alg_id, sign_pk, agree_pk, nats_fp, ts)`. **[amended v0.9.16,
+  A10.34]** The certificate now publishes the `sign_pk`/`agree_pk` preimage that `device_fp` already commits to
+  (above), giving A7's `X25519(dev_self, dev_agree_peer)` term a defined source; a verifier recomputes `device_fp`
+  locally and checks it, so this is not a new trust assumption. Dropping `label` is not a change — A7b already
+  recorded that the device certificate carries no `label`; this notation was simply stale. **Secondary devices cannot mint
+  devices** (a compromised secondary cannot amplify); browsers are never root holders. Adding a device = scan QR from the
   primary device (or enter the recovery phrase on the new device, which then becomes primary).
 - *Host* = has a **host identity root** (`host_fp = hash(host_root_pk)`, backed up with the share config / recovery
   phrase) that signs its **operating key** (`sig_host_root(host_op_pk, nats_fp, ts)`). Members pin `host_fp`; rotating
   or reinstalling the operating key from backup does **not** trigger the key-change wall; losing the host root = new
-  host (re-invite everyone) — stated in the host UI at setup, with backup nagging.
+  host (re-invite everyone) — stated in the host UI at setup, with backup nagging. **[amended v0.9.16, A10.35]** A
+  host has **two** fingerprints and they are not interchangeable: `host_fp = hash(host_root_pk)` is the **NATS
+  subject-scoping token** (every `host.<hfp>.*` subject in §A5) and is never an envelope field; the **host device
+  fingerprint** is its A7 envelope identity (`to_fp`/`from_fp`) and never appears in a NATS subject. The host device
+  keypair is dedicated (generated like any other device — A4 Device, above), certified by the **operating** key:
+  `sig_host_op(host_device_fp, alg_id, sign_pk, agree_pk, ts)`, chaining root→op→device, so a member that pins
+  `host_fp` verifies it with no new trust anchor; the root stays cold and device-key rotation never re-walls members.
 - *Member* = a host-local record binding a `root_fp` (and its accepted device chain) to host-local state (A4b).
 
 **Two credentials per device**
@@ -378,7 +393,9 @@ Photos because they're in Family") derived directly from the union model.
 | `host.<hfp>.presence` | broker helper (from `$SYS` events) | devices holding a cap for `hfp` | push deltas `{host_fp, state, last_seen}` only |
 | `helper.presence.get.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply snapshot for the caller's hosts (from the session record for `nfp` — identity = the callout-granted subject token, never the payload; core NATS has no retained messages) |
 | `registry.revoke.<hfp>` | host `hfp` only | broker helper | host-signed revocation/epoch records (durable; helper asserts subject token == record `host_fp`; per-host token bucket) |
+| `registry.devcert.<hfp>` | host `hfp` only | broker helper | host-signed device certificate (durable; helper asserts subject token == the cert's `host_fp`; per-host token bucket) |
 | `helper.turn.get.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply TURN credentials; caller identity = the subject token (callout-granted), never the payload; helper authorizes via the session record for `nfp` (below) |
+| `helper.devcert.get.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply fetch of a host device certificate; **caller identity = the subject token (callout-granted), never the payload**; the payload names the target `host_fp`, and the helper serves it only if that host is in the caller's session record (`nats_fp → {root_fp, host_fps, ...}`) — so it cannot be used to enumerate hosts the caller holds no cap for. This mirrors the v0.9.7/v0.9.8 parametrization precedent. |
 | `registry.admin.>` | operator (mTLS + operator cert) | broker helper | signed admin commands (A3b); replies via `allow_responses` |
 | `_INBOX_<dfp>.>` | host via `allow_responses` after prefix check | owning device | private inbox prefix |
 
@@ -387,8 +404,8 @@ Photos because they're in Family") derived directly from the union model.
   `allow_responses {max:1, expires:"2m"}`; explicit deny of `_INBOX.>`, `$SYS.>`, `$JS.>`.
 - Client, for each host `h` in its verified caps: `pub host.<h>.connect`, `pub host.<h>.sess.<own>.*.c2h`,
   `sub host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus `sub _INBOX_<own>.>`, `pub helper.presence.get.<own nfp>`,
-  `pub helper.turn.get.<own nfp>`. Invite-only and stale-cap connections get just `pub host.<h>.connect` + inbox. Max 32 hosts
-  per connection (A10.5). **Session record**: on each successful auth the callout writes
+  `pub helper.turn.get.<own nfp>`, `pub helper.devcert.get.<own nfp>`. Invite-only and stale-cap connections get just
+  `pub host.<h>.connect` + inbox. Max 32 hosts per connection (A10.5). **Session record**: on each successful auth the callout writes
   `nats_fp → {root_fp, host_fps, quota_profile, exp}` to the helper store, so the helper can authorize non-callout
   requests (`helper.presence.get.<nfp>`, `helper.turn.get.<nfp>` — keyed by the subject token) — cleaned up on
   DISCONNECT/expiry.
@@ -475,6 +492,10 @@ replied. The host's answer carries `eph_pk_h`; from that message on **both direc
 ephemeral-ephemeral hybrid. This is the X3DH initial-message shape and costs no extra round trip. The distinct
 HKDF `info` labels (`spindle-sess-boot-v1` / `spindle-sess-v1`) domain-separate the two keys, which otherwise share
 (sid, from_fp, to_fp); a receiver decrypts `kind = offer` under `k0` and every other `kind` under `k1` — never both.
+**[amended v0.9.16]** The two static agreement keys now have a defined source (A10.34/35): `dev_agree_h` comes from
+the host device certificate — fetched once via `helper.devcert.get.<nfp>`, verified root→op→device against the
+pinned `host_fp`, and cached; `dev_agree_c` comes from the host's own member roster, or from the device certificate
+carried in the offer on invite redemption.
 **Receiver MUST**: verify `sig` under the **pinned** key for `from_fp` (or, for an invite redemption, under the key
 carried in the device certificate, which must chain to a root and be HMAC-bound to the invite nonce); `to_fp == self`;
 sender active/not revoked; `sid` matches subject and is bound to `from_fp`; `seq` strictly increasing per
@@ -494,8 +515,10 @@ against later device-key compromise, but the **offer is not** — `k0` is deriva
 key, so an attacker who captures signaling and later compromises that key **can decrypt captured offers** (the
 client's SDP, and the client ephemeral). Accepted, with eyes open, to keep connect at one round trip; the earlier
 unqualified claim that "device-key compromise does not retroactively decrypt captured signaling" was false for the
-offer and is withdrawn. Mitigation available if the exposure is later judged unacceptable: rotate the host
-agreement key on a schedule, bounding the window of retroactively-readable offers.
+offer and is withdrawn. Mitigation available if the exposure is later judged unacceptable: rotate the host agreement
+key on a schedule, bounding the window of retroactively-readable offers. **[amended v0.9.16]** A10.35's dedicated
+host device key makes this mitigation practical: rotating a dedicated device key touches nothing else, whereas
+rotating the root or op key would re-wall members or break cap chains.
 
 ## A7b. Signed-artifact profile (applies A7's discipline to every signed thing)
 
@@ -511,6 +534,7 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 | Revocation record | `spindle-rev-v1` | host op key / identity root | none (permanent) | **max-wins, never decreases**; old records cannot roll back |
 | Admin command | `spindle-adm-cmd-v1` | operator key | `ts` ±2 min | per-signer monotonic `seq` + nonce; idempotent execution |
 | Host op-key cert | `spindle-host-cert-v1` | host root | `exp` 90 d | n/a (rotation) |
+| Host device cert | `spindle-host-dev-cert-v1` | host op key | `exp` 90 d | n/a (rotation) |
 
 Root keys sign two artifact types (device certs, self-revocations) — the distinct tags prevent cross-artifact
 signature confusion. Host and helper both use helper server time for `exp`/`nbf` checks (single authority; ±2 min).
@@ -519,15 +543,18 @@ signature confusion. Host and helper both use helper server time for `exp`/`nbf`
 `crates/spindle-proto/src/lib.rs` (Stage 2 implementation), superseding this table for field-level detail. Two
 clarifications resolved during implementation: (1) **Device certificate carries no `label` field** — A4's "labels
 never baked into certificates" rule supersedes the older inline notation that listed `label`; (2) only **Envelope**,
-**Member/invite cap** (Capability), and **Admin command** carry an explicit `v` field — for the other four artifacts
-(Admission token, Device certificate, Revocation record, Host op-key cert) the A7b domain tag above is itself the
-version discriminant; (3) the Capability artifact carries no `nbf` field — `exp` is the sole time bound; (4) the
-pre-committed root-rotation record (`sig_old_root(new_root_pk)`, §A4) is not one of the seven cataloged wire
+**Member/invite cap** (Capability), and **Admin command** carry an explicit `v` field — for the other five artifacts
+(Admission token, Device certificate, Revocation record, Host op-key cert, Host device cert) the A7b domain tag above
+is itself the version discriminant; (3) the Capability artifact carries no `nbf` field — `exp` is the sole time bound;
+(4) the pre-committed root-rotation record (`sig_old_root(new_root_pk)`, §A4) is not one of the eight cataloged wire
 artifacts — v1 implements it crate-locally in spindle-core with its own domain tag; promoting it to a spindle-proto
 wire type (with golden vectors) is flagged for when rotation records first cross the wire (device↔host sync); (5)
 **[amended v0.9.5, A10.30]** the Capability now embeds the HostOpKeyCert (complete canonical encoding, a byte-string
-field) and is op-key signed rather than host-root signed; `host_fp` is always root-derived — resolving the S1-
-discovered divergence between op-key-signed caps and the root-derived `host_fp` that §A4/§A5 pin and scope by.
+field) and is op-key signed rather than host-root signed; `host_fp` is always root-derived — resolving the
+S1-discovered divergence between op-key-signed caps and the root-derived `host_fp` that §A4/§A5 pin and scope by; (6)
+**[amended v0.9.16, A10.34/35]** the Device certificate and the new Host device cert both carry
+`alg_id`/`sign_pk`/`agree_pk`; a verifier MUST recompute the fingerprint from that preimage and reject on mismatch —
+this is a **wire-visible change requiring regenerated golden vectors and the TypeScript twin**.
 
 ## A8. Transport, VFS RPC, and file safety (→ ADR-005)
 
@@ -787,8 +814,8 @@ Docker is explicitly not the primary dev environment.
 | 31 | Transport split | **DECIDED 2026-08-24:** QUIC (quinn) for native↔native; WebRTC data channels only for browser peers; browser WAN ceiling stated in A9/UI |
 | 32 | QUIC NAT traversal & stack | **DECIDED 2026-08-24:** quinn + standalone ICE (reuse webrtc-rs ice + coturn); per-session self-signed QUIC cert pinned via A7 envelope; iroh rejected |
 | 33 | Signaling key schedule (offer bootstrap) | **DECIDED 2026-08-30:** two keys per session — offer under `k0` (ephemeral-static), answer and all later messages under `k1` (ephemeral-ephemeral); X3DH initial-message shape, no extra round trip; forward secrecy for the offer explicitly traded away (A7) |
-| 34 | Device agreement-key distribution | **[USER DECISION]** No wire artifact carries a device's raw X25519 **agreement** public key — `DeviceCertificate` carries only the `device_fp` hash — so A7's `X25519(dev_self, dev_agree_peer)` term has no defined source at connect time. Options: add the agreement key to the device certificate; derive it from the signing key (Ed25519→X25519 birational map); or a separate pinned-key exchange. (S2 leg A step A finding, 2026-08-30.) |
-| 35 | Host device identity for E2E envelopes | **[USER DECISION]** A host's own **device** keypair for A7 envelope signing/agreement is undefined relative to `host_fp` (root-derived, cold — A10.30). Options: the host op key doubles as its device key; a dedicated host device key certified by the op key; or the root signs directly. Interacts with A10.34. (S2 leg A step A finding, 2026-08-30.) |
+| 34 | Device agreement-key distribution | **DECIDED 2026-08-31:** the agreement key is published in the device certificate and reaches the peer over a self-verifying root→op→device signature chain, never by trusting the carrier (A7). Rejected: registry/helper-minted agreement keys — gives the registry both private halves of every static-static term in `k0`/`k1`, making it a passive full-session eavesdropper and destroying §A7's stated "registry cannot read or forge SDP/ICE" property; also rejected: the Ed25519→X25519 birational map. (S2 leg A step A finding, 2026-08-30.) |
+| 35 | Host device identity for E2E envelopes | **DECIDED 2026-08-31:** a host's envelope identity is a dedicated host device keypair (Ed25519 sign + X25519 agree) certified by the host **operating** key, chaining root→op→device. Rejected: the root signing directly (A10.30 keeps the root cold); the op key doubling up as the device key (forces an Ed25519→X25519 birational map). Interacts with A10.34. (S2 leg A step A finding, 2026-08-30.) |
 | 36 | Envelope `inbox` field semantics | **[USER DECISION]** §A6's connect envelope carries an `inbox` field whose relationship to the NATS reply subject (`_INBOX_<c>.x`) is unstated: redundant, authoritative, or a binding of the reply subject into the signed header (which would let the host detect reply-subject substitution). Wire-visible ⇒ expensive to reverse. (S2 leg A step A finding, 2026-08-30.) |
 
 ## A11. Alternatives considered
@@ -865,6 +892,7 @@ Docker is explicitly not the primary dev environment.
 | 44 | Admin command replay / race / audit fork (A7) | A7b per-signer seq + idempotence; single-writer audit chain (A14) |
 | 45 | TURN quota griefing via self-declared identity in `turn.get` payload (A1) | A5 subject parametrization `helper.turn.get.<nfp>` — identity from the NATS permission, not the payload |
 | 46 | Cross-user host-list disclosure via self-declared identity in `presence.get` (A1) | A5 subject parametrization `helper.presence.get.<nfp>` — identity from the NATS permission, not the payload |
+| 47 | Registry substitutes or mints a host agreement key (A1/A2) | agreement key bound into `device_fp` and certified root→op→device (A10.34/35); the client pins `host_fp` and verifies the chain locally, so the helper can only withhold or serve a stale cert (bounded by `exp`) — never forge or substitute one |
 
 ## A13. Spikes (evidence before code) — ordered by risk
 
@@ -986,6 +1014,17 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.16 (2026-08-31)** — A10.34 and A10.35 decided together. A host's A7 envelope identity is a **dedicated host
+  device keypair** (Ed25519 sign + X25519 agree), certified by the host **operating** key
+  (`sig_host_op(host_device_fp, alg_id, sign_pk, agree_pk, ts)`), chaining root→op→device; the agreement key is
+  published in the device certificate and reaches the peer over that self-verifying chain, never by trusting the
+  carrier. Rejected: registry/helper-minted agreement keys — would give the registry both private halves of every
+  static-static term in `k0`/`k1`, a total break of §A7's stated "registry cannot read or forge SDP/ICE" property;
+  also rejected the Ed25519→X25519 birational map. The live run of `spindle-net::signaling` (commit c7528af) turned
+  A10.35 from a theoretical gap into an observed defect under a fully green 483-test suite: a host that conflates
+  `host_fp` with its envelope `device_fp` cannot subscribe to its own subject — `Permissions Violation for
+  Subscription to "host.<device_fp>.connect"`. Wire-visible consequence: the device-certificate schema now carries
+  `alg_id`/`sign_pk`/`agree_pk` (§A4, §A7b), requiring regenerated golden vectors and the TypeScript twin.
 - **v0.9.15 (2026-08-30)** — Documentation-debt sweep, no design change. A9c manifest completed: `same-file` and
   `winapi-util` are recorded as Windows-only direct dependencies of spindle-vfs, backing §A4b's
   `(volume_serial_number, file_index)` identity via `GetFileInformationByHandle`. Unlike the rustix/windows-sys
