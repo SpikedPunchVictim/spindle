@@ -1086,11 +1086,20 @@ const RECONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(150);
 /// Attempts a brand-new device CONNECT presenting the SAME (now revoked) identity — a fresh
 /// session nkey each try, exactly the wire-level shape of `async-nats`'s own automatic reconnect,
 /// made explicit and observable rather than left to run in the background — until either a
-/// refusal is observed and confirmed durable, or `deadline` passes.
+/// refusal is confirmed durable (1 initial refusal + `RECONNECT_CONFIRMATION_ATTEMPTS` more), or
+/// `deadline` passes.
+///
+/// Only `ConnectErrorKind::AuthorizationViolation` counts as a refusal. Any other connect error
+/// (`TimedOut`, `Io`, `Dns`, ...) is an immediate, loud panic: it means the NATS stack itself is
+/// unreachable or misconfigured, which proves NOTHING about whether the revoked device is
+/// refused, and must be reported as an inconclusive run rather than silently counted as a pass.
 ///
 /// Returns the [`Instant`] the refusal was **first** observed (t1) — not the instant the last
 /// confirmation attempt finished, so extra confirmation attempts add confidence without inflating
-/// the measured timing.
+/// the measured timing. The only way this function returns normally is reaching
+/// `RECONNECT_CONFIRMATION_ATTEMPTS` confirmations before `deadline`; hitting `deadline` first —
+/// whether zero or only some confirmations were observed — is always a loud panic, never a quiet
+/// pass.
 ///
 /// **Any attempt that connects successfully is an immediate, loud panic — never a retry.** The
 /// entire point of this helper is to prove the revoked identity genuinely cannot get back onto
@@ -1114,14 +1123,20 @@ async fn assert_revoked_device_cannot_reconnect(
             }
         }
         if Instant::now() >= deadline {
-            return first_refusal.unwrap_or_else(|| {
-                panic!(
+            match first_refusal {
+                None => panic!(
                     "the revoked device's fresh reconnect attempts (all {attempt} of them) never \
                      received a single authorization refusal before the bound expired — the \
                      revoked device was never conclusively cut off from NATS. FAILURE, not a \
                      pass."
-                )
-            });
+                ),
+                Some(_) => panic!(
+                    "the revoked device was refused at least once, but only {confirmations} of \
+                     the required {RECONNECT_CONFIRMATION_ATTEMPTS} confirmation attempts \
+                     completed before the bound expired — the refusal was never conclusively \
+                     confirmed as durable/repeatable. FAILURE, not a pass."
+                ),
+            }
         }
         attempt += 1;
 
@@ -1152,14 +1167,27 @@ async fn assert_revoked_device_cannot_reconnect(
                      weakening this assertion."
                 );
             }
-            Err(e) => {
-                println!("[reconnect] attempt #{attempt}: fresh connect correctly refused: {e}");
-                match first_refusal {
-                    None => first_refusal = Some(Instant::now()),
-                    Some(_) => confirmations += 1,
+            Err(e) => match e.kind() {
+                async_nats::ConnectErrorKind::AuthorizationViolation => {
+                    println!(
+                        "[reconnect] attempt #{attempt}: fresh connect correctly refused: {e}"
+                    );
+                    match first_refusal {
+                        None => first_refusal = Some(Instant::now()),
+                        Some(_) => confirmations += 1,
+                    }
+                    tokio::time::sleep(RECONNECT_RETRY_INTERVAL).await;
                 }
-                tokio::time::sleep(RECONNECT_RETRY_INTERVAL).await;
-            }
+                kind => {
+                    panic!(
+                        "attempt #{attempt}: fresh connect failed with a non-authorization error \
+                         (kind={kind}, full error: {e}) — a timeout, IO, or DNS failure means the \
+                         NATS stack itself is unreachable or misconfigured, which proves NOTHING \
+                         about whether the revoked device is actually refused. This must be \
+                         reported as an inconclusive run, not counted as a pass."
+                    );
+                }
+            },
         }
     }
 }
