@@ -207,6 +207,15 @@ pub enum StoreError {
          share\"); see StoreLimits"
     )]
     TooManyExcludeGlobs { share: ShareId, limit: usize },
+
+    /// A database file written by a newer build than this one. Refused rather than opened: the
+    /// newer schema's columns and constraints would be silently used by code that does not know
+    /// about them.
+    #[error(
+        "database schema version {found} is newer than this build supports (newest known \
+         migration is {supported}); refusing to open it — upgrade the application"
+    )]
+    SchemaTooNew { found: i64, supported: i64 },
 }
 
 /// The atomically-persisted result of redeeming an invite nonce (DESIGN.md §A4: "the host stores

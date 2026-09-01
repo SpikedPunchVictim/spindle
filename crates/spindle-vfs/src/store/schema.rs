@@ -5,7 +5,8 @@
 //! highest version applied. Versions are never edited after being shipped — a schema change is a
 //! new numbered constant appended to [`MIGRATIONS`].
 
-use rusqlite::Connection;
+use super::StoreError;
+use rusqlite::{Connection, TransactionBehavior};
 
 /// Version 1 — the core host-authorization tables (DESIGN.md §A4b): members, devices, groups
 /// (+ built-in `Owner`/`Members` seeded here so every fresh store has them from the first
@@ -182,13 +183,53 @@ const MIGRATIONS: &[(i64, &str)] = &[
 /// Applies every migration strictly newer than the connection's current `user_version`, each in
 /// its own transaction, advancing `user_version` as it goes. Safe to call on every [`super::Store`]
 /// open (a fully up-to-date connection is a no-op).
-pub(super) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+///
+/// Refuses to open a database whose `user_version` is newer than the newest migration this build
+/// knows about ([`StoreError::SchemaTooNew`]) — an older build silently using a newer schema's
+/// columns/constraints is worse than failing to open at all.
+///
+/// Each pending migration re-reads `user_version` under an `Immediate` (write-locked) transaction
+/// before deciding whether to apply it, so two connections racing to open the same out-of-date
+/// file cannot both apply the same migration (see the loop below for why a plain `Deferred`
+/// transaction is not enough).
+pub(super) fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
+    let latest = MIGRATIONS.last().map(|&(v, _)| v).unwrap_or(0);
+
+    // Fast path: an up-to-date connection takes no write lock at all. Reading `user_version`
+    // outside a transaction is safe *here* only because `current == latest` means there is
+    // nothing left to apply — a concurrent migrator could only be advancing it to this same
+    // `latest`. Any other value falls through to the locked path below, which re-reads.
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current > latest {
+        return Err(StoreError::SchemaTooNew {
+            found: current,
+            supported: latest,
+        });
+    }
+    if current == latest {
+        return Ok(());
+    }
+
     for &(version, sql) in MIGRATIONS {
+        // `Immediate`, not the default `Deferred`: the write lock must be held BEFORE
+        // `user_version` is read, or two openers both read the same stale version and both
+        // apply the same migration. rusqlite's default `busy_timeout(5000)` makes the loser
+        // of a deferred race wait out the winner and then proceed on its stale read rather
+        // than failing, which is exactly the "duplicate column name" case this prevents.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if current > latest {
+            return Err(StoreError::SchemaTooNew {
+                found: current,
+                supported: latest,
+            });
+        }
         if version <= current {
+            // Already applied — possibly by the racing opener we just waited out for the write
+            // lock. Dropping `tx` here rolls back (nothing was written under it), which is
+            // correct and intended: this connection has nothing left to commit for this version.
             continue;
         }
-        let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
         tx.execute_batch(&format!("PRAGMA user_version = {version}"))?;
         tx.commit()?;
@@ -225,5 +266,115 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM groups", [], |row| row.get(0))
             .expect("count groups");
         assert_eq!(count, 2, "Owner and Members must be seeded at init");
+    }
+
+    #[test]
+    fn migrate_refuses_a_database_from_a_newer_build() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        migrate(&mut conn).expect("migrate to latest");
+        let supported = MIGRATIONS.last().unwrap().0;
+
+        conn.execute_batch("PRAGMA user_version = 9")
+            .expect("simulate a newer-build database");
+
+        let err = migrate(&mut conn).expect_err("must refuse a newer schema version");
+        match err {
+            StoreError::SchemaTooNew {
+                found,
+                supported: s,
+            } => {
+                assert_eq!(found, 9);
+                assert_eq!(s, supported);
+            }
+            other => panic!("expected StoreError::SchemaTooNew, got {other:?}"),
+        }
+        let message = err_to_string(&err);
+        assert!(
+            message.contains('9'),
+            "message must mention found version: {message}"
+        );
+        assert!(
+            message.contains(&supported.to_string()),
+            "message must mention the newest known migration: {message}"
+        );
+    }
+
+    /// Small helper so the test above can render the error message without fighting borrow
+    /// checker gymnastics around `expect_err` + `to_string`.
+    fn err_to_string(err: &StoreError) -> String {
+        err.to_string()
+    }
+
+    /// Reproduces the Bug B race directly against the real [`super::super::Store::open`]: two
+    /// threads opening the same out-of-date file concurrently must not both apply the same
+    /// migration (which previously surfaced as "duplicate column name: agree_pk" from the loser,
+    /// which had read a stale `user_version` under rusqlite's default busy-timeout-then-proceed
+    /// behavior). Run 20 times in one test to make the race bite reliably.
+    #[test]
+    fn concurrent_opens_on_an_out_of_date_file_do_not_both_apply_the_same_migration() {
+        use std::sync::Barrier;
+        use tempfile::tempdir;
+
+        for iteration in 0..20 {
+            let dir = tempdir().expect("tempdir");
+            let path = dir.path().join("store.sqlite3");
+
+            // Build a fully-migrated store, then downgrade it to v3 by dropping the v4 column.
+            {
+                let store = super::super::Store::open(&path).expect("initial open migrates");
+                drop(store);
+                let conn = Connection::open(&path).expect("reopen raw");
+                conn.execute_batch("PRAGMA user_version = 3")
+                    .expect("downgrade user_version");
+                let dropped = conn.execute_batch("ALTER TABLE devices DROP COLUMN agree_pk");
+                match dropped {
+                    Ok(()) => {}
+                    Err(e) => {
+                        panic!(
+                            "ALTER TABLE ... DROP COLUMN failed verbatim: {e}; SQLite bundled by \
+                             rusqlite was expected to support DROP COLUMN (3.35+)"
+                        );
+                    }
+                }
+            }
+
+            let barrier = std::sync::Arc::new(Barrier::new(2));
+            let path_a = path.clone();
+            let barrier_a = barrier.clone();
+            let handle_a = std::thread::spawn(move || {
+                barrier_a.wait();
+                super::super::Store::open(&path_a)
+            });
+            let path_b = path.clone();
+            let barrier_b = barrier.clone();
+            let handle_b = std::thread::spawn(move || {
+                barrier_b.wait();
+                super::super::Store::open(&path_b)
+            });
+
+            let result_a = handle_a.join().expect("thread a did not panic");
+            let result_b = handle_b.join().expect("thread b did not panic");
+
+            assert!(
+                result_a.is_ok(),
+                "iteration {iteration}: thread a must succeed, got {:?}",
+                result_a.err()
+            );
+            assert!(
+                result_b.is_ok(),
+                "iteration {iteration}: thread b must succeed, got {:?}",
+                result_b.err()
+            );
+
+            let conn = Connection::open(&path).expect("reopen to check version");
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("read user_version");
+            assert_eq!(
+                version,
+                MIGRATIONS.last().unwrap().0,
+                "iteration {iteration}: user_version must land on the newest migration"
+            );
+        }
     }
 }
