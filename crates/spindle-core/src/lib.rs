@@ -56,3 +56,11 @@ pub use identity::{
 /// re-export rather than adding `ed25519-dalek` to a crate that is only supposed to depend on
 /// `spindle-core`.
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
+
+/// Re-exported for the same reason as [`VerifyingKey`] above: `spindle_net::signaling::authorize`'s
+/// `ConnectDecision::Allow` carries an `agree_pk: x25519_dalek::PublicKey` (the X25519 half
+/// [`identity::device_fp_of`] binds `device_fp` over — see that function's doc comment), and its
+/// production implementation in `spindle-host-core` must name that type without taking its own
+/// direct `x25519-dalek` dependency. Downstream crates should name it as `spindle_core::X25519PublicKey`
+/// rather than adding `x25519-dalek` to a crate that is only supposed to depend on `spindle-core`.
+pub use x25519_dalek::PublicKey as X25519PublicKey;

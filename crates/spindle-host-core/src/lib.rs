@@ -16,6 +16,14 @@
 //!
 //! # Module map
 //!
+//! - [`authorize`] — [`authorize::HostConnectAuthorizer`], the production
+//!   `spindle_net::signaling::authorize::ConnectAuthorizer` implementation, wired to this crate's
+//!   own member/device registry via the [`authorize::DeviceLookup`] seam (see that module's doc
+//!   comment for why the seam exists rather than naming `spindle_vfs::store::Store` directly) and
+//!   its `Store`-backed adapter [`authorize::SqliteDeviceLookup`]. This is the connect-time twin of
+//!   [`server::VfsRpcServer::handle`]'s per-request `denied:device_revoked` gate — both enforce
+//!   DESIGN.md §A4's member-active-and-device-not-revoked rule, one at connect time (once per
+//!   session) and one per request.
 //! - [`server`] — [`server::VfsRpcServer`], the per-request enforcement pipeline, and
 //!   [`server::SessionContext`] (the trusted, already-authenticated `{member_id, device_fp}}` a
 //!   transport layer hands in per call). This is the crate's whole public surface.
@@ -70,6 +78,7 @@
 //! **Out**: streaming a `read`/`upload_chunk` reply's bytes across multiple frames instead of one
 //! shot; the browser-peer WebRTC data-channel transport (needs signaling — Stage 5, unscheduled).
 
+pub mod authorize;
 pub mod serve;
 pub mod server;
 
@@ -80,6 +89,7 @@ mod mount;
 mod ratelimit;
 mod upload;
 
+pub use authorize::{DeviceLookup, HostConnectAuthorizer, LookupError, SqliteDeviceLookup};
 pub use serve::{serve_control_stream, ServeError};
 pub use server::{SessionContext, VfsRpcServer};
 
