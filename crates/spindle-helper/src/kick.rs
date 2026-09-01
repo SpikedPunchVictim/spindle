@@ -69,13 +69,18 @@
 //! records for the same `device_fp` (or `root_fp`), not out of this map's own key shape.
 //!
 //! # Out of scope (DESIGN.md items this module deliberately does not implement)
-//! **CONNZ seeding.** `src/bin/helper.rs`'s `seed_presence_map` backfills
-//! `presence::ConnectionMap` from a startup `$SYS.REQ.SERVER.PING.CONNZ` snapshot, so connections
-//! that predate this helper process are still trackable. No equivalent exists for [`KickMap`]:
-//! it is fed *only* from live `$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT` events. A connection that was
-//! already established when this helper process started has no entry here until it reconnects —
-//! not requested by this slice, and CONNZ rows do carry a `cid` so closing this gap later is a
-//! straightforward graduation of `seed_presence_map`'s own pattern, not a redesign.
+//! **CONNZ seeding is implemented, but entirely on `src/bin/helper.rs`'s side of this module's
+//! boundary.** `seed_maps` (renamed from `seed_presence_map` when this graduated) backfills BOTH
+//! `presence::ConnectionMap` and [`KickMap`] from the same startup `$SYS.REQ.SERVER.PING.CONNZ`
+//! reply, so a connection that predates this helper process is kickable immediately rather than
+//! only after its next CONNECT. This module has no code of its own for that: `seed_maps` seeds
+//! [`KickMap`] by calling [`KickMap::connect`] per CONNZ row, the exact same public entry point a
+//! live `$SYS.ACCOUNT.*.CONNECT` event already uses — CONNZ seeding is a second *feed* into this
+//! map's existing API, not new logic inside it. A miss a delayed re-plan still can't resolve (see
+//! [`KickPlan`]'s doc comment on why `unresolved` names sessions, not just counts) falls back to a
+//! second, on-demand CONNZ request (`src/bin/helper.rs`'s `connz_kick_fallback`) for the same
+//! reason — still wiring, still on the other side of the boundary this file's opening section
+//! describes.
 //!
 //! **Actually sending the KICK request.** See this module doc's opening section — that, and
 //! parsing the reply for an `error` key, is `src/bin/helper.rs`'s job entirely.
@@ -106,22 +111,46 @@ pub struct KickTarget {
     pub matched_subject: Fingerprint,
 }
 
+/// One session [`kicks_for_revocation`] matched to a revoked subject but found no live entry for
+/// in the [`KickMap`] snapshot it was given — see [`KickPlan`]'s doc comment for why this is
+/// carried as an identity, not folded into a bare count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedSession {
+    /// The connection's own `nats_fp` — same meaning as [`KickTarget::nats_fp`], and what
+    /// [`KickMap::target_for`] re-looks-up on a retry.
+    pub nats_fp: Fingerprint,
+    /// Which entry of the revocation's `revoked` list resolved to this session — same meaning as
+    /// [`KickTarget::matched_subject`], carried forward so a retry that later succeeds can still
+    /// log which revoked subject drove it.
+    pub matched_subject: Fingerprint,
+}
+
 /// The outcome of planning kicks for one accepted revocation: the connections to actually kick,
-/// plus a count of matched-but-unkickable sessions for `src/bin/helper.rs` to fold into a single
-/// summary log line. **Deliberately not just `Vec<KickTarget>`**: a session record can outlive
-/// the connection it describes (DISCONNECT hasn't been processed yet, or never will be — a crash
-/// dropped the TCP connection without an advisory), and silently dropping that fact entirely
-/// would make "nobody was live to kick" indistinguishable from "everybody who should have been
-/// kicked, was" — the same false-green class this crate treats as severity zero (see
-/// `revoke.rs`'s and `spikes/s9-revoke-kick/RESULTS.md`'s own framing of that concern).
+/// plus the sessions that matched but had no live entry in the map at that moment.
+/// **Deliberately not just `Vec<KickTarget>`**: a session record can outlive the connection it
+/// describes (DISCONNECT hasn't been processed yet, or never will be — a crash dropped the TCP
+/// connection without an advisory), and silently dropping that fact entirely would make "nobody
+/// was live to kick" indistinguishable from "everybody who should have been kicked, was" — the
+/// same false-green class this crate treats as severity zero (see `revoke.rs`'s and
+/// `spikes/s9-revoke-kick/RESULTS.md`'s own framing of that concern).
+///
+/// `unresolved` names *which* sessions missed, not merely how many, because a miss produced by
+/// this function is not necessarily permanent. DESIGN.md §A4's revoke -> kick -> reject chain runs
+/// advisories (`$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT`) and revocations (`registry.revoke.<hfp>`)
+/// over two independent connections (`sys_client` and `app_client`), so a CONNECT advisory that
+/// simply hasn't been drained into the [`KickMap`] yet produces the exact same "no live entry"
+/// shape this type reports for a connection that is genuinely gone. Carrying the identity — not
+/// just a count — lets `src/bin/helper.rs` retry those specific sessions against the map's later
+/// state via [`KickMap::target_for`], instead of only logging that some number of kicks silently
+/// didn't happen.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KickPlan {
     /// Targets to kick, already de-duplicated by connection (see [`kicks_for_revocation`]).
     pub targets: Vec<KickTarget>,
-    /// Number of sessions [`crate::authz::HelperView::sessions_for_subject`] matched that had no
-    /// live entry in the [`KickMap`] at all — not kicked, but counted rather than silently
-    /// dropped.
-    pub sessions_without_connection: usize,
+    /// Sessions [`crate::authz::HelperView::sessions_for_subject`] matched that had no live entry
+    /// in the [`KickMap`] at all — not kicked, but named rather than silently dropped, so a caller
+    /// can retry them (see this struct's doc comment).
+    pub unresolved: Vec<UnresolvedSession>,
 }
 
 /// The broker helper's kick-relay connection map (DESIGN.md §A3, S9). Pure/NATS-free, following
@@ -177,6 +206,24 @@ impl KickMap {
             .get(nats_fp)
             .map(|(sid, cid)| (sid.as_str(), *cid))
     }
+
+    /// Re-resolves one [`UnresolvedSession`] against this map's *current* state. Public (unlike
+    /// [`Self::lookup`]) because it is `src/bin/helper.rs`'s entry point for a delayed re-plan: a
+    /// [`KickPlan::unresolved`] entry recorded a miss against an earlier snapshot of this map, and
+    /// by the time the retry runs (`KICK_REPLAN_DELAY` later, per that file's doc comment) a
+    /// queued CONNECT advisory that raced the original revocation may since have landed. Returns
+    /// `None` if the session is still not live here — the caller's next move at that point is the
+    /// CONNZ fallback ([`crate::kick`]'s module doc, "Out of scope"), not another retry of this
+    /// same map.
+    pub fn target_for(&self, unresolved: &UnresolvedSession) -> Option<KickTarget> {
+        let (server_id, cid) = self.lookup(&unresolved.nats_fp)?;
+        Some(KickTarget {
+            server_id: server_id.to_string(),
+            cid,
+            nats_fp: unresolved.nats_fp,
+            matched_subject: unresolved.matched_subject,
+        })
+    }
 }
 
 /// Computes the [`KickTarget`]s an accepted revocation (`revoked` — the record's own `revoked`
@@ -192,9 +239,8 @@ impl KickMap {
 /// must be kicked exactly once. This function tracks every `nats_fp` it has already produced a
 /// decision for (kicked or not) and skips it on a later match, so the first revoked-subject entry
 /// to reach a given connection is the one credited as `matched_subject` on its [`KickTarget`],
-/// and a connection with no live map entry is only ever counted once in
-/// [`KickPlan::sessions_without_connection`], not once per revoked subject that happened to
-/// resolve to it.
+/// and a connection with no live map entry is only ever pushed once into
+/// [`KickPlan::unresolved`], not once per revoked subject that happened to resolve to it.
 pub fn kicks_for_revocation(
     revoked: &[Fingerprint],
     map: &KickMap,
@@ -218,7 +264,10 @@ pub fn kicks_for_revocation(
                     nats_fp: session.nats_fp,
                     matched_subject: *subject,
                 }),
-                None => plan.sessions_without_connection += 1,
+                None => plan.unresolved.push(UnresolvedSession {
+                    nats_fp: session.nats_fp,
+                    matched_subject: *subject,
+                }),
             }
         }
     }
@@ -355,7 +404,7 @@ mod tests {
         assert_eq!(plan.targets[0].cid, 111);
         assert_eq!(plan.targets[0].nats_fp, nats_fp);
         assert_eq!(plan.targets[0].matched_subject, root_fp);
-        assert_eq!(plan.sessions_without_connection, 0);
+        assert_eq!(plan.unresolved.len(), 0);
     }
 
     #[test]
@@ -381,7 +430,7 @@ mod tests {
             plan.targets.iter().map(|t| t.nats_fp).collect();
         assert!(nats_fps.contains(&nats_fp_a));
         assert!(nats_fps.contains(&nats_fp_b));
-        assert_eq!(plan.sessions_without_connection, 0);
+        assert_eq!(plan.unresolved.len(), 0);
     }
 
     #[test]
@@ -403,7 +452,8 @@ mod tests {
         assert_eq!(plan.targets.len(), 1);
         assert_eq!(plan.targets[0].nats_fp, nats_fp_a);
         assert_eq!(
-            plan.sessions_without_connection, 0,
+            plan.unresolved.len(),
+            0,
             "the sibling session was never matched at all, not matched-and-skipped"
         );
     }
@@ -413,9 +463,10 @@ mod tests {
         let mut s = store();
         let map = KickMap::new();
         let root_fp = fp(b"root-no-conn");
+        let nats_fp = fp(b"nats-no-conn");
         put_session(
             &mut s,
-            fp(b"nats-no-conn"),
+            nats_fp,
             root_fp,
             Some(fp(b"device-no-conn")),
             10_000,
@@ -424,7 +475,16 @@ mod tests {
         let plan = kicks_for_revocation(&[root_fp], &map, &mut s, 1_000);
 
         assert!(plan.targets.is_empty());
-        assert_eq!(plan.sessions_without_connection, 1);
+        assert_eq!(plan.unresolved.len(), 1);
+        assert_eq!(
+            plan.unresolved[0],
+            UnresolvedSession {
+                nats_fp,
+                matched_subject: root_fp,
+            },
+            "unresolved must name the exact session and the revoked subject that reached it, not \
+             just count it"
+        );
     }
 
     #[test]
@@ -471,6 +531,48 @@ mod tests {
         let plan = kicks_for_revocation(&[root_fp], &map, &mut s, 1_000);
 
         assert!(plan.targets.is_empty());
-        assert_eq!(plan.sessions_without_connection, 1);
+        assert_eq!(plan.unresolved.len(), 1);
+        assert_eq!(plan.unresolved[0].nats_fp, nats_fp);
+        assert_eq!(plan.unresolved[0].matched_subject, root_fp);
+    }
+
+    // ---- KickMap::target_for -----------------------------------------------------------------
+
+    #[test]
+    fn target_for_resolves_once_the_map_gains_an_entry() {
+        // Models the delayed-re-plan case this type exists for (see `KickPlan`'s doc comment): a
+        // session was unresolved against an earlier map snapshot, but by the time a retry runs,
+        // the connection has since been armed (a queued CONNECT advisory finally drained in).
+        let mut map = KickMap::new();
+        let nats_fp = fp(b"nats-retry-hit");
+        let root_fp = fp(b"root-retry-hit");
+        let unresolved = UnresolvedSession {
+            nats_fp,
+            matched_subject: root_fp,
+        };
+
+        assert_eq!(map.target_for(&unresolved), None, "not armed yet");
+
+        map.conns.insert(nats_fp, ("server-a".to_string(), 77));
+
+        assert_eq!(
+            map.target_for(&unresolved),
+            Some(KickTarget {
+                server_id: "server-a".to_string(),
+                cid: 77,
+                nats_fp,
+                matched_subject: root_fp,
+            })
+        );
+    }
+
+    #[test]
+    fn target_for_stays_none_when_the_map_never_gains_an_entry() {
+        let map = KickMap::new();
+        let unresolved = UnresolvedSession {
+            nats_fp: fp(b"nats-retry-miss"),
+            matched_subject: fp(b"root-retry-miss"),
+        };
+        assert_eq!(map.target_for(&unresolved), None);
     }
 }

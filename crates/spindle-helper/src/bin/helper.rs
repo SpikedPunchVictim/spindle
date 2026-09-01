@@ -37,15 +37,32 @@
 //! below for why `callout_client`'s AUTH-account membership is not sufficient) subscribes to
 //! `$SYS.ACCOUNT.*.CONNECT` and `$SYS.ACCOUNT.*.DISCONNECT` and, once at startup, requests
 //! `$SYS.REQ.SERVER.PING.CONNZ` to seed [`spindle_helper::presence::ConnectionMap`] with whatever
-//! connections predate this process (see `seed_presence_map`'s doc comment for the exact fold
-//! logic and its one flagged gap). Every DISCONNECT additionally triggers
+//! connections predate this process (see `seed_maps`'s doc comment for the exact fold logic and
+//! its one flagged gap — that same request now also seeds the kick relay's `KickMap`, see this
+//! file's "Kick relay" section below). Every DISCONNECT additionally triggers
 //! [`HelperView::delete_session_record`] for that connection's `nats_fp`, host or device alike
 //! (DESIGN.md §A5's "cleaned up on DISCONNECT/expiry"). See `spindle_helper::presence`'s own
-//! module doc for the wire schema, and this file's `seed_presence_map`/`user_from_sys_event` doc
+//! module doc for the wire schema, and this file's `seed_maps`/`user_from_sys_event` doc
 //! comments and their `#[cfg(test)] mod tests` for the real, live-verified `$SYS`/CONNZ payload
 //! shapes (spikes/s5-presence, docs/SPIKES.md §S5 — two shapes were wrong on the first pass, see
 //! that spike's RESULTS.md), and the explicit list of what's still out of scope (kick relay,
 //! split-brain, multi-server `CONNZ`, leader-only publishing).
+//!
+//! # Kick relay (DESIGN.md §A3/§A4, S9 leg 3 — see `spindle_helper::kick`'s module doc for the
+//! pure planning core)
+//! A revocation accepted on `app_client` (`registry.revoke.<hfp>`) is planned against `kick_map`,
+//! which is armed from two independent sources: live `$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT`
+//! advisories on `sys_client` below, and the same startup `$SYS.REQ.SERVER.PING.CONNZ` reply that
+//! seeds presence (`seed_maps`). Because the advisory and revocation paths are two separate TCP
+//! connections with no ordering guarantee between them, a revocation can be planned before its
+//! own triggering CONNECT advisory has arrived — a real defect found and fixed post-graduation
+//! (not a spike finding): the failing sequence was CONNECT queued -> revoke processed against an
+//! unarmed map -> CONNECT drained too late to matter. [`kick::KickPlan::unresolved`] exists so
+//! that miss is a named retry list, not a silently-dropped count: the revoke branch schedules a
+//! delayed re-plan (`KICK_REPLAN_DELAY` below — sized to outlast the advisory backlog, not
+//! guessed), and anything still unresolved after that falls back to an on-demand
+//! `connz_kick_fallback` request, which is the honest last word — if the server's own connection
+//! table doesn't know about it either, there is nothing left to kick.
 //!
 //! # `verify_nkey_sig` (DESIGN.md §A4 step 1: "signing the server nonce with its session nkey")
 //! Satisfied the same way S1 proved it: the authorization request's `connect_opts.sig` is the
@@ -504,6 +521,20 @@ async fn next_or_pending(sub: &mut Option<async_nats::Subscriber>) -> Option<asy
     }
 }
 
+/// How long the revoke branch waits before re-planning kicks against `kick_map`'s later state,
+/// after an initial [`kick::kicks_for_revocation`] plan reports one or more
+/// [`kick::KickPlan::unresolved`] sessions (this file's "Kick relay" module-doc section explains
+/// why a miss here isn't necessarily permanent: the CONNECT advisory that would have armed
+/// `kick_map` may simply not have arrived on `sys_client` yet, independently of the revocation
+/// that already landed on `app_client`).
+///
+/// Sized from measurement, not guessed: the failing run that exposed this defect had a queued-
+/// advisory-to-drain backlog of about 15.6 ms. `250` ms is roughly an order of magnitude of
+/// headroom over that, cheap because a revocation with an unresolved session is expected to be
+/// rare, and short enough that a legitimately-gone connection is still kicked promptly by the
+/// `connz_kick_fallback` a still-unresolved retry falls through to.
+const KICK_REPLAN_DELAY: Duration = Duration::from_millis(250);
+
 async fn run(config: Config) -> anyhow::Result<()> {
     let app_kp = KeyPair::from_seed(&config.app_account_seed)
         .map_err(|e| anyhow::anyhow!("bad APP_ACCOUNT_SEED: {e}"))?;
@@ -654,12 +685,34 @@ async fn run(config: Config) -> anyhow::Result<()> {
         None => None,
     };
 
-    let mut presence_map = seed_presence_map(sys_ref, &mut store, now_secs()).await;
+    // Kick relay (DESIGN.md §A3, S9 leg 3 — see `spindle_helper::kick`'s module doc, and this
+    // file's own "Kick relay" module-doc section above). `seed_maps` seeds BOTH maps from the same
+    // one CONNZ reply now — `kick_map` used to be fed *only* from live
+    // `$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT` events below with no CONNZ-seeding equivalent; that
+    // gap is what let a connection established before this helper process started sit unkickable
+    // until its next CONNECT, and closing it is exactly `kick.rs`'s former "Out of scope" section
+    // graduating (see that module doc's current version).
+    let (mut presence_map, mut kick_map) = seed_maps(sys_ref, &mut store, now_secs()).await;
 
-    // Kick relay (DESIGN.md §A3, S9 leg 3 — see `spindle_helper::kick`'s module doc). Fed only
-    // from live `$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT` events below, unlike `presence_map`: there
-    // is no CONNZ-seeding equivalent for it (see that module's "Out of scope" section).
-    let mut kick_map = kick::KickMap::new();
+    // Delayed kick re-plan channel (see this file's "Kick relay" module-doc section and
+    // `KICK_REPLAN_DELAY`'s own doc comment below). The revoke branch pushes
+    // `kick::UnresolvedSession`s here from a spawned `sleep`-then-send task rather than sleeping
+    // inline in the select loop itself — the loop must keep servicing every other branch
+    // (including the very CONNECT advisory a retry is waiting on) while the delay elapses. `64` is
+    // a generous bound on in-flight retries: one send per accepted revocation with a partial miss,
+    // not per unresolved session, and revocations are not expected to be a high-frequency subject.
+    let (kick_retry_tx, mut kick_retry_rx) =
+        tokio::sync::mpsc::channel::<Vec<kick::UnresolvedSession>>(64);
+
+    // Test-only delayed `kick_map` arming channel (see
+    // `SPINDLE_HELPER_TEST_ADVISORY_DELAY_MS`'s doc comment at its one use site in the connect
+    // branch below for why this exists and why an inline sleep there was wrong). Same shape as
+    // `kick_retry_tx`/`kick_retry_rx` above: the delay is a spawned `sleep`-then-send task, never
+    // an in-branch `.await` on the sleep itself, so the select loop keeps servicing every other
+    // branch (in particular `$SYS.REQ.USER.AUTH`) while the simulated late advisory is in flight.
+    // `8` is a generous bound for a test-only knob that only ever fires when the env var is set.
+    let (delayed_arm_tx, mut delayed_arm_rx) =
+        tokio::sync::mpsc::channel::<(String, String, u64)>(8);
 
     // Periodic best-effort cleanup of expired session records (DESIGN.md §A9b: "a cleanup path
     // for expired rows (on-read filter + periodic delete — keep simple)"). The on-read `exp`
@@ -781,13 +834,32 @@ async fn run(config: Config) -> anyhow::Result<()> {
                                     &mut store,
                                     now_secs(),
                                 );
-                                if plan.sessions_without_connection > 0 {
-                                    tracing::info!(
+                                if !plan.unresolved.is_empty() {
+                                    // `warn!`, not `info!`: this is the exact fail-open this
+                                    // defect fix exists for — a revoked session that looked
+                                    // unkickable only because its own CONNECT advisory hadn't
+                                    // drained into `kick_map` yet (two independent connections,
+                                    // no ordering guarantee between `sys_client` and `app_client`
+                                    // — see this file's "Kick relay" module-doc section). A
+                                    // security-relevant fail-open must survive a production `warn`
+                                    // filter, not get buried at `info`.
+                                    tracing::warn!(
                                         %host_fp,
-                                        sessions_without_connection = plan.sessions_without_connection,
+                                        unresolved = plan.unresolved.len(),
                                         "revocation matched live session records with no known \
-                                         connection to kick"
+                                         connection to kick yet — scheduling a delayed re-plan"
                                     );
+                                    // Do NOT sleep inline here: stalling this `select!` loop for
+                                    // `KICK_REPLAN_DELAY` would also stall the very CONNECT
+                                    // advisory the retry is waiting on, defeating the fix. Spawn a
+                                    // separate task that sleeps and then hands the unresolved list
+                                    // back to the loop over `kick_retry_tx`.
+                                    let retry_tx = kick_retry_tx.clone();
+                                    let unresolved = plan.unresolved;
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(KICK_REPLAN_DELAY).await;
+                                        let _ = retry_tx.send(unresolved).await;
+                                    });
                                 }
                                 for target in plan.targets {
                                     issue_kick(sys_ref, &target).await;
@@ -837,7 +909,43 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 // client.id just means this connection isn't kickable yet — never fatal, and
                 // never blocks presence tracking below.
                 if let Some((server_id, cid)) = kick_coords_from_sys_event(&msg.payload) {
-                    kick_map.connect(&user_pk, server_id, cid);
+                    // TEST-ONLY INSTRUMENTATION, no-op unless explicitly configured. Set
+                    // `SPINDLE_HELPER_TEST_ADVISORY_DELAY_MS` to make this defect's race
+                    // deterministic under test: it delays arming `kick_map` for this CONNECT by
+                    // the given number of milliseconds, which is exactly the window a queued
+                    // advisory sat in on the failing run this fix addresses (see this file's
+                    // "Kick relay" module-doc section and `KICK_REPLAN_DELAY`'s doc comment for
+                    // the measured ~15.6 ms backlog this reproduces on demand). Never read in
+                    // production — no env var means no delay and no behavior change at all.
+                    //
+                    // An inline `tokio::time::sleep` right here — tried first — is WRONG, not just
+                    // suboptimal: `tokio::select!` runs exactly one branch's body at a time, so
+                    // sleeping inside this branch stalls the *entire* loop, including the
+                    // `$SYS.REQ.USER.AUTH` callout branch above. Proved live: with this hook set to
+                    // 2000 ms, the helper's own startup connections each stalled the loop for 2 s,
+                    // the callout never got a chance to answer, and every subsequent CONNECT was
+                    // refused with an unrelated-looking `authorization violation` — the helper log
+                    // showed no activity at all after "responder ready". A late CONNECT advisory
+                    // must delay only the *arming of `kick_map`*, not the responder's ability to
+                    // service anything else, so — mirroring `kick_retry_tx`/`kick_retry_rx` above —
+                    // this defers the `kick_map.connect` call itself to a spawned task that sleeps
+                    // and then hands the coordinates back to the loop over `delayed_arm_tx`, rather
+                    // than blocking this branch on the sleep.
+                    match env::var("SPINDLE_HELPER_TEST_ADVISORY_DELAY_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .filter(|&ms| ms > 0)
+                    {
+                        Some(delay_ms) => {
+                            let arm_tx = delayed_arm_tx.clone();
+                            let user_pk = user_pk.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                let _ = arm_tx.send((user_pk, server_id, cid)).await;
+                            });
+                        }
+                        None => kick_map.connect(&user_pk, server_id, cid),
+                    }
                 }
                 if let Some(delta) = presence_map.connect(&user_pk, now_secs()) {
                     publish_presence_delta(&app_client, delta).await;
@@ -864,6 +972,19 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 // Eager session-record cleanup (DESIGN.md §A5 "cleaned up on DISCONNECT/expiry")
                 // applies to every disconnecting user, host or device alike — decoupled from the
                 // presence map below, which only exists for registered hosts.
+                //
+                // **Known gap, flagged not silently resolved**: this delete is unconditional,
+                // while `kick_map.disconnect` just below it correctly guards on `cid` — a stale
+                // DISCONNECT (superseded by a newer CONNECT/reconnect under the same `nats_fp`,
+                // see `kick::KickMap`'s module doc's "Reconnect" section) evicts a *live* session's
+                // record here even though the kick map itself correctly ignores that same stale
+                // event. This cannot be closed the way `kick_map.disconnect` is: `SessionRecord`
+                // (session.rs) carries no `cid` field at all, and
+                // `HelperView::delete_session_record` takes only a `nats_fp`, with no `cid`
+                // parameter to condition on — the store has no fact to compare against. Adding one
+                // would mean extending `SessionRecord`'s schema (and threading a `cid` through
+                // every `HelperView` impl/call site), which is out of scope for this fix per its
+                // own constraints; left as-is and reported rather than patched over.
                 if let Ok(nats_fp) = auth_token::nats_fp_of_nkey(&user_pk) {
                     store.delete_session_record(&nats_fp);
                 }
@@ -875,6 +996,44 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 }
                 if let Some(delta) = presence_map.disconnect(&user_pk, now_secs()) {
                     publish_presence_delta(&app_client, delta).await;
+                }
+            }
+            // Test-only delayed `kick_map` arming (see `SPINDLE_HELPER_TEST_ADVISORY_DELAY_MS`'s
+            // doc comment in the connect branch above). Declared after the connect/disconnect
+            // branches for consistency with the retry branch just below, but — unlike that
+            // branch's `biased;` ordering, which is load-bearing — this one's position doesn't
+            // actually matter: it only ever fires under the test-only env var, and its only job is
+            // to arm `kick_map` a bit later than a real CONNECT would, not to race anything else
+            // in this loop.
+            Some((user_pk, server_id, cid)) = delayed_arm_rx.recv() => {
+                kick_map.connect(&user_pk, server_id, cid);
+            }
+            // Delayed kick re-plan (this file's "Kick relay" module-doc section). Declared AFTER
+            // the connect and disconnect branches above — under `biased;`, that ordering is
+            // load-bearing, not incidental: it guarantees that if a CONNECT advisory for one of
+            // these `unresolved` sessions is *also* ready at this same poll, it gets drained into
+            // `kick_map` first, so the re-plan below reads the map's newest state rather than
+            // racing it the same way the original bug did.
+            Some(unresolved) = kick_retry_rx.recv() => {
+                let mut still_unresolved = Vec::new();
+                for u in unresolved {
+                    match kick_map.target_for(&u) {
+                        Some(target) => {
+                            tracing::info!(
+                                nats_fp = %target.nats_fp,
+                                matched_subject = %target.matched_subject,
+                                "delayed kick re-plan resolved a session the original plan missed"
+                            );
+                            issue_kick(sys_ref, &target).await;
+                        }
+                        None => still_unresolved.push(u),
+                    }
+                }
+                if !still_unresolved.is_empty() {
+                    // Spawned, not awaited inline: `connz_kick_fallback` carries its own 5s
+                    // timeout (see `connz_request`'s doc comment) and must not stall this loop.
+                    let sys_client = sys_ref.clone();
+                    tokio::spawn(connz_kick_fallback(sys_client, still_unresolved));
                 }
             }
             _ = purge_interval.tick() => {
@@ -1048,11 +1207,77 @@ async fn publish_presence_delta(
     let _ = client.flush().await;
 }
 
-/// Seeds a fresh [`presence::ConnectionMap`] from a `$SYS.REQ.SERVER.PING.CONNZ` reply at startup
-/// (DESIGN.md §A6: "CONNZ on start + ... deltas"). Best-effort: any failure (timeout, unparseable
-/// reply, an unrecognized shape) is a warning, not a fatal error — presence self-heals from
-/// `$SYS.ACCOUNT.*.CONNECT|DISCONNECT` deltas as connections churn, so starting with an empty map
-/// is safe, just momentarily stale (every host reads offline/unknown until its next CONNECT).
+/// Performs one `$SYS.REQ.SERVER.PING.CONNZ` round trip and returns the parsed reply body.
+/// Shared by [`seed_maps`] (startup backfill of both maps) and `connz_kick_fallback` (an
+/// on-demand retry when even the delayed re-plan in the revoke branch still can't resolve a
+/// session) so the request shape and the 5s timeout live in exactly one place. Returns `None` on
+/// any transport/timeout/parse failure — logging that failure is each caller's own job, since the
+/// two callers want differently-worded warnings for what is otherwise the same failure (a startup
+/// backfill silently starting empty reads very differently from an in-flight kick retry giving
+/// up).
+///
+/// `{"auth": true}` is nats-server's `ConnzOptions.Username` field (JSON key `"auth"`) — spikes/
+/// s5-presence (docs/SPIKES.md §S5) found live that an empty request body gets back a CONNZ reply
+/// whose `connections[]` entries have NO `"user"` field at all (cid/ip/port/etc. only), silently
+/// defeating every seed. Requesting `auth` info is what makes the server include it (see that
+/// spike's RESULTS.md for the captured before/after payload samples).
+async fn connz_request(sys_client: &async_nats::Client) -> Result<serde_json::Value, ConnzError> {
+    let request_payload = serde_json::json!({ "auth": true });
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        sys_client.request(
+            "$SYS.REQ.SERVER.PING.CONNZ",
+            serde_json::to_vec(&request_payload)
+                .expect("static json! value always serializes")
+                .into(),
+        ),
+    )
+    .await
+    .map_err(|_| ConnzError::Timeout)?
+    .map_err(|e| ConnzError::Transport(e.to_string()))?;
+
+    serde_json::from_slice(&reply.payload).map_err(|e| ConnzError::BadJson(e.to_string()))
+}
+
+/// Why a [`connz_request`] round trip failed to produce a usable reply — carried instead of
+/// logging inline so each caller can word its own warning (see that function's doc comment).
+enum ConnzError {
+    Transport(String),
+    Timeout,
+    BadJson(String),
+}
+
+/// The concrete `server.id` a CONNZ reply's rows share — top level, sibling of `data` (see
+/// `kick.rs`'s module doc: there is no broadcast KICK form, a `server_id` is always required to
+/// kick any of them). `None` here means every row in this reply is unkickable; it has no bearing
+/// on presence seeding, which doesn't need a server id at all.
+fn connz_server_id(value: &serde_json::Value) -> Option<&str> {
+    value.get("server")?.get("id")?.as_str()
+}
+
+/// The CONNZ reply's `connections` array, tolerating either the documented `data.connections`
+/// wrapping or a bare top-level `connections` (kept from [`seed_maps`]'s original doc comment,
+/// unchanged by this refactor: "a bare top-level `connections` array is also tolerated in case of
+/// a differently-wrapped reply").
+fn connz_connections(value: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    value
+        .get("data")
+        .and_then(|d| d.get("connections"))
+        .or_else(|| value.get("connections"))
+        .and_then(|c| c.as_array())
+}
+
+/// Seeds a fresh [`presence::ConnectionMap`] *and* a fresh [`kick::KickMap`] from one shared
+/// `$SYS.REQ.SERVER.PING.CONNZ` reply at startup (DESIGN.md §A6: "CONNZ on start + ... deltas";
+/// DESIGN.md §A3/S9 for the kick relay). Renamed from `seed_presence_map` when this graduated to
+/// seed both maps — one reply already carries everything both need (`server.id` at the top level,
+/// `cid` and `authorized_user` per row), so a second request would just be redundant load on
+/// `nats-server`. Best-effort for both: any failure (timeout, unparseable reply, an unrecognized
+/// shape) is a warning, not a fatal error — presence self-heals from
+/// `$SYS.ACCOUNT.*.CONNECT|DISCONNECT` deltas and the kick relay self-heals the same way (plus the
+/// delayed-re-plan/CONNZ-fallback path in the revoke branch, see this file's "Kick relay"
+/// module-doc section) as connections churn, so starting either map empty is safe, just
+/// momentarily stale.
 ///
 /// Multi-server `CONNZ` aggregation (a cluster's `$SYS.REQ.SERVER.PING.CONNZ` fans out to every
 /// node in the cluster and each node replies separately) is explicitly deferred to the HA slice
@@ -1060,18 +1285,18 @@ async fn publish_presence_delta(
 /// deployment.
 ///
 /// Payload shape verified live by spikes/s5-presence (docs/SPIKES.md §S5 — see RESULTS.md for
-/// the captured samples, before and after both fixes below): the reply is `{"server": {...},
-/// "data": {"connections": [{"authorized_user": "<pubkey>", "account": "<account name>", "cid":
-/// ..., "ip": ..., ...}, ...], ...}, ...}`; a bare top-level `connections` array is also
-/// tolerated in case of a differently-wrapped reply. Two live-only gotchas, both found by S5's
-/// restart-reseed scenario failing and both required together to fix it:
+/// the captured samples, before and after both fixes below): the reply is `{"server": {"id":
+/// ..., ...}, "data": {"connections": [{"authorized_user": "<pubkey>", "account": "<account
+/// name>", "cid": ..., "ip": ..., ...}, ...], ...}, ...}`; a bare top-level `connections` array is
+/// also tolerated in case of a differently-wrapped reply. Two live-only gotchas, both found by
+/// S5's restart-reseed scenario failing and both required together to fix it:
 /// 1. The request body must be `{"auth": true}` (nats-server's `ConnzOptions.Username`, JSON key
 ///    `"auth"`) — an empty request body gets a reply with no identity field on any connection at
 ///    all.
 /// 2. Even with `auth: true`, the identity field is named `"authorized_user"`, not `"user"` as
 ///    first assumed (`"user"` is kept as a tolerant fallback below, never observed in practice).
 ///
-/// # Host-user resolution gap (flagged ambiguity, not silently resolved)
+/// # Host-user resolution gap (flagged ambiguity, not silently resolved) — presence only
 /// [`presence::ConnectionMap::register_host_user`] is normally populated live, at the moment a
 /// host's callout succeeds (`handle_one`'s Host branch, below). CONNZ rows for connections
 /// established *before this helper process started* were never seen by that code path, so there
@@ -1083,52 +1308,40 @@ async fn publish_presence_delta(
 /// `decide_host_connect` always builds for a host connection (see `authz.rs`) — is recognized as
 /// a host session, and its `root_fp` (== `host_fp`) is registered before folding the connection
 /// in. A connection with no durable session record at all (the in-memory store was never durable
-/// to begin with, or the record already expired) is silently skipped: from CONNZ alone it's
-/// indistinguishable from a device or the helper's own connection, and presence for it simply
-/// reads "offline/unknown" until its own next CONNECT/DISCONNECT cycle re-establishes it live.
-async fn seed_presence_map(
+/// to begin with, or the record already expired) is silently skipped for presence: from CONNZ
+/// alone it's indistinguishable from a device or the helper's own connection, and presence for it
+/// simply reads "offline/unknown" until its own next CONNECT/DISCONNECT cycle re-establishes it
+/// live. **This gap does not apply to kick-map seeding below**: unlike presence, every connection
+/// with a usable `cid` and a live session record is kickable, host or device alike — there is no
+/// "only hosts" restriction on the kick relay (DESIGN.md §A3's kick relay reaches any revoked
+/// `root_fp`/`device_fp`, not just hosts).
+async fn seed_maps(
     sys_client: &async_nats::Client,
     store: &mut Store,
     now: u64,
-) -> presence::ConnectionMap {
-    let mut map = presence::ConnectionMap::new();
+) -> (presence::ConnectionMap, kick::KickMap) {
+    let mut presence_map = presence::ConnectionMap::new();
+    let mut kick_map = kick::KickMap::new();
 
-    // `{"auth": true}` is nats-server's `ConnzOptions.Username` field (JSON key "auth") — spikes/
-    // s5-presence (docs/SPIKES.md §S5) found live that an empty request body gets back a CONNZ
-    // reply whose `connections[]` entries have NO `"user"` field at all (cid/ip/port/etc. only),
-    // silently defeating every seed below. Requesting `auth` info is what makes the server
-    // include it (see that spike's RESULTS.md for the captured before/after payload samples).
-    let request_payload = serde_json::json!({ "auth": true });
-    let reply = match tokio::time::timeout(
-        Duration::from_secs(5),
-        sys_client.request(
-            "$SYS.REQ.SERVER.PING.CONNZ",
-            serde_json::to_vec(&request_payload)
-                .expect("static json! value always serializes")
-                .into(),
-        ),
-    )
-    .await
-    {
-        Ok(Ok(reply)) => reply,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "CONNZ request failed — starting presence with an empty map");
-            return map;
-        }
-        Err(_) => {
-            tracing::warn!("CONNZ request timed out — starting presence with an empty map");
-            return map;
-        }
-    };
-
-    let value: serde_json::Value = match serde_json::from_slice(&reply.payload) {
+    let value = match connz_request(sys_client).await {
         Ok(v) => v,
-        Err(e) => {
+        Err(ConnzError::Transport(e)) => {
             tracing::warn!(
                 error = %e,
-                "CONNZ reply was not valid JSON — starting presence with an empty map"
+                "CONNZ request failed — starting presence and kick maps empty"
             );
-            return map;
+            return (presence_map, kick_map);
+        }
+        Err(ConnzError::Timeout) => {
+            tracing::warn!("CONNZ request timed out — starting presence and kick maps empty");
+            return (presence_map, kick_map);
+        }
+        Err(ConnzError::BadJson(e)) => {
+            tracing::warn!(
+                error = %e,
+                "CONNZ reply was not valid JSON — starting presence and kick maps empty"
+            );
+            return (presence_map, kick_map);
         }
     };
 
@@ -1137,17 +1350,23 @@ async fn seed_presence_map(
     // doc comment's assumption. Debug-level only.
     tracing::debug!(reply = %value, "raw $SYS.REQ.SERVER.PING.CONNZ reply");
 
-    let connections = value
-        .get("data")
-        .and_then(|d| d.get("connections"))
-        .or_else(|| value.get("connections"))
-        .and_then(|c| c.as_array());
-
-    let Some(connections) = connections else {
+    // Missing top-level server.id only sinks kick-map seeding (see kick.rs's module doc: there's
+    // no broadcast KICK form, a concrete server_id is always required) — presence has no such
+    // dependency, so it proceeds below regardless.
+    let server_id = connz_server_id(&value);
+    if server_id.is_none() {
         tracing::warn!(
-            "CONNZ reply had no recognizable connections array — starting presence with an empty map"
+            "CONNZ reply had no top-level server.id — kick map will start empty; presence \
+             seeding is unaffected"
         );
-        return map;
+    }
+
+    let Some(connections) = connz_connections(&value) else {
+        tracing::warn!(
+            "CONNZ reply had no recognizable connections array — starting presence and kick maps \
+             empty"
+        );
+        return (presence_map, kick_map);
     };
 
     for conn in connections {
@@ -1160,29 +1379,160 @@ async fn seed_presence_map(
         let Some(session) = store.session_record(&nats_fp, now) else {
             continue;
         };
+
+        // Kick-map seeding: every connection with a live session record is kickable, host or
+        // device alike — deliberately NOT gated on `is_host_session` below (see this function's
+        // doc comment's last paragraph).
+        if let (Some(server_id), Some(cid)) = (server_id, connz_row_cid(conn)) {
+            kick_map.connect(user_pk, server_id, cid);
+        }
+
         let is_host_session = session.host_fps.len() == 1 && session.host_fps[0] == session.root_fp;
         if !is_host_session {
             continue;
         }
-        map.register_host_user(user_pk.to_string(), session.root_fp);
+        presence_map.register_host_user(user_pk.to_string(), session.root_fp);
         // Discard the delta: nothing is subscribed to host.<hfp>.presence yet this early in
         // startup, and every seeded connection is by definition not a fresh transition.
-        let _ = map.connect(user_pk, now);
+        let _ = presence_map.connect(user_pk, now);
     }
 
-    map
+    (presence_map, kick_map)
 }
 
-/// Extracts a CONNZ connection row's authorized-user nkey pubkey. Split out of
-/// [`seed_presence_map`]'s loop so the field-name lookup — the exact thing spikes/s5-presence
-/// (docs/SPIKES.md §S5) got wrong on the first pass — is independently unit-testable against the
-/// real captured shape (see the tests below), without needing a live NATS server. Real nats-
-/// server rows (with `{"auth": true}` requested) name this field `"authorized_user"`; `"user"` is
-/// a tolerant fallback that has never actually been observed.
+/// The CONNZ fallback for a session a delayed kick re-plan still couldn't resolve (this file's
+/// "Kick relay" module-doc section, and `KICK_REPLAN_DELAY`'s doc comment). By the time this runs,
+/// both the natural `$SYS.ACCOUNT.*.CONNECT` advisory feed and one delayed re-plan against it have
+/// already had their chance — an on-demand CONNZ snapshot is the last independent source of truth
+/// left: it asks `nats-server` directly, bypassing this helper's own advisory-ingestion pipeline
+/// entirely, so it succeeds even if that pipeline itself is what's stuck or backlogged.
+///
+/// Reuses [`connz_request`]/[`connz_server_id`]/[`connz_connections`]/[`connz_row_user_pk`]/
+/// [`connz_row_cid`] — the exact same parsing [`seed_maps`] uses — rather than re-implementing any
+/// of it; only the fold logic differs (matching against a specific `unresolved` list instead of
+/// seeding two fresh maps from scratch).
+///
+/// Spawned by the revoke branch rather than awaited inline (`connz_request` carries its own 5s
+/// timeout, which must not stall the responder's `select!` loop). Anything still unresolved after
+/// this is the honest end of the chain, logged at `warn!` with the count and the fingerprints —
+/// the session record exists, but the server's own connection table doesn't know about it either,
+/// so there is nothing left to kick.
+async fn connz_kick_fallback(
+    sys_client: async_nats::Client,
+    unresolved: Vec<kick::UnresolvedSession>,
+) {
+    let value = match connz_request(&sys_client).await {
+        Ok(v) => v,
+        Err(ConnzError::Transport(e)) => {
+            tracing::warn!(
+                error = %e,
+                unresolved = unresolved.len(),
+                "CONNZ kick-fallback request failed — these sessions remain unresolved"
+            );
+            return;
+        }
+        Err(ConnzError::Timeout) => {
+            tracing::warn!(
+                unresolved = unresolved.len(),
+                "CONNZ kick-fallback request timed out — these sessions remain unresolved"
+            );
+            return;
+        }
+        Err(ConnzError::BadJson(e)) => {
+            tracing::warn!(
+                error = %e,
+                unresolved = unresolved.len(),
+                "CONNZ kick-fallback reply was not valid JSON — these sessions remain unresolved"
+            );
+            return;
+        }
+    };
+
+    let Some(server_id) = connz_server_id(&value) else {
+        tracing::warn!(
+            unresolved = unresolved.len(),
+            "CONNZ kick-fallback reply had no top-level server.id — these sessions remain unresolved"
+        );
+        return;
+    };
+
+    let Some(connections) = connz_connections(&value) else {
+        tracing::warn!(
+            unresolved = unresolved.len(),
+            "CONNZ kick-fallback reply had no recognizable connections array — these sessions \
+             remain unresolved"
+        );
+        return;
+    };
+
+    // Index by nats_fp so the connections loop below is a single pass regardless of how many
+    // sessions are still unresolved, not O(rows * unresolved).
+    let mut still_unresolved: std::collections::HashMap<_, _> =
+        unresolved.into_iter().map(|u| (u.nats_fp, u)).collect();
+
+    for conn in connections {
+        if still_unresolved.is_empty() {
+            break;
+        }
+        let Some(user_pk) = connz_row_user_pk(conn) else {
+            continue;
+        };
+        let Ok(nats_fp) = auth_token::nats_fp_of_nkey(user_pk) else {
+            continue;
+        };
+        let Some(u) = still_unresolved.remove(&nats_fp) else {
+            continue;
+        };
+        let Some(cid) = connz_row_cid(conn) else {
+            // Put it back — this row identified the session but had no usable cid, so it's still
+            // genuinely unresolved, not a spurious "found and removed."
+            still_unresolved.insert(nats_fp, u);
+            continue;
+        };
+        let target = kick::KickTarget {
+            server_id: server_id.to_string(),
+            cid,
+            nats_fp: u.nats_fp,
+            matched_subject: u.matched_subject,
+        };
+        tracing::info!(
+            nats_fp = %target.nats_fp,
+            matched_subject = %target.matched_subject,
+            "CONNZ kick fallback resolved a session the delayed re-plan still missed"
+        );
+        issue_kick(&sys_client, &target).await;
+    }
+
+    if !still_unresolved.is_empty() {
+        let fingerprints: Vec<String> = still_unresolved.keys().map(|fp| fp.to_string()).collect();
+        tracing::warn!(
+            unresolved = still_unresolved.len(),
+            nats_fps = ?fingerprints,
+            "CONNZ kick fallback still could not resolve these sessions — the server's own \
+             connection table doesn't know about them either, nothing left to kick"
+        );
+    }
+}
+
+/// Extracts a CONNZ connection row's authorized-user nkey pubkey. Split out of [`seed_maps`]'s
+/// loop so the field-name lookup — the exact thing spikes/s5-presence (docs/SPIKES.md §S5) got
+/// wrong on the first pass — is independently unit-testable against the real captured shape (see
+/// the tests below), without needing a live NATS server. Real nats-server rows (with `{"auth":
+/// true}` requested) name this field `"authorized_user"`; `"user"` is a tolerant fallback that has
+/// never actually been observed.
 fn connz_row_user_pk(conn: &serde_json::Value) -> Option<&str> {
     conn.get("authorized_user")
         .or_else(|| conn.get("user"))
         .and_then(|u| u.as_str())
+}
+
+/// Extracts a CONNZ connection row's `cid` — the kick relay's other half of a target, alongside
+/// [`connz_server_id`] (DESIGN.md §A3, S9). Split out for the same testability reason as
+/// [`connz_row_user_pk`]. Note the shape contrast with `$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT`
+/// events: `kick_coords_from_sys_event` reads this same fact from a nested `client.id`, but a
+/// CONNZ row has it at its own top level.
+fn connz_row_cid(conn: &serde_json::Value) -> Option<u64> {
+    conn.get("cid").and_then(|c| c.as_u64())
 }
 
 fn verifying_key_from_raw(raw: &[u8]) -> anyhow::Result<spindle_core::VerifyingKey> {
