@@ -63,7 +63,7 @@ use crate::model::{
     Device, DevicePublicKeys, Entitlement, Group, GroupId, GroupKind, Member, MemberId,
     MemberStatus, ModelError, Perms, Share, ShareFlags, ShareId, VirtualPath,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use spindle_core::{Fingerprint, FingerprintError};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -301,20 +301,32 @@ impl Store {
 
     /// The **only** method in this crate that increments `cap_epoch` — see the module doc
     /// comment's "Two counters, two rules" section. Returns the new value.
+    ///
+    /// The `UPDATE ... RETURNING` is load-bearing, not stylistic: an `UPDATE` followed by a
+    /// separate `SELECT` (this method's previous shape) is two autocommit statements with a gap
+    /// between them, so under concurrency another connection's bump could land in that gap and
+    /// this call's `SELECT` would then return an epoch it did not produce — the caller would go
+    /// on to mint a revocation record naming an epoch it never actually caused. `RETURNING` makes
+    /// the value handed back provably the one this statement's own `UPDATE` produced, in one
+    /// atomic step.
     pub fn bump_cap_epoch(&self) -> Result<u64, StoreError> {
-        self.conn
-            .execute("UPDATE meta SET cap_epoch = cap_epoch + 1 WHERE id = 0", [])?;
-        self.cap_epoch()
+        Ok(self.conn.query_row(
+            "UPDATE meta SET cap_epoch = cap_epoch + 1 WHERE id = 0 RETURNING cap_epoch",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? as u64)
     }
 
     /// Called from every entitlement/group-membership/share mutation in this file — never from
-    /// callers directly (not `pub`).
+    /// callers directly (not `pub`). Uses the same `UPDATE ... RETURNING` shape as
+    /// [`Store::bump_cap_epoch`], for the same reason: the returned value must be provably the
+    /// one this statement's own `UPDATE` produced, not a value read back in a separate statement.
     fn bump_grants_version(&self) -> Result<u64, StoreError> {
-        self.conn.execute(
-            "UPDATE meta SET grants_version = grants_version + 1 WHERE id = 0",
+        Ok(self.conn.query_row(
+            "UPDATE meta SET grants_version = grants_version + 1 WHERE id = 0 RETURNING grants_version",
             [],
-        )?;
-        self.grants_version()
+            |r| r.get::<_, i64>(0),
+        )? as u64)
     }
 
     // ---------------------------------------------------------------------------------------
@@ -477,6 +489,71 @@ impl Store {
         self.set_member_status(member_id, MemberStatus::Revoked)
     }
 
+    /// Atomically revokes a member and bumps `cap_epoch`, or does neither — added to fix a
+    /// crash-window defect in the old two-autocommit-statement sequencing (`store.revoke_member`
+    /// then `store.bump_cap_epoch`, each a separate transaction): a crash between them could
+    /// leave a member durably `Revoked` with `cap_epoch` never bumped, and because
+    /// [`Store::set_member_status`] permits only `Invited -> Active | Invited -> Revoked |
+    /// Active -> Revoked`, every retry then failed forever with
+    /// `StoreError::InvalidStatusTransition { from: Revoked, to: Revoked }`. This method does not
+    /// change [`Store::revoke_member`] or [`Store::set_member_status`]'s existing behavior at all
+    /// (both are untouched, and `revoke_does_not_bump_cap_epoch_automatically` still passes
+    /// unchanged) — it is an additional, atomic entry point a caller can use instead.
+    ///
+    /// The whole operation — reading the member's current status, writing
+    /// `status = 'revoked'`, and bumping `cap_epoch` — happens inside one
+    /// `self.conn.unchecked_transaction()`, committed at the end. `unchecked_transaction` (rather
+    /// than `rusqlite::Connection::transaction`, which requires `&mut Connection`) is used
+    /// because every `Store` method takes `&self` and `Store` holds a single `Connection` with no
+    /// nesting, so this is the only constructor available without rippling a `&mut self` API
+    /// break through every method here and every caller in `spindle-host-core`. Because it is one
+    /// transaction, the crash-window defect above is now unreachable: a crash before commit rolls
+    /// back the status write too, so a retry sees the member still in its pre-crash status and
+    /// takes the ordinary forward-transition path again, rather than wedging on a terminal state
+    /// with no bump to show for it.
+    ///
+    /// Returns:
+    /// - `Err(StoreError::MemberNotFound(member_id))` if the member does not exist.
+    /// - `Ok(None)` if the member is already `Revoked`: nothing is written and `cap_epoch` is
+    ///   deliberately **not** bumped. `cap_epoch` invalidates every outstanding capability on
+    ///   this host, so a redundant revoke must not pay that cost again for no reason.
+    /// - `Ok(Some(new_epoch))` if the member was `Invited` or `Active`: its status becomes
+    ///   `Revoked` and `cap_epoch` is bumped exactly once, returning the new value.
+    ///
+    /// [`Store::revoke_device_and_bump_epoch`] behaves identically on retry — that symmetry is
+    /// the point. The old device path (a plain `UPDATE ... SET revoked = 1` with no status-machine
+    /// check) was accidentally retryable, while the old member path was permanently wedged; both
+    /// atomic entry points are now idempotent for the same reason instead of by accident.
+    pub fn revoke_member_and_bump_epoch(
+        &self,
+        member_id: MemberId,
+    ) -> Result<Option<u64>, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT status FROM members WHERE member_id = ?1",
+                params![member_id.0 as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(status_str_val) = current else {
+            return Err(StoreError::MemberNotFound(member_id));
+        };
+        if parse_status(&status_str_val) == MemberStatus::Revoked {
+            // Nothing to write, nothing to bump — commit (equivalent to rollback here, since
+            // nothing was written) and report "no-op" to the caller.
+            tx.commit()?;
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE members SET status = 'revoked' WHERE member_id = ?1",
+            params![member_id.0 as i64],
+        )?;
+        let new_epoch = bump_cap_epoch_in_tx(&tx)?;
+        tx.commit()?;
+        Ok(Some(new_epoch))
+    }
+
     // ---------------------------------------------------------------------------------------
     // Devices
     // ---------------------------------------------------------------------------------------
@@ -527,6 +604,68 @@ impl Store {
             return Err(StoreError::DeviceNotFound(device_fp));
         }
         Ok(())
+    }
+
+    /// Atomically revokes a device and bumps `cap_epoch`, or does neither — the device
+    /// counterpart to [`Store::revoke_member_and_bump_epoch`]; see that method's doc comment for
+    /// why `unchecked_transaction` is used and why one transaction closes the crash window the
+    /// old two-autocommit-statement sequencing left open. This method does not change
+    /// [`Store::revoke_device`]'s existing behavior at all — it is an additional, atomic entry
+    /// point a caller can use instead.
+    ///
+    /// The status-machine wedge that motivates the member path's existence does not apply to
+    /// devices (`revoked` is a plain boolean, not a multi-state transition), but the *epoch*
+    /// defect does: the old sequence bumped `cap_epoch` even when re-revoking an
+    /// already-revoked device, because a same-value `UPDATE devices SET revoked = 1 ...` still
+    /// reports a row changed. Since `cap_epoch` invalidates every outstanding capability on this
+    /// host, that needlessly invalidated everything on a pure no-op retry. This method fixes that
+    /// by conditioning the `UPDATE` on `revoked = 0`: a device already revoked matches zero rows,
+    /// which this method then reads back as "no-op" rather than "not found".
+    ///
+    /// Returns:
+    /// - `Err(StoreError::DeviceNotFound(device_fp))` if the device does not exist.
+    /// - `Ok(None)` if the device is already revoked: nothing is written and `cap_epoch` is
+    ///   deliberately **not** bumped.
+    /// - `Ok(Some(new_epoch))` if the device was not yet revoked: its `revoked` flag becomes
+    ///   `true` and `cap_epoch` is bumped exactly once, returning the new value.
+    ///
+    /// This behaves identically to [`Store::revoke_member_and_bump_epoch`] on retry — that
+    /// symmetry is the point: the old device path was accidentally retryable (it just happened
+    /// not to error), while the old member path was permanently wedged; both atomic entry points
+    /// are now idempotent for the same reason instead of by accident.
+    pub fn revoke_device_and_bump_epoch(
+        &self,
+        device_fp: Fingerprint,
+    ) -> Result<Option<u64>, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        // `AND revoked = 0` is load-bearing: it is what makes re-revoking an already-revoked
+        // device match zero rows (a no-op) instead of one, which is what lets the branch below
+        // distinguish "no-op" from "not found" and avoid an unnecessary `cap_epoch` bump.
+        let changed = tx.execute(
+            "UPDATE devices SET revoked = 1 WHERE device_fp = ?1 AND revoked = 0",
+            params![device_fp.to_vec()],
+        )?;
+        if changed == 0 {
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT revoked FROM devices WHERE device_fp = ?1",
+                    params![device_fp.to_vec()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            return match exists {
+                None => Err(StoreError::DeviceNotFound(device_fp)),
+                Some(_) => {
+                    // Row exists and is already revoked — commit (equivalent to rollback here,
+                    // since nothing was written) and report "no-op" to the caller.
+                    tx.commit()?;
+                    Ok(None)
+                }
+            };
+        }
+        let new_epoch = bump_cap_epoch_in_tx(&tx)?;
+        tx.commit()?;
+        Ok(Some(new_epoch))
     }
 
     /// The device's pinned signing public key, if any (Stage 6 slice 4 — see
@@ -1135,6 +1274,18 @@ impl Store {
     }
 }
 
+/// The same `UPDATE ... RETURNING` shape as [`Store::bump_cap_epoch`], run against an in-progress
+/// [`Transaction`] rather than the bare connection — the shared building block
+/// [`Store::revoke_member_and_bump_epoch`] and [`Store::revoke_device_and_bump_epoch`] both use so
+/// their status/revoked-flag write and their `cap_epoch` bump commit (or roll back) together.
+fn bump_cap_epoch_in_tx(tx: &Transaction<'_>) -> Result<u64, StoreError> {
+    Ok(tx.query_row(
+        "UPDATE meta SET cap_epoch = cap_epoch + 1 WHERE id = 0 RETURNING cap_epoch",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? as u64)
+}
+
 fn status_str(status: MemberStatus) -> &'static str {
     match status {
         MemberStatus::Invited => "invited",
@@ -1357,6 +1508,173 @@ mod tests {
             store.cap_epoch().expect("e unchanged"),
             e0,
             "revoke_member must not itself bump cap_epoch — see module doc comment"
+        );
+    }
+
+    #[test]
+    fn bump_cap_epoch_returns_the_value_it_produced() {
+        let store = Store::open_in_memory().expect("open");
+        let e0 = store.cap_epoch().expect("e0");
+        let r1 = store.bump_cap_epoch().expect("bump 1");
+        let r2 = store.bump_cap_epoch().expect("bump 2");
+        let r3 = store.bump_cap_epoch().expect("bump 3");
+        assert_eq!(
+            (r1, r2, r3),
+            (e0 + 1, e0 + 2, e0 + 3),
+            "each call's returned value must be strictly consecutive with the last"
+        );
+    }
+
+    // ---- revoke_member_and_bump_epoch / revoke_device_and_bump_epoch (td-323605 / td-798ae8) --
+
+    #[test]
+    fn revoke_member_and_bump_epoch_revokes_and_bumps_once() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        store.activate_member(member_id).expect("activate");
+        let e0 = store.cap_epoch().expect("e0");
+
+        let result = store
+            .revoke_member_and_bump_epoch(member_id)
+            .expect("revoke_member_and_bump_epoch");
+
+        assert_eq!(result, Some(e0 + 1), "must bump cap_epoch by exactly one");
+        assert_eq!(
+            store.cap_epoch().expect("e1"),
+            e0 + 1,
+            "the store's cap_epoch must reflect the bump"
+        );
+        assert_eq!(
+            store.get_member(member_id).unwrap().unwrap().status,
+            MemberStatus::Revoked
+        );
+    }
+
+    #[test]
+    fn revoke_member_and_bump_epoch_is_idempotent_and_does_not_rebump() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        store.activate_member(member_id).expect("activate");
+
+        let first = store
+            .revoke_member_and_bump_epoch(member_id)
+            .expect("first revoke");
+        assert!(first.is_some(), "first call must actually revoke and bump");
+        let e_after_first = store.cap_epoch().expect("e after first");
+
+        // Second call: this is the exact wedge td-323605 describes. The old sequencing left the
+        // member durably Revoked with no epoch bump; every retry then failed forever with
+        // InvalidStatusTransition { from: Revoked, to: Revoked }. Assert both that it does NOT
+        // error at all, and specifically that it is not that error.
+        let second = store
+            .revoke_member_and_bump_epoch(member_id)
+            .expect("second (retry) revoke must succeed, not error");
+
+        assert_eq!(
+            second, None,
+            "an already-revoked member must report Ok(None), not re-bump"
+        );
+        assert_eq!(
+            store.cap_epoch().expect("e after second"),
+            e_after_first,
+            "cap_epoch must be unchanged by the idempotent retry"
+        );
+    }
+
+    #[test]
+    fn revoke_member_and_bump_epoch_on_a_missing_member_is_an_error() {
+        let store = Store::open_in_memory().expect("open");
+        let e0 = store.cap_epoch().expect("e0");
+        let missing_id = MemberId(999_999);
+
+        let err = store.revoke_member_and_bump_epoch(missing_id).unwrap_err();
+
+        assert!(matches!(err, StoreError::MemberNotFound(id) if id == missing_id));
+        assert_eq!(
+            store.cap_epoch().expect("e unchanged"),
+            e0,
+            "cap_epoch must be unchanged when the member does not exist"
+        );
+    }
+
+    #[test]
+    fn revoke_device_and_bump_epoch_revokes_and_bumps_once() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let device_fp = Fingerprint::of_parts(&[b"alex-device"]);
+        store
+            .add_device(member_id, device_fp, "laptop", 0, None)
+            .expect("add_device");
+        let e0 = store.cap_epoch().expect("e0");
+
+        let result = store
+            .revoke_device_and_bump_epoch(device_fp)
+            .expect("revoke_device_and_bump_epoch");
+
+        assert_eq!(result, Some(e0 + 1), "must bump cap_epoch by exactly one");
+        assert_eq!(store.cap_epoch().expect("e1"), e0 + 1);
+        let member = store.get_member(member_id).unwrap().unwrap();
+        let device = member
+            .devices
+            .iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("device present");
+        assert!(device.revoked, "device must be revoked");
+    }
+
+    #[test]
+    fn revoke_device_and_bump_epoch_is_idempotent_and_does_not_rebump() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let device_fp = Fingerprint::of_parts(&[b"alex-device"]);
+        store
+            .add_device(member_id, device_fp, "laptop", 0, None)
+            .expect("add_device");
+
+        let first = store
+            .revoke_device_and_bump_epoch(device_fp)
+            .expect("first revoke");
+        assert!(first.is_some(), "first call must actually revoke and bump");
+        let e_after_first = store.cap_epoch().expect("e after first");
+
+        // This is td-798ae8's acceptance criterion: re-revoking an already-revoked device must
+        // not re-bump cap_epoch, since cap_epoch invalidates every outstanding capability.
+        let second = store
+            .revoke_device_and_bump_epoch(device_fp)
+            .expect("second (retry) revoke must succeed");
+
+        assert_eq!(
+            second, None,
+            "an already-revoked device must report Ok(None), not re-bump"
+        );
+        assert_eq!(
+            store.cap_epoch().expect("e after second"),
+            e_after_first,
+            "cap_epoch must be unchanged by the idempotent retry"
+        );
+    }
+
+    #[test]
+    fn revoke_device_and_bump_epoch_on_a_missing_device_is_an_error() {
+        let store = Store::open_in_memory().expect("open");
+        let e0 = store.cap_epoch().expect("e0");
+        let missing_fp = Fingerprint::of_parts(&[b"nonexistent-device"]);
+
+        let err = store.revoke_device_and_bump_epoch(missing_fp).unwrap_err();
+
+        assert!(matches!(err, StoreError::DeviceNotFound(fp) if fp == missing_fp));
+        assert_eq!(
+            store.cap_epoch().expect("e unchanged"),
+            e0,
+            "cap_epoch must be unchanged when the device does not exist"
         );
     }
 

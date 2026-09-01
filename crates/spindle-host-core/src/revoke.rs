@@ -21,16 +21,42 @@
 //! `denied:member_not_active`/`denied:device_revoked` gates and `crate::authorize`'s connect-time
 //! twin both read straight from the store, not from anything this module mints.
 //!
-//! # `cap_epoch` is bumped here, explicitly — not inside `Store::revoke_*` [deliberate]
+//! # `cap_epoch` is bumped atomically with the store mutation, inside `Store`; the mint still
+//! happens after, and outside, that transaction [deliberate]
 //!
-//! `Store::revoke_member`/`Store::revoke_device` do **not** touch `cap_epoch` — see
-//! `spindle_vfs::store`'s module doc comment ("Two counters, two rules") and the store's own
-//! `revoke_does_not_bump_cap_epoch_automatically` test. That split is mechanism vs. policy: the
-//! store primitive records the membership/device fact; deciding that a given revocation is *also*
-//! the kind of security event that must invalidate every outstanding capability (§A4: "cap_epoch
-//! bumps ... only on security events (member/device revocation)") is this module's job, not the
-//! store's. A caller that wants to revoke without invalidating any outstanding cap — not a
-//! scenario this module needs, but one the store's split deliberately still allows — calls
+//! [`revoke_member_and_mint`]/[`revoke_device_and_mint`] call
+//! `Store::revoke_member_and_bump_epoch`/`Store::revoke_device_and_bump_epoch`, which perform the
+//! status write (or `revoked`-flag write) and the `cap_epoch` bump as a **single transaction**
+//! inside `spindle_vfs::store::Store` — not as the two separate autocommit statements
+//! (`store.revoke_member`/`revoke_device` then `store.bump_cap_epoch`) this module used to issue.
+//! That closes a crash window: previously, a process death between those two statements could
+//! leave a member durably `Revoked` with `cap_epoch` never bumped, and — because
+//! `Store::set_member_status` permits only `Invited -> Active | Invited -> Revoked |
+//! Active -> Revoked` — every retry then failed forever with
+//! `StoreError::InvalidStatusTransition { from: Revoked, to: Revoked }`. Now the mutation and the
+//! bump commit together or not at all: a crash before commit rolls back the status/flag write
+//! too, so a retry starts over from the pre-crash state, and a retry *after* a successful commit
+//! sees "already revoked" (`Ok(None)`) rather than an error. When that happens, these functions
+//! mint at the store's *current* `cap_epoch` rather than bumping again — see each function's own
+//! doc comment for why re-bumping purely to mint a duplicate record would be wrong (it would
+//! invalidate every outstanding capability on this host for nothing). Minting the signed record
+//! is still a separate step after that transaction, and still outside it — see "Ordering: store
+//! first, mint second" above for why the mint must not be folded into the same transaction as the
+//! store mutation.
+//!
+//! # Mechanism vs. policy: bare `Store::revoke_member`/`Store::revoke_device` still do not bump
+//! `cap_epoch` [deliberate]
+//!
+//! `Store::revoke_member`/`Store::revoke_device` — the plain, non-atomic primitives this module
+//! no longer calls directly, but which remain in `spindle_vfs::store::Store` unchanged — still do
+//! **not** touch `cap_epoch` on their own; see `spindle_vfs::store`'s module doc comment ("Two
+//! counters, two rules") and the store's own `revoke_does_not_bump_cap_epoch_automatically` test,
+//! both still true and unchanged. That split is mechanism vs. policy: the store primitive records
+//! the membership/device fact; deciding that a given revocation is *also* the kind of security
+//! event that must invalidate every outstanding capability (§A4: "cap_epoch bumps ... only on
+//! security events (member/device revocation)") is this module's job, not the store's. A caller
+//! that wants to revoke without invalidating any outstanding cap — not a scenario this module
+//! needs, but one the store's split deliberately still allows — calls
 //! `Store::revoke_member`/`Store::revoke_device` directly instead of going through here.
 //!
 //! # What goes in `revoked`
@@ -101,12 +127,14 @@ fn subject_for(host_fp: Fingerprint) -> String {
     format!("{SUBJECT_PREFIX}{host_fp}")
 }
 
-/// Revokes `member_id` and mints the record for it: applies `store.revoke_member`, bumps
-/// `cap_epoch`, then signs a `RevocationRecord` naming the member's `root_fp` alone (see the
-/// module doc comment's "What goes in `revoked`" section for why not its individual devices).
-/// `op_key` is the host operating key (or identity root — `issue_revocation_record` does not
-/// distinguish, per its own doc comment); key custody is deliberately out of scope here (see
-/// `crates/spindle-vfs/src/audit/mod.rs`'s doc comment on the same deferral).
+/// Revokes `member_id` and mints the record for it: applies
+/// `store.revoke_member_and_bump_epoch` (the store mutation and the `cap_epoch` bump happen
+/// together, atomically — see the module doc comment), then signs a `RevocationRecord` naming the
+/// member's `root_fp` alone (see the module doc comment's "What goes in `revoked`" section for why
+/// not its individual devices). `op_key` is the host operating key (or identity root —
+/// `issue_revocation_record` does not distinguish, per its own doc comment); key custody is
+/// deliberately out of scope here (see `crates/spindle-vfs/src/audit/mod.rs`'s doc comment on the
+/// same deferral).
 pub fn revoke_member_and_mint(
     store: &Store,
     op_key: &SigningKey,
@@ -114,8 +142,14 @@ pub fn revoke_member_and_mint(
     member_id: MemberId,
     ts: u64,
 ) -> Result<RevocationPublication, RevokeError> {
-    store.revoke_member(member_id)?;
-    let epoch = store.bump_cap_epoch()?;
+    let epoch = match store.revoke_member_and_bump_epoch(member_id)? {
+        Some(new_epoch) => new_epoch,
+        // Already revoked (a retry after a completed revocation): mint at the store's *current*
+        // cap_epoch rather than bumping again. The subject is already revoked as of that epoch,
+        // cap_epoch only ever moves forward, and re-bumping purely to mint a duplicate record
+        // would invalidate every outstanding capability on this host for nothing.
+        None => store.cap_epoch()?,
+    };
 
     let root_fp = store
         .get_member(member_id)?
@@ -130,9 +164,11 @@ pub fn revoke_member_and_mint(
     })
 }
 
-/// Revokes `device_fp` and mints the record for it: applies `store.revoke_device`, bumps
-/// `cap_epoch`, then signs a `RevocationRecord` naming `device_fp` alone — the member and their
-/// other devices are unaffected (see the module doc comment's "What goes in `revoked`" section).
+/// Revokes `device_fp` and mints the record for it: applies
+/// `store.revoke_device_and_bump_epoch` (the store mutation and the `cap_epoch` bump happen
+/// together, atomically — see the module doc comment), then signs a `RevocationRecord` naming
+/// `device_fp` alone — the member and their other devices are unaffected (see the module doc
+/// comment's "What goes in `revoked`" section).
 pub fn revoke_device_and_mint(
     store: &Store,
     op_key: &SigningKey,
@@ -140,8 +176,13 @@ pub fn revoke_device_and_mint(
     device_fp: Fingerprint,
     ts: u64,
 ) -> Result<RevocationPublication, RevokeError> {
-    store.revoke_device(device_fp)?;
-    let epoch = store.bump_cap_epoch()?;
+    let epoch = match store.revoke_device_and_bump_epoch(device_fp)? {
+        Some(new_epoch) => new_epoch,
+        // Already revoked (a retry after a completed revocation): mint at the store's *current*
+        // cap_epoch rather than bumping again — see revoke_member_and_mint's comment on the same
+        // branch for why re-bumping here would be wrong.
+        None => store.cap_epoch()?,
+    };
 
     let record = issue_revocation_record(op_key, host_fp, epoch, vec![device_fp], ts);
     Ok(RevocationPublication {
@@ -324,6 +365,68 @@ mod tests {
         assert!(
             is_newer_epoch(second.record.epoch, first.record.epoch),
             "the second revocation's epoch must be strictly newer than the first's"
+        );
+    }
+
+    // ---- retry-after-completion (td-323605 / td-798ae8) ---------------------------------------
+
+    #[test]
+    fn revoke_member_and_mint_is_retryable_after_a_completed_revocation() {
+        let (store, member_id, _root_fp) = store_with_member("alex");
+        let e0 = store.cap_epoch().expect("e0");
+
+        let first = revoke_member_and_mint(&store, &op_key(), host_fp(), member_id, 1_000)
+            .expect("first revoke_member_and_mint must succeed");
+
+        // Simulates a caller retrying after a completed revocation (e.g. an at-least-once retry
+        // of a request whose response was lost). This must NOT surface a
+        // StoreError::InvalidStatusTransition { from: Revoked, to: Revoked } the way the old
+        // two-autocommit-statement sequencing eventually would — it must simply succeed again.
+        let second = revoke_member_and_mint(&store, &op_key(), host_fp(), member_id, 2_000)
+            .expect("second (retry) revoke_member_and_mint must succeed, not error");
+
+        let e_final = store.cap_epoch().expect("e_final");
+        assert_eq!(
+            e_final,
+            e0 + 1,
+            "cap_epoch must be bumped exactly once across both calls"
+        );
+
+        verify_revocation_record(&second.record, &op_key().verifying_key())
+            .expect("the second call's minted record must still verify");
+        assert!(
+            second.record.epoch >= first.record.epoch,
+            "the second call's minted epoch must be >= the first's"
+        );
+    }
+
+    #[test]
+    fn revoke_device_and_mint_is_retryable_after_a_completed_revocation() {
+        let (store, member_id, _root_fp) = store_with_member("alex");
+        let device_a = enroll_device(&store, member_id, 0x0d);
+        let e0 = store.cap_epoch().expect("e0");
+
+        let first = revoke_device_and_mint(&store, &op_key(), host_fp(), device_a, 1_000)
+            .expect("first revoke_device_and_mint must succeed");
+
+        // Same retry-after-completion scenario as the member path, for the device path (this is
+        // td-798ae8's angle: the old sequencing was accidentally retryable but would needlessly
+        // re-bump cap_epoch on every retry, invalidating every outstanding capability each time).
+        let second = revoke_device_and_mint(&store, &op_key(), host_fp(), device_a, 2_000)
+            .expect("second (retry) revoke_device_and_mint must succeed");
+
+        let e_final = store.cap_epoch().expect("e_final");
+        assert_eq!(
+            e_final,
+            e0 + 1,
+            "cap_epoch must be bumped exactly once across both calls"
+        );
+
+        verify_revocation_record(&second.record, &op_key().verifying_key())
+            .expect("the second call's minted record must still verify");
+        assert!(
+            second.record.epoch >= first.record.epoch,
+            "the second call's minted epoch must be >= the first's"
         );
     }
 }
