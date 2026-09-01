@@ -969,30 +969,49 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     );
                     continue;
                 };
+                // Kick-relay feed first: it owns the only authoritative record of which `cid` is currently
+                // live for this `nats_fp`, and its verdict gates the session-record delete below. An event
+                // with no parseable `(server.id, client.id)` yields no verdict at all, so it touches neither
+                // the kick map nor the session record — but it must still fall through to the presence
+                // handling below, which needs only the user nkey `user_from_sys_event` already returned.
+                let verdict = match kick_coords_from_sys_event(&msg.payload) {
+                    Some((_, cid)) => kick_map.disconnect(&user_pk, cid),
+                    None => {
+                        tracing::warn!(
+                            payload = %String::from_utf8_lossy(&msg.payload),
+                            "DISCONNECT event had no recognizable server.id/client.id — cannot tell a live \
+                             disconnect from a stale one, so neither the kick map nor the session record is \
+                             touched; the record's own `exp` still retires it (DESIGN.md §A5). Presence is \
+                             still updated below, which needs only the user nkey."
+                        );
+                        kick::DisconnectVerdict::Unknown
+                    }
+                };
+
                 // Eager session-record cleanup (DESIGN.md §A5 "cleaned up on DISCONNECT/expiry")
                 // applies to every disconnecting user, host or device alike — decoupled from the
                 // presence map below, which only exists for registered hosts.
                 //
-                // **Known gap, flagged not silently resolved**: this delete is unconditional,
-                // while `kick_map.disconnect` just below it correctly guards on `cid` — a stale
-                // DISCONNECT (superseded by a newer CONNECT/reconnect under the same `nats_fp`,
-                // see `kick::KickMap`'s module doc's "Reconnect" section) evicts a *live* session's
-                // record here even though the kick map itself correctly ignores that same stale
-                // event. This cannot be closed the way `kick_map.disconnect` is: `SessionRecord`
-                // (session.rs) carries no `cid` field at all, and
-                // `HelperView::delete_session_record` takes only a `nats_fp`, with no `cid`
-                // parameter to condition on — the store has no fact to compare against. Adding one
-                // would mean extending `SessionRecord`'s schema (and threading a `cid` through
-                // every `HelperView` impl/call site), which is out of scope for this fix per its
-                // own constraints; left as-is and reported rather than patched over.
-                if let Ok(nats_fp) = auth_token::nats_fp_of_nkey(&user_pk) {
-                    store.delete_session_record(&nats_fp);
-                }
-                // Kick-relay feed: only removes the entry if this DISCONNECT's own cid still
-                // matches what's stored (see `kick::KickMap::disconnect`'s doc comment on why a
-                // stale disconnect must not evict a newer reconnection's coordinates).
-                if let Some((_, cid)) = kick_coords_from_sys_event(&msg.payload) {
-                    kick_map.disconnect(&user_pk, cid);
+                // Gated on the kick map's verdict so that a *stale* DISCONNECT — one superseded
+                // by a newer CONNECT reusing the same `nats_fp`, see `kick::KickMap`'s module
+                // doc's "Reconnect" section — cannot evict a live session's record. Deleting it
+                // would be the silent half of the missed-kick defect: a later revocation would
+                // find no session at all via `sessions_for_subject` and would never kick the
+                // revoked device.
+                //
+                // Only `Current` deletes. `Superseded` must not (that is the bug). `Unknown` must
+                // not either: it means either a duplicate DISCONNECT whose record is already gone
+                // (so the delete would be a no-op anyway) or a connection this map never saw,
+                // where there is no evidence the record is dead. Both non-deleting cases are safe
+                // to skip because the store filters on `exp` at read time in every impl
+                // (`HelperView::session_record` / `sessions_for_subject`), so a record left behind
+                // here is already invisible to every reader, and `purge_expired_sessions`
+                // reclaims the row. The asymmetry is deliberate: a skipped delete costs a dead row
+                // until expiry, while a wrong delete silently un-revokes a device.
+                if verdict == kick::DisconnectVerdict::Current {
+                    if let Ok(nats_fp) = auth_token::nats_fp_of_nkey(&user_pk) {
+                        store.delete_session_record(&nats_fp);
+                    }
                 }
                 if let Some(delta) = presence_map.disconnect(&user_pk, now_secs()) {
                     publish_presence_delta(&app_client, delta).await;

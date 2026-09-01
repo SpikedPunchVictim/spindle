@@ -51,6 +51,14 @@
 //! if the `cid` it's asked to remove still matches the currently stored `cid`. A disconnect for a
 //! `cid` that's already been superseded by a newer connection is a no-op, not an eviction.
 //!
+//! That same stale-vs-current decision is now surfaced to callers as [`DisconnectVerdict`],
+//! rather than staying an internal detail this method acts on silently. `src/bin/helper.rs`'s
+//! DISCONNECT handler must make the identical decision for the durable session-record store
+//! sitting next to this map — and that store has no `cid` of its own to compare against, since
+//! `SessionRecord` doesn't carry one. Rather than duplicate this map's `cid` bookkeeping a second
+//! time purely to re-derive a verdict this method already computes, [`KickMap::disconnect`] just
+//! hands the verdict back so the caller can gate its own eviction on it.
+//!
 //! # Key shape: `Fingerprint -> (server_id, cid)`, not `device_fp -> (server_id, cid)`
 //! [DESIGN.md §A3 deviation, flagged not silently resolved]
 //! DESIGN.md §A3/§A6 describe the kick relay's key as `device_fp -> (server_id, cid)`,
@@ -125,6 +133,28 @@ pub struct UnresolvedSession {
     pub matched_subject: Fingerprint,
 }
 
+/// The outcome of asking [`KickMap::disconnect`] to remove one `(nats_fp, cid)` pair — lets a
+/// caller make the same stale-vs-current distinction [`KickMap::disconnect`] already makes
+/// internally, instead of only observing that the map's own state changed (or didn't).
+/// `src/bin/helper.rs` needs this to decide whether a DISCONNECT event may *also* delete the
+/// durable session record: that store has no `cid` of its own to compare against, so it borrows
+/// this verdict from the one place that does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectVerdict {
+    /// An entry existed for this `nats_fp` under exactly this `cid`; it was removed. The
+    /// connection is genuinely gone.
+    Current,
+    /// An entry exists under a *different* `cid`. This DISCONNECT is stale: a newer connection
+    /// reused the same `nats_fp` (see the module doc's "Reconnect" section). The entry was left
+    /// untouched, and **no caller may use this event to tear down any state belonging to that
+    /// `nats_fp`**.
+    Superseded,
+    /// No entry at all: either an already-processed duplicate DISCONNECT, or a `user_pk` that
+    /// does not decode as an nkey. The two are not distinguishable here, and callers should treat
+    /// this as "no evidence this connection is the live one" rather than as proof it is gone.
+    Unknown,
+}
+
 /// The outcome of planning kicks for one accepted revocation: the connections to actually kick,
 /// plus the sessions that matched but had no live entry in the map at that moment.
 /// **Deliberately not just `Vec<KickTarget>`**: a session record can outlive the connection it
@@ -189,14 +219,26 @@ impl KickMap {
     /// "Reconnect" section for why an unconditional removal here would be wrong. A `user_pk` that
     /// doesn't decode, or a `nats_fp` with no entry, or an entry whose stored `cid` no longer
     /// matches (already superseded by a newer connection), are all silent no-ops.
-    pub fn disconnect(&mut self, user_pk: &str, cid: u64) {
+    ///
+    /// Returns a [`DisconnectVerdict`] naming which of those cases applied, so a caller can make
+    /// the identical stale-vs-current distinction this method already makes internally rather
+    /// than only observing whether the map changed. `src/bin/helper.rs` needs this: it must make
+    /// the same call for its own durable session-record delete, and that store carries no `cid`
+    /// to compare against on its own.
+    pub fn disconnect(&mut self, user_pk: &str, cid: u64) -> DisconnectVerdict {
         let Ok(nats_fp) = nats_fp_of_nkey(user_pk) else {
-            return;
+            return DisconnectVerdict::Unknown;
         };
-        if let std::collections::hash_map::Entry::Occupied(entry) = self.conns.entry(nats_fp) {
-            if entry.get().1 == cid {
-                entry.remove();
+        match self.conns.entry(nats_fp) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if entry.get().1 == cid {
+                    entry.remove();
+                    DisconnectVerdict::Current
+                } else {
+                    DisconnectVerdict::Superseded
+                }
             }
+            std::collections::hash_map::Entry::Vacant(_) => DisconnectVerdict::Unknown,
         }
     }
 
@@ -334,7 +376,8 @@ mod tests {
         let mut map = KickMap::new();
         map.connect("not-an-nkey", "server-1", 1);
         assert!(map.conns.is_empty());
-        map.disconnect("not-an-nkey", 1); // must not panic
+        let verdict = map.disconnect("not-an-nkey", 1); // must not panic
+        assert_eq!(verdict, DisconnectVerdict::Unknown);
     }
 
     #[test]
@@ -343,8 +386,9 @@ mod tests {
         let user_pk = nkey_pk();
         let nats_fp = nats_fp_of_nkey(&user_pk).unwrap();
         map.connect(&user_pk, "server-1", 7);
-        map.disconnect(&user_pk, 7);
+        let verdict = map.disconnect(&user_pk, 7);
         assert_eq!(map.lookup(&nats_fp), None);
+        assert_eq!(verdict, DisconnectVerdict::Current);
     }
 
     #[test]
@@ -358,13 +402,14 @@ mod tests {
         map.connect(&user_pk, "server-1", 100); // old connection
         map.connect(&user_pk, "server-1", 200); // reconnect: new cid, overwrites
 
-        map.disconnect(&user_pk, 100); // stale DISCONNECT for the OLD cid
+        let verdict = map.disconnect(&user_pk, 100); // stale DISCONNECT for the OLD cid
 
         assert_eq!(
             map.lookup(&nats_fp),
             Some(("server-1", 200)),
             "the newer connection's coordinates must survive a stale disconnect for the old cid"
         );
+        assert_eq!(verdict, DisconnectVerdict::Superseded);
     }
 
     #[test]
@@ -375,9 +420,18 @@ mod tests {
 
         map.connect(&user_pk, "server-1", 100);
         map.connect(&user_pk, "server-1", 200);
-        map.disconnect(&user_pk, 200);
+        let verdict = map.disconnect(&user_pk, 200);
 
         assert_eq!(map.lookup(&nats_fp), None);
+        assert_eq!(verdict, DisconnectVerdict::Current);
+    }
+
+    #[test]
+    fn disconnect_for_an_unknown_nats_fp_reports_unknown() {
+        let mut map = KickMap::new();
+        let user_pk = nkey_pk(); // well-formed nkey, never connected
+        let verdict = map.disconnect(&user_pk, 1);
+        assert_eq!(verdict, DisconnectVerdict::Unknown);
     }
 
     // ---- kicks_for_revocation ---------------------------------------------------------------
