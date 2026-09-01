@@ -1,5 +1,6 @@
-//! Live end-to-end integration test for [`spindle_net::signaling`] against the composed stack
-//! (`deploy/docker-compose.yml`'s `nats` + `postgres` + `helper` + `coturn`).
+//! Live end-to-end integration test for [`spindle_net::signaling`], and for DESIGN.md §A4's
+//! revoke -> kick -> reject chain, against the composed stack (`deploy/docker-compose.yml`'s
+//! `nats` + `postgres` + `helper` + `coturn`).
 //!
 //! # Why this file exists
 //!
@@ -97,6 +98,20 @@
 //!    single binding request. Every connect ended in `SignalingError::Timeout("ICE trickle")`.
 //!
 //! Both are fixed; this test is what keeps them fixed.
+//!
+//! # S9: the revoke -> kick -> reject chain
+//!
+//! `live_revocation_kicks_and_then_refuses_the_devices_reconnect_within_the_five_second_bar`
+//! measures the whole of DESIGN.md §A4's chain against this same live stack: a host publishes a
+//! `RevocationRecord` on `registry.revoke.<host_fp>` (t0), the composed helper ingests it
+//! (`spindle_helper::revoke::ingest_revocation`), computes and issues a
+//! `$SYS.REQ.SERVER.<id>.KICK` for the live session (`spindle_helper::kick`), and the revoked
+//! device's own NATS connection is dropped with a `$SYS.ACCOUNT.*.DISCONNECT` advisory whose
+//! `reason` is exactly `"Kicked"` (t_kick — anything else, notably `"Client Closed"`, is NOT a
+//! kick; `spikes/s9-revoke-kick/RESULTS.md` was bitten by exactly that false green). Because a
+//! kicked NATS client auto-reconnects on its own, a kick alone cuts nobody off: the test's real
+//! assertion is that a brand-new connect attempt presenting the same now-revoked identity is
+//! refused by the callout (t1), and that `t1 - t0 < 5s`.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -104,8 +119,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+use futures_util::StreamExt;
+use spindle_core::artifacts::issue_revocation_record;
 use spindle_core::identity::DeviceKey;
-use spindle_core::{Fingerprint, VerifyingKey};
+use spindle_core::{Fingerprint, SigningKey, VerifyingKey};
 use spindle_net::framing::{read_frame, write_frame};
 use spindle_net::quic::ControlStream;
 use spindle_net::signaling::{
@@ -341,15 +359,21 @@ fn base_opts() -> (async_nats::ConnectOptions, EventLog) {
 
 /// Connects a device to the live stack through the real Auth Callout: fresh session nkey,
 /// root-signed device certificate binding it to that key's `nats_fp`, `auth_token` carrying
-/// `caps`, and the `_INBOX_<device_fp>` prefix §A5 grants.
+/// `caps`, and the `_INBOX_<device_fp>` prefix §A5 grants. Also returns the session nkey's own
+/// public-key string (`session.public_key()`) — the same value nats-server's own
+/// `$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT` advisories carry at `client.user`
+/// (`spindle_helper::presence`'s module doc names this field), so a caller can later recognize
+/// *this exact connection* in a live advisory stream (the S9 revocation test needs this; neither
+/// existing live test does, hence the leading underscore at most of their call sites).
 async fn connect_device(
     url: &str,
     device: &DeviceIdentity,
     caps: &[spindle_proto::artifacts::Capability],
     exp: u64,
-) -> (async_nats::Client, EventLog) {
+) -> (async_nats::Client, EventLog, String) {
     let session = nkeys::KeyPair::new_user();
-    let nats_fp = fixtures::nats_fp_of_nkey(&session.public_key());
+    let user_pk = session.public_key();
+    let nats_fp = fixtures::nats_fp_of_nkey(&user_pk);
     let cert = device.certificate(nats_fp, fixtures::now(), exp);
     let token = fixtures::device_auth_token(&device.root.public_key().to_bytes(), &cert, caps);
     let (opts, events) = base_opts();
@@ -363,10 +387,15 @@ async fn connect_device(
             panic!(
                 "device CONNECT to the live stack at {url} failed: {e}\n\
                  This test requires `docker compose -f deploy/docker-compose.yml up -d` \
-                 (nats + postgres + helper). It never skips."
+                 (nats + postgres + helper). It never skips.\n\
+                 If the error above is an authorization violation rather than an unreachable-stack \
+                 error, the stack may be perfectly healthy: this device's root_fp may already be \
+                 durably revoked in the helper's own store from a PREVIOUS run (Postgres's \
+                 `revoked_subjects` table, keyed by root_fp under a host_fp) — check that table for \
+                 this identity before assuming the stack is broken."
             )
         });
-    (client, events)
+    (client, events, user_pk)
 }
 
 /// Connects a host to the live stack through the real Auth Callout (operating-key certificate,
@@ -390,7 +419,12 @@ async fn connect_host(
             panic!(
                 "host CONNECT to the live stack at {url} failed: {e}\n\
                  This test requires `docker compose -f deploy/docker-compose.yml up -d` \
-                 (nats + postgres + helper). It never skips."
+                 (nats + postgres + helper). It never skips.\n\
+                 If the error above is an authorization violation rather than an unreachable-stack \
+                 error, the stack may be perfectly healthy: this host's root_fp may already be \
+                 durably revoked in the helper's own store from a PREVIOUS run (Postgres's \
+                 `revoked_subjects` table, keyed by root_fp under a host_fp) — check that table for \
+                 this identity before assuming the stack is broken."
             )
         });
     (client, events)
@@ -409,6 +443,198 @@ async fn assert_stack_rejects_anonymous(url: &str) {
              requires Auth Callout."
         ),
         Err(e) => println!("[auth] anonymous CONNECT correctly rejected: {e}"),
+    }
+}
+
+// =================================================================================================
+// Minimal JSON — just enough to read a nats-server $SYS advisory
+// =================================================================================================
+
+/// `spindle-net`'s `[dev-dependencies]` carry only `nkeys`/`base64` (see this crate's
+/// `Cargo.toml`) — no `serde_json`, and this task is explicitly not to add one. The only JSON this
+/// test ever needs to read is nats-server's own `$SYS.ACCOUNT.*.DISCONNECT` advisory payload
+/// (`spikes/s9-revoke-kick/RESULTS.md` documents its exact shape), and the only two fields that
+/// matter are a top-level string (`reason`) and one nested string (`client.user`). This is a
+/// deliberately small recursive-descent parser covering just enough of RFC 8259 to read
+/// nats-server's own advisories — not a general-purpose JSON library.
+mod tinyjson {
+    #[derive(Debug, Clone)]
+    // This test only ever reads `String`/`Object` values back out (via `get`/`as_str`) — the
+    // other variants exist so `parse_value` can walk past whatever shape of JSON a real
+    // nats-server advisory contains (numbers, bools, nested arrays) without failing, even though
+    // nothing in this test currently reads their payloads back out.
+    #[allow(dead_code)]
+    pub enum Json {
+        Null,
+        Bool(bool),
+        Number(f64),
+        String(String),
+        Array(Vec<Json>),
+        Object(Vec<(String, Json)>),
+    }
+
+    impl Json {
+        /// Looks up `key` if `self` is an object; `None` for every other shape or a missing key.
+        pub fn get(&self, key: &str) -> Option<&Json> {
+            match self {
+                Json::Object(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+                _ => None,
+            }
+        }
+
+        pub fn as_str(&self) -> Option<&str> {
+            match self {
+                Json::String(s) => Some(s.as_str()),
+                _ => None,
+            }
+        }
+    }
+
+    pub fn parse(input: &str) -> Option<Json> {
+        let bytes = input.as_bytes();
+        let mut pos = 0usize;
+        parse_value(bytes, &mut pos)
+    }
+
+    fn skip_ws(bytes: &[u8], pos: &mut usize) {
+        while matches!(bytes.get(*pos), Some(b) if b.is_ascii_whitespace()) {
+            *pos += 1;
+        }
+    }
+
+    fn parse_value(bytes: &[u8], pos: &mut usize) -> Option<Json> {
+        skip_ws(bytes, pos);
+        match bytes.get(*pos)? {
+            b'{' => parse_object(bytes, pos),
+            b'[' => parse_array(bytes, pos),
+            b'"' => parse_string(bytes, pos).map(Json::String),
+            b't' => parse_literal(bytes, pos, "true", Json::Bool(true)),
+            b'f' => parse_literal(bytes, pos, "false", Json::Bool(false)),
+            b'n' => parse_literal(bytes, pos, "null", Json::Null),
+            _ => parse_number(bytes, pos),
+        }
+    }
+
+    fn parse_literal(bytes: &[u8], pos: &mut usize, literal: &str, value: Json) -> Option<Json> {
+        let end = *pos + literal.len();
+        if bytes.get(*pos..end)? == literal.as_bytes() {
+            *pos = end;
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    fn parse_number(bytes: &[u8], pos: &mut usize) -> Option<Json> {
+        let start = *pos;
+        if bytes.get(*pos) == Some(&b'-') {
+            *pos += 1;
+        }
+        while matches!(
+            bytes.get(*pos),
+            Some(b'0'..=b'9') | Some(b'.') | Some(b'e') | Some(b'E') | Some(b'+') | Some(b'-')
+        ) {
+            *pos += 1;
+        }
+        let s = std::str::from_utf8(&bytes[start..*pos]).ok()?;
+        s.parse::<f64>().ok().map(Json::Number)
+    }
+
+    fn parse_string(bytes: &[u8], pos: &mut usize) -> Option<String> {
+        if bytes.get(*pos) != Some(&b'"') {
+            return None;
+        }
+        *pos += 1;
+        let mut s = String::new();
+        loop {
+            match *bytes.get(*pos)? {
+                b'"' => {
+                    *pos += 1;
+                    return Some(s);
+                }
+                b'\\' => {
+                    *pos += 1;
+                    match *bytes.get(*pos)? {
+                        b'"' => s.push('"'),
+                        b'\\' => s.push('\\'),
+                        b'/' => s.push('/'),
+                        b'n' => s.push('\n'),
+                        b't' => s.push('\t'),
+                        b'r' => s.push('\r'),
+                        b'b' => s.push('\u{8}'),
+                        b'f' => s.push('\u{c}'),
+                        b'u' => {
+                            let hex = std::str::from_utf8(bytes.get(*pos + 1..*pos + 5)?).ok()?;
+                            let code_point = u32::from_str_radix(hex, 16).ok()?;
+                            s.push(char::from_u32(code_point)?);
+                            *pos += 4;
+                        }
+                        _ => return None,
+                    }
+                    *pos += 1;
+                }
+                _ => {
+                    // Copy one UTF-8 scalar verbatim (advisories may carry non-ASCII in, e.g.,
+                    // hostnames — never assumed ASCII-only).
+                    let rest = std::str::from_utf8(&bytes[*pos..]).ok()?;
+                    let ch = rest.chars().next()?;
+                    s.push(ch);
+                    *pos += ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    fn parse_object(bytes: &[u8], pos: &mut usize) -> Option<Json> {
+        *pos += 1; // consume '{'
+        let mut entries = Vec::new();
+        skip_ws(bytes, pos);
+        if bytes.get(*pos) == Some(&b'}') {
+            *pos += 1;
+            return Some(Json::Object(entries));
+        }
+        loop {
+            skip_ws(bytes, pos);
+            let key = parse_string(bytes, pos)?;
+            skip_ws(bytes, pos);
+            if bytes.get(*pos) != Some(&b':') {
+                return None;
+            }
+            *pos += 1;
+            let value = parse_value(bytes, pos)?;
+            entries.push((key, value));
+            skip_ws(bytes, pos);
+            match bytes.get(*pos)? {
+                b',' => *pos += 1,
+                b'}' => {
+                    *pos += 1;
+                    return Some(Json::Object(entries));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn parse_array(bytes: &[u8], pos: &mut usize) -> Option<Json> {
+        *pos += 1; // consume '['
+        let mut items = Vec::new();
+        skip_ws(bytes, pos);
+        if bytes.get(*pos) == Some(&b']') {
+            *pos += 1;
+            return Some(Json::Array(items));
+        }
+        loop {
+            items.push(parse_value(bytes, pos)?);
+            skip_ws(bytes, pos);
+            match bytes.get(*pos)? {
+                b',' => *pos += 1,
+                b']' => {
+                    *pos += 1;
+                    return Some(Json::Array(items));
+                }
+                _ => return None,
+            }
+        }
     }
 }
 
@@ -568,7 +794,8 @@ async fn live_connect_round_trips_bytes_and_reports_latency() {
 
     // ---- live, callout-authenticated NATS connections ----------------------------------------
     let (host_nats, host_events) = connect_host(&url, &host_root, exp).await;
-    let (client_nats, client_events) = connect_device(&url, &client, &[cap], exp).await;
+    let (client_nats, client_events, _client_user_pk) =
+        connect_device(&url, &client, &[cap], exp).await;
 
     // ---- the real SignalingHost --------------------------------------------------------------
     let (authorizer, authorize_calls) = RegistryAuthorizer::new(&[&client]);
@@ -724,8 +951,10 @@ async fn live_connect_denied_by_the_authorizer_never_reaches_a_session() {
     let cap_denied = host_root.member_capability(denied.root_fp(), exp, vec![0xB2]);
 
     let (host_nats, host_events) = connect_host(&url, &host_root, exp).await;
-    let (allowed_nats, _allowed_events) = connect_device(&url, &allowed, &[cap_allowed], exp).await;
-    let (denied_nats, denied_events) = connect_device(&url, &denied, &[cap_denied], exp).await;
+    let (allowed_nats, _allowed_events, _allowed_user_pk) =
+        connect_device(&url, &allowed, &[cap_allowed], exp).await;
+    let (denied_nats, denied_events, _denied_user_pk) =
+        connect_device(&url, &denied, &[cap_denied], exp).await;
 
     let (authorizer, authorize_calls) = RegistryAuthorizer::new(&[&allowed]);
     let sessions = Arc::new(AtomicUsize::new(0));
@@ -836,6 +1065,323 @@ async fn live_connect_denied_by_the_authorizer_never_reaches_a_session() {
     assert_no_permission_violation(&denied_events, "denied client");
 
     host_task.abort();
+}
+
+/// Dev-only throwaway SYS-account nkey seed, copied verbatim from
+/// `spikes/s9-revoke-kick/src/main.rs`'s `SYS_CONN_SEED` (itself lifted from
+/// `deploy/docker-compose.yml`'s `helper.environment.SYS_CONN_SEED` — the same seed the composed
+/// helper container uses for its own `sys_client`). Genuine SYS-account membership is required to
+/// receive `$SYS.ACCOUNT.*.DISCONNECT` advisories at all (`spikes/s5-presence`'s finding, repeated
+/// in `spikes/s9-revoke-kick/RESULTS.md`'s header comment) — the `AUTH`-account `CALLOUT_USER`
+/// this file's other fixtures bootstrap through is not sufficient. Never used outside this local
+/// stack.
+const SYS_CONN_SEED: &str = "SUAJNND3A4EBPOPMXASJCSIAPEFJROE7JFVDDZMLN2WEP3OPTNQSLMBO6A";
+
+/// Extra fresh-reconnect attempts made *after* the first observed refusal, before trusting that
+/// refusal as durable rather than a one-off blip. See
+/// [`assert_revoked_device_cannot_reconnect`]'s doc comment.
+const RECONNECT_CONFIRMATION_ATTEMPTS: usize = 4;
+const RECONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Attempts a brand-new device CONNECT presenting the SAME (now revoked) identity — a fresh
+/// session nkey each try, exactly the wire-level shape of `async-nats`'s own automatic reconnect,
+/// made explicit and observable rather than left to run in the background — until either a
+/// refusal is observed and confirmed durable, or `deadline` passes.
+///
+/// Returns the [`Instant`] the refusal was **first** observed (t1) — not the instant the last
+/// confirmation attempt finished, so extra confirmation attempts add confidence without inflating
+/// the measured timing.
+///
+/// **Any attempt that connects successfully is an immediate, loud panic — never a retry.** The
+/// entire point of this helper is to prove the revoked identity genuinely cannot get back onto
+/// NATS; a single success anywhere in this loop falsifies that outright, regardless of how many
+/// earlier attempts were refused (DESIGN.md §A4's actual security property is "revoked stays
+/// revoked", not "revoked is refused most of the time").
+async fn assert_revoked_device_cannot_reconnect(
+    url: &str,
+    device: &DeviceIdentity,
+    caps: &[spindle_proto::artifacts::Capability],
+    exp: u64,
+    deadline: Instant,
+) -> Instant {
+    let mut first_refusal: Option<Instant> = None;
+    let mut confirmations = 0usize;
+    let mut attempt = 0usize;
+    loop {
+        if let Some(t1) = first_refusal {
+            if confirmations >= RECONNECT_CONFIRMATION_ATTEMPTS {
+                return t1;
+            }
+        }
+        if Instant::now() >= deadline {
+            return first_refusal.unwrap_or_else(|| {
+                panic!(
+                    "the revoked device's fresh reconnect attempts (all {attempt} of them) never \
+                     received a single authorization refusal before the bound expired — the \
+                     revoked device was never conclusively cut off from NATS. FAILURE, not a \
+                     pass."
+                )
+            });
+        }
+        attempt += 1;
+
+        // Deliberately NOT `connect_device`: that helper panics on a connect error, which is
+        // exactly the outcome this loop expects and must NOT treat as fatal. A fresh session nkey
+        // every attempt matches what a real auto-reconnect does (a new TCP connection, same
+        // credentials) and sidesteps any server-side nkey-reuse throttling that isn't the concern
+        // under test here.
+        let session = nkeys::KeyPair::new_user();
+        let nats_fp = fixtures::nats_fp_of_nkey(&session.public_key());
+        let cert = device.certificate(nats_fp, fixtures::now(), exp);
+        let token = fixtures::device_auth_token(&device.root.public_key().to_bytes(), &cert, caps);
+        let (opts, _events) = base_opts();
+        let result = opts
+            .nkey(session.seed().expect("session nkey seed"))
+            .token(token)
+            .custom_inbox_prefix(format!("_INBOX_{}", device.device_fp))
+            .connect(url)
+            .await;
+
+        match result {
+            Ok(client) => {
+                drop(client);
+                panic!(
+                    "attempt #{attempt}: a FRESH connection using the revoked device's identity \
+                     SUCCEEDED. The device was NOT cut off — this is the security property under \
+                     test failing, and must be reported as a genuine finding, not papered over by \
+                     weakening this assertion."
+                );
+            }
+            Err(e) => {
+                println!("[reconnect] attempt #{attempt}: fresh connect correctly refused: {e}");
+                match first_refusal {
+                    None => first_refusal = Some(Instant::now()),
+                    Some(_) => confirmations += 1,
+                }
+                tokio::time::sleep(RECONNECT_RETRY_INTERVAL).await;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live stack required: run `docker compose -f deploy/docker-compose.yml up -d` first, \
+            then `cargo test -p spindle-net --test live_signaling -- --ignored --nocapture`. \
+            When run, an unreachable stack fails loudly — this test never skips."]
+async fn live_revocation_kicks_and_then_refuses_the_devices_reconnect_within_the_five_second_bar() {
+    let url = nats_url();
+
+    // ---- SYS-account connection: subscribe to DISCONNECT advisories BEFORE anything else, so no
+    // kick evidence can possibly be missed (the same ordering discipline
+    // `spikes/s9-revoke-kick/src/main.rs` uses). ------------------------------------------------
+    let sys_client = async_nats::ConnectOptions::new()
+        .nkey(SYS_CONN_SEED.to_string())
+        .connect(&url)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "SYS-account CONNECT to the live stack at {url} failed: {e}\n\
+                 This test requires `docker compose -f deploy/docker-compose.yml up -d` \
+                 (nats + postgres + helper) — the helper container is configured with the \
+                 identical SYS_CONN_SEED. It never skips."
+            )
+        });
+    let mut disconnect_sub = sys_client
+        .subscribe("$SYS.ACCOUNT.*.DISCONNECT")
+        .await
+        .expect("subscribing to $SYS.ACCOUNT.*.DISCONNECT");
+
+    let exp = fixtures::now() + 3600;
+
+    // ---- per-run identity material --------------------------------------------------------------
+    // Unlike this file's other two live tests, this one PUBLISHES A REVOCATION, and
+    // `spindle_helper::revoke::ingest_revocation` persists it DURABLY in Postgres (`revoked_subjects`,
+    // plus a bumped `revocation_epochs` row), keyed by the device's `root_fp` under the host's
+    // `host_fp`. A fixed seed here — as the other two live tests correctly use, since they never
+    // revoke anything — would make THIS test single-use: its first run revokes that `root_fp`
+    // forever, and every later run's very first `connect_device(...)` call fails at that
+    // permanently-revoked identity's *initial* CONNECT, with a generic "stack unreachable" panic
+    // that looks nothing like what actually happened. Deriving both the host's and the device's
+    // identities fresh each run — from one throwaway nkey keypair, domain-separated per seed so the
+    // five derived 32-byte seeds are independent — keeps this test repeatable against the same live
+    // database. `nkeys` is already a dev-dependency used elsewhere in this file; no new dependency.
+    let identity_entropy = nkeys::KeyPair::new_user().public_key().into_bytes();
+    let seed_for = |domain: &[u8]| -> [u8; 32] {
+        *Fingerprint::of_parts(&[domain, &identity_entropy]).as_bytes()
+    };
+
+    // ---- host + device identities, and a member capability binding the device to the host ------
+    let host_root = HostRootIdentity::new(
+        seed_for(b"spindle-net:live_signaling:revocation-test:host-root-seed"),
+        seed_for(b"spindle-net:live_signaling:revocation-test:host-op-seed"),
+    );
+    let device = DeviceIdentity::new(
+        seed_for(b"spindle-net:live_signaling:revocation-test:device-root-seed"),
+        seed_for(b"spindle-net:live_signaling:revocation-test:device-sign-seed"),
+        seed_for(b"spindle-net:live_signaling:revocation-test:device-agree-seed"),
+    );
+    let cap = host_root.member_capability(device.root_fp(), exp, vec![0xC1]);
+    let caps = vec![cap];
+
+    println!(
+        "[ids] host_fp={} (revocation subject scope)",
+        host_root.host_fp
+    );
+    println!(
+        "[ids] device root_fp={} (revocation target)",
+        device.root_fp()
+    );
+
+    // ---- live, callout-authenticated NATS connections --------------------------------------------
+    let (host_nats, host_events) = connect_host(&url, &host_root, exp).await;
+    let (device_nats, device_events, device_user_pk) =
+        connect_device(&url, &device, &caps, exp).await;
+    assert_no_permission_violation(&host_events, "host");
+    assert_no_permission_violation(&device_events, "device");
+
+    // ---- sanity: the device connection is genuinely live, not just "connect() returned Ok" -----
+    // A round-tripped request on a subject the device's own callout-issued permissions grant
+    // (`client_member_permissions`'s `pub helper.presence.get.<own_nats_fp>`) proves the
+    // connection can both publish and receive a reply through its own inbox grant right now. A
+    // device that was never actually live cannot prove anything about being cut off later.
+    let device_nats_fp = fixtures::nats_fp_of_nkey(&device_user_pk);
+    let presence_subject = format!("helper.presence.get.{device_nats_fp}");
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        device_nats.request(presence_subject.clone(), Bytes::new()),
+    )
+    .await
+    {
+        Ok(Ok(reply)) => println!(
+            "[sanity] device connection is live: {presence_subject} replied with {} bytes",
+            reply.payload.len()
+        ),
+        Ok(Err(e)) => panic!(
+            "sanity check failed: request on {presence_subject} errored: {e} — the device \
+             connection does not appear to be genuinely live, so nothing this test observes \
+             later about it being 'cut off' would mean anything."
+        ),
+        Err(_) => panic!(
+            "sanity check failed: request on {presence_subject} timed out — the device \
+             connection does not appear to be genuinely live, so nothing this test observes \
+             later about it being 'cut off' would mean anything."
+        ),
+    }
+
+    // ---- mint + publish the revocation record, naming the device's root_fp ----------------------
+    // The signer is a throwaway key: `spindle_helper::revoke::ingest_revocation` never verifies
+    // this signature (see that module's doc comment's "Identity check" section) — trust here comes
+    // entirely from NATS subject scoping (`host_permissions` grants `pub
+    // registry.revoke.<own_host_fp>` to the host connection alone), matching that module's own
+    // test fixtures.
+    let revocation_signer = SigningKey::from_bytes(&[0x16; 32]);
+    let record = issue_revocation_record(
+        &revocation_signer,
+        host_root.host_fp,
+        1, // epoch — irrelevant to whether the connect-time check refuses (see decide_device_connect)
+        vec![device.root_fp()],
+        fixtures::now(),
+    );
+    let record_bytes = record.to_canonical_bytes();
+    let subject = format!("registry.revoke.{}", host_root.host_fp);
+
+    let t0 = Instant::now();
+    host_nats
+        .publish(subject.clone(), record_bytes.into())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "publishing the revocation record on {subject} failed: {e} — host_permissions \
+                 grants `pub registry.revoke.<own_host_fp>`; a failure here means that grant has \
+                 drifted from `permissions::host_permissions`."
+            )
+        });
+    host_nats
+        .flush()
+        .await
+        .expect("flush after publishing the revocation record");
+
+    // ---- wait for the confirmed KICK: a DISCONNECT advisory for THIS device's connection whose
+    // top-level `reason` is exactly "Kicked". Nothing else counts (see this file's module doc
+    // comment's S9 section and spikes/s9-revoke-kick/RESULTS.md's false-green correction). --------
+    let kick_deadline = t0 + Duration::from_secs(15);
+    let mut seen_disconnects: Vec<String> = Vec::new();
+    let t_kick = loop {
+        let remaining = kick_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "no $SYS.ACCOUNT.*.DISCONNECT advisory with reason==\"Kicked\" for the device's \
+                 connection (client.user={device_user_pk}) arrived within {:?} of the revocation \
+                 publish. Advisories observed while waiting:\n{}",
+                kick_deadline.saturating_duration_since(t0),
+                if seen_disconnects.is_empty() {
+                    "  (none)".to_string()
+                } else {
+                    seen_disconnects.join("\n")
+                }
+            );
+        }
+        let msg = match tokio::time::timeout(remaining, disconnect_sub.next()).await {
+            Ok(Some(m)) => m,
+            Ok(None) => panic!(
+                "$SYS.ACCOUNT.*.DISCONNECT subscription ended unexpectedly while waiting for the \
+                 kick"
+            ),
+            Err(_) => continue, // deadline re-checked at the top of the loop
+        };
+        let raw = String::from_utf8_lossy(&msg.payload).to_string();
+        let Some(json) = tinyjson::parse(&raw) else {
+            seen_disconnects.push(format!("[unparsable JSON, subject={}] {raw}", msg.subject));
+            continue;
+        };
+        let user = json
+            .get("client")
+            .and_then(|c| c.get("user"))
+            .and_then(|v| v.as_str());
+        let reason = json.get("reason").and_then(|v| v.as_str());
+        seen_disconnects.push(format!(
+            "subject={} client.user={user:?} reason={reason:?} raw={raw}",
+            msg.subject
+        ));
+        if user == Some(device_user_pk.as_str()) {
+            if reason == Some("Kicked") {
+                break Instant::now();
+            }
+            println!(
+                "[kick-watch] a DISCONNECT for the device's OWN connection arrived but its \
+                 reason was {reason:?}, not \"Kicked\" — per \
+                 spikes/s9-revoke-kick/RESULTS.md this is NOT evidence of a kick; still waiting."
+            );
+        }
+    };
+    let t_kick_minus_t0_ms = t_kick.duration_since(t0).as_secs_f64() * 1000.0;
+    println!("[timing] t_kick - t0 (revoke publish -> confirmed KICK) = {t_kick_minus_t0_ms:.1}ms");
+
+    // ---- the real assertion: a brand-new connect for the same identity must be refused ---------
+    // A kicked NATS client auto-reconnects on its own (spikes/s9-revoke-kick/RESULTS.md's own
+    // "curiosity" section) — a kick alone cuts nobody off. This is the client's own reconnect,
+    // made explicit and bounded rather than left to race in the background on `device_nats`.
+    drop(device_nats); // stop the original connection's own background auto-reconnect from racing
+                       // this explicit, observable stand-in for it.
+    let reconnect_deadline = t0 + Duration::from_secs(15);
+    let t1 =
+        assert_revoked_device_cannot_reconnect(&url, &device, &caps, exp, reconnect_deadline).await;
+
+    let t1_minus_t0_ms = t1.duration_since(t0).as_secs_f64() * 1000.0;
+    println!("\n==== S9 REVOKE -> KICK -> REJECT TIMING ====");
+    println!("t_kick - t0 (revoke publish -> confirmed KICK disconnect):        {t_kick_minus_t0_ms:.1}ms");
+    println!(
+        "t1     - t0 (revoke publish -> reconnect conclusively refused):   {t1_minus_t0_ms:.1}ms"
+    );
+
+    assert_no_permission_violation(&host_events, "host");
+
+    assert!(
+        t1.duration_since(t0) < Duration::from_secs(5),
+        "DESIGN.md §A4's revoke -> kick -> reject bar (< 5s) was NOT met: t1 - t0 = \
+         {t1_minus_t0_ms:.1}ms (t_kick - t0 was {t_kick_minus_t0_ms:.1}ms). This is a genuine \
+         timing finding, not a test bug — do not weaken this assertion to make it pass."
+    );
 }
 
 /// Fails if this connection ever reported a NATS permissions violation. A violation here would
