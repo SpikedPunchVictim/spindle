@@ -261,11 +261,13 @@ pub trait HelperView {
     /// Records a revocation for `host_fp`: bumps the stored epoch to `max(existing, epoch)`
     /// (DESIGN.md §A7b "max-wins, never decreases") and adds every fingerprint in
     /// `revoked_subjects` to the durable revoked-subject set for `host_fp` (DESIGN.md §A9b
-    /// "revocation epochs ... revoked-subject sets alongside"). Not currently called by
-    /// `src/bin/helper.rs` — `registry.revoke.<hfp>` handling is still unwired (a later slice) —
-    /// but the store operation and its SQL semantics are this slice's deliverable regardless, so
-    /// the read side above (`revocation_epoch`/`is_revoked`) has something to prove itself against
-    /// in the store-contract tests.
+    /// "revocation epochs ... revoked-subject sets alongside"). Wired: `src/bin/helper.rs`
+    /// subscribes to `registry.revoke.*` and hands each message to
+    /// `revoke::ingest_revocation`, which calls this method (`crates/spindle-helper/src/
+    /// revoke.rs:170`) once it has checked the subject token's `host_fp` against the record's own
+    /// — so the store operation and its SQL semantics are exercised by that real entry point, not
+    /// only by the store-contract tests the read side above (`revocation_epoch`/`is_revoked`)
+    /// proves itself against.
     fn record_revocation(
         &mut self,
         host_fp: Fingerprint,

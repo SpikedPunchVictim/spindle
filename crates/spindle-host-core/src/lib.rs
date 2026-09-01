@@ -46,6 +46,12 @@
 //! - [`ratelimit`] (crate-private, Stage 6 slice 4) — [`ratelimit::RateLimiter`], the per-caller
 //!   token-bucket limiter DESIGN.md §A5 describes for pre-auth connects, adapted here to the
 //!   post-auth VFS RPC entry point.
+//! - [`revoke`] — [`revoke::revoke_member_and_mint`]/[`revoke::revoke_device_and_mint`]: applies a
+//!   revocation to the store, bumps `cap_epoch` (DESIGN.md §A4: only on security events), and
+//!   mints the signed `RevocationRecord` `spindle_helper::revoke::ingest_revocation` admits on
+//!   `registry.revoke.<host_fp>` — everything except the actual NATS publish. See that module's
+//!   doc comment for the store-first ordering rationale and why `cap_epoch` is bumped here rather
+//!   than inside `spindle_vfs::store::Store::revoke_member`/`revoke_device`.
 //! - [`serve`] (Stage 6 slice 5) — [`serve::serve_control_stream`], the binding loop: reads
 //!   [`spindle_net::framing`] frames off a real duplex stream (production: a
 //!   `spindle_net::quic::ControlStream`'s QUIC control stream), calls
@@ -87,9 +93,13 @@ mod identity_cache;
 pub mod limits;
 mod mount;
 mod ratelimit;
+pub mod revoke;
 mod upload;
 
 pub use authorize::{DeviceLookup, HostConnectAuthorizer, LookupError, SqliteDeviceLookup};
+pub use revoke::{
+    revoke_device_and_mint, revoke_member_and_mint, RevocationPublication, RevokeError,
+};
 pub use serve::{serve_control_stream, ServeError};
 pub use server::{SessionContext, VfsRpcServer};
 
