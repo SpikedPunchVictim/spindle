@@ -49,6 +49,61 @@ flowchart LR
 4. The file transfer runs directly between the two machines, end-to-end encrypted, with
    entitlements enforced by the host on every request.
 
+## Actors and terminology
+
+Three actors, but the names in the code are more specific than "server, host, client" — this is
+the vocabulary used throughout `docs/DESIGN.md`, the crate names, and the logs.
+
+**Registry** — the operator-run brokering side, and a connection broker only (DESIGN.md §A3). It is
+not one process but three:
+
+- **NATS cluster** — the signaling substrate, nothing more. A TCP listener for daemons, a
+  WebSocket listener for browsers.
+- **Broker helper** (usually just *the helper*) — the whole "backend": the auth-callout responder
+  that verifies host-signed capabilities, the presence service, the TURN credential issuer, the
+  kick relay, and the revocation store. Crate `spindle-helper`.
+- **TURN (coturn)** — relay, used only when hole-punching fails. Still end-to-end encrypted.
+
+**Host** — the daemon that holds the files, the accounts, and the authority. Crate
+`spindle-host-core`, app `apps/host`. It signs capabilities; the registry only ever *verifies*
+them. Accounts, shares, groups, and entitlements live only here.
+
+**Client** — the app that connects to a host to browse and transfer files. Crate
+`spindle-client-core`, with `apps/client` (native) and `apps/web` (browser).
+
+"Client" splits into two identities that are not interchangeable, and the distinction is
+load-bearing:
+
+- **Member** — the *person* holding an account on a host, identified by their identity root
+  fingerprint `root_fp`.
+- **Device** — one *installation* belonging to a member (a laptop, a phone, a browser profile),
+  identified by `device_fp` and carrying its own keypair.
+
+This is why the authorization entry points are `decide_device_connect` and `decide_host_connect`:
+what actually connects is a device, never an abstract "client". It is also why revoking a member
+(names their `root_fp`, cuts off every device they own) and revoking a device (names one
+`device_fp`, leaves their other devices alone) are separate operations.
+
+A third fingerprint appears in every helper log line: **`nats_fp`** identifies a single
+*connection*, not a person and not a device. One device with the native app and a browser tab
+open holds two of them.
+
+| Informally | In this repo | Identified by |
+|---|---|---|
+| main server | registry (NATS + broker helper + TURN) | — |
+| the backend | broker helper / the helper | — |
+| host | host, host daemon | `host_fp` |
+| client | client app | — |
+| the person | member | `root_fp` |
+| their laptop/phone | device | `device_fp` |
+| one live connection | session | `nats_fp` |
+
+One clarification the diagram above can hide: a client does not read files *through* the registry.
+The registry brokers only the introduction. Once signaling completes, the transfer is direct —
+QUIC between two native peers, a WebRTC DataChannel for browsers — and end-to-end encrypted. The
+registry never sees file bytes and by design cannot: it holds no session keys and can neither read
+nor forge them (DESIGN.md §A7).
+
 ## Shape: one wire contract, two engines, one UI layer
 
 - **One wire contract** — canonical CBOR schemas and signed-artifact formats (`spindle-proto` /
