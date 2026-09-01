@@ -155,9 +155,29 @@ CREATE TABLE share_upload_bytes (
 );
 "#;
 
+/// Version 4 — connect-time authorization (DESIGN.md §A5 / `spindle-net`'s injected
+/// `ConnectAuthorizer`): `devices.agree_pk`, the device's X25519 key-agreement public key,
+/// alongside the `sign_pk` V3 already added. Nullable for the same reason `sign_pk` is (`ALTER
+/// TABLE ... ADD COLUMN` requires a default for `NOT NULL`, and there is no sensible default for a
+/// key) — rows written before this version have no value for it. A device row missing either key
+/// half fails closed at authorization time: `spindle_core::identity::device_fp_of` shows
+/// `device_fp` is the hash of exactly `(DEVICE_FP_DOMAIN, alg_id, sign_pk, agree_pk)`, so a
+/// verifier needs *both* halves to recompute it and check the binding — the same check
+/// `spindle_core::artifacts::verify_device_certificate` performs (DESIGN.md §A7b clarification 6).
+/// A verifier cannot recompute that binding from half a preimage, and MUST NOT treat a missing key
+/// as "skip the check" — see `crate::model::Device::agree_pk`'s doc comment.
+const SCHEMA_V4: &str = r#"
+ALTER TABLE devices ADD COLUMN agree_pk BLOB;
+"#;
+
 /// Every schema version in order, oldest first. Appending a new `(N, SQL)` pair is the only way
 /// to evolve the schema — existing entries are never edited once shipped.
-const MIGRATIONS: &[(i64, &str)] = &[(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, SCHEMA_V1),
+    (2, SCHEMA_V2),
+    (3, SCHEMA_V3),
+    (4, SCHEMA_V4),
+];
 
 /// Applies every migration strictly newer than the connection's current `user_version`, each in
 /// its own transaction, advancing `user_version` as it goes. Safe to call on every [`super::Store`]

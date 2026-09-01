@@ -1757,8 +1757,9 @@ fn paginate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spindle_core::identity::DeviceKey;
     use spindle_core::SigningKey;
-    use spindle_vfs::model::{MemberId, ShareFlags, ShareId};
+    use spindle_vfs::model::{DevicePublicKeys, MemberId, ShareFlags, ShareId};
     use spindle_vfs::store::Store;
     use tempfile::TempDir;
 
@@ -1859,26 +1860,41 @@ mod tests {
         /// Enrolls a device with a real Ed25519 signing keypair pinned as its `sign_pk` — the
         /// upload-manifest-signature tests' way of getting a `(device_fp, SigningKey)` pair the
         /// server can actually verify against (see `crate::server`'s
-        /// `verify_manifest_signature`).
+        /// `verify_manifest_signature`). Also pins a real, matching `agree_pk`: `device_fp` is
+        /// `spindle_core::identity::DeviceKey`'s own binding hash over both keys (rather than the
+        /// pre-Stage-6-slice-5 arbitrary hash of just the label), so `sign_pk`/`agree_pk`/
+        /// `device_fp` genuinely rehash together the way `Store::member_for_device_fp`'s doc
+        /// comment says a connect-time authorizer relies on.
         fn add_signing_device(
             &self,
             member_id: MemberId,
             label: &str,
         ) -> (Fingerprint, SigningKey) {
-            let device_fp = Fingerprint::of_parts(&[b"device", label.as_bytes()]);
-            let signing_key = SigningKey::from_bytes(&{
+            let sign_seed = {
                 let mut seed = [0u8; 32];
                 let digest = Fingerprint::of_parts(&[b"signing-key-seed", label.as_bytes()]);
                 seed.copy_from_slice(digest.as_bytes());
                 seed
-            });
+            };
+            let agree_seed = {
+                let mut seed = [0u8; 32];
+                let digest = Fingerprint::of_parts(&[b"agree-key-seed", label.as_bytes()]);
+                seed.copy_from_slice(digest.as_bytes());
+                seed
+            };
+            let dev = DeviceKey::from_seeds(sign_seed, agree_seed);
+            let device_fp = dev.device_fp();
+            let signing_key = SigningKey::from_bytes(&sign_seed);
             self.store
                 .add_device(
                     member_id,
                     device_fp,
                     label,
                     0,
-                    Some(signing_key.verifying_key().as_bytes()),
+                    Some(&DevicePublicKeys {
+                        sign_pk: dev.sign_public_key().as_bytes().to_vec(),
+                        agree_pk: dev.agree_public_key().as_bytes().to_vec(),
+                    }),
                 )
                 .expect("add signing device");
             (device_fp, signing_key)

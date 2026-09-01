@@ -60,8 +60,8 @@ mod schema;
 use crate::confine::{self, overlap_check};
 use crate::glob::CompiledGlob;
 use crate::model::{
-    Device, Entitlement, Group, GroupId, GroupKind, Member, MemberId, MemberStatus, ModelError,
-    Perms, Share, ShareFlags, ShareId, VirtualPath,
+    Device, DevicePublicKeys, Entitlement, Group, GroupId, GroupKind, Member, MemberId,
+    MemberStatus, ModelError, Perms, Share, ShareFlags, ShareId, VirtualPath,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use spindle_core::{Fingerprint, FingerprintError};
@@ -388,7 +388,8 @@ impl Store {
 
     fn devices_for_member(&self, member_id: MemberId) -> Result<Vec<Device>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT device_fp, label, added, revoked, sign_pk FROM devices WHERE member_id = ?1",
+            "SELECT device_fp, label, added, revoked, sign_pk, agree_pk FROM devices \
+             WHERE member_id = ?1",
         )?;
         let rows = stmt.query_map(params![member_id.0 as i64], |r| {
             Ok((
@@ -397,17 +398,19 @@ impl Store {
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, Option<Vec<u8>>>(4)?,
+                r.get::<_, Option<Vec<u8>>>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (fp_bytes, label, added, revoked, sign_pk) = row?;
+            let (fp_bytes, label, added, revoked, sign_pk, agree_pk) = row?;
             out.push(Device {
                 device_fp: Fingerprint::from_slice(&fp_bytes)?,
                 label,
                 added: added as u64,
                 revoked: revoked != 0,
                 sign_pk,
+                agree_pk,
             });
         }
         Ok(out)
@@ -469,32 +472,37 @@ impl Store {
     // Devices
     // ---------------------------------------------------------------------------------------
 
-    /// `sign_pk` is the device's Ed25519 signing public key — DESIGN.md §A4's device certificates
-    /// already carry it; this is where the host pins it at enrollment (see
-    /// `crate::model::Device::sign_pk`'s doc comment, Stage 6 slice 4 schema addition). `None` is
-    /// accepted (e.g. a test that never needs upload-manifest verification), but a real enrollment
-    /// flow should always supply one — a device with no key on file cannot have any upload it
-    /// signs verified later.
+    /// `keys` is the device's pinned Ed25519 signing + X25519 agreement public keys, paired in one
+    /// [`DevicePublicKeys`] rather than two adjacent `Option<&[u8]>` parameters (see that struct's
+    /// doc comment for why: an accidental transposition of two same-typed byte slices is not a
+    /// type error, and would silently produce a device whose stored keys never rehash to its own
+    /// `device_fp`). DESIGN.md §A4's device certificates already carry both keys; this is where
+    /// the host pins them at enrollment. `None` is accepted (e.g. a test that never needs
+    /// upload-manifest verification or connect-time authorization), but a real enrollment flow
+    /// should always supply both — a device with no keys on file cannot have any upload it signs
+    /// verified later (`crate::model::Device::sign_pk`), nor can it ever be authorized to connect
+    /// (`crate::model::Device::agree_pk`).
     pub fn add_device(
         &self,
         member_id: MemberId,
         device_fp: Fingerprint,
         label: &str,
         added: u64,
-        sign_pk: Option<&[u8]>,
+        keys: Option<&DevicePublicKeys>,
     ) -> Result<(), StoreError> {
         if self.get_member(member_id)?.is_none() {
             return Err(StoreError::MemberNotFound(member_id));
         }
         self.conn.execute(
-            "INSERT INTO devices (device_fp, member_id, label, added, revoked, sign_pk) \
-             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+            "INSERT INTO devices (device_fp, member_id, label, added, revoked, sign_pk, agree_pk) \
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
             params![
                 device_fp.to_vec(),
                 member_id.0 as i64,
                 label,
                 added as i64,
-                sign_pk.map(|k| k.to_vec()),
+                keys.map(|k| k.sign_pk.clone()),
+                keys.map(|k| k.agree_pk.clone()),
             ],
         )?;
         Ok(())
@@ -526,6 +534,41 @@ impl Store {
             )
             .optional()?;
         Ok(key.flatten())
+    }
+
+    /// Resolves the [`Member`] owning `device_fp` — the connect-time lookup direction. `device_fp`
+    /// is what a connect offer's envelope names (DESIGN.md §A5's injected `ConnectAuthorizer`,
+    /// `crates/spindle-net/src/signaling/authorize.rs`); `member_id` is host-internal and never
+    /// appears on the wire, which is why this exists alongside [`Store::get_member`] rather than
+    /// replacing it.
+    ///
+    /// Returns the whole `Member` (via [`Store::get_member`], so it carries its full `devices` and
+    /// `groups` exactly as that method builds them — not hand-assembled here) rather than just a
+    /// status, deliberately: the caller must check BOTH the member's status AND the specific
+    /// device's `revoked` flag, since a still-`Active` member can have one revoked device among
+    /// several (DESIGN.md §A4: a revocation names `root_fp | device_fp`), and both halves come
+    /// from this single read. `crates/spindle-host-core/src/server.rs`'s two-part gate (search
+    /// `denied:device_revoked`) is the per-request twin of that same check.
+    ///
+    /// `Ok(None)` when `device_fp` is unknown. A devices row referencing a missing member is
+    /// impossible (the `member_id` foreign key), but the delegation to `get_member` would surface
+    /// that as `Ok(None)` anyway rather than panicking.
+    pub fn member_for_device_fp(
+        &self,
+        device_fp: Fingerprint,
+    ) -> Result<Option<Member>, StoreError> {
+        let member_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT member_id FROM devices WHERE device_fp = ?1",
+                params![device_fp.to_vec()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(member_id) = member_id else {
+            return Ok(None);
+        };
+        self.get_member(MemberId(member_id as u64))
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1629,7 +1672,16 @@ mod tests {
             .add_device(member_id, fp_no_key, "Laptop", 0, None)
             .expect("add_device without key");
         store
-            .add_device(member_id, fp_with_key, "Phone", 0, Some(&[0xAB; 32]))
+            .add_device(
+                member_id,
+                fp_with_key,
+                "Phone",
+                0,
+                Some(&DevicePublicKeys {
+                    sign_pk: vec![0xAB; 32],
+                    agree_pk: vec![0xCD; 32],
+                }),
+            )
             .expect("add_device with key");
 
         assert_eq!(store.device_sign_pk(fp_no_key).expect("lookup"), None);
@@ -1643,6 +1695,128 @@ mod tests {
                 .expect("lookup nonexistent"),
             None,
             "an unknown device_fp is treated the same as a known device with no key on file"
+        );
+    }
+
+    // ---- Devices: agree_pk + member_for_device_fp (Stage 6 slice 5) ----
+
+    #[test]
+    fn member_for_device_fp_returns_the_owning_member_with_both_stored_key_halves() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let device_fp = Fingerprint::of_parts(&[b"alex-laptop"]);
+        let keys = DevicePublicKeys {
+            sign_pk: vec![0x11; 32],
+            agree_pk: vec![0x22; 32],
+        };
+        store
+            .add_device(member_id, device_fp, "Laptop", 0, Some(&keys))
+            .expect("add_device");
+
+        let member = store
+            .member_for_device_fp(device_fp)
+            .expect("lookup")
+            .expect("device is known");
+        assert_eq!(member.member_id, member_id);
+        let device = member
+            .devices
+            .iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("owning member's devices include the looked-up device");
+        assert_eq!(device.sign_pk, Some(keys.sign_pk));
+        assert_eq!(device.agree_pk, Some(keys.agree_pk));
+    }
+
+    #[test]
+    fn member_for_device_fp_returns_none_for_a_device_fp_that_was_never_added() {
+        let store = Store::open_in_memory().expect("open");
+        store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+
+        assert!(store
+            .member_for_device_fp(Fingerprint::of_parts(&[b"never-added"]))
+            .expect("lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn stored_device_key_bytes_are_the_exact_preimage_device_fp_of_was_computed_from() {
+        // Proves the binding property a connect-time authorizer relies on: a verifier that
+        // recomputes `device_fp_of(alg_id, sign_pk, agree_pk)` from the STORED bytes must get back
+        // the STORED `device_fp`. `spindle-vfs` may depend only on `spindle-core` (A9c crate-
+        // layering law) and `x25519_dalek::PublicKey` is not re-exported from there, so this
+        // asserts byte-for-byte preservation against the original `DeviceKey`'s own public keys
+        // instead of round-tripping through a locally-parsed `X25519PublicKey` — that is sufficient
+        // to prove the store never mutates either half, which is the property that matters here.
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let dev = spindle_core::identity::DeviceKey::from_seeds([0x30; 32], [0x31; 32]);
+        let device_fp = dev.device_fp();
+        let keys = DevicePublicKeys {
+            sign_pk: dev.sign_public_key().as_bytes().to_vec(),
+            agree_pk: dev.agree_public_key().as_bytes().to_vec(),
+        };
+        store
+            .add_device(member_id, device_fp, "Laptop", 0, Some(&keys))
+            .expect("add_device");
+
+        let member = store
+            .member_for_device_fp(device_fp)
+            .expect("lookup")
+            .expect("device is known");
+        let device = member
+            .devices
+            .iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("owning member's devices include the looked-up device");
+        assert_eq!(
+            device.sign_pk.as_deref(),
+            Some(dev.sign_public_key().as_bytes().as_slice())
+        );
+        assert_eq!(
+            device.agree_pk.as_deref(),
+            Some(dev.agree_public_key().as_bytes().as_slice())
+        );
+        assert_eq!(
+            device_fp,
+            spindle_core::device_fp_of(
+                spindle_core::ALG_ID_V1,
+                &dev.sign_public_key(),
+                &dev.agree_public_key()
+            ),
+            "test fixture sanity: DeviceKey::device_fp must equal device_fp_of over its own keys"
+        );
+    }
+
+    #[test]
+    fn member_for_device_fp_still_finds_a_revoked_device_with_revoked_flag_set() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let device_fp = Fingerprint::of_parts(&[b"alex-laptop"]);
+        store
+            .add_device(member_id, device_fp, "Laptop", 0, None)
+            .expect("add_device");
+        store.revoke_device(device_fp).expect("revoke_device");
+
+        let member = store
+            .member_for_device_fp(device_fp)
+            .expect("lookup")
+            .expect("a revoked device must still be findable, so the deny path is auditable");
+        let device = member
+            .devices
+            .iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("owning member's devices include the revoked device");
+        assert!(
+            device.revoked,
+            "the authorizer must be able to tell 'revoked' apart from 'unknown'"
         );
     }
 

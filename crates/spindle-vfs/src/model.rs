@@ -207,6 +207,17 @@ pub struct Group {
 /// a test that never supplied one; an upload manifest signed by such a device fails closed
 /// (`spindle-host-core` cannot verify without a key, and does not treat a missing key as "skip
 /// verification").
+///
+/// **Stage 6 slice 5 addition**: `agree_pk` — the device's X25519 key-agreement public key —
+/// arrives later than `sign_pk` for the same reason `sign_pk` arrived later than `device_fp`: each
+/// slice persists only the key material its own consumer needs. Slice 4's upload-manifest
+/// verification only ever checks an Ed25519 signature, so only `sign_pk` was needed. Connect-time
+/// authorization (DESIGN.md §A5's injected `ConnectAuthorizer`, `crates/spindle-net/src/signaling/
+/// authorize.rs`) needs the X25519 half too: `ConnectDecision::Allow` must hand the caller *both*
+/// pinned public keys before a single byte of a connect offer's signature or ciphertext can be
+/// verified — `sign_pk` verifies the envelope signature, `agree_pk` is the key `k0`/`k1` are
+/// derived from (DESIGN.md §A7). `None` means "cannot authorize this device" — fail closed, the
+/// same as a missing `sign_pk`, never "skip the check".
 #[derive(Clone, Debug)]
 pub struct Device {
     pub device_fp: Fingerprint,
@@ -214,6 +225,22 @@ pub struct Device {
     pub added: u64,
     pub revoked: bool,
     pub sign_pk: Option<Vec<u8>>,
+    pub agree_pk: Option<Vec<u8>>,
+}
+
+/// The write-path pairing of a device's two public key halves, for [`crate::store::Store::add_device`].
+/// Exists so that method takes ONE optional argument instead of two adjacent `Option<&[u8]>`
+/// parameters a caller could silently transpose — a transposition would not be caught by the type
+/// system (both are just byte slices) and would produce a device whose stored keys do not rehash
+/// to its own `device_fp` (see [`Device::agree_pk`]'s doc comment on the binding
+/// `spindle_core::identity::device_fp_of` checks), i.e. a device that can never authenticate,
+/// discovered only at connect time. It also encodes "both halves or neither" — the only
+/// combination a `device_fp` binding check can use — as a single `Option` rather than letting two
+/// independent `Option`s disagree.
+#[derive(Clone, Debug)]
+pub struct DevicePublicKeys {
+    pub sign_pk: Vec<u8>,
+    pub agree_pk: Vec<u8>,
 }
 
 /// `invited | active | revoked` (§A4b).
