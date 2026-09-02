@@ -27,6 +27,18 @@
 
 use std::fmt;
 
+/// Maximum number of enclosing arrays/maps a decoded item may sit inside.
+///
+/// `decode_one` recurses once per nesting level, so without a ceiling a small payload of
+/// repeated `0x81` (array, count 1) bytes overflows the stack and **aborts the process** — an
+/// abort, not a panic, so no caller can catch it. Both decode paths that reach this code are
+/// pre-authentication, so the payload need not come from a peer that authenticated.
+///
+/// 32 is eight times the deepest structure this protocol actually produces: across all 84
+/// canonical vectors in `vectors/*.json` — every artifact type, including VFS RPC listing
+/// replies and the codec's own torture cases — the maximum observed nesting depth is 4.
+pub const MAX_NESTING_DEPTH: usize = 32;
+
 /// A canonical CBOR data item.
 ///
 /// `NegInt(n)` represents the CBOR negative integer whose value is `-1 - n` (i.e. major type 1
@@ -167,6 +179,8 @@ pub enum CborError {
     MapKeyOrder { offset: usize },
     /// Extra bytes remained after decoding one complete top-level item.
     TrailingBytes { offset: usize },
+    /// An item was nested inside more than [`MAX_NESTING_DEPTH`] enclosing arrays/maps.
+    DepthLimitExceeded { offset: usize },
 }
 
 impl fmt::Display for CborError {
@@ -205,6 +219,10 @@ impl fmt::Display for CborError {
             CborError::TrailingBytes { offset } => {
                 write!(f, "trailing bytes after top-level item (offset {offset})")
             }
+            CborError::DepthLimitExceeded { offset } => write!(
+                f,
+                "nesting deeper than {MAX_NESTING_DEPTH} levels at offset {offset}"
+            ),
         }
     }
 }
@@ -221,7 +239,7 @@ pub fn canonical_encode(value: &CborValue) -> Vec<u8> {
 /// Decodes exactly one canonical CBOR item from `bytes`, rejecting the item (and any trailing
 /// bytes) if it is not fully canonical per RFC 8949 §4.2.1.
 pub fn canonical_decode(bytes: &[u8]) -> Result<CborValue, CborError> {
-    let (value, consumed) = decode_one(bytes, 0)?;
+    let (value, consumed) = decode_one(bytes, 0, 0)?;
     if consumed != bytes.len() {
         return Err(CborError::TrailingBytes { offset: consumed });
     }
@@ -368,7 +386,10 @@ fn read_arg(
     }
 }
 
-fn decode_one(bytes: &[u8], offset: usize) -> Result<(CborValue, usize), CborError> {
+fn decode_one(bytes: &[u8], offset: usize, depth: usize) -> Result<(CborValue, usize), CborError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(CborError::DepthLimitExceeded { offset });
+    }
     let head_offset = offset;
     let b = *bytes
         .get(offset)
@@ -427,7 +448,7 @@ fn decode_one(bytes: &[u8], offset: usize) -> Result<(CborValue, usize), CborErr
             }
             let mut items = Vec::with_capacity(count as usize);
             for _ in 0..count {
-                let (item, next) = decode_one(bytes, off)?;
+                let (item, next) = decode_one(bytes, off, depth + 1)?;
                 items.push(item);
                 off = next;
             }
@@ -446,14 +467,14 @@ fn decode_one(bytes: &[u8], offset: usize) -> Result<(CborValue, usize), CborErr
             let mut prev_key_bytes: Option<&[u8]> = None;
             for _ in 0..count {
                 let key_start = off;
-                let (key, after_key) = decode_one(bytes, off)?;
+                let (key, after_key) = decode_one(bytes, off, depth + 1)?;
                 let key_bytes = &bytes[key_start..after_key];
                 if let Some(prev) = prev_key_bytes {
                     if key_bytes <= prev {
                         return Err(CborError::MapKeyOrder { offset: key_start });
                     }
                 }
-                let (val, after_val) = decode_one(bytes, after_key)?;
+                let (val, after_val) = decode_one(bytes, after_key, depth + 1)?;
                 entries.push((key, val));
                 prev_key_bytes = Some(&bytes[key_start..after_key]);
                 off = after_val;
@@ -639,12 +660,58 @@ mod tests {
 
     #[test]
     fn count_bound_rejects_one_past_the_limit() {
+        // NOTE: this is a boundary test, not a regression test for the count bound — it passes
+        // with the guard deleted, because the decode loop already runs out of bytes one element
+        // short. `rejects_array_count_exceeding_input` / `rejects_map_count_exceeding_input` are
+        // the tests that fail without the guard.
         // array(4) with only three bytes left, and map(2) with only three bytes left: both are
         // one past what the input can supply, and both must fail before allocating.
         let err = canonical_decode(&[0x84, 0x01, 0x02, 0x03]).unwrap_err();
         assert!(matches!(err, CborError::UnexpectedEof { .. }));
         let err = canonical_decode(&[0xa2, 0x01, 0x02, 0x03]).unwrap_err();
         assert!(matches!(err, CborError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn accepts_nesting_up_to_the_limit() {
+        // MAX_NESTING_DEPTH enclosing arrays, each count 1, then a terminal uint.
+        let mut bytes = vec![0x81u8; MAX_NESTING_DEPTH];
+        bytes.push(0x00);
+        assert!(canonical_decode(&bytes).is_ok());
+    }
+
+    #[test]
+    fn rejects_nesting_past_the_limit() {
+        // One deeper. Without this guard a large N here aborts the process outright via stack
+        // overflow — an abort, not a panic, so no test harness could catch it.
+        let mut bytes = vec![0x81u8; MAX_NESTING_DEPTH + 1];
+        bytes.push(0x00);
+        let err = canonical_decode(&bytes).unwrap_err();
+        assert!(matches!(err, CborError::DepthLimitExceeded { .. }));
+    }
+
+    #[test]
+    fn deep_payload_that_previously_aborted_is_now_rejected() {
+        // 20_000 nested arrays: measured to abort a release build on an 8 MiB stack, and a
+        // debug build at a twentieth of that. Must now return an error instead.
+        let mut bytes = vec![0x81u8; 20_000];
+        bytes.push(0x00);
+        let err = canonical_decode(&bytes).unwrap_err();
+        assert!(matches!(err, CborError::DepthLimitExceeded { .. }));
+    }
+
+    #[test]
+    fn depth_limit_applies_through_maps_too() {
+        // map(1) { 0: <next> } repeated — the map branch recurses twice per level (key, value),
+        // so it needs its own coverage.
+        let mut bytes = Vec::new();
+        for _ in 0..(MAX_NESTING_DEPTH + 1) {
+            bytes.push(0xa1);
+            bytes.push(0x00);
+        }
+        bytes.push(0x00);
+        let err = canonical_decode(&bytes).unwrap_err();
+        assert!(matches!(err, CborError::DepthLimitExceeded { .. }));
     }
 
     #[test]

@@ -64,7 +64,7 @@ pub use artifacts::{
     AdminCommand, AdmissionToken, CapKind, Capability, DeviceCertificate, Envelope, HostOpKeyCert,
     ProtoError, RevocationRecord,
 };
-pub use canonical::{canonical_decode, canonical_encode, CborError, CborValue};
+pub use canonical::{canonical_decode, canonical_encode, CborError, CborValue, MAX_NESTING_DEPTH};
 pub use signaling::{
     AnswerPayload, IcePayload, OfferPayload, SignalingError, Transport, CERT_FP_LEN, KIND_ANSWER,
     KIND_ICE, KIND_OFFER, MAX_CANDIDATE_LEN, MAX_INBOX_LEN, MAX_PWD_LEN, MAX_UFRAG_LEN,

@@ -22,6 +22,18 @@
 // - indefinite-length items and the `break` stop code: always rejected
 
 /**
+ * Maximum number of enclosing arrays/maps a decoded item may sit inside. Mirrors
+ * `MAX_NESTING_DEPTH` in `canonical.rs` — same value, same rationale: `decodeOne` recurses once
+ * per nesting level, so without a ceiling a small payload of repeated `0x81` (array, count 1)
+ * bytes recurses without bound. In JS this raises a catchable `RangeError` (stack overflow)
+ * rather than aborting the process the way the Rust decoder does, so the limit exists here
+ * primarily to keep both decoders accepting exactly the same payloads. 32 is eight times the
+ * deepest structure this protocol actually produces (measured max nesting depth 4 across all 84
+ * canonical vectors in `vectors/*.json`).
+ */
+export const MAX_NESTING_DEPTH = 32;
+
+/**
  * A canonical CBOR data item. Mirrors Rust's `CborValue` enum field-for-field.
  *
  * `{ kind: "negint", value: n }` represents the CBOR negative integer whose logical value is
@@ -153,7 +165,8 @@ export type CborErrorKind =
   | "SimpleNotAllowed"
   | "InvalidUtf8"
   | "MapKeyOrder"
-  | "TrailingBytes";
+  | "TrailingBytes"
+  | "DepthLimitExceeded";
 
 const CBOR_ERROR_MESSAGES: Record<CborErrorKind, string> = {
   UnexpectedEof: "unexpected end of input",
@@ -166,6 +179,7 @@ const CBOR_ERROR_MESSAGES: Record<CborErrorKind, string> = {
   InvalidUtf8: "invalid UTF-8 in text string",
   MapKeyOrder: "map keys are not in strictly increasing canonical order",
   TrailingBytes: "trailing bytes after top-level item",
+  DepthLimitExceeded: "nesting deeper than 32 levels",
 };
 
 export class CborError extends Error {
@@ -190,7 +204,7 @@ export function canonicalEncode(value: CborValue): Uint8Array {
 /** Decodes exactly one canonical CBOR item from `bytes`, rejecting the item (and any trailing
  * bytes) if it is not fully canonical per RFC 8949 §4.2.1. */
 export function canonicalDecode(bytes: Uint8Array): CborValue {
-  const [value, consumed] = decodeOne(bytes, 0);
+  const [value, consumed] = decodeOne(bytes, 0, 0);
   if (consumed !== bytes.length) {
     throw new CborError("TrailingBytes", consumed);
   }
@@ -330,7 +344,10 @@ function readArg(
 
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
-function decodeOne(bytes: Uint8Array, offset: number): [CborValue, number] {
+function decodeOne(bytes: Uint8Array, offset: number, depth: number): [CborValue, number] {
+  if (depth > MAX_NESTING_DEPTH) {
+    throw new CborError("DepthLimitExceeded", offset);
+  }
   const headOffset = offset;
   if (offset >= bytes.length) throw new CborError("UnexpectedEof", offset);
   const b = bytes[offset];
@@ -374,7 +391,7 @@ function decodeOne(bytes: Uint8Array, offset: number): [CborValue, number] {
       const items: CborValue[] = [];
       let off = offAfterHeader;
       for (let i = 0; i < count; i++) {
-        const [item, next] = decodeOne(bytes, off);
+        const [item, next] = decodeOne(bytes, off, depth + 1);
         items.push(item);
         off = next;
       }
@@ -388,12 +405,12 @@ function decodeOne(bytes: Uint8Array, offset: number): [CborValue, number] {
       let prevKeyBytes: Uint8Array | null = null;
       for (let i = 0; i < count; i++) {
         const keyStart = off;
-        const [key, afterKey] = decodeOne(bytes, off);
+        const [key, afterKey] = decodeOne(bytes, off, depth + 1);
         const keyBytes = bytes.slice(keyStart, afterKey);
         if (prevKeyBytes !== null && compareBytes(keyBytes, prevKeyBytes) <= 0) {
           throw new CborError("MapKeyOrder", keyStart);
         }
-        const [val, afterVal] = decodeOne(bytes, afterKey);
+        const [val, afterVal] = decodeOne(bytes, afterKey, depth + 1);
         entries.push([key, val]);
         prevKeyBytes = keyBytes;
         off = afterVal;

@@ -3,7 +3,13 @@
 // rule the strict decoder must enforce, exercised independently of any Spindle artifact type.
 
 import { describe, expect, it } from "vitest";
-import { CborError, CborValue, canonicalDecode, canonicalEncode } from "../src/canonical.js";
+import {
+  CborError,
+  CborValue,
+  MAX_NESTING_DEPTH,
+  canonicalDecode,
+  canonicalEncode,
+} from "../src/canonical.js";
 import { hexToBytes, bytesToHex } from "../src/hex.js";
 import { loadVectorFile, normalize, parseCborTree } from "./helpers.js";
 
@@ -137,6 +143,46 @@ describe("canonical decode: rejection rules", () => {
   it("rejects an empty input", () => {
     const err = expectThrowsCborError(() => canonicalDecode(Uint8Array.from([])));
     expect(err.kind).toBe("UnexpectedEof");
+  });
+});
+
+describe("canonical decode: nesting depth limit", () => {
+  it("accepts nesting up to MAX_NESTING_DEPTH", () => {
+    // MAX_NESTING_DEPTH enclosing arrays, each count 1, then a terminal uint.
+    const bytes = new Uint8Array(MAX_NESTING_DEPTH + 1);
+    bytes.fill(0x81, 0, MAX_NESTING_DEPTH);
+    bytes[MAX_NESTING_DEPTH] = 0x00;
+    expect(() => canonicalDecode(bytes)).not.toThrow();
+  });
+
+  it("rejects nesting one deeper than MAX_NESTING_DEPTH", () => {
+    const depth = MAX_NESTING_DEPTH + 1;
+    const bytes = new Uint8Array(depth + 1);
+    bytes.fill(0x81, 0, depth);
+    bytes[depth] = 0x00;
+    const err = expectThrowsCborError(() => canonicalDecode(bytes));
+    expect(err.kind).toBe("DepthLimitExceeded");
+  });
+
+  it("rejects a 20,000-deep payload instead of overflowing the stack", () => {
+    const depth = 20_000;
+    const bytes = new Uint8Array(depth + 1);
+    bytes.fill(0x81, 0, depth);
+    bytes[depth] = 0x00;
+    const err = expectThrowsCborError(() => canonicalDecode(bytes));
+    expect(err.kind).toBe("DepthLimitExceeded");
+  });
+
+  it("applies the depth limit through maps too", () => {
+    // map(1) { 0: <next> } repeated — the map branch recurses twice per level (key, value), so
+    // it needs its own coverage.
+    const bytes: number[] = [];
+    for (let i = 0; i < MAX_NESTING_DEPTH + 1; i++) {
+      bytes.push(0xa1, 0x00);
+    }
+    bytes.push(0x00);
+    const err = expectThrowsCborError(() => canonicalDecode(Uint8Array.from(bytes)));
+    expect(err.kind).toBe("DepthLimitExceeded");
   });
 });
 
