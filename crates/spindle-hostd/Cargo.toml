@@ -51,3 +51,31 @@ async-nats = { workspace = true }
 # crate-local `features = [...]` override is added on top of it.
 tokio = { workspace = true }
 thiserror = { workspace = true }
+
+# `tests/live_hostd.rs`'s own remaining code (Stage 4 part 2, td-539ffa): the `#[ignore]`d live
+# test that drives `HostDaemon` — and therefore the production `HostConnectAuthorizer<
+# SqliteDeviceLookup>` — against `deploy/docker-compose.yml`'s real NATS Auth Callout, in place of
+# `crates/spindle-net/tests/live_signaling.rs`'s test-local `RegistryAuthorizer`.
+[dev-dependencies]
+# The test seeds a real, on-disk `spindle_vfs::store::Store` (via `Store::open`) at a throwaway
+# path, then hands that same path to `HostDaemon::new` so the daemon opens its own independent
+# connection to it. Crate-local (not a workspace dependency), matching the identical precedent
+# already set by `spindle-vfs`'s and `spindle-host-core`'s own `Cargo.toml`s for exactly this use
+# (a disposable temp directory for a store/confinement test, never a runtime dependency).
+tempfile = "3"
+
+# The test sends a real `spindle_proto::VfsRequestEnvelope` (`VfsRequest::Whoami`) over the QUIC
+# control stream and decodes the `VfsReply` that comes back. `spindle-proto` is already a
+# transitive dependency of this crate (via `spindle-core`/`spindle-net`/`spindle-vfs`/
+# `spindle-host-core`), but an integration test can only name a crate directly if it is a direct
+# dependency of the package under test — hence this explicit dev-dependency.
+spindle-proto = { path = "../spindle-proto" }
+
+# The NATS Auth Callout bootstrap fixtures (`fixtures::DeviceIdentity`/`HostRootIdentity`) and
+# live-stack connection helpers (`connect_device`/`connect_host`/`nats_url`/
+# `assert_no_permission_violation`) this test needs are the exact same ones
+# `crates/spindle-net/tests/live_signaling.rs` uses, graduated into this shared dev-only crate so
+# a second, driftable copy of ~190 lines of callout/certificate bootstrap is never written — see
+# that crate's own module doc comment for the full rationale (the 2026-08-31 wire-schema incident
+# `tests/live_hostd.rs`'s own module doc comment also carries forward).
+spindle-test-fixtures = { path = "../spindle-test-fixtures" }

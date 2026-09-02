@@ -3337,7 +3337,10 @@ dependencies = [
  "spindle-core",
  "spindle-host-core",
  "spindle-net",
+ "spindle-proto",
+ "spindle-test-fixtures",
  "spindle-vfs",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
 ]
