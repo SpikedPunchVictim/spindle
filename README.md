@@ -177,15 +177,20 @@ macOS/Windows/Linux host (ADR-010); use the mise path above for that.
 | Windows | MSVC C++ Build Tools (for Tauri) | https://visualstudio.microsoft.com/visual-cpp-build-tools/ |
 | Linux | webkit2gtk (for Tauri) | `sudo apt install libwebkit2gtk-4.1-dev build-essential libssl-dev pkg-config` |
 
-## Scaffold status
+## Build status
 
-**This scaffold has not been compile-verified.** It was generated on a machine with no Rust
-toolchain (`cargo`) and no `just` installed, so no Rust crate here has been built, tested, or even
-`cargo check`ed, and no `justfile` target has been executed end to end. All JSON/YAML/TOML files
-were validated syntactically (JSON via `node`, YAML/TOML by careful hand construction) but not
-functionally exercised. Treat every crate and package as a structural skeleton — filenames,
-dependency lists, and comments matching `docs/DESIGN.md` §A9c — until the first real
-implementation stage (see `IMPLEMENTATION_PLAN.md`) builds and tests it for real.
+The workspace builds, tests, and lints on Linux, macOS, and Windows; CI (`.github/workflows/`) runs
+`cargo fmt --check`, `cargo clippy -D warnings`, and `cargo test --workspace` on all three. As of
+2026-09-01 the Rust suite is **574 passing, 0 failing, 11 ignored**. The ignored tests are the ones
+`cargo test` cannot run unaided: three need a live stack (`docker compose -f
+deploy/docker-compose.yml up -d`), and the rest are Windows-only path-confinement tests that compile
+everywhere but only execute on Windows.
+
+Not every stage is implemented, and a directory existing does not mean the code inside it works.
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) is the authoritative record of what is done, what
+is in progress, and what has been proven only in a test rather than against live infrastructure —
+read it before assuming a subsystem exists. The implemented work lives in the Rust crates under
+`crates/`; `apps/host/`, `apps/client/`, and `apps/web/` are still scaffolding.
 
 ## Where to go next
 

@@ -45,7 +45,7 @@ that `nfp`.
 | Subject | Publisher | Subscriber | Purpose | Status |
 |---------|-----------|------------|---------|--------|
 | `registry.revoke.<hfp>` | host `hfp` only | broker helper | host-signed revocation/epoch records; durable; helper asserts subject token == record `host_fp`; per-host token bucket | ✅ |
-| `registry.devcert.<hfp>` | host `hfp` only | broker helper | host-signed device certificate; durable; helper asserts subject token == the cert's `host_fp`; per-host token bucket | ❌ no handler exists |
+| `registry.devcert.<hfp>` | host `hfp` only | broker helper | host-signed device certificate; durable; republished on **every** host connect (A10.37); helper asserts subject token == the cert's `host_fp`; per-host token bucket | ❌ no handler exists |
 | `registry.admin.>` | operator (mTLS + operator cert) | broker helper | signed admin commands (A3b); replies via `allow_responses` | ❌ no handler exists |
 
 ## System plane (`$SYS`) — absent from A5's tables until now
@@ -86,10 +86,11 @@ the registry for distribution, and pinned by the client.
 
 - **Authoritative — the host.** The host mints the cert (its **operating** key signs it, per A10.35) and persists it
   in its own store. The host is its only writer.
-- **Distribution cache — the broker helper.** The host publishes on `registry.devcert.<hfp>`; the helper stores it
-  durably and serves it on demand via `helper.devcert.get.<nfp>`. The helper is an **untrusted carrier by
-  construction**: A10.34 requires the cert to reach the peer over a self-verifying root→op→device signature chain,
-  "never by trusting the carrier", so caching it at the registry adds no trust and grants the registry nothing.
+- **Distribution cache — the broker helper.** The host publishes on `registry.devcert.<hfp>` **on every connect to
+  the registry** (see Open items); the helper stores it durably and serves it on demand via
+  `helper.devcert.get.<nfp>`. The helper is an **untrusted carrier by construction**: A10.34 requires the cert to
+  reach the peer over a self-verifying root→op→device signature chain, "never by trusting the carrier", so caching
+  it at the registry adds no trust and grants the registry nothing.
 - **Pinned copy — the client.** The invite carries the host's keys at first contact (A10.3); the client pins the
   **root** and verifies every subsequent certificate's chain up to it.
 
@@ -121,8 +122,14 @@ every member.
 
 ## Open items
 
-- **[USER DECISION]** Should the host publish its device certificate on **every** registry connect, or only on
-  rotation? Every-connect is simpler and idempotent; rotation-only is cheaper. This mirrors the same question the
-  A4c draft raises for revocation reconciliation, and the two should be answered the same way.
+- **DECIDED 2026-09-01 (user): publish on every host connect.** The host republishes its device certificate to
+  `registry.devcert.<hfp>` each time it connects to the registry, not only after a rotation. Every-connect covers
+  every scenario through one code path: it needs no rotation-detection state on the host, it is idempotent at the
+  helper (an identical cert overwrites itself harmlessly), and it self-heals a helper that lost its cached copy —
+  whereas rotation-only leaves a host permanently unreachable by new clients if the single publish that mattered was
+  dropped. The cost is one small publish per host connect, already bounded by the per-host token bucket.
+- **Not settled by the above.** A4c's two `[USER DECISION]` items — periodic revocation reconciliation versus
+  trigger-driven only, and whether the digest earns its keep — remain open. This decision is consistent with A4c's
+  existing host-connect trigger but does not answer either question.
 - **No owner yet.** `apps/host/` is still a README, so nothing exists to publish the certificate or answer a resync.
   Specify now, implement with the host daemon.
