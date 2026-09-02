@@ -1,0 +1,53 @@
+[package]
+name = "spindle-hostd"
+version.workspace = true
+edition.workspace = true
+
+# Why this is a separate crate rather than a `[[bin]]` inside `spindle-host-core` (Stage 4,
+# td-539ffa):
+#
+# `spindle-host-core` is a library other things link *in-process* — most importantly, per
+# DESIGN.md §A10.26 ("host = single Tauri tray app": "daemon in-process, tray always on"),
+# `apps/host`'s Tauri shell (Stage 7) runs the whole host daemon inside its own process rather than
+# shelling out to a separate binary. `async-nats` and a Tokio runtime are exactly the kind of
+# dependency that library must not carry: `async-nats` pulls in its own connection-management
+# machinery and Tokio brings a runtime a Tauri app already has opinions about owning itself. If this
+# crate's wiring lived as a `[[bin]]` inside `spindle-host-core`, both would ride along as
+# `spindle-host-core` dependencies for *every* consumer of that crate, including the Tauri shell
+# that must never see them. Splitting the daemon assembly into its own crate keeps
+# `spindle-host-core` exactly what its own module docs already describe it as — the injected-trait
+# implementations (`HostConnectAuthorizer`, `VfsSessionHandler`) and the serve loop they drive — and
+# confines "own a NATS client, own a Tokio runtime, run a process" to the one place that actually
+# needs it.
+#
+# `apps/host` (Stage 7) calls **into** this crate rather than duplicating its wiring — user decision
+# 2026-09-02. Concretely: the Tauri shell constructs its own already-connected `async_nats::Client`
+# (callout-authenticated the same way this crate's own binary would be) and hands it, along with the
+# host's identity and store path, to `HostDaemon::new`/`run` in `src/lib.rs` below. That is the
+# whole point of this crate being a library first (see that module's doc comment) — `src/main.rs`
+# is a thin, dev-only caller of the exact same assembly, not a second implementation of it.
+#
+# Dependency set approved by the user for exactly this crate (no others — see this crate's task
+# brief): `spindle-core`, `spindle-net`, `spindle-vfs`, `spindle-host-core` supply the identity,
+# signaling, VFS, and daemon-wiring types `src/lib.rs` assembles; `async-nats` is the caller-owned
+# NATS client type `HostDaemon` is constructed from (never connected by this crate itself — see
+# `src/lib.rs`'s module doc comment); `tokio` backs `HostDaemon::run`'s `async fn` and the
+# `SignalingHost::run` future it drives — a real caller (a future `#[tokio::main]` binary, or the
+# Tauri shell's own runtime) needs it to actually execute that future, even though `src/main.rs`
+# itself does not use it directly today (see that file's own module doc comment for why it is
+# currently a synchronous stub rather than a real `#[tokio::main]` entry point); `thiserror` matches
+# every other library crate in this workspace's error-enum convention (see
+# `spindle-host-core/Cargo.toml`'s own comment on the same point).
+[dependencies]
+spindle-core = { path = "../spindle-core" }
+spindle-net = { path = "../spindle-net" }
+spindle-vfs = { path = "../spindle-vfs" }
+spindle-host-core = { path = "../spindle-host-core" }
+async-nats = { workspace = true }
+# The workspace pin already carries `features = ["full"]` (see the root `Cargo.toml`'s
+# `[workspace.dependencies]`), so `workspace = true` alone already gives this crate everything a
+# minimal `rt-multi-thread` + `macros` build would ask for (and matches every other crate in this
+# workspace that depends on `tokio`, none of which narrows the workspace feature set) — no
+# crate-local `features = [...]` override is added on top of it.
+tokio = { workspace = true }
+thiserror = { workspace = true }

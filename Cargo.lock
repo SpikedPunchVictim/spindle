@@ -3330,11 +3330,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "spindle-hostd"
+version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "spindle-core",
+ "spindle-host-core",
+ "spindle-net",
+ "spindle-vfs",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "spindle-net"
 version = "0.1.0"
 dependencies = [
  "async-nats",
- "base64",
  "bytes",
  "futures-util",
  "nkeys",
@@ -3349,6 +3361,7 @@ dependencies = [
  "sha2",
  "spindle-core",
  "spindle-proto",
+ "spindle-test-fixtures",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -3358,6 +3371,17 @@ dependencies = [
 [[package]]
 name = "spindle-proto"
 version = "0.1.0"
+
+[[package]]
+name = "spindle-test-fixtures"
+version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "base64",
+ "nkeys",
+ "spindle-core",
+ "spindle-proto",
+]
 
 [[package]]
 name = "spindle-vfs"

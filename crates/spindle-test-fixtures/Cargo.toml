@@ -1,0 +1,35 @@
+# DEV-ONLY CRATE. This crate ships no production code — only the NATS Auth Callout bootstrap
+# fixtures and live-stack connection helpers that `crates/spindle-net/tests/live_signaling.rs`
+# graduated out of its own `mod fixtures` (see that file's module doc comment for the full
+# narrative: the callout bootstrap recipe, the 2026-08-31 incident, the "rebuild the helper image"
+# warning). It exists solely to be a `[dev-dependencies]` entry of other crates' integration tests
+# (`spindle-net`'s `tests/live_signaling.rs`, and `spindle-hostd`'s own live test) — it must never
+# appear in any crate's `[dependencies]`.
+[package]
+name = "spindle-test-fixtures"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+# Crate layering law (A9c boundary rule 3): the fixtures below mint real `spindle-core` artifact
+# types (`RootKey`, `DeviceKey`, `Fingerprint`, `SigningKey`) and encode/decode real
+# `spindle-proto` wire types (`DeviceCertificate`, `HostOpKeyCert`, `Capability`, `CborValue`) —
+# the same layering `spindle-net` itself sits on.
+spindle-core = { path = "../spindle-core" }
+spindle-proto = { path = "../spindle-proto" }
+
+# The connection helpers below build and drive real `async_nats` connections against the live
+# stack's Auth Callout (CONNECT with nkey + auth_token, event-callback based permission-violation
+# observation) — see `spindle-net`'s own `Cargo.toml` for the workspace-wide why-this-version
+# rationale (condensed there rather than repeated here).
+async-nats = { workspace = true }
+
+# Generates the per-connection session nkey (ed25519) each NATS CONNECT presents, and decodes an
+# nkey-encoded public key back to its raw 32 bytes so the test can compute `nats_fp = hash(nats_pk)`
+# (DESIGN.md §A4) — the value the device/host certificate must be bound to.
+nkeys = "0.4"
+# The CONNECT `auth_token` is "compact CBOR ... base64url" (DESIGN.md §A4); `spindle_helper::
+# auth_token` only decodes that envelope, so the test builds the encode half itself and needs the
+# same `URL_SAFE_NO_PAD` alphabet the helper decodes with.
+base64 = "0.22"
