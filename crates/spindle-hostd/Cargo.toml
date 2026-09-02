@@ -22,20 +22,23 @@ edition.workspace = true
 #
 # `apps/host` (Stage 7) calls **into** this crate rather than duplicating its wiring — user decision
 # 2026-09-02. Concretely: the Tauri shell constructs its own already-connected `async_nats::Client`
-# (callout-authenticated the same way this crate's own binary would be) and hands it, along with the
-# host's identity and store path, to `HostDaemon::new`/`run` in `src/lib.rs` below. That is the
-# whole point of this crate being a library first (see that module's doc comment) — `src/main.rs`
-# is a thin, dev-only caller of the exact same assembly, not a second implementation of it.
+# (callout-authenticated the same way this crate's live integration test, `tests/live_hostd.rs`,
+# authenticates its own client) and hands it, along with the host's identity and store path, to
+# `HostDaemon::new`/`run` in `src/lib.rs` below. That is the whole point of this crate being a
+# library first (see that module's doc comment) — this crate ships no binary of its own today (see
+# `src/lib.rs`'s own module doc comment, "Why this crate ships no binary (yet)") and won't until
+# Stage 7.
 #
 # Dependency set approved by the user for exactly this crate (no others — see this crate's task
 # brief): `spindle-core`, `spindle-net`, `spindle-vfs`, `spindle-host-core` supply the identity,
 # signaling, VFS, and daemon-wiring types `src/lib.rs` assembles; `async-nats` is the caller-owned
 # NATS client type `HostDaemon` is constructed from (never connected by this crate itself — see
 # `src/lib.rs`'s module doc comment); `tokio` backs `HostDaemon::run`'s `async fn` and the
-# `SignalingHost::run` future it drives — a real caller (a future `#[tokio::main]` binary, or the
-# Tauri shell's own runtime) needs it to actually execute that future, even though `src/main.rs`
-# itself does not use it directly today (see that file's own module doc comment for why it is
-# currently a synchronous stub rather than a real `#[tokio::main]` entry point); `thiserror` matches
+# `SignalingHost::run` future it drives — this crate ships no binary to execute that future itself
+# (see `src/lib.rs`'s own module doc comment, "Why this crate ships no binary (yet)");
+# `tests/live_hostd.rs`'s live integration test drives it on a real Tokio runtime today, and a real
+# Stage 7 caller (`apps/host`'s Tauri shell, or a binary this crate may grow then) will need the
+# same runtime to run it in production; `thiserror` matches
 # every other library crate in this workspace's error-enum convention (see
 # `spindle-host-core/Cargo.toml`'s own comment on the same point).
 [dependencies]

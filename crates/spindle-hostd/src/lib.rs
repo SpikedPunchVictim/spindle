@@ -1,16 +1,40 @@
 //! [`HostDaemon`] — the assembled host process: the injected-trait implementations
 //! `spindle-host-core` supplies (`HostConnectAuthorizer`, `VfsSessionHandler`) wired to a real
 //! `spindle_net::signaling::host::SignalingHost` and driven to completion. This crate exists so
-//! that assembly is written exactly once, in a place both `src/main.rs` (this crate's dev-only
-//! binary) and, eventually, `apps/host`'s Tauri shell (Stage 7) can call — see this crate's
-//! `Cargo.toml` header comment for why the wiring could not simply live as a `[[bin]]` inside
-//! `spindle-host-core` itself (in short: that would drag `async-nats` and a Tokio runtime into a
-//! library the Tauri shell links in-process, per DESIGN.md §A10.26).
+//! that assembly is written exactly once, in a place both this crate's own live integration test
+//! (`tests/live_hostd.rs`) and, eventually, `apps/host`'s Tauri shell (Stage 7) can call — see
+//! this crate's `Cargo.toml` header comment for why the wiring could not simply live as a
+//! `[[bin]]` inside `spindle-host-core` itself (in short: that would drag `async-nats` and a
+//! Tokio runtime into a library the Tauri shell links in-process, per DESIGN.md §A10.26).
 //!
 //! The library, not the binary, is the deliverable. `apps/host` is a user decision away
 //! (2026-09-02) from calling directly into [`HostDaemon`] rather than re-deriving this wiring on
 //! its own side of the boundary — every piece of assembly below is therefore written to be called
-//! from a non-`main` caller, not just from this crate's own `src/main.rs`.
+//! from a non-`main` caller, not just from this crate's own live integration test
+//! (`tests/live_hostd.rs`).
+//!
+//! # Why this crate ships no binary (yet)
+//!
+//! This crate is library-only today: no `src/main.rs`, no `[[bin]]` target. [`HostDaemon::new`]
+//! needs this host's envelope [`DeviceKey`] and root [`Fingerprint`] (`host_fp`) — see this
+//! module's "Two fingerprints, not one" section below — and DESIGN.md §A4 puts custody of a
+//! host's root key in the OS keystore, the same custody model §A4 states for a person's identity
+//! root key. That keystore integration is Stage 7 work and does not exist anywhere in this
+//! workspace yet, confirmed against `crates/spindle-vfs/src/store/schema.rs`, which has no table
+//! for a host root key, an operating key, or a device key of any kind.
+//!
+//! The only public way this workspace can produce a [`DeviceKey`] today is
+//! [`DeviceKey::generate`] (a fresh, unpersisted random keypair — useless here, since a real host
+//! needs the *same* identity across restarts) or [`DeviceKey::from_seeds`], whose own doc comment
+//! reads "Deterministic construction from two 32-byte seeds — TEST-ONLY / crypto-vector use."
+//! Wiring seeds in from the environment would satisfy the type signature while being a dishonest
+//! implementation of key custody, not a real one. A binary that cannot possibly work is worse
+//! than no binary at all — someone runs it, it fails, and they conclude the daemon itself is
+//! broken — so no binary ships until there is something real for it to do.
+//!
+//! Stage 7, when OS-keystore-backed host identity lands, is when a real entry point appears —
+//! either a binary here, or, per this module's own opening paragraphs, `apps/host`'s Tauri shell
+//! calling [`HostDaemon`] directly instead.
 //!
 //! # The caller-owned NATS client rule
 //!
@@ -18,10 +42,10 @@
 //! connects one itself, for the same reason `spindle_net::signaling::host::SignalingHost`'s own
 //! doc comment states it: "holds the caller-owned NATS client (never connects one itself)". The
 //! connection has to be callout-authenticated (DESIGN.md §A4/§A5) by whatever code holds the
-//! credentials — this crate's `src/main.rs` in dev, the Tauri shell's own connection setup in
-//! Stage 7 — and a live test needs to be able to inject a connection of its own (a fake or
-//! sandboxed `nats-server`) rather than have one materialize from environment state this crate
-//! reached into on its own.
+//! credentials — this crate's own live integration test (`tests/live_hostd.rs`) in dev, the
+//! Tauri shell's own connection setup in Stage 7 — and a live test needs to be able to inject a
+//! connection of its own (a fake or sandboxed `nats-server`) rather than have one materialize
+//! from environment state this crate reached into on its own.
 //!
 //! # Two fingerprints, not one
 //!
@@ -76,9 +100,10 @@ use spindle_net::signaling::host::SignalingHost;
 use spindle_net::signaling::SignalingError;
 use spindle_vfs::store::StoreError;
 
-/// Re-exported so a caller — this crate's own `src/main.rs`, `apps/host`'s Tauri shell (Stage 7),
-/// or a test — can configure [`HostDaemon::run`]'s connect/session lifecycle knobs without also
-/// depending on `spindle-net` directly for this one type.
+/// Re-exported so a caller — this crate's own live integration test (`tests/live_hostd.rs`)
+/// today, or `apps/host`'s Tauri shell in Stage 7 — can configure [`HostDaemon::run`]'s
+/// connect/session lifecycle knobs without also depending on `spindle-net` directly for this one
+/// type.
 pub use spindle_net::signaling::host::HostOptions;
 
 /// The real wall-clock `now_fn`: `SystemTime::now()` truncated to whole seconds since the Unix

@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.19) + Execution Plan
+# Spindle — System Design Document (draft v0.9.20) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -46,6 +46,8 @@
 > v0.9.19: A9c manifest gains two crates — `spindle-hostd` (the host daemon binary, library-first) and
 > `spindle-test-fixtures` (dev-only shared NATS auth-callout fixtures for the live test suites) (user decision,
 > 2026-09-02).
+> v0.9.20: `spindle-hostd` drops its binary target — library-only until Stage 7 lands host key custody (user
+> decision, 2026-09-02).
 
 ---
 
@@ -727,10 +729,11 @@ spindle/
 │   │                           #   (native↔native), trickle ICE, transfer manager (A8)
 │   ├── spindle-vfs/            #   shares/groups/entitlements engine, cap-std confinement, audit chain (A4b); SQLite
 │   ├── spindle-host-core/      #   host library: members, invites, revocation, VFS RPC server, live-ops
-│   ├── spindle-hostd/          #   host daemon: wires spindle-host-core's HostConnectAuthorizer + VfsSessionHandler
-│   │                           #   onto spindle-net's signaling host, runs the connect path. Library-first —
-│   │                           #   apps/host's tray app runs it in-process (§A10.26), keeping async-nats + Tokio out
-│   │                           #   of spindle-host-core, which the Tauri shell links.
+│   ├── spindle-hostd/          #   host daemon library: wires spindle-host-core's HostConnectAuthorizer +
+│   │                           #   VfsSessionHandler onto spindle-net's signaling host, runs the connect path.
+│   │                           #   Library-only — no bin target until Stage 7 lands host key custody (§A4).
+│   │                           #   apps/host's tray app runs it in-process (§A10.26), keeping async-nats +
+│   │                           #   Tokio out of spindle-host-core, which the Tauri shell links.
 │   ├── spindle-client-core/    #   client library: sessions, pinning store, transfer queue, key custody
 │   ├── spindle-helper/         #   broker-helper service bin: callout responder, presence, TURN, revocation
 │   │                           #   store, admin verifier; Postgres (sqlx)
@@ -1049,6 +1052,20 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.20 (2026-09-02)** — `spindle-hostd` drops its binary target; the crate is library-only until Stage 7
+  (user decision). Why: the entry point could only ever have been the always-failing stub v0.9.19 described, since
+  §A4's OS-keystore host key custody does not exist yet. Shipping a binary that cannot start invites someone to
+  run it and misdiagnose the daemon as broken. Removing the target makes the crate's real deliverable — the
+  `HostDaemon` library assembly — the only thing callable. What is preserved: nothing about the wiring changes.
+  `HostDaemon` still assembles `HostConnectAuthorizer<SqliteDeviceLookup>` and `VfsSessionHandler` onto
+  `SignalingHost`, and that assembly was proven live on 2026-09-02 against the composed stack
+  (`crates/spindle-hostd/tests/live_hostd.rs`, 2 tests green; the accompanying `spindle-net` live signaling suite,
+  3 tests green). Rejected alternative: keeping the stub binary as a placeholder — rejected because an
+  always-failing entry point is a false signal about the daemon's health, the exact class of defect this project
+  treats as severity zero. When it returns: Stage 7, alongside OS-keystore-backed host identity — at which point
+  either this crate regains an entry point or `apps/host`'s Tauri shell calls `HostDaemon` directly, per the
+  existing §A10.26 decision. Note that the `tokio` dependency stays, since it backs `HostDaemon::run`'s async fn
+  and the live test executes that future.
 - **v0.9.19 (2026-09-02)** — A9c manifest gains two crates. (1) `spindle-hostd` added (user decision): depends on
   `spindle-core`, `spindle-net`, `spindle-vfs`, `spindle-host-core`, `async-nats`, `tokio`, `thiserror`. Rejected: a
   `[[bin]]` inside `spindle-host-core` — that would make `async-nats` and a Tokio runtime dependencies of the
