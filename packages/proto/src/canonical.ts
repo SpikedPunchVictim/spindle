@@ -27,9 +27,11 @@
  * per nesting level, so without a ceiling a small payload of repeated `0x81` (array, count 1)
  * bytes recurses without bound. In JS this raises a catchable `RangeError` (stack overflow)
  * rather than aborting the process the way the Rust decoder does, so the limit exists here
- * primarily to keep both decoders accepting exactly the same payloads. 32 is eight times the
- * deepest structure this protocol actually produces (measured max nesting depth 4 across all 84
- * canonical vectors in `vectors/*.json`).
+ * primarily to keep both decoders accepting exactly the same payloads. 32 is roughly ten times
+ * the deepest structure this protocol actually produces: across all 84 canonical vectors in
+ * `vectors/*.json`, the deepest reaches `depth` 3, in the same units compared against this
+ * constant (top-level item at `depth` 0). Counting items instead of depth levels gives 4 —
+ * state which convention you mean if you re-derive this.
  */
 export const MAX_NESTING_DEPTH = 32;
 

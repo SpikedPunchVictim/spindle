@@ -10,6 +10,7 @@ export {
   canonicalEncode,
   canonicalDecode,
   cborValueEquals,
+  MAX_NESTING_DEPTH,
 } from "./canonical.js";
 export type { CborErrorKind } from "./canonical.js";
 

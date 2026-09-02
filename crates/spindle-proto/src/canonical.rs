@@ -34,9 +34,12 @@ use std::fmt;
 /// abort, not a panic, so no caller can catch it. Both decode paths that reach this code are
 /// pre-authentication, so the payload need not come from a peer that authenticated.
 ///
-/// 32 is eight times the deepest structure this protocol actually produces: across all 84
-/// canonical vectors in `vectors/*.json` — every artifact type, including VFS RPC listing
-/// replies and the codec's own torture cases — the maximum observed nesting depth is 4.
+/// 32 is roughly ten times the deepest structure this protocol actually produces. Measured
+/// across all 84 canonical vectors in `vectors/*.json` — every artifact type, including VFS RPC
+/// listing replies and the codec's own torture cases — the deepest reaches `depth` 3 here, in
+/// the same units this constant is compared against: the top-level item is decoded at `depth`
+/// 0, so a `{"item": [{"id": 1}]}` chain reaches 3 at its innermost scalar. (Counting items
+/// along that chain instead gives 4 — state which convention you mean if you re-derive this.)
 pub const MAX_NESTING_DEPTH: usize = 32;
 
 /// A canonical CBOR data item.
@@ -221,7 +224,7 @@ impl fmt::Display for CborError {
             }
             CborError::DepthLimitExceeded { offset } => write!(
                 f,
-                "nesting deeper than {MAX_NESTING_DEPTH} levels at offset {offset}"
+                "nesting deeper than {MAX_NESTING_DEPTH} levels (offset {offset})"
             ),
         }
     }
