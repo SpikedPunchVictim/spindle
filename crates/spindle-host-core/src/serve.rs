@@ -9,13 +9,20 @@
 //!
 //! `VfsRpcServer::handle_bytes` takes `&self` (its caches are `RefCell`-based — see
 //! [`crate::server`]'s module doc comment — so it is intentionally `!Sync`, single-threaded by
-//! design). That fact alone dictates this module's shape: **one task, one borrowed server, for
-//! the lifetime of one control stream.** [`serve_control_stream`] takes `&VfsRpcServer<'_>` (not
-//! an owned value, not a `&mut`, and absolutely no `Arc<Mutex<_>>`/`unsafe impl Sync` wrapper —
-//! the task brief is explicit that this crate must not introduce either) and drives it in a plain
-//! read-dispatch-write loop on whatever task calls this function. A real host process constructs
-//! one `VfsRpcServer` and one task per accepted session, exactly mirroring
-//! `spindle_net::quic::QuicServer::accept`'s per-session `ControlStream`.
+//! design). That fact alone dictates this module's shape: **one task, one server, for the
+//! lifetime of one control stream.** [`serve_control_stream`] takes the server **by value**
+//! (not a `&VfsRpcServer<'_>`, not a `&mut`, and absolutely no `Arc<Mutex<_>>`/`unsafe impl Sync`
+//! wrapper — the task brief is explicit that this crate must not introduce either) and drives it
+//! in a plain read-dispatch-write loop on whatever task calls this function. Taking ownership is
+//! precisely what avoids needing either of those forbidden wrappers: `VfsRpcServer` is
+//! deliberately `!Sync` (its `RefCell` caches), so `&VfsRpcServer` is `!Send` and could not be
+//! held across an await point inside the `Send` future a `spindle_net::signaling::SessionHandler`
+//! must return (`SignalingHost::run` `tokio::spawn`s it) — an owned `VfsRpcServer<Store>` holds
+//! only owned `Send` values, so the future built around it is `Send` automatically. The caller
+//! keeps no handle to the server afterward, which is correct for a per-session server whose
+//! caches die with the session: a real host process constructs one `VfsRpcServer` and one task
+//! per accepted session, exactly mirroring `spindle_net::quic::QuicServer::accept`'s per-session
+//! `ControlStream`.
 //!
 //! # Framing vs. decode violations: close, don't reply (DESIGN.md §A5)
 //!
@@ -40,6 +47,8 @@
 
 use crate::server::{SessionContext, VfsRpcServer};
 use spindle_net::framing::{read_frame, write_frame, FramingError};
+use spindle_vfs::store::Store;
+use std::borrow::Borrow;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// A framing-layer or decode-layer protocol violation — see the module doc comment for why
@@ -76,14 +85,15 @@ pub enum ServeError {
 /// RPC has no pipelining), so there is no combined-stream abstraction to gain by fusing them
 /// first — two plain generic parameters is the boring, direct fit for `handle_bytes`'s `&self`
 /// (no `&mut` needed, no lifetime gymnastics forced by this loop).
-pub async fn serve_control_stream<R, W>(
-    server: &VfsRpcServer<'_>,
+pub async fn serve_control_stream<S, R, W>(
+    server: VfsRpcServer<S>,
     ctx: &SessionContext,
     now_fn: impl Fn() -> u64,
     mut recv: R,
     mut send: W,
 ) -> Result<(), ServeError>
 where
+    S: Borrow<Store>,
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {

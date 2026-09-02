@@ -384,7 +384,7 @@ async fn full_session_over_real_quic_control_stream() {
     // this crate's "never a wall clock inside the pipeline" convention (`VfsRpcServer::handle`'s
     // own `ts` parameter) — the loop's `now_fn` seam this slice adds is exercised here, not just
     // documented.
-    let result = serve_control_stream(&server, &ctx, || 1u64, control.recv, control.send).await;
+    let result = serve_control_stream(server, &ctx, || 1u64, control.recv, control.send).await;
     assert!(
         result.is_ok(),
         "the control-stream loop must end cleanly once the client finishes its send side: {result:?}"
@@ -527,7 +527,7 @@ async fn oversized_frame_is_a_protocol_violation_with_no_reply() {
         device_fp: Some(device_fp),
     };
     let server = VfsRpcServer::new(&h.store);
-    let result = serve_control_stream(&server, &ctx, || 1u64, control.recv, control.send).await;
+    let result = serve_control_stream(server, &ctx, || 1u64, control.recv, control.send).await;
     assert!(
         matches!(result, Err(ServeError::Framing(_))),
         "an oversized frame must surface as a framing protocol violation, got {result:?}"

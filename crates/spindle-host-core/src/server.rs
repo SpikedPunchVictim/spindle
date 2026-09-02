@@ -27,6 +27,7 @@ use spindle_vfs::audit::AuditEntry;
 use spindle_vfs::confine::{self, identity as confine_identity};
 use spindle_vfs::model::{Member, MemberStatus, Perms, Share, VirtualPath};
 use spindle_vfs::store::Store;
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write as _};
 
@@ -56,32 +57,43 @@ struct Candidate {
     perms: Perms,
 }
 
-/// The host-side VFS RPC enforcement pipeline. Holds a borrow of the `Store` it enforces against
-/// (never owns it — a real host process owns exactly one `Store` per running host and constructs
-/// this server around a reference to it) plus this crate's caches/state
+/// The host-side VFS RPC enforcement pipeline. The store holder is a type parameter so the same
+/// server serves both shapes: `VfsRpcServer<&Store>` for a caller that already owns a `Store` and
+/// only lends it (tests, single-threaded callers), and `VfsRpcServer<Store>` for a per-session
+/// server that must live in a `Send` future — SQLite supports several connections to one database
+/// file, the same reasoning `SqliteDeviceLookup`'s doc comment already gives for keeping the
+/// connect path off the RPC path's connection. Plus this crate's caches/state
 /// (`crate::cache::GrantsCache` for the host-wide shares/entitlements snapshot,
 /// `crate::identity_cache::IdentityCache` for the stat→read TOCTOU baseline,
 /// `crate::upload::UploadSessions` for in-flight upload sessions, `crate::ratelimit::RateLimiter`
 /// for the per-caller VFS-RPC-entry-point throttle) plus this slice's configuration
 /// (`crate::limits::UploadLimits`, a `crate::limits::FreeSpaceProbe`) — see each module's doc
 /// comment for what is and is not cached/configurable and why.
-pub struct VfsRpcServer<'s> {
-    store: &'s Store,
+pub struct VfsRpcServer<S> {
+    store: S,
     grants_cache: GrantsCache,
     identity_cache: IdentityCache,
     upload_sessions: UploadSessions,
     limits: UploadLimits,
-    free_space_probe: Box<dyn FreeSpaceProbe>,
+    free_space_probe: Box<dyn FreeSpaceProbe + Send>,
     rate_limiter: RateLimiter,
 }
 
-impl<'s> VfsRpcServer<'s> {
+impl<S: Borrow<Store>> VfsRpcServer<S> {
+    /// The `Store` this server enforces against, whether it was given a borrow or handed an owned
+    /// one. Every read below goes through here rather than touching the field, so the same body
+    /// serves `VfsRpcServer<&Store>` and `VfsRpcServer<Store>` — see this type's doc comment for
+    /// why both exist.
+    fn store(&self) -> &Store {
+        self.store.borrow()
+    }
+
     /// Generous defaults throughout: unlimited free-space reporting (see
     /// `crate::limits`'s module doc comment for why a real OS probe is not wired in here), default
     /// `UploadLimits`, default `RateLimitConfig`. Use [`Self::with_limits`] to override any of
     /// these (production wiring, or a test exercising `quota_exceeded`/`storage_full`/`throttled`
     /// with small numbers).
-    pub fn new(store: &'s Store) -> Self {
+    pub fn new(store: S) -> Self {
         Self::with_limits(
             store,
             UploadLimits::default(),
@@ -91,9 +103,9 @@ impl<'s> VfsRpcServer<'s> {
     }
 
     pub fn with_limits(
-        store: &'s Store,
+        store: S,
         limits: UploadLimits,
-        free_space_probe: Box<dyn FreeSpaceProbe>,
+        free_space_probe: Box<dyn FreeSpaceProbe + Send>,
         rate_limit_config: RateLimitConfig,
     ) -> Self {
         VfsRpcServer {
@@ -118,7 +130,7 @@ impl<'s> VfsRpcServer<'s> {
     }
 
     fn discard_staging_bytes(&self, session: &UploadSession) {
-        if let Ok(Some(share)) = self.store.get_share(session.share_id) {
+        if let Ok(Some(share)) = self.store().get_share(session.share_id) {
             if let Ok(dir) = confine::open_share_root(&share.real_root) {
                 let _ = dir.remove_file(confine::staging_name(&session.id));
             }
@@ -198,7 +210,7 @@ impl<'s> VfsRpcServer<'s> {
 
         // Step 2: member active? Always a fresh store read — see `crate::cache` module doc
         // comment for why this is never served from a grants_version/cap_epoch-keyed cache.
-        let member = match self.store.get_member(ctx.member_id) {
+        let member = match self.store().get_member(ctx.member_id) {
             Ok(Some(m)) => m,
             Ok(None) => {
                 self.audit(
@@ -332,7 +344,7 @@ impl<'s> VfsRpcServer<'s> {
     // -------------------------------------------------------------------------------------
 
     fn handle_whoami(&self, ts: u64, ctx: &SessionContext, member: &Member) -> VfsReply {
-        let (shares, entitlements) = self.grants_cache.get(self.store).unwrap_or_default();
+        let (shares, entitlements) = self.grants_cache.get(self.store()).unwrap_or_default();
         // DESIGN.md's literal `{member_display, effective_paths}` tuple, trimmed per §A4b/A12
         // #32 (no group names, no internal ids): the full virtual path (mount_path + subpath) of
         // every entitlement, belonging to a group this member is in, that grants `browse`
@@ -382,7 +394,7 @@ impl<'s> VfsRpcServer<'s> {
         cursor: Option<&[u8]>,
         limit: Option<u32>,
     ) -> VfsReply {
-        let (shares, entitlements) = match self.grants_cache.get(self.store) {
+        let (shares, entitlements) = match self.grants_cache.get(self.store()) {
             Ok(v) => v,
             Err(_) => {
                 return self.deny(
@@ -395,7 +407,7 @@ impl<'s> VfsRpcServer<'s> {
                 )
             }
         };
-        let version = GrantsVersion(self.store.grants_version().unwrap_or(0));
+        let version = GrantsVersion(self.store().grants_version().unwrap_or(0));
         let effective = EffectiveGrants::compute(member, &entitlements, version);
         let mount_table = MountTable::build(shares);
 
@@ -494,7 +506,7 @@ impl<'s> VfsRpcServer<'s> {
     // -------------------------------------------------------------------------------------
 
     fn handle_stat(&self, ts: u64, ctx: &SessionContext, member: &Member, path: &str) -> VfsReply {
-        let (shares, entitlements) = match self.grants_cache.get(self.store) {
+        let (shares, entitlements) = match self.grants_cache.get(self.store()) {
             Ok(v) => v,
             Err(_) => {
                 return self.deny(
@@ -507,7 +519,7 @@ impl<'s> VfsRpcServer<'s> {
                 )
             }
         };
-        let version = GrantsVersion(self.store.grants_version().unwrap_or(0));
+        let version = GrantsVersion(self.store().grants_version().unwrap_or(0));
         let effective = EffectiveGrants::compute(member, &entitlements, version);
         let mount_table = MountTable::build(shares);
 
@@ -598,7 +610,7 @@ impl<'s> VfsRpcServer<'s> {
         offset: u64,
         len: u32,
     ) -> VfsReply {
-        let (shares, entitlements) = match self.grants_cache.get(self.store) {
+        let (shares, entitlements) = match self.grants_cache.get(self.store()) {
             Ok(v) => v,
             Err(_) => {
                 return self.deny(
@@ -611,7 +623,7 @@ impl<'s> VfsRpcServer<'s> {
                 )
             }
         };
-        let version = GrantsVersion(self.store.grants_version().unwrap_or(0));
+        let version = GrantsVersion(self.store().grants_version().unwrap_or(0));
         let effective = EffectiveGrants::compute(member, &entitlements, version);
         let mount_table = MountTable::build(shares);
 
@@ -715,7 +727,7 @@ impl<'s> VfsRpcServer<'s> {
     // -------------------------------------------------------------------------------------
 
     fn handle_mkdir(&self, ts: u64, ctx: &SessionContext, member: &Member, path: &str) -> VfsReply {
-        let (shares, entitlements) = match self.grants_cache.get(self.store) {
+        let (shares, entitlements) = match self.grants_cache.get(self.store()) {
             Ok(v) => v,
             Err(_) => {
                 return self.deny(
@@ -728,7 +740,7 @@ impl<'s> VfsRpcServer<'s> {
                 )
             }
         };
-        let version = GrantsVersion(self.store.grants_version().unwrap_or(0));
+        let version = GrantsVersion(self.store().grants_version().unwrap_or(0));
         let effective = EffectiveGrants::compute(member, &entitlements, version);
         let mount_table = MountTable::build(shares);
 
@@ -796,7 +808,7 @@ impl<'s> VfsRpcServer<'s> {
         member: &Member,
         path: &str,
     ) -> VfsReply {
-        let (shares, entitlements) = match self.grants_cache.get(self.store) {
+        let (shares, entitlements) = match self.grants_cache.get(self.store()) {
             Ok(v) => v,
             Err(_) => {
                 return self.deny(
@@ -809,7 +821,7 @@ impl<'s> VfsRpcServer<'s> {
                 )
             }
         };
-        let version = GrantsVersion(self.store.grants_version().unwrap_or(0));
+        let version = GrantsVersion(self.store().grants_version().unwrap_or(0));
         let effective = EffectiveGrants::compute(member, &entitlements, version);
         let mount_table = MountTable::build(shares);
 
@@ -852,7 +864,7 @@ impl<'s> VfsRpcServer<'s> {
                     .forget(member.member_id, share.share_id, &subpath);
                 if let Some(bytes) = bytes_removed {
                     let _ = self
-                        .store
+                        .store()
                         .adjust_share_upload_bytes(share.share_id, -(bytes as i64));
                 }
                 self.audit(
@@ -886,7 +898,7 @@ impl<'s> VfsRpcServer<'s> {
         hash: &[u8],
         manifest_sig: &[u8],
     ) -> VfsReply {
-        let (shares, entitlements) = match self.grants_cache.get(self.store) {
+        let (shares, entitlements) = match self.grants_cache.get(self.store()) {
             Ok(v) => v,
             Err(_) => {
                 return self.deny(
@@ -899,8 +911,8 @@ impl<'s> VfsRpcServer<'s> {
                 )
             }
         };
-        let grants_version = self.store.grants_version().unwrap_or(0);
-        let cap_epoch = self.store.cap_epoch().unwrap_or(0);
+        let grants_version = self.store().grants_version().unwrap_or(0);
+        let cap_epoch = self.store().cap_epoch().unwrap_or(0);
         let version = GrantsVersion(grants_version);
         let effective = EffectiveGrants::compute(member, &entitlements, version);
         let mount_table = MountTable::build(shares);
@@ -947,7 +959,7 @@ impl<'s> VfsRpcServer<'s> {
         }
 
         let member_bytes = self
-            .store
+            .store()
             .member_upload_bytes(member.member_id)
             .unwrap_or(0);
         if member_bytes.saturating_add(size) > self.limits.max_member_upload_bytes {
@@ -961,7 +973,7 @@ impl<'s> VfsRpcServer<'s> {
                 VfsErrorCode::QuotaExceeded,
             );
         }
-        let share_bytes = self.store.share_upload_bytes(share.share_id).unwrap_or(0);
+        let share_bytes = self.store().share_upload_bytes(share.share_id).unwrap_or(0);
         if share_bytes.saturating_add(size) > self.limits.max_share_upload_bytes {
             return self.deny_with_code(
                 ts,
@@ -1059,7 +1071,7 @@ impl<'s> VfsRpcServer<'s> {
         let Some(fp) = device_fp else {
             return false;
         };
-        let Ok(Some(sign_pk)) = self.store.device_sign_pk(fp) else {
+        let Ok(Some(sign_pk)) = self.store().device_sign_pk(fp) else {
             return false;
         };
         let Ok(arr): Result<[u8; 32], _> = sign_pk.as_slice().try_into() else {
@@ -1075,8 +1087,8 @@ impl<'s> VfsRpcServer<'s> {
     /// True if neither `grants_version` nor `cap_epoch` has moved since `session` was opened (or
     /// last resumed) — DESIGN.md §A8: "an entitlement change mid-transfer aborts the session".
     fn entitlement_unchanged(&self, session: &UploadSession) -> bool {
-        let grants_version = self.store.grants_version().unwrap_or(0);
-        let cap_epoch = self.store.cap_epoch().unwrap_or(0);
+        let grants_version = self.store().grants_version().unwrap_or(0);
+        let cap_epoch = self.store().cap_epoch().unwrap_or(0);
         session.grants_version_at_open == grants_version && session.cap_epoch_at_open == cap_epoch
     }
 
@@ -1150,7 +1162,7 @@ impl<'s> VfsRpcServer<'s> {
             );
         }
 
-        let Ok(Some(share)) = self.store.get_share(session.share_id) else {
+        let Ok(Some(share)) = self.store().get_share(session.share_id) else {
             return self.deny(
                 ts,
                 member,
@@ -1240,7 +1252,7 @@ impl<'s> VfsRpcServer<'s> {
         // The *full* virtual path (mount + subpath) — must match exactly what `upload_open`
         // signed the manifest over (DESIGN.md §A8 "path"), not `session.subpath` alone (which is
         // share-relative and omits the share's own mount prefix).
-        let path_str = match self.store.get_share(session.share_id) {
+        let path_str = match self.store().get_share(session.share_id) {
             Ok(Some(share)) => combine_mount_and_subpath(&share, &session.subpath).to_path_string(),
             _ => session.subpath.to_path_string(),
         };
@@ -1270,7 +1282,7 @@ impl<'s> VfsRpcServer<'s> {
             );
         }
 
-        let Ok(Some(share)) = self.store.get_share(session.share_id) else {
+        let Ok(Some(share)) = self.store().get_share(session.share_id) else {
             return self.deny(
                 ts,
                 member,
@@ -1281,7 +1293,7 @@ impl<'s> VfsRpcServer<'s> {
             );
         };
 
-        let (shares, entitlements) = match self.grants_cache.get(self.store) {
+        let (shares, entitlements) = match self.grants_cache.get(self.store()) {
             Ok(v) => v,
             Err(_) => {
                 return self.deny(
@@ -1295,7 +1307,7 @@ impl<'s> VfsRpcServer<'s> {
             }
         };
         let _ = shares;
-        let version = GrantsVersion(self.store.grants_version().unwrap_or(0));
+        let version = GrantsVersion(self.store().grants_version().unwrap_or(0));
         let effective = EffectiveGrants::compute(member, &entitlements, version);
         let decision = effective.resolve_access(&share, &session.subpath);
         let can_delete = decision.perms().contains(Perms::DELETE);
@@ -1386,7 +1398,7 @@ impl<'s> VfsRpcServer<'s> {
         // Quota re-check: usage may have grown since `upload_open` (other sessions committing
         // concurrently).
         let member_bytes = self
-            .store
+            .store()
             .member_upload_bytes(member.member_id)
             .unwrap_or(0);
         if member_bytes.saturating_add(session.size) > self.limits.max_member_upload_bytes {
@@ -1400,7 +1412,7 @@ impl<'s> VfsRpcServer<'s> {
                 VfsErrorCode::QuotaExceeded,
             );
         }
-        let share_bytes = self.store.share_upload_bytes(share.share_id).unwrap_or(0);
+        let share_bytes = self.store().share_upload_bytes(share.share_id).unwrap_or(0);
         if share_bytes.saturating_add(session.size) > self.limits.max_share_upload_bytes {
             return self.deny_with_code(
                 ts,
@@ -1424,10 +1436,10 @@ impl<'s> VfsRpcServer<'s> {
                 self.identity_cache
                     .forget(member.member_id, share.share_id, &session.subpath);
                 let _ = self
-                    .store
+                    .store()
                     .adjust_member_upload_bytes(member.member_id, session.size as i64);
                 let _ = self
-                    .store
+                    .store()
                     .adjust_share_upload_bytes(share.share_id, session.size as i64);
                 self.audit(
                     ts,
@@ -1562,7 +1574,7 @@ impl<'s> VfsRpcServer<'s> {
             bytes,
             outcome: outcome.to_string(),
         };
-        let _ = self.store.audit().append(entry);
+        let _ = self.store().audit().append(entry);
     }
 }
 
@@ -1778,16 +1790,16 @@ mod tests {
             }
         }
 
-        fn server(&self) -> VfsRpcServer<'_> {
+        fn server(&self) -> VfsRpcServer<&Store> {
             VfsRpcServer::new(&self.store)
         }
 
         fn server_with_limits(
             &self,
             limits: UploadLimits,
-            probe: Box<dyn FreeSpaceProbe>,
+            probe: Box<dyn FreeSpaceProbe + Send>,
             rate_limit_config: RateLimitConfig,
-        ) -> VfsRpcServer<'_> {
+        ) -> VfsRpcServer<&Store> {
             VfsRpcServer::with_limits(&self.store, limits, probe, rate_limit_config)
         }
 
@@ -2308,7 +2320,7 @@ mod tests {
             self.h.ctx_with_device(self.member_id, self.device_fp)
         }
 
-        fn server(&self) -> VfsRpcServer<'_> {
+        fn server(&self) -> VfsRpcServer<&Store> {
             self.h.server()
         }
 
@@ -2318,7 +2330,7 @@ mod tests {
 
         fn open(
             &self,
-            server: &VfsRpcServer<'_>,
+            server: &VfsRpcServer<&Store>,
             ts: u64,
             virtual_path: &str,
             data: &[u8],

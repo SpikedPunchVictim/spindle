@@ -74,7 +74,7 @@ impl Harness {
             .expect("grant entitlement");
     }
 
-    fn server(&self) -> VfsRpcServer<'_> {
+    fn server(&self) -> VfsRpcServer<&Store> {
         VfsRpcServer::new(&self.store)
     }
 
