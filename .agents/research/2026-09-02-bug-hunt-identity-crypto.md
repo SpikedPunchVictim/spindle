@@ -20,7 +20,7 @@
 
 ## Summary Counts
 
-BUG 7 · FRAGILE 2 · REVIEW 2 · Refuted-and-killed 3
+BUG 5 · FRAGILE 2 · REVIEW 2 · Refuted-and-killed 5 — *two of the five (#3 and #4) were refuted after publication; see Post-Publication Corrections*
 
 ## Issue Rating Table
 
@@ -28,8 +28,8 @@ BUG 7 · FRAGILE 2 · REVIEW 2 · Refuted-and-killed 3
 |---|----|---------|------|------------|---------|-----------|---------------|-----|---------------|------------|
 | 1 | td-13c7dc | Canonical CBOR decoder: 9-byte unauthenticated message panics via unvalidated `Vec::with_capacity` | 3 | **Confirmed (empirical)** | Now | Low | **Critical** — unauthenticated remote DoS on host *and* on the helper's auth callout | Highest | 1 file (`canonical.rs`), no data, no coordination | S |
 | 2 | td-2454b3 | `Store::add_share` check-then-act race persists overlapping shares; 3-statement insert is non-atomic | 6 | **Confirmed (empirical)** | Soon | Low | High — overlapping shares bypass overlap guard; share can commit without its exclusion globs | High | 1 file, no migration, single service | S–M |
-| 3 | td-c057a1 | No `PRAGMA foreign_keys = ON` — every `REFERENCES` clause is decoration | 4 | **Confirmed** (search receipt) | Soon | **Medium** — enabling FKs can surface pre-existing orphan rows | Medium (latent; live the moment any delete API ships) | High | 1 file + possible data audit | S |
-| 4 | td-f65637 | No `busy_timeout` — concurrent access returns SQLITE_BUSY immediately | 6/7 | **Confirmed** (search receipt) | Soon | Low | Medium — spurious runtime failures under normal multi-connection load | High | 1 file, no data | S |
+| ~~3~~ | ~~td-c057a1~~ | ~~No `PRAGMA foreign_keys = ON` — every `REFERENCES` clause is decoration~~ **REFUTED after publication — not a defect** | 4 | **Refuted** | — | — | — (bundled SQLite compiles SQLITE_DEFAULT_FOREIGN_KEYS=1; enforcement verified against the real schema) | — | none | none |
+| ~~4~~ | ~~td-f65637~~ | ~~No `busy_timeout` — concurrent access returns SQLITE_BUSY immediately~~ **REFUTED after publication — not a defect** | 6/7 | **Refuted** | — | — | — (rusqlite already sets a 5 s busy timeout on open) | — | none | none |
 | 5 | td-de94c5 | Per-request device-revocation gate skipped when `SessionContext.device_fp` is `None` | 8 | **Traced** | Soon | Medium — touches ~59 test call sites | Medium now, High at Stage 7 (in-process Tauri caller) | Medium | 1–2 files + broad test churn | M |
 | 6 | td-93cee6 | `invite_nonces.member_id` lacks `REFERENCES`; `burn_invite_nonce` can't distinguish burn from no-op | 4 | **Traced** | Later | Low | Low–Medium — silent replay window | Medium | 1–2 files | S |
 | 7 | td-b940b1 | Quota counters bumped via `let _ =` outside any transaction with the file move | 4/5 | **Traced** | Later | Low | Low–Medium — silent quota drift, always low | Medium | 1 file | S |
@@ -38,13 +38,13 @@ BUG 7 · FRAGILE 2 · REVIEW 2 · Refuted-and-killed 3
 | 10 | td-70c90b | `Capability`/`AdminCommand` carry a signed `v` never checked — no `min_v` floor | 8 | **Traced** | Later | Low | Low now, High later — a version floor is only worth shipping *before* the version you want to reject | High | 1–2 files | S |
 | 11 | td-e6f19f | `root_fp` preimage rebuilt inline at 3 sites instead of calling `root_fp_of` | 8 | **Traced** | Later | Low | Low — drift hazard only | Medium | 1–2 files, behavior-preserving | S |
 
-**Note**: rows 9 and 11 are REVIEW/chore rather than BUG; rows 5 and 10 are FRAGILE (correct today, break under a named foreseeable change).
+**Note**: rows 9 and 11 are REVIEW/chore rather than BUG; rows 5 and 10 are FRAGILE (correct today, break under a named foreseeable change). **Rows 3 and 4 were refuted after publication and are not defects** — they are struck rather than deleted so the mistake stays visible; see Post-Publication Corrections. Row numbering is unchanged so existing cross-references still resolve.
 
 ## Fix Plan & Interactions
 
 - **#1 ships alone and first.** It is the only unauthenticated-remote finding and touches one file with no data or coordination cost. Nothing blocks it.
-- **#2 and #4 must ship together.** Adding a transaction to `add_share` (#2) makes correctness right but makes `SQLITE_BUSY` *more* likely, because a transaction holds its lock longer. Shipping #2 without #4 trades a rare race for a common spurious failure. Use `TransactionBehavior::Immediate`.
-- **#3 ships behind an existing-data audit.** Enabling FK enforcement can fail at startup on orphan rows that were legal to write while enforcement was off. Audit before enabling. #6's `REFERENCES` addition ships *after* #3, since it is inert until enforcement is on.
+- ~~**#2 and #4 must ship together.**~~ **This ordering constraint dissolved when #4 was refuted — #2 ships alone.** `TransactionBehavior::Immediate` is still the right choice for #2, but for a different reason than originally given: `Deferred` takes only a SHARED lock for the scans and can deadlock on upgrade, and SQLite does **not** resolve an upgrade deadlock by waiting on the busy handler. The original reasoning here — that a longer-held lock would make `SQLITE_BUSY` more likely in the absence of a timeout — was built on the false premise of #4.
+- ~~**#3 ships behind an existing-data audit.**~~ **#3 was refuted — there is nothing to ship, and the audit is moot.** FK enforcement has been on the whole time (bundled SQLite compiles `SQLITE_DEFAULT_FOREIGN_KEYS=1`), so no orphan rows can ever have been written under it; there was never a "before enabling" state to audit against. #6's missing `REFERENCES` clause on `invite_nonces.member_id` is now **more** worth adding, not less, because clauses in this schema are genuinely enforced — it no longer waits on anything.
 - **#5 is a test-surface change, not a one-liner.** The `ctx()` helper (12 call sites in `rpc_negative.rs`, 47 in `server.rs`) defaults `device_fp` to `None`. Either supply a real fingerprint in the helper, or make the field non-optional so the type system deletes the branch. Prefer the latter.
 - **#9 gates the severity of several other tasks.** Device-related findings cap at FRAGILE *because* enrollment is unreachable. When enrollment ships, re-triage td-de94c5, td-ad318f and td-6c01e3 against the new reachability facts.
 - Deferred to design work: none. Every fix above passed the Step 6 checklist or is explicitly scoped as a design decision (#9).
@@ -121,43 +121,51 @@ Second defect, same function: the insert is three independent autocommits — `I
 
 **Fix direction**: wrap check + insert(s) in a single transaction, `TransactionBehavior::Immediate` (see Fix Plan interaction with #4).
 
-### #3 — no `PRAGMA foreign_keys` (td-c057a1), Confirmed
+### #3 — no `PRAGMA foreign_keys` (td-c057a1) — ~~Confirmed~~ **REFUTED AFTER PUBLICATION. NOT A DEFECT.**
 
-**Lens**: 4 (data lifecycle)
+**This finding was wrong.** Foreign-key enforcement is already ON and already working. Probed through the real production entry point (`Store::open` on a temp file, then a connection opened exactly as `Store::open` opens one):
 
-`crates/spindle-vfs/src/store/mod.rs:240-267`. `Store::open` / `open_with_limits` / `open_in_memory` / `open_in_memory_with_limits` all call `Connection::open(...)` then `schema::migrate(...)` and nothing else. No pragma is set anywhere.
+```
+file-backed: PRAGMA foreign_keys = Integer(1)
+file-backed: PRAGMA busy_timeout  = Integer(5000)
+file-backed: PRAGMA journal_mode  = Text("delete")
+```
 
-**Assumption**: `REFERENCES` clauses in `schema.rs` were assumed to be enforced.
+And against the REAL schema, not a toy table — `devices.member_id REFERENCES members(member_id)`:
 
-**Violation scenario**: any write that would violate a foreign-key relationship succeeds silently, because SQLite disables FK enforcement by default, per connection.
+```
+INSERT INTO devices (device_fp, member_id, label, added, revoked)
+VALUES (x'00', 999999, 'orphan', 0, 0)
+-> Err(SqliteFailure(ConstraintViolation, extended_code: 787, "FOREIGN KEY constraint failed"))
+```
 
-**Consequence**: `devices.member_id`, `member_groups.member_id/group_id`, `share_excludes.share_id`, `entitlements.group_id/share_id`, `member_upload_bytes.member_id`, `share_upload_bytes.share_id` are all decorative-only.
+**Cause**: the bundled SQLite this workspace builds (`libsqlite3-sys` with the `bundled` feature; rusqlite pinned to 0.32 in the root `Cargo.toml`) compiles with `SQLITE_DEFAULT_FOREIGN_KEYS=1`. So the `REFERENCES` clauses are enforcement, not decoration. td-c057a1 is closed as invalid.
 
-**Current code**: `store/mod.rs:240-267`.
+**How the finding was wrong**: same root cause as #4 — a repo-only grep (`grep -rn "foreign_keys" --include='*.rs'` → zero matches) read as absence of the behavior, when the behavior came from the dependency's build configuration rather than from repo code.
 
-**Confidence + evidence**: Search receipt: `grep -rn "foreign_keys" --include='*.rs'` across the repo → **zero matches**. `grep -n "pragma|PRAGMA"` across `crates/spindle-vfs/src/store/` → only `user_version` (the migration mechanism).
+**What this invalidated, and what survived**: the "existing-data audit" the Fix Plan gated #3's fix behind is moot — enforcement has been on the whole time, so no orphan rows can ever have been written. #6's missing `REFERENCES` clause on `invite_nonces.member_id` is now more worth adding, not less (see Fix Plan and #6).
 
-Latent today: no `delete_member`/`delete_share`/`delete_group` exists anywhere in the crate (searched), so nothing orphans a row yet. It goes live the moment any admin removal API is written — by an author who will reasonably assume the `REFERENCES` clauses already protect them.
+### #4 — no `busy_timeout` (td-f65637) — ~~Confirmed~~ **REFUTED AFTER PUBLICATION. NOT A DEFECT.**
 
-**Fix direction**: enable `PRAGMA foreign_keys = ON` on every connection, after an existing-data audit for orphan rows (see Fix Plan).
+**This finding was wrong.** rusqlite's `Connection::open` already sets a 5-second busy timeout unconditionally, on the open path itself, before the `Connection` is handed back:
 
-### #4 — no `busy_timeout` (td-f65637), Confirmed
+```rust
+// rusqlite-0.32.1/src/inner_connection.rs:119
+let r = ffi::sqlite3_busy_timeout(db, 5000);
+```
 
-**Lens**: 6/7 (time & concurrency / environment divergence)
+Every `Store` connection has therefore had a 5000 ms busy timeout all along. There is nothing to fix. td-f65637 is closed as invalid.
 
-Same four constructors as #3, same absence.
+**How the finding was wrong**: the search receipt (`grep -rn "busy_timeout|busy_handler|journal_mode|WAL" --include='*.rs'` → zero matches) was *accurate*. The error was in the inference: absence of an explicit call in the repo was read as absence of the behavior. The guard lived in the **dependency**, and the dependency was never searched. The Guard Map (Step 2) listed only in-repo locations — that is the gap this finding exposes.
 
-**Assumption**: the daemon's multi-connection access pattern was assumed to tolerate SQLite's default locking behavior.
+**The repo said so already**: `crates/spindle-vfs/src/store/schema.rs:216` states *"rusqlite's default `busy_timeout(5000)` makes the loser of a deferred race wait out the winner"*. An existing in-repo comment directly contradicted the finding and was not consulted.
 
-**Violation scenario**: a writer finds the database locked and returns `SQLITE_BUSY` on the *first* attempt, because rusqlite's default busy timeout is effectively zero.
+**What this invalidated, and what survived**:
+- The `#2 and #4 ship together` ordering constraint — **dissolved**.
+- #2's probe claimed to mirror `Store::open` "exactly" while passing `timeout=0` — **provenance was wrong**. Re-run at `timeout=5.0`: both inserts still commit, identical rows. #2 **survives on corrected evidence** (see its entry).
+- Refutation-log entry 1's *mechanism* — **corrected** (see that entry).
 
-**Consequence**: `spindle-hostd` opens its own `Store`, `SqliteDeviceLookup` opens one, `VfsSessionHandler` opens one, plus one per session — contention is normal operation. Under the default rollback journal a single writer also blocks **readers**, so an ordinary VFS list during an admin write can fail outright.
-
-**Current code**: same four constructors as #3 (`store/mod.rs:240-267`).
-
-**Confidence + evidence**: Search receipt: `grep -rn "busy_timeout|busy_handler|journal_mode|WAL" --include='*.rs'` → **zero matches**.
-
-**Fix direction**: set a `busy_timeout` on every connection (see Fix Plan interaction with #2).
+**Not covered by this retraction**: no explicit `journal_mode` is set anywhere, so the default rollback journal still lets a writer block readers. That is a separate and much smaller question, and it is **not** claimed as a defect here.
 
 ### #5 — optional revocation gate (td-de94c5), Traced. FRAGILE
 
@@ -189,9 +197,9 @@ The in-code justification is half stale: it says wiring per-session device ident
 
 **Lens**: 4 (data lifecycle)
 
-Two weaknesses: `invite_nonces.member_id` declares no `REFERENCES`, unlike every other member-scoped table in `schema.rs` (`devices`, `member_groups`, `member_upload_bytes` all do) — a divergence from the crate's own convention, though inert until #3 lands. And `burn_invite_nonce` issues its UPDATE/DELETE without first asserting the nonce exists and is unburned, so "burned a live nonce" and "burned nothing" are indistinguishable to the caller — a single-use nonce whose burn silently no-ops is a replay window with no signal to reject on.
+Two weaknesses: `invite_nonces.member_id` declares no `REFERENCES`, unlike every other member-scoped table in `schema.rs` (`devices`, `member_groups`, `member_upload_bytes` all do) — a divergence from the crate's own convention. **Live now, not inert**: FK enforcement was on the whole time (#3 was refuted — see that entry), so this table alone lacks the protection every sibling table already has. And `burn_invite_nonce` issues its UPDATE/DELETE without first asserting the nonce exists and is unburned, so "burned a live nonce" and "burned nothing" are indistinguishable to the caller — a single-use nonce whose burn silently no-ops is a replay window with no signal to reject on.
 
-**Fix direction**: add the `REFERENCES` clause (after #3 ships); make `burn_invite_nonce` assert existence/unburned state and surface a distinct result for no-op vs. burn.
+**Fix direction**: add the `REFERENCES` clause — it no longer waits on anything; make `burn_invite_nonce` assert existence/unburned state and surface a distinct result for no-op vs. burn.
 
 ### #7 — quota counters (td-b940b1), Traced
 
@@ -246,19 +254,46 @@ Search receipt: `grep -rn "add_device" --include='*.rs'` → 13 call sites, **al
 
 ## Refutation Log (killed in Step 5)
 
-1. **"Revoke double-bumps `cap_epoch` under concurrency" — REFUTED.** A python sqlite3 probe showed SQLite's RESERVED lock blocks the second writer; the observed `cap_epoch` was **1, not 2**. The revoke path *does* wrap its work in a transaction, which is precisely why it is protected and `add_share` (#2, no transaction at all) is not. This contrast is the reason #2 is credible.
+1. **"Revoke double-bumps `cap_epoch` under concurrency" — REFUTED.** Conclusion correct, **mechanism as originally stated was wrong** (corrected post-publication). The original claim was that SQLite's RESERVED lock errors the second writer out. Re-run with the real 5000 ms busy timeout and a `DEFERRED` transaction (what `unchecked_transaction()` actually uses), two threads racing:
+
+   ```
+   ('A', 'no-op, no bump')
+   ('B', 'revoked + bumped')
+   cap_epoch = 1   (2 would mean the refutation was wrong)
+   ```
+
+   The loser is **not** erroring out — it *waits* for the winner, then its `AND revoked = 0` clause matches zero rows and it correctly declines to bump. That clause is what `store/mod.rs:641` already calls "load-bearing". The contrast with #2 still holds and is in fact sharper: `add_share` has no transaction at all *and* no idempotence clause to save it.
 2. **"base32 padding aliases distinct fingerprints" — REFUTED.** `base32` is a **private** module, and `Fingerprint::from_str` rejects every padded variant with `WrongLength(33/34/35)`. No aliasing path exists.
 3. **My own sub-claim "the `device_fp: None` comment inflates its test count ~4×" — REFUTED by me.** Only 5 literal `device_fp: None` sites exist, but the comment counts callers of the `ctx()` helper: 12 in `rpc_negative.rs`, 47 in `server.rs`. The comment's count is accurate; my correction was wrong. This is why #5's fix is scoped as a test-surface change rather than a one-line flip.
 4. **"Manifest `sign_pk` rehash is escalatable to session hijack" — REFUTED.** `sign_pk`/`agree_pk` are never written after insert: the sole `INSERT INTO devices` is `store/mod.rs:583`, and the only other writes touching that table are `UPDATE devices SET revoked = 1`. So connect-time check 8 covers the whole session — the keys it validated cannot change underneath it. (The rehash concern on td-ad318f stands on its own terms; the escalation does not. Logged there too.)
 5. **My first CBOR probe did not reproduce the DoS.** Count `1e10` returned `UnexpectedEof` cleanly on macOS because lazy VM satisfied the allocation. Reported as a non-reproduction rather than claimed as confirmation; refined to `u64::MAX`, which does panic. Recorded because the negative result is what makes the positive one trustworthy.
+6. **My own finding #4 ("no `busy_timeout`") — REFUTED, post-publication, by me.** rusqlite sets `busy_timeout(5000)` on open (`inner_connection.rs:119`). See the #4 subsection above. This is one of two entries in this log that matter most: it is one of the two findings in this hunt that reached the board and a published report while being false, and one of the two whose refutation required reading a dependency's build/source rather than the repo's.
+7. **My own finding #3 ("no `PRAGMA foreign_keys`") — REFUTED, post-publication, by me.** The bundled SQLite this workspace builds compiles with `SQLITE_DEFAULT_FOREIGN_KEYS=1`, so FK enforcement has been on the whole time; a real insert against `devices.member_id` was rejected with `FOREIGN KEY constraint failed`. See the #3 subsection above. Same shape of miss as entry 6: a clean repo-only grep receipt was treated as proof the behavior was absent, when the behavior was supplied by the dependency's build configuration.
 
 ## Needs Human Review
 
 - **#1's intermediate-count abort path on Linux/containers was NOT measured.** Measure `handle_alloc_error` behavior (uncatchable abort) before fixing, so the fix is verified against the real failure mode and not only against the macOS `capacity overflow` panic.
 - **#9 — device enrollment** is a scope/design decision, not a defect. It also gates the severity of td-de94c5, td-ad318f and td-6c01e3.
-- **#3's existing-data audit**: whether orphan rows already exist that would make enabling FK enforcement fail at startup.
+- ~~**#3's existing-data audit**: whether orphan rows already exist that would make enabling FK enforcement fail at startup.~~ **Moot — #3 was refuted.** FK enforcement has been on the whole time; there was never a "before enabling" state to audit.
 - **#5's fix shape**: tighten `None` to a denial, or make `device_fp` non-optional. The latter is preferred here but is a public-API change to a `pub` re-exported type.
 
 ## Footer
 
 Note that no duplicates were filed: td-684764 (revocation no audit), td-ad318f (manifest rehash), td-6c01e3 (alg_id), td-b2c16b (agree_pk backfill) and td-4bcf24 (rate-limit) were already on the board and cover ground this hunt re-touched.
+
+## Post-Publication Corrections
+
+| When | What changed | Why |
+|---|---|---|
+| 2026-09-02, same day | #4 (td-f65637) retracted; counts, rating table, Fix Plan, and Refutation Log entry 1 corrected | rusqlite sets a 5 s busy timeout on open; the finding's premise was false |
+| 2026-09-02, same day | #2's empirical evidence re-run at `timeout=5.0` | its original probe misdescribed itself as mirroring `Store::open` "exactly" |
+| 2026-09-02, same day | #3 (td-c057a1) retracted; counts, rating table, Note, Fix Plan, #6's text, Needs Human Review, and Refutation Log corrected | bundled SQLite compiles `SQLITE_DEFAULT_FOREIGN_KEYS=1`; FK enforcement was on the whole time, verified against the real schema |
+
+## Method Lessons For The Next Hunt
+
+Written for the series, not for this report.
+
+1. **The Guard Map must include dependency source, not just repo paths.** Every guard location listed in Step 2 was in-repo. The guard that refuted #4 was in `~/.cargo/registry/.../rusqlite-0.32.1/src/`; the guard that refuted #3 was in the bundled SQLite's build configuration (`SQLITE_DEFAULT_FOREIGN_KEYS=1`, set by `libsqlite3-sys`'s `bundled` feature). This hunt produced **two** false Confirmed findings from that single gap, both about SQLite behavior supplied by the dependency's build configuration rather than by repo code, and the tell was identical each time: a clean repo-only grep receipt treated as proof of absence. A negative claim about *library-provided* behavior — defaults, implicit timeouts, automatic escaping, framework middleware, compiled-in build flags — is not supported by a repo-only grep. **Concrete rule**: when a negative claim concerns a library's runtime defaults, the receipt is not a grep — it is a probe that observes the value in effect (here, `PRAGMA foreign_keys` / `PRAGMA busy_timeout` queried on a real connection).
+2. **Grep the repo's own comments for the claim you are about to make.** `schema.rs:216` stated the correct fact in prose. A hunt that greps for identifiers but not for the *claim* walks past its own refutation.
+3. **A probe must state its fidelity, and that statement must be checked.** "Mirroring `Store::open` exactly" was asserted, not verified, and was false. The result happened to survive; that was luck, not method.
+4. **Right conclusion, wrong mechanism is still a defective finding** — Step 5 says so explicitly, and refutation-log entry 1 is a live example that slipped through the first time.
