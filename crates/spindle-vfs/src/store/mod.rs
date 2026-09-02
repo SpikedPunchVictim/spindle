@@ -63,7 +63,7 @@ use crate::model::{
     Device, DevicePublicKeys, Entitlement, Group, GroupId, GroupKind, Member, MemberId,
     MemberStatus, ModelError, Perms, Share, ShareFlags, ShareId, VirtualPath,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use spindle_core::{Fingerprint, FingerprintError};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -849,6 +849,30 @@ impl Store {
         excludes: &[String],
         created: u64,
     ) -> Result<ShareId, StoreError> {
+        // One `Immediate` transaction spans every check below and every write that follows.
+        //
+        // Without it the four checks are plain autocommitted reads, nothing holds a lock across
+        // the gap to the `INSERT`, and two concurrent callers both scan, both see no conflict,
+        // and both commit — overlapping shares that `OverlappingShareRoot`/`MountPathCollision`
+        // exist to prevent, and that `check_persisted_share_overlaps` then only notices at the
+        // *next* `Store::open`. The `UNIQUE` index on `mount_path` cannot catch it either:
+        // `mount_paths_collide` is a prefix test, not equality, so `/pub` and `/pub/sub` are
+        // distinct keys.
+        //
+        // `Immediate`, not the default `Deferred`, for the same reason `schema::migrate` gives:
+        // the write lock must be taken BEFORE the checks read, or both callers take a SHARED
+        // lock, both scan stale, and one then deadlocks on upgrade — which SQLite does *not*
+        // resolve by waiting on the busy handler.
+        //
+        // `Transaction::new_unchecked` (rather than `Connection::transaction`, which needs
+        // `&mut Connection`) because this method takes `&self`, matching the precedent already
+        // set by `revoke_member_and_bump_epoch` and `revoke_device_and_bump_epoch` above.
+        //
+        // It also closes the second half of the defect: the share row, its `share_excludes`
+        // rows, and the `grants_version` bump were three separate autocommits, so a crash
+        // between them could commit a share *without* its exclusion globs — the globs that hide
+        // files. All three now commit together or not at all.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let existing_count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))?;
@@ -909,6 +933,7 @@ impl Store {
             )?;
         }
         self.bump_grants_version()?;
+        tx.commit()?;
         Ok(share_id)
     }
 
@@ -1746,6 +1771,49 @@ mod tests {
             .add_share("Nested", "Nested", &nested, ShareFlags::default(), &[], 0)
             .unwrap_err();
         assert!(matches!(err, StoreError::OverlappingShareRoot { .. }));
+    }
+
+    #[test]
+    fn concurrent_add_share_cannot_persist_overlapping_roots() {
+        // Two threads, two independent `Store`s on one file, racing to add overlapping shares.
+        // Before `add_share` took a transaction, both scans saw an empty table and both inserts
+        // committed, leaving `/pub` and `/pub/sub` over `/srv/data` and `/srv/data/inner`
+        // persisted together. Exactly one must now win.
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("store.db");
+        Store::open(&db).expect("create");
+
+        let sandbox = tempdir().expect("sandbox");
+        let outer = sandbox.path().join("data");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).expect("mkdir");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for (name, mount, root) in [
+            ("Outer", "/pub", outer.clone()),
+            ("Inner", "/pub/sub", inner.clone()),
+        ] {
+            let db = db.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let store = Store::open(&db).expect("open");
+                barrier.wait();
+                store
+                    .add_share(name, mount, &root, ShareFlags::default(), &[], 0)
+                    .is_ok()
+            }));
+        }
+        let wins = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .filter(|ok| *ok)
+            .count();
+
+        let store = Store::open(&db).expect("reopen");
+        let shares = store.list_shares().expect("list");
+        assert_eq!(wins, 1, "exactly one concurrent add_share may succeed");
+        assert_eq!(shares.len(), 1, "only one share may be persisted");
     }
 
     #[test]
