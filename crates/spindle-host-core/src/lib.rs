@@ -58,6 +58,16 @@
 //!   [`server::VfsRpcServer::handle_bytes`], and writes the reply frame back. Framing/decode
 //!   violations close the connection rather than producing a typed [`spindle_proto::VfsErrorCode`]
 //!   — see that module's doc comment for the §A5 uniform-drop rationale.
+//! - [`session`] (Stage 5 slice 4) — [`session::VfsSessionHandler`], the production
+//!   `spindle_net::signaling::host::SessionHandler` implementation: opens a per-session
+//!   [`session::StoreFactory`]-produced `Store`, re-checks DESIGN.md §A4's member-active-and-
+//!   device-not-revoked rule at the moment the session's QUIC control stream comes up, and drives
+//!   [`serve::serve_control_stream`] over it. This re-check is not what makes revocation safe —
+//!   `server.rs`'s per-request gate is §A4's one authoritative checkpoint, and it runs on every
+//!   request inside every session — see [`session::VfsSessionHandler::session_context`]'s doc
+//!   comment for what this gate is actually for (a fail-closed source for `SessionContext`'s
+//!   `member_id`, and a cheap early-out) and why it must still be re-run rather than cached from
+//!   `authorize`'s connect-time decision.
 //!
 //! # Pipeline order (task brief; see [`server::VfsRpcServer::handle`]'s doc comment for the
 //! authoritative, code-adjacent version of this list)
@@ -87,6 +97,7 @@
 pub mod authorize;
 pub mod serve;
 pub mod server;
+pub mod session;
 
 mod cache;
 mod identity_cache;
@@ -102,6 +113,10 @@ pub use revoke::{
 };
 pub use serve::{serve_control_stream, ServeError};
 pub use server::{SessionContext, VfsRpcServer};
+pub use session::{
+    SqliteStoreFactory, StoreFactory, VfsSessionHandler, CLOSE_PROTOCOL_VIOLATION,
+    CLOSE_SESSION_REFUSED, CLOSE_SESSION_UNAVAILABLE,
+};
 
 #[cfg(test)]
 mod tests {

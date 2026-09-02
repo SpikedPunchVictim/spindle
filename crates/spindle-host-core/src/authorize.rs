@@ -87,6 +87,59 @@ impl DeviceLookup for SqliteDeviceLookup {
     }
 }
 
+/// Resolves `device_fp` to its owning member, but only if every one of DESIGN.md §A4's liveness
+/// checks holds: the device is enrolled, its member is `Active`, and neither the member nor this
+/// specific device has been revoked. Returns `None` on any failure — including a [`LookupError`]
+/// — never propagating an error, because every caller of this function treats "I could not prove
+/// this device is live" as "treat it as not live" (fail closed).
+///
+/// This is [`HostConnectAuthorizer::authorize`]'s checks 1–5, extracted rather than duplicated:
+/// [`crate::session::VfsSessionHandler`]'s session-time gate (building a
+/// `crate::server::SessionContext` — see that module's doc comment) needs exactly this same "is
+/// this device's member still live, right now" answer, at a different moment in a session's
+/// lifecycle. Duplicating a fail-closed security rule across two files is worse than sharing it: a
+/// future change to §A4's liveness definition (a new revocation state, an added precondition)
+/// would otherwise have to be found and re-applied in both places by hand.
+///
+/// 1. Lookup error (including a poisoned lock): fail closed, never propagate.
+/// 2. No such device: fail closed.
+/// 3. Member status is not `Active` (§A4b: unauthorized is indistinguishable from not-found): fail
+///    closed.
+/// 4. The device row for `device_fp` is not in `member.devices`. Should be impossible given
+///    `member_for_device_fp` resolved through that device, but handled explicitly rather than
+///    unwrapped — mirroring how `server.rs`'s gate handles its own `None` arm.
+/// 5. This device is revoked — the independently-enforced half of §A4: a still-Active member can
+///    have one revoked device among several (see `server.rs`'s `denied:device_revoked` gate, the
+///    per-request twin of this check).
+///
+/// Only reaching past all five returns `Some(member)`.
+pub(crate) fn active_member_for_device<L: DeviceLookup + ?Sized>(
+    lookup: &L,
+    device_fp: Fingerprint,
+) -> Option<Member> {
+    // 1 & 2.
+    let member = match lookup.member_for_device_fp(device_fp) {
+        Ok(Some(member)) => member,
+        Ok(None) => return None,
+        Err(_) => return None,
+    };
+
+    // 3.
+    if member.status != MemberStatus::Active {
+        return None;
+    }
+
+    // 4.
+    let device = member.devices.iter().find(|d| d.device_fp == device_fp)?;
+
+    // 5.
+    if device.revoked {
+        return None;
+    }
+
+    Some(member)
+}
+
 /// The production `ConnectAuthorizer`: DESIGN.md §A5's "is this connect offer's sender an active,
 /// non-revoked member device permitted to connect to this host?" decision, resolved against a
 /// real member registry via [`DeviceLookup`].
@@ -109,37 +162,25 @@ impl<L: DeviceLookup> HostConnectAuthorizer<L> {
 impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
     /// Every failure mode below returns `Deny`; only reaching the final line returns `Allow`. See
     /// the module doc comment and this crate's task brief for why each check exists; in
-    /// particular, checks 3 and 5 are independently enforced (a still-`Active` member can have one
-    /// revoked device among several — the same split `server.rs`'s `denied:device_revoked` gate
-    /// makes per request).
+    /// particular, checks 3 and 5 (folded into [`active_member_for_device`] below — see its own
+    /// doc comment for the full per-check narrative, including why checks 3 and 5 are
+    /// independently enforced: a still-`Active` member can have one revoked device among several,
+    /// the same split `server.rs`'s `denied:device_revoked` gate makes per request) are shared
+    /// with [`crate::session::VfsSessionHandler`]'s session-time gate rather than duplicated here.
     async fn authorize(&self, from_fp: &Fingerprint) -> ConnectDecision {
-        // 1. Lookup error (including a poisoned lock): fail closed, never propagate.
-        let member = match self.lookup.member_for_device_fp(*from_fp) {
-            Ok(Some(member)) => member,
-            // 2. No such device.
-            Ok(None) => return ConnectDecision::Deny,
-            Err(_) => return ConnectDecision::Deny,
-        };
-
-        // 3. Member status is not Active (§A4b: unauthorized is indistinguishable from
-        // not-found).
-        if member.status != MemberStatus::Active {
+        // 1-5: is `from_fp` an active, non-revoked member's non-revoked device? See
+        // `active_member_for_device`'s doc comment for the full five-check narrative this folds
+        // together.
+        let Some(member) = active_member_for_device(&self.lookup, *from_fp) else {
             return ConnectDecision::Deny;
-        }
-
-        // 4. The device row for `from_fp` is not in `member.devices`. Should be impossible given
-        // `member_for_device_fp` resolved through that device, but handled explicitly rather than
-        // unwrapped — mirroring how `server.rs`'s gate handles its own `None` arm.
+        };
+        // Re-finding the device row is redundant with what `active_member_for_device` already
+        // confirmed, but this module's house style never unwraps an invariant instead of failing
+        // closed (see check 4's own comment for the same call) — an `expect` here would be the
+        // one panic-shaped seam in an otherwise all-`Deny` function.
         let Some(device) = member.devices.iter().find(|d| d.device_fp == *from_fp) else {
             return ConnectDecision::Deny;
         };
-
-        // 5. This device is revoked — the independently-enforced half of §A4: a still-Active
-        // member can have one revoked device among several (see `server.rs`'s
-        // `denied:device_revoked` gate, the per-request twin of this check).
-        if device.revoked {
-            return ConnectDecision::Deny;
-        }
 
         // 6. Either key is missing on file. Fail closed; a missing key is never "skip the check".
         let (Some(sign_pk_bytes), Some(agree_pk_bytes)) = (&device.sign_pk, &device.agree_pk)

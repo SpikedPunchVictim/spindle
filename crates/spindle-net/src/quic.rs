@@ -54,7 +54,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{NoInitialCipherSuite, QuicClientConfig, QuicServerConfig};
-use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -378,6 +378,42 @@ pub struct ControlStream {
     pub connection: Connection,
     pub send: SendStream,
     pub recv: RecvStream,
+}
+
+impl ControlStream {
+    /// Closes the underlying [`quinn::Connection`] with an application-level `CONNECTION_CLOSE`
+    /// (`code`, `reason`) — **not** a QUIC transport error code; `code` is interpreted in the
+    /// application error space quinn/the QUIC wire format reserves for exactly this call
+    /// (`quinn::Connection::close`'s own contract).
+    ///
+    /// This exists here, one line deep, rather than having callers reach for
+    /// `self.connection.close(...)` directly, because the one real caller —
+    /// `spindle-host-core::serve`'s module doc comment says outright that "closing the underlying
+    /// transport connection ... is the caller's job" — has no `quinn` dependency of its own, and
+    /// must not gain one: per DESIGN.md §A9c's crate layering law, `spindle-host-core` depends on
+    /// `spindle-net` for exactly this kind of QUIC concern, so adding a second, direct `quinn`
+    /// dependency to that crate just to call one method would duplicate a manifest entry this
+    /// crate already exists to own. The QUIC concern belongs here; the decision of *when* to call
+    /// it belongs to the caller.
+    ///
+    /// # Interaction with the `connection.closed()` lifecycle bug
+    ///
+    /// `signaling/host.rs`'s module doc comment documents that quinn implicitly sends
+    /// `CONNECTION_CLOSE` when the last [`Connection`] handle drops, and that
+    /// `SignalingHost::handle_connect` awaits `connection.closed()` (bounded by
+    /// `HostOptions::session_close_timeout`) before letting that drop happen, specifically to give
+    /// the peer a chance to read whatever was last written before the connection dies. Calling
+    /// this method makes that bounded wait resolve immediately, because it *is* the
+    /// `CONNECTION_CLOSE` the wait is watching for — so it should only be called by a
+    /// [`crate::signaling::host::SessionHandler`] that is **refusing** a session outright (nothing
+    /// was written that the peer still needs to read, so there is nothing this explicit close
+    /// could discard). A handler whose session ended cleanly must not call this: an explicit close
+    /// on that path risks discarding a reply the peer has not read yet — precisely the race
+    /// `spikes/s2-signaling`'s `RESULTS.md` found empirically, and precisely why the bounded
+    /// `connection.closed()` wait exists at all.
+    pub fn close(&self, code: u32, reason: &[u8]) {
+        self.connection.close(VarInt::from_u32(code), reason);
+    }
 }
 
 // ── Server ───────────────────────────────────────────────────────────────────────────────────────
