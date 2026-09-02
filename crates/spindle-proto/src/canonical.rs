@@ -413,6 +413,18 @@ fn decode_one(bytes: &[u8], offset: usize) -> Result<(CborValue, usize), CborErr
         }
         4 => {
             let (count, mut off) = read_arg(bytes, offset, info, head_offset)?;
+            // Bound the count against the input before allocating against it. Every element
+            // costs at least one byte, so a count exceeding the bytes remaining can never be
+            // satisfied — and `count` is attacker-controlled, reached pre-authentication on
+            // both the signaling and auth-callout decode paths. The byte- and text-string
+            // branches above already bound their length the same way; this branch did not,
+            // and a 9-byte payload could drive `Vec::with_capacity` to abort the process.
+            // Compared in `u64` rather than via `count as usize` so a 32-bit target cannot
+            // truncate a large count into a small, passing one.
+            let remaining = bytes.len().saturating_sub(off) as u64;
+            if count > remaining {
+                return Err(CborError::UnexpectedEof { offset: off });
+            }
             let mut items = Vec::with_capacity(count as usize);
             for _ in 0..count {
                 let (item, next) = decode_one(bytes, off)?;
@@ -423,6 +435,13 @@ fn decode_one(bytes: &[u8], offset: usize) -> Result<(CborValue, usize), CborErr
         }
         5 => {
             let (count, mut off) = read_arg(bytes, offset, info, head_offset)?;
+            // Same bound as the array branch above, halved: a map entry is a key *and* a
+            // value, so each costs at least two bytes. Written as `remaining / 2` rather than
+            // `2 * count` so the comparison cannot itself overflow.
+            let remaining = bytes.len().saturating_sub(off) as u64;
+            if count > remaining / 2 {
+                return Err(CborError::UnexpectedEof { offset: off });
+            }
             let mut entries = Vec::with_capacity(count as usize);
             let mut prev_key_bytes: Option<&[u8]> = None;
             for _ in 0..count {
@@ -563,6 +582,69 @@ mod tests {
     fn rejects_trailing_bytes() {
         let err = canonical_decode(&[0x00, 0x00]).unwrap_err();
         assert_eq!(err, CborError::TrailingBytes { offset: 1 });
+    }
+
+    #[test]
+    fn rejects_array_count_exceeding_input() {
+        // 0x9b = array, 8-byte count. Count u64::MAX in nine total bytes. Before the count was
+        // bounded this reached `Vec::with_capacity` and aborted the process; a payload this
+        // shape is decoded pre-authentication on both the signaling and auth-callout paths.
+        let err =
+            canonical_decode(&[0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]).unwrap_err();
+        assert!(matches!(err, CborError::UnexpectedEof { .. }));
+
+        // An intermediate count is the more dangerous case: large enough to be a ~68 GB
+        // allocation, small enough that the allocator may abort rather than panic.
+        let err = canonical_decode(&[0x9a, 0xff, 0xff, 0xff, 0xff]).unwrap_err();
+        assert!(matches!(err, CborError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn rejects_map_count_exceeding_input() {
+        // 0xbb = map, 8-byte count.
+        let err =
+            canonical_decode(&[0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]).unwrap_err();
+        assert!(matches!(err, CborError::UnexpectedEof { .. }));
+
+        // 0xbf is indefinite-length, so use the 4-byte-count form for the intermediate case.
+        let err = canonical_decode(&[0xba, 0xff, 0xff, 0xff, 0xff]).unwrap_err();
+        assert!(matches!(err, CborError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn count_bound_admits_every_satisfiable_length() {
+        // The bound must reject only counts that *cannot* be satisfied. array(3) of three
+        // one-byte uints is exactly at the limit — three elements, three bytes remaining.
+        let v = canonical_decode(&[0x83, 0x01, 0x02, 0x03]).unwrap();
+        assert_eq!(
+            v,
+            CborValue::array(vec![
+                CborValue::Uint(1),
+                CborValue::Uint(2),
+                CborValue::Uint(3)
+            ])
+        );
+
+        // map(1) { 1: 2 } is exactly at the halved limit — one entry, two bytes remaining.
+        let v = canonical_decode(&[0xa1, 0x01, 0x02]).unwrap();
+        assert_eq!(
+            v,
+            CborValue::Map(vec![(CborValue::Uint(1), CborValue::Uint(2))])
+        );
+
+        // Empty array and empty map: count 0 with zero bytes remaining must still decode.
+        assert_eq!(canonical_decode(&[0x80]).unwrap(), CborValue::array(vec![]));
+        assert_eq!(canonical_decode(&[0xa0]).unwrap(), CborValue::Map(vec![]));
+    }
+
+    #[test]
+    fn count_bound_rejects_one_past_the_limit() {
+        // array(4) with only three bytes left, and map(2) with only three bytes left: both are
+        // one past what the input can supply, and both must fail before allocating.
+        let err = canonical_decode(&[0x84, 0x01, 0x02, 0x03]).unwrap_err();
+        assert!(matches!(err, CborError::UnexpectedEof { .. }));
+        let err = canonical_decode(&[0xa2, 0x01, 0x02, 0x03]).unwrap_err();
+        assert!(matches!(err, CborError::UnexpectedEof { .. }));
     }
 
     #[test]
