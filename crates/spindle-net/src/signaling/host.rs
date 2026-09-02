@@ -47,9 +47,26 @@ use super::wire::{seal_ice, OpenedOffer};
 /// `spindle-host-core`. Takes ownership of `control` and hands it back once the session is over
 /// (still holding its `Connection`), so [`SignalingHost::handle_connect`] can perform the
 /// `connection.closed()` wait described in this module's doc comment.
+///
+/// `peer_device_fp` is the **authenticated** envelope device fingerprint of the peer this session
+/// belongs to — not merely the `from_fp` the offer claimed. By the time this method is called,
+/// [`process_offer`] has resolved that fingerprint through the injected [`ConnectAuthorizer`] and
+/// then verified the offer's signature against the `sign_pk` the authorizer returned for it (see
+/// [`super::wire::open_offer`]), so a peer cannot reach here under a fingerprint whose signing key
+/// it does not hold.
+///
+/// Passing it is not a convenience. A host's session layer is required to bind one VFS RPC session
+/// to one `{member_id, device_fp}` pair for the session's whole duration, resolved once before the
+/// request loop starts rather than re-derived per request (see
+/// `spindle_host_core::serve::serve_control_stream`'s `ctx` parameter, whose doc comment names
+/// establishing those two values as this crate's responsibility). This crate can supply only the
+/// device half: it does not and must not own the member registry, per A9c boundary rule 3 — the
+/// same rule that makes [`ConnectAuthorizer`] an injected trait — so resolving `member_id` from
+/// this fingerprint is left to the implementer.
 pub trait SessionHandler: Send + Sync {
     fn handle_session(
         &self,
+        peer_device_fp: Fingerprint,
         control: ControlStream,
     ) -> impl std::future::Future<Output = ControlStream> + Send;
 }
@@ -351,7 +368,10 @@ where
         let server = QuicServer::from_socket(std_socket, &cert, opened.offer.cert_fp)?;
         let control = server.accept().await?;
 
-        let control = self.handler.handle_session(control).await;
+        // `opened.from_fp` is authenticated at this point, not merely claimed: `process_offer`
+        // resolved it through the authorizer and `open_offer` verified the offer signature against
+        // the `sign_pk` that lookup returned. See `SessionHandler`'s doc comment.
+        let control = self.handler.handle_session(opened.from_fp, control).await;
         let _ = tokio::time::timeout(opts.session_close_timeout, control.connection.closed()).await;
         Ok(())
     }

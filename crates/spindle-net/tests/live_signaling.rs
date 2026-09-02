@@ -700,11 +700,23 @@ impl ConnectAuthorizer for RegistryAuthorizer {
 /// denied connect never reaches a session at all.
 struct EchoHandler {
     sessions: Arc<AtomicUsize>,
+    /// Every `peer_device_fp` this handler was handed, in order. The host-side proof that
+    /// `spindle-net` passes the *authenticated* client identity through to the session layer —
+    /// without this, a handler could only assume who it is serving.
+    peers: Arc<Mutex<Vec<Fingerprint>>>,
 }
 
 impl SessionHandler for EchoHandler {
-    async fn handle_session(&self, mut control: ControlStream) -> ControlStream {
+    async fn handle_session(
+        &self,
+        peer_device_fp: Fingerprint,
+        mut control: ControlStream,
+    ) -> ControlStream {
         self.sessions.fetch_add(1, Ordering::SeqCst);
+        self.peers
+            .lock()
+            .expect("session peer log mutex")
+            .push(peer_device_fp);
         match read_frame(&mut control.recv).await {
             Ok(Some(frame)) => {
                 if let Err(error) = write_frame(&mut control.send, &frame).await {
@@ -800,6 +812,7 @@ async fn live_connect_round_trips_bytes_and_reports_latency() {
     // ---- the real SignalingHost --------------------------------------------------------------
     let (authorizer, authorize_calls) = RegistryAuthorizer::new(&[&client]);
     let sessions = Arc::new(AtomicUsize::new(0));
+    let session_peers = Arc::new(Mutex::new(Vec::new()));
     let host = Arc::new(SignalingHost::new(
         host_nats,
         host_device,
@@ -807,6 +820,7 @@ async fn live_connect_round_trips_bytes_and_reports_latency() {
         authorizer,
         EchoHandler {
             sessions: sessions.clone(),
+            peers: session_peers.clone(),
         },
     ));
     let host_task = tokio::spawn({
@@ -904,6 +918,16 @@ async fn live_connect_round_trips_bytes_and_reports_latency() {
         N_RUNS,
         "the injected SessionHandler must have handled exactly one session per run"
     );
+    let handled_peers = session_peers
+        .lock()
+        .expect("session peer log mutex")
+        .clone();
+    assert_eq!(
+        handled_peers,
+        vec![client.device_fp; N_RUNS],
+        "every session must have been handed the real client device_fp as its authenticated peer \
+         identity, got {handled_peers:?}"
+    );
     let calls = authorize_calls
         .lock()
         .expect("authorize call log mutex")
@@ -958,6 +982,7 @@ async fn live_connect_denied_by_the_authorizer_never_reaches_a_session() {
 
     let (authorizer, authorize_calls) = RegistryAuthorizer::new(&[&allowed]);
     let sessions = Arc::new(AtomicUsize::new(0));
+    let session_peers = Arc::new(Mutex::new(Vec::new()));
     let host = Arc::new(SignalingHost::new(
         host_nats,
         host_device,
@@ -965,6 +990,7 @@ async fn live_connect_denied_by_the_authorizer_never_reaches_a_session() {
         authorizer,
         EchoHandler {
             sessions: sessions.clone(),
+            peers: session_peers.clone(),
         },
     ));
     let host_task = tokio::spawn({
@@ -1059,6 +1085,14 @@ async fn live_connect_denied_by_the_authorizer_never_reaches_a_session() {
         1,
         "the denied connect must not have reached the SessionHandler — only the control run's \
          session may be counted"
+    );
+
+    assert!(
+        session_peers
+            .lock()
+            .expect("session peer log mutex")
+            .is_empty(),
+        "a denied connect must never hand a peer identity to the session layer"
     );
 
     assert_no_permission_violation(&host_events, "host");
