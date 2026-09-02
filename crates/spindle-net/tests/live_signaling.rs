@@ -1087,12 +1087,16 @@ async fn live_connect_denied_by_the_authorizer_never_reaches_a_session() {
          session may be counted"
     );
 
-    assert!(
-        session_peers
-            .lock()
-            .expect("session peer log mutex")
-            .is_empty(),
-        "a denied connect must never hand a peer identity to the session layer"
+    let handled_peers = session_peers
+        .lock()
+        .expect("session peer log mutex")
+        .clone();
+    assert_eq!(
+        handled_peers,
+        vec![allowed.device_fp],
+        "the session layer must have been handed exactly one peer identity — the control run's \
+         allowed device — and never the denied device's ({}), got {handled_peers:?}",
+        denied.device_fp
     );
 
     assert_no_permission_violation(&host_events, "host");
