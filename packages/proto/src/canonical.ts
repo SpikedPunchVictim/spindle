@@ -196,10 +196,30 @@ export class CborError extends Error {
   }
 }
 
-/** Encodes a `CborValue` tree to canonical CBOR bytes. */
+/**
+ * Encodes a `CborValue` tree to canonical CBOR bytes.
+ *
+ * Throws if `value` nests more than {@link MAX_NESTING_DEPTH} arrays/maps deep. `CborValue`'s
+ * `array()`/`map()` constructors are exported, so a future caller could in principle hand this
+ * function a tree built by recursing over some other unbounded input. Without a ceiling, encoding
+ * such a tree would recurse exactly the way `decodeOne` used to before it gained its own guard —
+ * in the Rust twin that recursion aborts the process uncatchably (SIGABRT); in JS it would
+ * eventually throw an engine `RangeError` at whatever depth the current call stack happens to
+ * allow, which varies by engine and by how much stack the caller has already used. Throwing our
+ * own bounded, deterministic error here keeps both languages agreeing on exactly which trees are
+ * legal to encode, matching `canonical_encode`'s panic in `canonical.rs` — Rust panics, TS
+ * throws, but both signal a programmer error (an over-deep in-memory value), not a protocol
+ * violation like `canonicalDecode`'s typed `CborError`/`DepthLimitExceeded`.
+ *
+ * This function stays a plain function that throws rather than returning a `Result`-like union:
+ * it has 22 TypeScript call sites plus 49 in the Rust twin, and every one today holds a
+ * provably-shallow value (either built by this package's own flat struct-encoding code, or
+ * round-tripped from the now-bounded decoder). Threading a fallible return through all 71 call
+ * sites would turn each into an unwrap for zero present benefit.
+ */
 export function canonicalEncode(value: CborValue): Uint8Array {
   const out: number[] = [];
-  encodeInto(value, out);
+  encodeInto(value, out, 0);
   return Uint8Array.from(out);
 }
 
@@ -241,7 +261,21 @@ function writeHeader(out: number[], major: number, value: bigint): void {
 
 const textEncoder = new TextEncoder();
 
-function encodeInto(value: CborValue, out: number[]): void {
+/** Mirrors `encode_into` in `canonical.rs` exactly: the top-level call starts at `depth` 0, each
+ * `array` element and each `map` key/value recurses at `depth + 1`, and the guard fires on entry
+ * before any work happens. Keeping the counting convention identical to `decodeOne` (and to the
+ * Rust twin) is what makes both sides agree on which trees are legal — see the symmetry test in
+ * `test/canonical.test.ts`. */
+function encodeInto(value: CborValue, out: number[], depth: number): void {
+  if (depth > MAX_NESTING_DEPTH) {
+    // Programmer-error signal (an over-deep in-memory value), not a protocol error — see
+    // `canonicalEncode`'s doc comment. A bare `Error`, not `CborError`, following this file's
+    // existing pattern for "should never happen" conditions (the `unreachable` branch below).
+    throw new Error(
+      `canonicalEncode: value nests deeper than MAX_NESTING_DEPTH (${MAX_NESTING_DEPTH}) levels; ` +
+        "flatten the CborValue tree before encoding it",
+    );
+  }
   switch (value.kind) {
     case "uint":
       writeHeader(out, 0, value.value);
@@ -261,14 +295,14 @@ function encodeInto(value: CborValue, out: number[]): void {
     }
     case "array":
       writeHeader(out, 4, BigInt(value.value.length));
-      for (const item of value.value) encodeInto(item, out);
+      for (const item of value.value) encodeInto(item, out, depth + 1);
       return;
     case "map": {
       const encoded: Array<[Uint8Array, Uint8Array]> = value.value.map(([k, v]) => {
         const kOut: number[] = [];
-        encodeInto(k, kOut);
+        encodeInto(k, kOut, depth + 1);
         const vOut: number[] = [];
-        encodeInto(v, vOut);
+        encodeInto(v, vOut, depth + 1);
         return [Uint8Array.from(kOut), Uint8Array.from(vOut)];
       });
       encoded.sort((a, b) => compareBytes(a[0], b[0]));

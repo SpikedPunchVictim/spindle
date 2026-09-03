@@ -186,6 +186,53 @@ describe("canonical decode: nesting depth limit", () => {
   });
 });
 
+describe("canonical encode: nesting depth limit", () => {
+  // Builds `uint(0)` wrapped in `depth` enclosing single-element arrays, e.g. `nestedArray(2)` is
+  // `[[0]]`. Encoding this drives `encodeInto` to exactly `depth` on the innermost scalar — the
+  // same units `decodeOne` counts in for the byte pattern of `depth` repeated `0x81` bytes
+  // followed by a terminal `0x00`, used by the decode depth-limit tests above.
+  function nestedArray(depth: number): CborValue {
+    let v: CborValue = CborValue.uint(0);
+    for (let i = 0; i < depth; i++) {
+      v = CborValue.array([v]);
+    }
+    return v;
+  }
+
+  it("accepts nesting up to MAX_NESTING_DEPTH", () => {
+    const value = nestedArray(MAX_NESTING_DEPTH);
+    const bytes = canonicalEncode(value);
+    const expected = new Uint8Array(MAX_NESTING_DEPTH + 1);
+    expected.fill(0x81, 0, MAX_NESTING_DEPTH);
+    expected[MAX_NESTING_DEPTH] = 0x00;
+    expect(bytes).toEqual(expected);
+  });
+
+  it("throws when encoding nesting one deeper than MAX_NESTING_DEPTH", () => {
+    const value = nestedArray(MAX_NESTING_DEPTH + 1);
+    expect(() => canonicalEncode(value)).toThrow(/nests deeper than MAX_NESTING_DEPTH/);
+  });
+
+  it("encode/decode depth symmetry: both accept at the ceiling, both reject one past it", () => {
+    // At exactly the ceiling: encode succeeds, and the resulting bytes decode back to an equal
+    // value (full round-trip) rather than either side rejecting it.
+    const atCeiling = nestedArray(MAX_NESTING_DEPTH);
+    const bytes = canonicalEncode(atCeiling);
+    const decoded = canonicalDecode(bytes);
+    expect(normalize(decoded)).toEqual(normalize(atCeiling));
+    expect(canonicalEncode(decoded)).toEqual(bytes);
+
+    // One level deeper: both sides must reject. The encoder throws (verified above);
+    // independently confirm the decoder rejects the equivalent byte-level tree, so neither side
+    // is more permissive than the other.
+    const onePast = new Uint8Array(MAX_NESTING_DEPTH + 2);
+    onePast.fill(0x81, 0, MAX_NESTING_DEPTH + 1);
+    onePast[MAX_NESTING_DEPTH + 1] = 0x00;
+    const err = expectThrowsCborError(() => canonicalDecode(onePast));
+    expect(err.kind).toBe("DepthLimitExceeded");
+  });
+});
+
 describe("canonical encode: map key sorting", () => {
   it("sorts shorter keys before longer keys regardless of content", () => {
     // "z" (1 byte, header 0x61) sorts before "aa" (2 bytes, header 0x62), even though "aa" < "z"

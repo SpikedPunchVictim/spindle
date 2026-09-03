@@ -233,9 +233,27 @@ impl fmt::Display for CborError {
 impl std::error::Error for CborError {}
 
 /// Encodes a `CborValue` tree to canonical CBOR bytes.
+///
+/// # Panics
+///
+/// Panics if `value` nests more than [`MAX_NESTING_DEPTH`] arrays/maps deep. `CborValue`'s
+/// `array()`/`map()` constructors are `pub` and re-exported, so a future caller could in
+/// principle hand this function a tree built by recursing over some other unbounded input.
+/// Without a ceiling, encoding such a tree would recurse exactly the way `decode_one` used to
+/// before it gained its own guard — and unbounded recursion on the encode side **aborts the
+/// process** (SIGABRT) rather than panicking, which no caller can `catch_unwind`. Panicking here
+/// converts that uncatchable abort into a catchable, diagnosable panic, matching the decoder's
+/// severity rationale (see [`MAX_NESTING_DEPTH`]'s docs).
+///
+/// This function stays infallible (`Vec<u8>`, not `Result<Vec<u8>, _>`) rather than growing a
+/// fallible return: it has 49 Rust call sites plus 22 in the TypeScript twin, and every one of
+/// them today holds a provably-shallow value (either built by this crate's own flat
+/// struct-encoding code, or round-tripped from the now-bounded decoder). Threading a `Result`
+/// through all 71 call sites would turn each into `.expect(...)` for zero present benefit,
+/// landing back at a panic anyway with far more churn than this one guard.
 pub fn canonical_encode(value: &CborValue) -> Vec<u8> {
     let mut out = Vec::new();
-    encode_into(value, &mut out);
+    encode_into(value, &mut out, 0);
     out
 }
 
@@ -270,7 +288,18 @@ fn write_header(out: &mut Vec<u8>, major: u8, value: u64) {
     }
 }
 
-fn encode_into(value: &CborValue, out: &mut Vec<u8>) {
+/// Mirrors `decode_one`'s depth threading exactly: the top-level call starts at `depth` 0, each
+/// `Array` element and each `Map` key/value recurses at `depth + 1`, and the guard fires on
+/// entry before any work happens. Keeping the counting convention identical between encode and
+/// decode is what makes the two sides agree on which trees are legal — see the symmetry test in
+/// this module.
+fn encode_into(value: &CborValue, out: &mut Vec<u8>, depth: usize) {
+    if depth > MAX_NESTING_DEPTH {
+        panic!(
+            "canonical_encode: value nests deeper than MAX_NESTING_DEPTH ({MAX_NESTING_DEPTH}) \
+             levels; flatten the CborValue tree before encoding it"
+        );
+    }
     match value {
         CborValue::Uint(v) => write_header(out, 0, *v),
         CborValue::NegInt(v) => write_header(out, 1, *v),
@@ -285,7 +314,7 @@ fn encode_into(value: &CborValue, out: &mut Vec<u8>) {
         CborValue::Array(items) => {
             write_header(out, 4, items.len() as u64);
             for item in items {
-                encode_into(item, out);
+                encode_into(item, out, depth + 1);
             }
         }
         CborValue::Map(entries) => {
@@ -293,9 +322,9 @@ fn encode_into(value: &CborValue, out: &mut Vec<u8>) {
                 .iter()
                 .map(|(k, v)| {
                     let mut kb = Vec::new();
-                    encode_into(k, &mut kb);
+                    encode_into(k, &mut kb, depth + 1);
                     let mut vb = Vec::new();
-                    encode_into(v, &mut vb);
+                    encode_into(v, &mut vb, depth + 1);
                     (kb, vb)
                 })
                 .collect();
@@ -714,6 +743,58 @@ mod tests {
         }
         bytes.push(0x00);
         let err = canonical_decode(&bytes).unwrap_err();
+        assert!(matches!(err, CborError::DepthLimitExceeded { .. }));
+    }
+
+    /// Builds `Uint(0)` wrapped in `depth` enclosing single-element arrays, e.g. `nested(2)` is
+    /// `[[0]]`. Encoding this drives `encode_into` to exactly `depth` on the innermost scalar,
+    /// the same units `decode_one` counts in for the byte pattern `vec![0x81; depth]` followed by
+    /// a terminal `0x00` used by the decoder's own nesting tests above.
+    fn nested_array(depth: usize) -> CborValue {
+        let mut v = CborValue::Uint(0);
+        for _ in 0..depth {
+            v = CborValue::array(vec![v]);
+        }
+        v
+    }
+
+    #[test]
+    fn encode_accepts_nesting_up_to_the_limit() {
+        let v = nested_array(MAX_NESTING_DEPTH);
+        let bytes = canonical_encode(&v);
+        // Same byte shape as the decoder's `accepts_nesting_up_to_the_limit` test.
+        let mut expected = vec![0x81u8; MAX_NESTING_DEPTH];
+        expected.push(0x00);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "nests deeper than MAX_NESTING_DEPTH")]
+    fn encode_panics_one_past_the_limit() {
+        let v = nested_array(MAX_NESTING_DEPTH + 1);
+        canonical_encode(&v);
+    }
+
+    #[test]
+    fn encode_decode_depth_symmetry_at_and_past_the_ceiling() {
+        // At exactly the ceiling: encode must succeed, and the resulting bytes must decode back
+        // to an equal value (full round-trip) rather than either side rejecting it.
+        let at_ceiling = nested_array(MAX_NESTING_DEPTH);
+        let bytes = canonical_encode(&at_ceiling);
+        let decoded = canonical_decode(&bytes).expect("decoder must accept the encoder's ceiling");
+        assert_eq!(decoded, at_ceiling, "round-trip changed the value");
+        assert_eq!(
+            canonical_encode(&decoded),
+            bytes,
+            "re-encoding the decoded value changed the bytes"
+        );
+
+        // One level deeper: both sides must reject. The encoder panics (verified by the
+        // `#[should_panic]` test above); independently confirm the decoder rejects the
+        // equivalent byte-level tree, so neither side is more permissive than the other.
+        let mut one_past = vec![0x81u8; MAX_NESTING_DEPTH + 1];
+        one_past.push(0x00);
+        let err = canonical_decode(&one_past).unwrap_err();
         assert!(matches!(err, CborError::DepthLimitExceeded { .. }));
     }
 
