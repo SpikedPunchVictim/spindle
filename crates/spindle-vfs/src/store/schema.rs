@@ -139,9 +139,10 @@ CREATE TABLE signed_heads (
 /// - `member_upload_bytes` / `share_upload_bytes`: running byte counters backing DESIGN.md §A4b's
 ///   "quotas per member and per share". Deliberately scoped to bytes that moved through *this
 ///   crate's* upload path (an `upload_commit`), not a full recursive walk of on-disk usage — see
-///   `crate::store::Store::adjust_member_upload_bytes`'s doc comment for the accounting model and
-///   its documented limitation (a delete does not retroactively restore a *different* member's
-///   counter, since no ownership ledger maps a real file back to whichever member uploaded it).
+///   `crate::store::Store::adjust_member_upload_bytes`'s doc comment for the accounting model
+///   (an ownership ledger, `uploaded_files`, added in SCHEMA_V6/V7, now maps every real file back
+///   to whichever member uploaded it, so a delete *does* refund the original uploader's counter —
+///   see `Store::remove_uploads_under`, which returns the per-row `(MemberId, bytes)` it refunded).
 const SCHEMA_V3: &str = r#"
 ALTER TABLE devices ADD COLUMN sign_pk BLOB;
 
@@ -571,10 +572,17 @@ mod tests {
             .expect("read user_version");
         assert_eq!(version, MIGRATIONS.last().unwrap().0);
 
-        // The new shape exists (querying `fold_subpath` at all would error against the old
-        // table), and it is empty — SCHEMA_V7 discards the ledger rather than migrating it.
+        // The query itself names `fold_subpath` (it would error against the OLD table, which has
+        // no such column, so this genuinely proves the new shape exists rather than merely
+        // querying a column-agnostic `COUNT(*)` that a table recreated without `fold_subpath`
+        // would also pass), and it comes back empty — SCHEMA_V7 discards the ledger rather than
+        // migrating it.
         let row_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM uploaded_files", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM uploaded_files WHERE fold_subpath IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
             .expect("count rows via the new fold_subpath-keyed shape");
         assert_eq!(
             row_count, 0,

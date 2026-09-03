@@ -881,8 +881,9 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 // The filesystem delete already succeeded by this point, so a ledger failure here
                 // must not fail the RPC (fail-open) — but per this ticket it must not be silently
                 // discarded either, so it is folded into this call's own audit outcome instead of
-                // a bare `let _ = ...`. Same reasoning `Store::audit`'s doc comment gives at
-                // :1597-1601 for audit-append failures themselves.
+                // a bare `let _ = ...`. Same reasoning this file's own `fn audit` gives, in the
+                // inline comment on its `AuditEntry` append, for audit-append failures themselves
+                // (deliberately unversioned by line number: this comment has already gone stale once).
                 let ledger_outcome = match self
                     .store()
                     .remove_uploads_under(share.share_id, &subpath.to_path_string())
@@ -1464,8 +1465,9 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 // has already been moved into place by this point, so a ledger failure here must
                 // not fail the RPC (fail-open) — but per this ticket it must not be silently
                 // discarded either, so it is folded into this call's own audit outcome instead of
-                // a bare `let _ = ...`. Same reasoning `Store::audit`'s doc comment gives at
-                // :1597-1601 for audit-append failures themselves.
+                // a bare `let _ = ...`. Same reasoning this file's own `fn audit` gives, in the
+                // inline comment on its `AuditEntry` append, for audit-append failures themselves
+                // (deliberately unversioned by line number: this comment has already gone stale once).
                 let ledger_outcome = match self.store().record_upload(
                     share.share_id,
                     member.member_id,

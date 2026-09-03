@@ -1249,8 +1249,11 @@ impl Store {
 
     /// Adjusts `share_id`'s running upload-byte counter by `delta`, clamped at 0, and returns the
     /// new total. Creates the counter row on first use. See the module-section doc comment above
-    /// for why this counter (unlike [`Store::adjust_member_upload_bytes`]) is kept exactly in sync
-    /// with deletes.
+    /// for the current accounting model: this counter and
+    /// [`Store::adjust_member_upload_bytes`]'s are both maintained caches over the `uploaded_files`
+    /// ledger, kept in sync by [`Store::record_upload`] and [`Store::remove_uploads_under`] and
+    /// healed on drift by [`Store::reconcile_upload_counters`] — there is no longer an asymmetry
+    /// between the two counters.
     pub fn adjust_share_upload_bytes(
         &self,
         share_id: ShareId,
@@ -2871,26 +2874,37 @@ mod tests {
     fn remove_uploads_under_matches_descendants_of_a_non_ascii_subpath() {
         let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
 
-        // `"dossié/"` is 7 characters but 8 UTF-8 bytes. A prefix-length computed by Rust's
-        // `str::len()` (bytes) and compared against SQLite's `substr(...)` (characters) would
-        // disagree here and silently fail to match either descendant below.
+        // The ledger's prefix match runs against `fold_key(subpath)`, not the raw input, so this
+        // test only exercises the byte-vs-character bug if the input *survives folding* as
+        // multi-byte. It originally used "dossié", but `fold_key` maps Latin-1 accented letters
+        // to their base letter (see `LATIN1_DECOMPOSITIONS`), so "dossié/" folds to the
+        // pure-ASCII "dossie/" — 7 characters, 7 bytes, indistinguishable to a byte-length or a
+        // character-length count. Once SCHEMA_V7 moved the comparison onto `fold_subpath`, this
+        // input stopped discriminating anything and the test silently stopped catching its own
+        // bug. Cyrillic is used instead because `fold_key` only maps the 27 Latin-1 letters in
+        // `LATIN1_DECOMPOSITIONS` and strips combining marks U+0300..U+036F — Cyrillic passes
+        // through untouched, so "досье/" folds to itself: 6 characters but 11 UTF-8 bytes. A
+        // prefix-length computed by Rust's `str::len()` (bytes) and compared against SQLite's
+        // `substr(...)` (characters) still disagrees here, and would silently fail to match
+        // either descendant below. Anyone changing this input must re-check that the *folded*
+        // form is still multi-byte, not just the raw input.
         store
-            .record_upload(share_id, member_a, "dossié/a.txt", 10)
-            .expect("record direct child of dossié");
+            .record_upload(share_id, member_a, "досье/a.txt", 10)
+            .expect("record direct child of досье");
         store
-            .record_upload(share_id, member_b, "dossié/sub/b.txt", 20)
-            .expect("record nested descendant of dossié");
+            .record_upload(share_id, member_b, "досье/sub/b.txt", 20)
+            .expect("record nested descendant of досье");
 
-        // Unrelated sibling that only shares a prefix with "dossié", not a "/"-bounded
+        // Unrelated sibling that only shares a prefix with "досье", not a "/"-bounded
         // descendant of it — must survive, proving the fix didn't degrade into a bare prefix
         // match once character-counting was restored.
         store
-            .record_upload(share_id, member_a, "dossiéX/keep.txt", 30)
+            .record_upload(share_id, member_a, "досьеX/keep.txt", 30)
             .expect("record unrelated sibling sharing a textual prefix");
 
         let removed = store
-            .remove_uploads_under(share_id, "dossié")
-            .expect("remove_uploads_under dossié");
+            .remove_uploads_under(share_id, "досье")
+            .expect("remove_uploads_under досье");
         assert_eq!(removed, vec![(member_a, 10), (member_b, 20)]);
 
         // Both descendants' uploaders are refunded, and the share counter drops by their sum.

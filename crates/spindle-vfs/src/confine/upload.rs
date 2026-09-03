@@ -349,6 +349,20 @@ mod tests {
     /// The NFC/NFD equivalent of the case-collision fix above: a precomposed "café" (é as a
     /// single U+00E9 code point) and its decomposed spelling ("cafe" + combining U+0301) must
     /// fold equal and finalize onto the pre-existing dirent's spelling.
+    ///
+    /// **Platform caveat, confirmed by two independent reviewers**: the filesystem-level
+    /// assertions below (`entries.len() == 1`, the surviving dirent keeping the NFC spelling)
+    /// cannot fail on macOS. APFS is normalization-insensitive even on a volume created
+    /// case-sensitive — the two byte sequences resolve to *one* dirent at the filesystem layer
+    /// regardless of whether `finalize_upload`'s fold-key fix is present, verified empirically on
+    /// a case-sensitive APFS image. So on macOS this test is intent-locking only: it documents
+    /// the desired behavior but cannot distinguish "the fix works" from "the filesystem already
+    /// made this a non-issue". Real evidence that the fix does something requires a filesystem
+    /// that stores names as opaque bytes and would otherwise keep both spellings as separate
+    /// dirents — ext4 / Linux CI. The `names_collide(nfc, nfd)` sanity assertion just below DOES
+    /// prove the fold-key half of this fix on every platform; it is only the filesystem-plumbing
+    /// half (finalize actually overwriting rather than creating a second dirent) that stays
+    /// unproven here on macOS.
     #[test]
     fn finalize_upload_nfd_collision_overwrites_existing_dirent_not_requested_spelling() {
         let nfc = "caf\u{00E9}.txt"; // precomposed é (U+00E9)
