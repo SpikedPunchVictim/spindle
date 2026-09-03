@@ -258,7 +258,7 @@ where
         let member = active_member_for_device(&self.lookup, peer_device_fp)?;
         Some(SessionContext {
             member_id: member.member_id,
-            device_fp: Some(peer_device_fp),
+            device_fp: peer_device_fp,
         })
     }
 }
@@ -395,7 +395,7 @@ mod tests {
             .session_context(device_fp)
             .expect("expected Some for an active member's enrolled device");
         assert_eq!(ctx.member_id, member_id);
-        assert_eq!(ctx.device_fp, Some(device_fp));
+        assert_eq!(ctx.device_fp, device_fp);
     }
 
     #[test]

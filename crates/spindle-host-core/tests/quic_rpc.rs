@@ -377,7 +377,7 @@ async fn full_session_over_real_quic_control_stream() {
     let control = quic_server.accept().await.expect("server accept");
     let ctx = SessionContext {
         member_id,
-        device_fp: Some(device_fp),
+        device_fp,
     };
     let server = VfsRpcServer::new(&h.store);
     // Deterministic clock: every request in this test gets the same audit timestamp, matching
@@ -524,7 +524,7 @@ async fn oversized_frame_is_a_protocol_violation_with_no_reply() {
     let control = quic_server.accept().await.expect("server accept");
     let ctx = SessionContext {
         member_id,
-        device_fp: Some(device_fp),
+        device_fp,
     };
     let server = VfsRpcServer::new(&h.store);
     let result = serve_control_stream(server, &ctx, || 1u64, control.recv, control.send).await;

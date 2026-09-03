@@ -9,11 +9,17 @@ use spindle_host_core::{SessionContext, VfsRpcServer};
 use spindle_proto::{VfsErrorCode, VfsReply, VfsRequest, VfsRequestEnvelope};
 use spindle_vfs::model::{MemberId, MemberStatus, Perms, ShareFlags, ShareId, VirtualPath};
 use spindle_vfs::store::Store;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use tempfile::TempDir;
 
 struct Harness {
     sandbox: TempDir,
     store: Store,
+    /// Lazily populated by [`Self::ctx`]: each member gets exactly one enrolled "default" device
+    /// the first time a context is requested for it, then the same fingerprint on every later
+    /// call — see `ctx`'s doc comment for why `SessionContext::device_fp` can no longer be `None`.
+    default_devices: RefCell<BTreeMap<MemberId, Fingerprint>>,
 }
 
 impl Harness {
@@ -21,6 +27,7 @@ impl Harness {
         Harness {
             sandbox: tempfile::tempdir().expect("tempdir"),
             store: Store::open_in_memory().expect("open in-memory store"),
+            default_devices: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -78,20 +85,42 @@ impl Harness {
         VfsRpcServer::new(&self.store)
     }
 
+    /// The device fingerprint [`Self::ctx`] uses for `member_id`: enrolled (with no pinned keys —
+    /// these tests never verify an upload-manifest signature) the first time it's asked for, and
+    /// memoized after that so repeated `ctx(member_id)` calls within one test keep returning the
+    /// same device rather than silently enrolling a new one each time. `add_device` only requires
+    /// that the member row exist, not that it be `Active`, so this also works for the
+    /// not-yet-active/invited-member test that calls `ctx` directly.
+    fn default_device(&self, member_id: MemberId) -> Fingerprint {
+        if let Some(fp) = self.default_devices.borrow().get(&member_id) {
+            return *fp;
+        }
+        let fp = Fingerprint::of_parts(&[b"default-device", &member_id.0.to_be_bytes()]);
+        self.store
+            .add_device(member_id, fp, "default", 0, None)
+            .expect("enroll default device for ctx()");
+        self.default_devices.borrow_mut().insert(member_id, fp);
+        fp
+    }
+
+    /// A session context for `member_id`, carrying that member's default enrolled device (see
+    /// [`Self::default_device`]) — `SessionContext::device_fp` is no longer optional, so every
+    /// test context needs a real, enrolled device or it would hit `denied:unknown_device` in
+    /// Step 2b regardless of what the test is actually asserting.
     fn ctx(&self, member_id: MemberId) -> SessionContext {
         SessionContext {
             member_id,
-            device_fp: None,
+            device_fp: self.default_device(member_id),
         }
     }
 
-    /// Like [`Self::ctx`], but carries a `device_fp` — for tests exercising device-level
-    /// revocation specifically. A separate helper rather than a parameter on `ctx` so the ~20
-    /// existing tests that call `ctx` (and rely on `device_fp: None`) are untouched.
+    /// Like [`Self::ctx`], but carries a caller-chosen `device_fp` — for tests exercising
+    /// device-level revocation specifically, which need to name a *particular* device (e.g. one
+    /// they are about to revoke) rather than whichever one `ctx` would otherwise enroll.
     fn ctx_with_device(&self, member_id: MemberId, device_fp: Fingerprint) -> SessionContext {
         SessionContext {
             member_id,
-            device_fp: Some(device_fp),
+            device_fp,
         }
     }
 }
@@ -483,6 +512,43 @@ fn revoked_device_is_denied_on_the_very_next_request_while_its_member_stays_acti
     );
 }
 
+#[test]
+fn session_naming_a_device_the_member_never_enrolled_is_denied() {
+    let h = Harness::new();
+    let member_id = h.add_active_member("Alex");
+    let device_fp = Fingerprint::of_parts(&[b"Alex's iPhone"]);
+    h.store
+        .add_device(member_id, device_fp, "Alex's iPhone", 0, None)
+        .expect("add device");
+    let share_id = h.add_share("Photos", "Photos", ShareFlags::default());
+    let root = h.share_real_root(share_id);
+    std::fs::write(root.join("a.jpg"), b"hello").expect("write a.jpg");
+    h.grant(member_id, share_id, "", Perms::BROWSE | Perms::DOWNLOAD);
+
+    let server = h.server();
+    let unknown_device_fp = Fingerprint::of_parts(&[b"a device Alex never enrolled"]);
+    let ctx = h.ctx_with_device(member_id, unknown_device_fp);
+
+    let reply = server.handle(
+        &ctx,
+        1,
+        envelope(
+            1,
+            VfsRequest::Stat {
+                path: "Photos/a.jpg".to_string(),
+            },
+        ),
+    );
+    assert_eq!(
+        reply,
+        not_found(),
+        "a `SessionContext` naming a device the member never enrolled must be denied — this is \
+         the only runtime denial left on Step 2b's device-liveness gate now that \
+         `SessionContext::device_fp` is a plain `Fingerprint` rather than an `Option`, so it must \
+         be covered even though the member has an active, properly enrolled device of their own"
+    );
+}
+
 // =================================================================================================
 // Protocol version negotiation
 // =================================================================================================
@@ -792,7 +858,9 @@ fn unknown_member_id_is_not_found_not_a_crash() {
     let server = h.server();
     let ctx = SessionContext {
         member_id: MemberId(99999),
-        device_fp: None,
+        // Never enrolled anywhere — irrelevant here, since the member itself doesn't exist and
+        // the pipeline's member-active check (Step 2) rejects before Step 2b ever inspects it.
+        device_fp: Fingerprint::of_parts(&[b"unused-device"]),
     };
     let reply = server.handle(&ctx, 1, envelope(1, VfsRequest::Whoami));
     assert_eq!(reply, not_found());

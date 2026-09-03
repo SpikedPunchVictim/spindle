@@ -31,16 +31,21 @@ use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write as _};
 
-/// Identifies the calling session for pipeline purposes: which member is acting, and (optionally)
-/// which of their devices, for the audit trail. Authenticating a transport-level session down to
-/// these two values, and keeping them stable for the lifetime of that session, is `spindle-net`'s
-/// responsibility (a later slice) — `VfsRpcServer` trusts them completely, exactly as scoped
+/// Identifies the calling session for pipeline purposes: which member is acting, and which of
+/// their devices, for the audit trail and for the per-request device-revocation check (Step 2b of
+/// [`VfsRpcServer::handle`]). Authenticating a transport-level session down to these two values,
+/// and keeping them stable for the lifetime of that session, happens in `crate::session`'s
+/// `VfsSessionHandler::session_context` — the production `SessionHandler`, which builds this from
+/// the QUIC peer's device fingerprint and which `spindle-hostd` wires up as the real host's
+/// handler — `VfsRpcServer` trusts them completely, exactly as scoped
 /// (`spindle_proto::vfs_rpc`'s module doc comment: "VFS RPC messages travel inside an
-/// already-authenticated ... session").
+/// already-authenticated ... session"). `device_fp` is not optional: there is no legitimate
+/// device-less session (see Step 2b's comment for why), and making one unrepresentable in this
+/// type is what closes the fail-open gap a `None` used to leave.
 #[derive(Debug, Clone, Copy)]
 pub struct SessionContext {
     pub member_id: spindle_vfs::model::MemberId,
-    pub device_fp: Option<Fingerprint>,
+    pub device_fp: Fingerprint,
 }
 
 /// One real-filesystem-or-synthetic listing/stat candidate, before permission filtering has
@@ -178,7 +183,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
             self.audit(
                 ts,
                 None,
-                ctx.device_fp,
+                Some(ctx.device_fp),
                 op_name(&env.request),
                 request_path(&env.request),
                 None,
@@ -197,7 +202,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
             self.audit(
                 ts,
                 None,
-                ctx.device_fp,
+                Some(ctx.device_fp),
                 op_name(&env.request),
                 request_path(&env.request),
                 None,
@@ -216,7 +221,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 self.audit(
                     ts,
                     None,
-                    ctx.device_fp,
+                    Some(ctx.device_fp),
                     op_name(&env.request),
                     request_path(&env.request),
                     None,
@@ -232,7 +237,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 self.audit(
                     ts,
                     None,
-                    ctx.device_fp,
+                    Some(ctx.device_fp),
                     op_name(&env.request),
                     request_path(&env.request),
                     None,
@@ -247,7 +252,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
             self.audit(
                 ts,
                 Some(member.root_fp),
-                ctx.device_fp,
+                Some(ctx.device_fp),
                 op_name(&env.request),
                 request_path(&env.request),
                 None,
@@ -266,43 +271,45 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         // `store.get_member` read as the status check just above, so this costs no extra store
         // round-trip and is checked fresh every request for the same reason member liveness is
         // (never served from the grants_version/cap_epoch-keyed cache; see `crate::cache`'s module
-        // doc comment). `ctx.device_fp` is documented as optional (this struct's doc comment:
-        // wiring a real per-session device identity is `spindle-net`'s job, a later slice) — `None`
-        // is deliberately left passing here rather than tightened to a denial, both because that
-        // would be a scope decision belonging to whoever wires transport-level session identity,
-        // and because ~20 existing tests in this suite construct contexts with `device_fp: None`
-        // and must keep passing.
-        if let Some(device_fp) = ctx.device_fp {
-            match member.devices.iter().find(|d| d.device_fp == device_fp) {
-                Some(d) if d.revoked => {
-                    self.audit(
-                        ts,
-                        Some(member.root_fp),
-                        ctx.device_fp,
-                        op_name(&env.request),
-                        request_path(&env.request),
-                        None,
-                        "denied:device_revoked",
-                    );
-                    return VfsReply::Error {
-                        code: VfsErrorCode::NotFound,
-                    };
-                }
-                Some(_) => {}
-                None => {
-                    self.audit(
-                        ts,
-                        Some(member.root_fp),
-                        ctx.device_fp,
-                        op_name(&env.request),
-                        request_path(&env.request),
-                        None,
-                        "denied:unknown_device",
-                    );
-                    return VfsReply::Error {
-                        code: VfsErrorCode::NotFound,
-                    };
-                }
+        // doc comment). This check is unconditional: `SessionContext::device_fp` is a plain
+        // `Fingerprint`, not an `Option`, so there is no "no device supplied" case left to fall
+        // through on — DESIGN.md :1022 records that the helper's callout epoch check was demoted
+        // to best-effort precisely because this per-request check is the authoritative one, so
+        // this gate cannot itself have a silent bypass. That type is sound because there is no
+        // legitimate device-less session in production: the sole production constructor,
+        // `VfsSessionHandler::session_context`, only ever runs with a peer-supplied device
+        // fingerprint, and it resolves the member *through* `active_member_for_device`, which
+        // itself requires the device to exist and be unrevoked before a `SessionContext` is ever
+        // built.
+        match member.devices.iter().find(|d| d.device_fp == ctx.device_fp) {
+            Some(d) if d.revoked => {
+                self.audit(
+                    ts,
+                    Some(member.root_fp),
+                    Some(ctx.device_fp),
+                    op_name(&env.request),
+                    request_path(&env.request),
+                    None,
+                    "denied:device_revoked",
+                );
+                return VfsReply::Error {
+                    code: VfsErrorCode::NotFound,
+                };
+            }
+            Some(_) => {}
+            None => {
+                self.audit(
+                    ts,
+                    Some(member.root_fp),
+                    Some(ctx.device_fp),
+                    op_name(&env.request),
+                    request_path(&env.request),
+                    None,
+                    "denied:unknown_device",
+                );
+                return VfsReply::Error {
+                    code: VfsErrorCode::NotFound,
+                };
             }
         }
 
@@ -369,7 +376,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         self.audit(
             ts,
             Some(member.root_fp),
-            ctx.device_fp,
+            Some(ctx.device_fp),
             "whoami",
             None,
             None,
@@ -442,7 +449,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         self.audit(
             ts,
             Some(member.root_fp),
-            ctx.device_fp,
+            Some(ctx.device_fp),
             "list",
             Some(path),
             None,
@@ -556,7 +563,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 self.audit(
                     ts,
                     Some(member.root_fp),
-                    ctx.device_fp,
+                    Some(ctx.device_fp),
                     "stat",
                     Some(path),
                     None,
@@ -647,7 +654,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 self.audit(
                     ts,
                     Some(member.root_fp),
-                    ctx.device_fp,
+                    Some(ctx.device_fp),
                     "read",
                     Some(path),
                     Some(data.len() as u64),
@@ -771,7 +778,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 self.audit(
                     ts,
                     Some(member.root_fp),
-                    ctx.device_fp,
+                    Some(ctx.device_fp),
                     "mkdir",
                     Some(path),
                     None,
@@ -870,7 +877,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 self.audit(
                     ts,
                     Some(member.root_fp),
-                    ctx.device_fp,
+                    Some(ctx.device_fp),
                     "delete",
                     Some(path),
                     None,
@@ -986,7 +993,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
             );
         }
 
-        if !self.verify_manifest_signature(ctx.device_fp, path, size, hash, manifest_sig) {
+        if !self.verify_manifest_signature(Some(ctx.device_fp), path, size, hash, manifest_sig) {
             return self.deny_with_code(
                 ts,
                 member,
@@ -1005,7 +1012,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
             size,
             hash,
             manifest_sig,
-            ctx.device_fp,
+            Some(ctx.device_fp),
             ts,
             UPLOAD_SESSION_TTL_SECS,
             grants_version,
@@ -1041,7 +1048,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         self.audit(
             ts,
             Some(member.root_fp),
-            ctx.device_fp,
+            Some(ctx.device_fp),
             "upload_open",
             Some(path),
             None,
@@ -1230,7 +1237,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         self.audit(
             ts,
             Some(member.root_fp),
-            ctx.device_fp,
+            Some(ctx.device_fp),
             "upload_chunk",
             Some(&path_str),
             Some(data.len() as u64),
@@ -1377,7 +1384,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         // only at `upload_open`), so a mid-transfer device-key change/revocation is caught before
         // the bytes ever land.
         if !self.verify_manifest_signature(
-            ctx.device_fp,
+            Some(ctx.device_fp),
             &path_str,
             session.size,
             &session.hash,
@@ -1444,7 +1451,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 self.audit(
                     ts,
                     Some(member.root_fp),
-                    ctx.device_fp,
+                    Some(ctx.device_fp),
                     "upload_commit",
                     Some(&path_str),
                     Some(session.size),
@@ -1493,7 +1500,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         self.audit(
             ts,
             Some(member.root_fp),
-            ctx.device_fp,
+            Some(ctx.device_fp),
             "upload_abort",
             Some(&path_str),
             None,
@@ -1540,7 +1547,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         self.audit(
             ts,
             Some(member.root_fp),
-            ctx.device_fp,
+            Some(ctx.device_fp),
             action,
             path,
             None,
@@ -1613,18 +1620,10 @@ fn request_path(req: &VfsRequest) -> Option<&str> {
 }
 
 /// The per-caller key [`RateLimiter`] buckets on (`crate::ratelimit`'s module doc comment): the
-/// caller's device fingerprint when the transport supplied one, else a key derived from
-/// `member_id` alone so a device-less test/session context still gets its own independent bucket
-/// rather than colliding with every other device-less caller.
+/// caller's device fingerprint, so distinct devices of the same member each get their own
+/// independent bucket rather than colliding.
 fn rate_limit_key(ctx: &SessionContext) -> Vec<u8> {
-    match ctx.device_fp {
-        Some(fp) => fp.to_vec(),
-        None => {
-            let mut key = vec![0u8];
-            key.extend_from_slice(&ctx.member_id.0.to_be_bytes());
-            key
-        }
-    }
+    ctx.device_fp.to_vec()
 }
 
 /// `cap_std::fs::Dir::open`/`read_dir` treat an empty relative path as invalid, unlike
@@ -1773,6 +1772,7 @@ mod tests {
     use spindle_core::SigningKey;
     use spindle_vfs::model::{DevicePublicKeys, MemberId, ShareFlags, ShareId};
     use spindle_vfs::store::Store;
+    use std::cell::RefCell;
     use tempfile::TempDir;
 
     /// Shared test scaffolding: an in-memory `Store` plus a disposable real directory tree for
@@ -1780,6 +1780,11 @@ mod tests {
     struct Harness {
         sandbox: TempDir,
         store: Store,
+        /// Lazily populated by [`Self::ctx`]: each member gets exactly one enrolled "default"
+        /// device the first time a context is requested for it, then the same fingerprint on
+        /// every later call — see `ctx`'s doc comment for why `SessionContext::device_fp` can no
+        /// longer be `None`.
+        default_devices: RefCell<BTreeMap<MemberId, Fingerprint>>,
     }
 
     impl Harness {
@@ -1787,6 +1792,7 @@ mod tests {
             Harness {
                 sandbox: tempfile::tempdir().expect("tempdir"),
                 store: Store::open_in_memory().expect("open in-memory store"),
+                default_devices: RefCell::new(BTreeMap::new()),
             }
         }
 
@@ -1855,17 +1861,39 @@ mod tests {
                 .expect("grant entitlement");
         }
 
+        /// The device fingerprint [`Self::ctx`] uses for `member_id`: enrolled (with no pinned
+        /// keys — plain pipeline tests never verify an upload-manifest signature) the first time
+        /// it's asked for, and memoized after that so repeated `ctx(member_id)` calls within one
+        /// test keep returning the same device rather than silently enrolling a new one each
+        /// time. `add_device` only requires that the member row exist, not that it be `Active`, so
+        /// this also works for the not-yet-active/invited-member tests that call `ctx` directly.
+        fn default_device(&self, member_id: MemberId) -> Fingerprint {
+            if let Some(fp) = self.default_devices.borrow().get(&member_id) {
+                return *fp;
+            }
+            let fp = Fingerprint::of_parts(&[b"default-device", &member_id.0.to_be_bytes()]);
+            self.store
+                .add_device(member_id, fp, "default", 0, None)
+                .expect("enroll default device for ctx()");
+            self.default_devices.borrow_mut().insert(member_id, fp);
+            fp
+        }
+
+        /// A session context for `member_id`, carrying that member's default enrolled device
+        /// (see [`Self::default_device`]) — `SessionContext::device_fp` is no longer optional, so
+        /// every test context needs a real, enrolled device or it would hit
+        /// `denied:unknown_device` in Step 2b regardless of what the test is actually asserting.
         fn ctx(&self, member_id: MemberId) -> SessionContext {
             SessionContext {
                 member_id,
-                device_fp: None,
+                device_fp: self.default_device(member_id),
             }
         }
 
         fn ctx_with_device(&self, member_id: MemberId, device_fp: Fingerprint) -> SessionContext {
             SessionContext {
                 member_id,
-                device_fp: Some(device_fp),
+                device_fp,
             }
         }
 
