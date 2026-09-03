@@ -1191,16 +1191,29 @@ impl Store {
     // consumed via uploads" has no other durable source of truth once files sit anonymously on
     // the real filesystem.
     //
-    // **Documented limitation**: `share_upload_bytes` is accurate for deletes (a delete always
-    // knows the real size of what it removes, regardless of who uploaded it, so
-    // [`Store::adjust_share_upload_bytes`] is called with a negative delta from
-    // `spindle-host-core`'s delete handler). `member_upload_bytes` is **not** symmetrically
-    // decremented on a delete performed by a different member, because no ownership ledger here
-    // maps a real file back to the member who uploaded it (DESIGN.md does not specify this depth
-    // of per-member accounting). A member's own counter therefore only grows via their own
-    // commits and shrinks only via deltas from their own overwrites; deleting content does not
-    // retroactively refund any member's quota. Acceptable for generous, host-configured default
-    // limits; a full ownership ledger is out of scope for this slice.
+    // **Superseded (td-b940b1)**: earlier revisions of this comment documented a limitation where
+    // `member_upload_bytes` was not decremented on a delete performed by a different member,
+    // because no ownership ledger mapped a real file back to whichever member uploaded it. That
+    // ledger now exists — `uploaded_files` (`schema::SCHEMA_V6`) — so the limitation is obsolete;
+    // see the new model below rather than assuming this asymmetry still holds.
+    //
+    // **The new model**: `uploaded_files` is the durable source of truth — one row per
+    // `(share_id, subpath)` still present via the upload path, naming the member who uploaded it
+    // and its current size. `member_upload_bytes`/`share_upload_bytes` remain exactly as they were
+    // (running counters, not recomputed on demand), but are now a **maintained cache** over that
+    // table rather than the only record that exists: [`Store::record_upload`] upserts a row and
+    // applies the resulting counter deltas in one transaction, [`Store::remove_upload`] deletes a
+    // row and decrements both counters (returning the uploader and size that were removed, which
+    // is what lets a delete refund the *uploading* member even when a different member performed
+    // the delete — closing the old limitation rather than merely re-describing it), and
+    // [`Store::reconcile_upload_counters`] recomputes both counter tables from `uploaded_files`
+    // outright, so drift from any bug elsewhere (a swallowed error, a bypassed call site) is
+    // healable instead of permanent. The counters are still not recomputed *on every check* — a
+    // `SUM` over a large share's `uploaded_files` rows before every chunk write has the same
+    // performance problem the module comment above already rejected for a directory walk — so the
+    // running counters remain the fast path and `uploaded_files` is consulted only to populate or
+    // heal them. Owner-placed content is still out of scope for all of this: see `SCHEMA_V6`'s doc
+    // comment for why `uploaded_files` can never be a complete index of a share's contents.
 
     /// Adjusts `member_id`'s running upload-byte counter by `delta` (which may be negative, e.g.
     /// an overwrite that shrank a file), clamped at 0, and returns the new total. Creates the
@@ -1259,6 +1272,147 @@ impl Store {
             )
             .optional()?;
         Ok(bytes.unwrap_or(0) as u64)
+    }
+
+    /// Upserts `uploaded_files`'s row for `(share_id, subpath)` to `bytes`, attributed to
+    /// `member_id`, and applies the resulting deltas to both counter caches — all inside one
+    /// `Immediate` transaction, following the same discipline (and for the same reason) as
+    /// [`Store::add_share`]/[`Store::add_share_exclude`]'s doc comments: without a shared
+    /// transaction, the read-then-write gap between finding the old row and writing the new one
+    /// would let a concurrent caller observe or apply a half-updated state.
+    ///
+    /// Three cases, by what (if anything) already occupied this `(share_id, subpath)`:
+    /// - **No existing row**: both counters simply grow by `bytes`.
+    /// - **Existing row, same `member_id`**: this is an overwrite by its own uploader. Both
+    ///   counters move by the *difference* (`bytes as i64 - old_bytes as i64`), which may be
+    ///   negative if the new content is smaller.
+    /// - **Existing row, different `member_id`** (the subtle case): the share's total moves by
+    ///   the same difference as above — the share doesn't care who owns the bytes — but the two
+    ///   members' counters move independently: the *old* uploader's counter drops by the full
+    ///   `old_bytes` (they no longer have anything at this subpath), and the *new* uploader's
+    ///   counter grows by the full `bytes` (this is their file now). This is not the same as
+    ///   applying the difference to one member's counter; get it wrong and one member's total
+    ///   silently absorbs bytes that belong to the other.
+    pub fn record_upload(
+        &self,
+        share_id: ShareId,
+        member_id: MemberId,
+        subpath: &str,
+        bytes: u64,
+    ) -> Result<(), StoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+
+        let existing: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT member_id, bytes FROM uploaded_files WHERE share_id = ?1 AND subpath = ?2",
+                params![share_id.0 as i64, subpath],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        let new_bytes = bytes as i64;
+        match existing {
+            Some((old_member_id, old_bytes)) => {
+                let share_delta = new_bytes - old_bytes;
+                self.adjust_share_upload_bytes(share_id, share_delta)?;
+                if old_member_id == member_id.0 as i64 {
+                    self.adjust_member_upload_bytes(member_id, share_delta)?;
+                } else {
+                    self.adjust_member_upload_bytes(MemberId(old_member_id as u64), -old_bytes)?;
+                    self.adjust_member_upload_bytes(member_id, new_bytes)?;
+                }
+            }
+            None => {
+                self.adjust_share_upload_bytes(share_id, new_bytes)?;
+                self.adjust_member_upload_bytes(member_id, new_bytes)?;
+            }
+        }
+
+        self.conn.execute(
+            "INSERT INTO uploaded_files (share_id, member_id, subpath, bytes) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(share_id, subpath) \
+             DO UPDATE SET member_id = excluded.member_id, bytes = excluded.bytes",
+            params![share_id.0 as i64, member_id.0 as i64, subpath, new_bytes],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Removes `uploaded_files`'s row for `(share_id, subpath)`, if any, decrementing both
+    /// counter caches by its recorded size in the same `Immediate` transaction, and returns the
+    /// `(member_id, bytes)` that were removed — the uploader and size a caller (`spindle-host-core`
+    /// on a delete) needs in order to refund the *uploading* member's quota, even when the delete
+    /// itself is performed by someone else. Returns `Ok(None)` and changes nothing if no row
+    /// exists for this `(share_id, subpath)` (e.g. the file was never uploaded through this path).
+    pub fn remove_upload(
+        &self,
+        share_id: ShareId,
+        subpath: &str,
+    ) -> Result<Option<(MemberId, u64)>, StoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+
+        let existing: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT member_id, bytes FROM uploaded_files WHERE share_id = ?1 AND subpath = ?2",
+                params![share_id.0 as i64, subpath],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        let Some((member_id, bytes)) = existing else {
+            // Nothing to remove; `tx` drops here without a commit, rolling back (there is nothing
+            // to roll back, but this keeps the "no row => no writes at all" contract exact).
+            return Ok(None);
+        };
+
+        self.conn.execute(
+            "DELETE FROM uploaded_files WHERE share_id = ?1 AND subpath = ?2",
+            params![share_id.0 as i64, subpath],
+        )?;
+        self.adjust_share_upload_bytes(share_id, -bytes)?;
+        self.adjust_member_upload_bytes(MemberId(member_id as u64), -bytes)?;
+
+        tx.commit()?;
+        Ok(Some((MemberId(member_id as u64), bytes as u64)))
+    }
+
+    /// Recomputes both `member_upload_bytes` and `share_upload_bytes` from `uploaded_files` —
+    /// the source of truth — in one `Immediate` transaction, so drift between the cache and the
+    /// ledger (from a bug elsewhere, a bypassed call site, or manual DB surgery) is healable
+    /// rather than permanent.
+    ///
+    /// Every existing counter row is first reset to 0, then re-populated from
+    /// `SUM(bytes) GROUP BY member_id` / `GROUP BY share_id` over `uploaded_files`. The reset
+    /// matters: a member or share whose `uploaded_files` rows have all been removed (every file
+    /// they uploaded was since deleted) has no `GROUP BY` result at all, so without the reset its
+    /// counter would be left at its last (now-stale) value instead of correctly reconciling to 0.
+    pub fn reconcile_upload_counters(&self) -> Result<(), StoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+
+        self.conn
+            .execute("UPDATE member_upload_bytes SET bytes = 0", [])?;
+        self.conn
+            .execute("UPDATE share_upload_bytes SET bytes = 0", [])?;
+
+        self.conn.execute(
+            "INSERT INTO member_upload_bytes (member_id, bytes) \
+             SELECT member_id, SUM(bytes) FROM uploaded_files GROUP BY member_id \
+             ON CONFLICT(member_id) DO UPDATE SET bytes = excluded.bytes",
+            [],
+        )?;
+        self.conn.execute(
+            "INSERT INTO share_upload_bytes (share_id, bytes) \
+             SELECT share_id, SUM(bytes) FROM uploaded_files GROUP BY share_id \
+             ON CONFLICT(share_id) DO UPDATE SET bytes = excluded.bytes",
+            [],
+        )?;
+
+        tx.commit()?;
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2397,6 +2551,224 @@ mod tests {
                 .expect("adjust"),
             1048
         );
+    }
+
+    // ---- Upload ledger (`uploaded_files`, td-b940b1) ----
+
+    /// Shared fixture for the `uploaded_files` tests below: an in-memory store with one
+    /// upload-enabled share and two distinct members.
+    fn upload_ledger_fixture() -> (tempfile::TempDir, Store, ShareId, MemberId, MemberId) {
+        let sandbox = tempdir().expect("tempdir");
+        let store = Store::open_in_memory().expect("open");
+        let share_id = store
+            .add_share(
+                "Drop",
+                "Drop",
+                sandbox.path(),
+                ShareFlags {
+                    allow_upload: true,
+                    ..ShareFlags::default()
+                },
+                &[],
+                0,
+            )
+            .expect("add_share");
+        let member_a = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member alex");
+        let member_b = store
+            .add_member(Fingerprint::of_parts(&[b"blair"]), "Blair", 0)
+            .expect("add_member blair");
+        (sandbox, store, share_id, member_a, member_b)
+    }
+
+    /// Asserts `err` is a `StoreError::Sqlite` wrapping `SQLITE_CONSTRAINT_FOREIGNKEY` (extended
+    /// code 787), matching the precedent in
+    /// `burn_invite_nonce_for_a_nonexistent_member_fails_the_foreign_key_check` above.
+    fn assert_foreign_key_violation(err: &StoreError) {
+        match err {
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(ffi_err, ref msg)) => {
+                assert_eq!(
+                    ffi_err.extended_code, 787,
+                    "expected SQLITE_CONSTRAINT_FOREIGNKEY (787), got {ffi_err:?}: {msg:?}"
+                );
+            }
+            other => panic!("expected StoreError::Sqlite(SqliteFailure), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_upload_updates_counters_and_reconcile_leaves_them_unchanged() {
+        let (_sandbox, store, share_id, member_a, _member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "a.txt", 100)
+            .expect("record_upload");
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 100);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 100);
+
+        // The ledger already agrees with the cache, so reconciling must be a no-op.
+        store.reconcile_upload_counters().expect("reconcile");
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 100);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 100);
+    }
+
+    #[test]
+    fn record_upload_overwrite_by_same_member_adjusts_by_the_difference() {
+        let (_sandbox, store, share_id, member_a, _member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "a.txt", 100)
+            .expect("initial upload");
+        store
+            .record_upload(share_id, member_a, "a.txt", 250)
+            .expect("overwrite larger");
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 250);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 250);
+
+        store
+            .record_upload(share_id, member_a, "a.txt", 60)
+            .expect("overwrite smaller");
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 60);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 60);
+    }
+
+    /// The subtle case called out in [`Store::record_upload`]'s doc comment: an overwrite by a
+    /// *different* member must move the full old size off the original uploader's counter and the
+    /// full new size onto the new uploader's counter — not just apply the size difference to one
+    /// member — while the share's counter still moves only by the difference between the two
+    /// sizes (the share doesn't care who owns the bytes).
+    #[test]
+    fn record_upload_overwrite_by_a_different_member_moves_bytes_between_counters() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "a.txt", 100)
+            .expect("member_a uploads");
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 100);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 100);
+
+        store
+            .record_upload(share_id, member_b, "a.txt", 150)
+            .expect("member_b overwrites member_a's file");
+
+        assert_eq!(
+            store.member_upload_bytes(member_a).unwrap(),
+            0,
+            "the original uploader's counter must lose the full old size"
+        );
+        assert_eq!(
+            store.member_upload_bytes(member_b).unwrap(),
+            150,
+            "the new uploader's counter must gain the full new size"
+        );
+        assert_eq!(
+            store.share_upload_bytes(share_id).unwrap(),
+            150,
+            "the share's counter must change only by the size difference (100 -> 150), not by \
+             summing both members' contributions"
+        );
+    }
+
+    #[test]
+    fn remove_upload_decrements_both_counters_and_returns_the_original_uploader() {
+        let (_sandbox, store, share_id, member_a, _member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "a.txt", 500)
+            .expect("record_upload");
+
+        let removed = store
+            .remove_upload(share_id, "a.txt")
+            .expect("remove_upload")
+            .expect("a row existed to remove");
+        assert_eq!(removed, (member_a, 500));
+
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn remove_upload_of_a_nonexistent_row_returns_none_and_changes_nothing() {
+        let (_sandbox, store, share_id, member_a, _member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "kept.txt", 42)
+            .expect("record_upload");
+
+        let removed = store
+            .remove_upload(share_id, "missing.txt")
+            .expect("remove_upload of a nonexistent row must not error");
+        assert_eq!(removed, None);
+
+        // Unrelated state must be untouched.
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 42);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 42);
+    }
+
+    /// Deliberately corrupts both counter tables with direct `adjust_*` calls that bypass the
+    /// ledger (exactly the kind of drift `spindle-host-core`'s unguarded `let _ = ...` counter
+    /// bumps could cause), then proves [`Store::reconcile_upload_counters`] heals both: a counter
+    /// whose ledger total disagrees is corrected to match, and a counter with no corresponding
+    /// ledger rows at all reconciles to 0 rather than being left at its stale value.
+    #[test]
+    fn reconcile_upload_counters_heals_drift_and_zeroes_orphaned_counters() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "a.txt", 300)
+            .expect("record_upload");
+
+        // Corrupt member_a's and the share's counters directly, bypassing the ledger.
+        store
+            .adjust_member_upload_bytes(member_a, 9_999)
+            .expect("corrupt member counter");
+        store
+            .adjust_share_upload_bytes(share_id, 9_999)
+            .expect("corrupt share counter");
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 10_299);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 10_299);
+
+        // Give member_b a counter with no corresponding `uploaded_files` row at all.
+        store
+            .adjust_member_upload_bytes(member_b, 500)
+            .expect("orphaned member counter");
+        assert_eq!(store.member_upload_bytes(member_b).unwrap(), 500);
+
+        store.reconcile_upload_counters().expect("reconcile");
+
+        assert_eq!(
+            store.member_upload_bytes(member_a).unwrap(),
+            300,
+            "must match the ledger sum, not the corrupted value"
+        );
+        assert_eq!(
+            store.share_upload_bytes(share_id).unwrap(),
+            300,
+            "must match the ledger sum, not the corrupted value"
+        );
+        assert_eq!(
+            store.member_upload_bytes(member_b).unwrap(),
+            0,
+            "a counter with no ledger rows must reconcile to 0, not stay stale"
+        );
+    }
+
+    #[test]
+    fn record_upload_for_a_nonexistent_share_or_member_fails_the_foreign_key_check() {
+        let (_sandbox, store, share_id, member_a, _member_b) = upload_ledger_fixture();
+
+        let no_such_share = ShareId(999_999);
+        let err = store
+            .record_upload(no_such_share, member_a, "a.txt", 10)
+            .expect_err("a nonexistent share must fail the foreign key check");
+        assert_foreign_key_violation(&err);
+
+        let no_such_member = MemberId(999_999);
+        let err = store
+            .record_upload(share_id, no_such_member, "a.txt", 10)
+            .expect_err("a nonexistent member must fail the foreign key check");
+        assert_foreign_key_violation(&err);
     }
 
     // ---- Integration: store -> algebra survives a reopen ----

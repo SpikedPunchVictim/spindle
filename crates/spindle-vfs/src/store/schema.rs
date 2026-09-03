@@ -218,6 +218,53 @@ DROP TABLE invite_nonces;
 ALTER TABLE invite_nonces_new RENAME TO invite_nonces;
 "#;
 
+/// Version 6 (td-b940b1) — `uploaded_files`, the missing source of truth behind the upload-quota
+/// counters (`member_upload_bytes`/`share_upload_bytes`, added in `SCHEMA_V3`). Per that table's
+/// doc comment and `crate::store::Store`'s upload-quota module comment, those running counters
+/// have "no other durable source of truth once files sit anonymously on the real filesystem" —
+/// there was no row anywhere mapping a real file back to whichever member's upload put it there.
+/// Without one, `spindle-host-core`'s counter bumps (outside any transaction covering the
+/// filesystem operation, with no reconciliation path) drift silently and permanently: an upload
+/// undercounts on a swallowed error, and a delete by a member other than the uploader overcounts —
+/// the direction that can lock a member out of their own quota.
+///
+/// `uploaded_files` holds the **current state of files that arrived via the upload path** — one
+/// row per `(share_id, subpath)` still present on disk via that path, upserted on every commit and
+/// deleted when the file is removed. It is explicitly **not** a history of upload events (no
+/// per-event rows, no timestamps of past uploads — a later commit or delete simply updates or
+/// removes the row), and **not a complete index of every file in the share**: content the owner
+/// placed directly on the real filesystem, never seen by any VFS RPC call, has no row here and
+/// never will. Reintroducing it would require the recursive directory walk that was already
+/// rejected as the on-demand alternative to a running counter (see the module comment: "too slow
+/// to check before every chunk write"). Do not build anything on this table that assumes it
+/// enumerates a share's full contents.
+///
+/// The counter tables stay, as a maintained cache over this one: recomputing a `SUM` over
+/// `uploaded_files` before every chunk write does not scale to a large share any better than a
+/// directory walk did, so `member_upload_bytes`/`share_upload_bytes` remain the fast path for a
+/// quota check, and `crate::store::Store::reconcile_upload_counters` recomputes them from this
+/// table's rows when drift is suspected — making that drift healable instead of permanent.
+///
+/// **No backfill, by design**: existing databases carry `member_upload_bytes`/
+/// `share_upload_bytes` counters with no corresponding rows here, and there is no source to
+/// backfill them from — the entire premise of this migration is that no such record existed
+/// before it (a real file on disk carries no metadata saying which member's upload put it there).
+/// Pre-migration uploads are therefore forgotten by `uploaded_files`, which is a one-time quota
+/// amnesty for bytes already counted in the running totals: those totals are left as-is (nothing
+/// in this migration touches them), only future `record_upload`/`remove_upload` calls and any
+/// later `reconcile_upload_counters` run affect what `uploaded_files` itself knows about. This is
+/// acceptable because device enrollment — the only path that can currently reach an upload commit
+/// — has zero production callers; no real deployment exists yet to lose data from.
+const SCHEMA_V6: &str = r#"
+CREATE TABLE uploaded_files (
+    share_id  INTEGER NOT NULL REFERENCES shares(share_id),
+    member_id INTEGER NOT NULL REFERENCES members(member_id),
+    subpath   TEXT    NOT NULL,
+    bytes     INTEGER NOT NULL,
+    PRIMARY KEY (share_id, subpath)
+);
+"#;
+
 /// Every schema version in order, oldest first. Appending a new `(N, SQL)` pair is the only way
 /// to evolve the schema — existing entries are never edited once shipped.
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -226,6 +273,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (3, SCHEMA_V3),
     (4, SCHEMA_V4),
     (5, SCHEMA_V5),
+    (6, SCHEMA_V6),
 ];
 
 /// Applies every migration strictly newer than the connection's current `user_version`, each in
@@ -433,6 +481,19 @@ mod tests {
     /// migration (which previously surfaced as "duplicate column name: agree_pk" from the loser,
     /// which had read a stale `user_version` under rusqlite's default busy-timeout-then-proceed
     /// behavior). Run 20 times in one test to make the race bite reliably.
+    ///
+    /// The out-of-date file is built by applying `SCHEMA_V1..V3` directly and setting
+    /// `user_version = 3` (the same technique
+    /// `migrate_v5_rebuild_preserves_rows_and_adds_the_missing_foreign_key` uses above), rather
+    /// than fully migrating a store to latest and then trying to strip the later versions back
+    /// off. An earlier revision of this test did the latter — open a fully-migrated store, then
+    /// `ALTER TABLE ... DROP COLUMN agree_pk` to undo just `SCHEMA_V4` — which only ever happened
+    /// to work because every migration added after V4 (V5's rebuild, in particular) is naturally
+    /// safe to re-run against a database that already has its effect applied. `SCHEMA_V6`'s plain
+    /// `CREATE TABLE uploaded_files` is not: re-running it against a file that was never actually
+    /// downgraded past V6 fails with "table uploaded_files already exists". Building the v3 file
+    /// from the real V1..V3 SQL sidesteps this category of fragility entirely and keeps working
+    /// no matter what future migrations look like.
     #[test]
     fn concurrent_opens_on_an_out_of_date_file_do_not_both_apply_the_same_migration() {
         use std::sync::Barrier;
@@ -442,23 +503,15 @@ mod tests {
             let dir = tempdir().expect("tempdir");
             let path = dir.path().join("store.sqlite3");
 
-            // Build a fully-migrated store, then downgrade it to v3 by dropping the v4 column.
+            // Build a genuine v3 database directly, rather than fully migrating then trying to
+            // undo later versions — see this test's doc comment for why.
             {
-                let store = super::super::Store::open(&path).expect("initial open migrates");
-                drop(store);
-                let conn = Connection::open(&path).expect("reopen raw");
+                let conn = Connection::open(&path).expect("create file");
+                conn.execute_batch(SCHEMA_V1).expect("apply V1");
+                conn.execute_batch(SCHEMA_V2).expect("apply V2");
+                conn.execute_batch(SCHEMA_V3).expect("apply V3");
                 conn.execute_batch("PRAGMA user_version = 3")
-                    .expect("downgrade user_version");
-                let dropped = conn.execute_batch("ALTER TABLE devices DROP COLUMN agree_pk");
-                match dropped {
-                    Ok(()) => {}
-                    Err(e) => {
-                        panic!(
-                            "ALTER TABLE ... DROP COLUMN failed verbatim: {e}; SQLite bundled by \
-                             rusqlite was expected to support DROP COLUMN (3.35+)"
-                        );
-                    }
-                }
+                    .expect("set user_version to 3");
             }
 
             let barrier = std::sync::Arc::new(Barrier::new(2));
