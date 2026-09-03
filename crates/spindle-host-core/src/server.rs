@@ -24,7 +24,7 @@ use spindle_proto::{
 };
 use spindle_vfs::algebra::{AccessDecision, EffectiveGrants, GrantsVersion};
 use spindle_vfs::audit::AuditEntry;
-use spindle_vfs::confine::{self, identity as confine_identity};
+use spindle_vfs::confine::{self, identity as confine_identity, UploadOutcome};
 use spindle_vfs::model::{Member, MemberStatus, Perms, Share, VirtualPath};
 use spindle_vfs::store::Store;
 use std::borrow::Borrow;
@@ -1455,10 +1455,28 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
             &session.subpath.to_path_string(),
             can_delete,
         ) {
-            Ok(true) => {
+            Ok(UploadOutcome::Landed(landed_name)) => {
                 self.upload_sessions.remove(&session.id);
                 self.identity_cache
                     .forget(member.member_id, share.share_id, &session.subpath);
+                // The ledger must record the name the file actually landed under, not the name
+                // the member requested: on a fold-collision overwrite, `finalize_upload` renames
+                // onto the *existing* dirent's spelling (see its doc comment), so recording the
+                // requested spelling would store a `uploaded_files.subpath` that does not exist on
+                // a case-sensitive filesystem. Rebuild the full virtual path with the last
+                // component replaced by the landed name, keeping the parent components as-is.
+                let landed_subpath = match landed_name.to_str() {
+                    Some(landed_str) => session
+                        .subpath
+                        .parent()
+                        .unwrap_or_else(VirtualPath::root)
+                        .join(landed_str),
+                    // A non-UTF-8 landed name can only occur in the `Fresh` case (equal to the
+                    // requested name): `existing_entry_colliding` skips entries that fail
+                    // `to_str`, so a fold-collision `Overwrites` name is always valid UTF-8. Best
+                    // effort: fall back to the requested spelling, which is correct here anyway.
+                    None => session.subpath.clone(),
+                };
                 // `record_upload` upserts the `uploaded_files` ledger row and applies both
                 // counter deltas in one transaction, including the subtle different-uploader
                 // overwrite case (see its doc comment in `spindle_vfs::store`). The staged file
@@ -1471,7 +1489,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 let ledger_outcome = match self.store().record_upload(
                     share.share_id,
                     member.member_id,
-                    &session.subpath.to_path_string(),
+                    &landed_subpath.to_path_string(),
                     session.size,
                 ) {
                     Ok(()) => "ok",
@@ -1491,7 +1509,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
             // Collision without `delete` (DESIGN.md §A4b "collision == overwrite; overwrite
             // requires delete"): the session survives so the caller can delete the conflicting
             // entry and retry `upload_commit` without re-uploading any bytes.
-            Ok(false) => self.deny_with_code(
+            Ok(UploadOutcome::Refused) => self.deny_with_code(
                 ts,
                 member,
                 ctx,

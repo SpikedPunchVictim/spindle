@@ -76,6 +76,19 @@ pub enum WriteTarget {
     Overwrites(std::ffi::OsString),
 }
 
+/// The outcome of [`finalize_upload`]: either the staged file landed on disk (carrying the name
+/// it actually landed under), or the write was refused by the overwrite-requires-`delete` gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadOutcome {
+    /// The staged file was renamed into place. Carries the name it actually landed under,
+    /// which is the pre-existing dirent's spelling when the requested name fold-collided
+    /// with one, and the requested spelling otherwise.
+    Landed(std::ffi::OsString),
+    /// Refused: the requested name fold-collides with an existing entry and the caller
+    /// lacks `delete`. The staged file is left in place so the caller can retry.
+    Refused,
+}
+
 /// DESIGN.md §A4b entitlement rule: overwriting an existing entry (including one only reachable
 /// via a case/Unicode-folding collision, per [`existing_entry_colliding`]) requires `delete`;
 /// `upload` alone only ever creates a genuinely new dirent.
@@ -109,9 +122,9 @@ pub fn write_is_authorized(
 /// and confirming `can_upload` — this function only re-derives the target path and performs the
 /// final collision check + atomic same-filesystem rename, mirroring [`super::listing::create_dir_confined`]'s
 /// parent/name-splitting so a nested target (`"Vacation/photo.jpg"`) is collision-checked against
-/// its own parent directory's entries, not `dir`'s root. Returns `Ok(false)` (nothing moved) on a
-/// collision without `delete`, exactly like [`super::listing::create_dir_confined`]'s `mkdir`
-/// analogue.
+/// its own parent directory's entries, not `dir`'s root. Returns [`UploadOutcome::Refused`]
+/// (nothing moved) on a collision without `delete`, exactly like
+/// [`super::listing::create_dir_confined`]'s `mkdir` analogue.
 ///
 /// **The staged file lands on the *existing* entry's name, not the requested spelling, when this
 /// is an overwrite** (DESIGN.md :370-371: a case/Unicode-fold collision with an existing dirent
@@ -129,12 +142,18 @@ pub fn write_is_authorized(
 ///
 /// The visible consequence is that the uploader's chosen spelling is silently not honored once it
 /// collides — that is the intended reading of "collision is an overwrite", not a bug.
+///
+/// **The caller must record the name carried by [`UploadOutcome::Landed`], not the name it
+/// requested, in anything that later resolves this file on disk.** Recording the requested
+/// spelling instead is a bug: on a fold collision, this function renames onto the *existing*
+/// dirent's name (see above), so a caller that persists the requested spelling stores a path that
+/// does not exist on a case-sensitive filesystem — nothing will ever stat it back.
 pub fn finalize_upload(
     dir: &Dir,
     staging_name: &str,
     target_relative: &str,
     can_delete: bool,
-) -> Result<bool, ConfineError> {
+) -> Result<UploadOutcome, ConfineError> {
     let target = upload_target_path(target_relative)?;
     let (parent, name) = split_parent_and_name(&target);
     let parent_dir;
@@ -148,13 +167,13 @@ pub fn finalize_upload(
     };
     let write_target_name: std::ffi::OsString =
         match write_is_authorized(parent_ref, &name, true, can_delete)? {
-            WriteTarget::Denied => return Ok(false),
+            WriteTarget::Denied => return Ok(UploadOutcome::Refused),
             WriteTarget::Fresh => std::ffi::OsString::from(name),
             WriteTarget::Overwrites(existing_name) => existing_name,
         };
     dir.rename(staging_name, parent_ref, &write_target_name)
         .map_err(|e| ConfineError::io(target_relative, e))?;
-    Ok(true)
+    Ok(UploadOutcome::Landed(write_target_name))
 }
 
 #[cfg(test)]
@@ -173,7 +192,10 @@ mod tests {
         let staging = staging_name(&[1, 2, 3]);
         dir.write(&staging, b"upload-bytes").expect("write staging");
 
-        assert!(finalize_upload(&dir, &staging, "incoming.bin", false).expect("finalize"));
+        assert_eq!(
+            finalize_upload(&dir, &staging, "incoming.bin", false).expect("finalize"),
+            UploadOutcome::Landed(std::ffi::OsString::from("incoming.bin"))
+        );
         assert!(!root.join(&staging).exists(), "staging file must be gone");
         assert_eq!(
             std::fs::read(root.join("incoming.bin")).expect("read final"),
@@ -192,7 +214,10 @@ mod tests {
         dir.write(&staging, b"new-bytes").expect("write staging");
 
         // Collision in the nested parent dir, no delete: refused, staging survives untouched.
-        assert!(!finalize_upload(&dir, &staging, "Vacation/photo.jpg", false).expect("finalize"));
+        assert_eq!(
+            finalize_upload(&dir, &staging, "Vacation/photo.jpg", false).expect("finalize"),
+            UploadOutcome::Refused
+        );
         assert!(root.join(&staging).exists());
         assert_eq!(
             std::fs::read(root.join("Vacation/photo.jpg")).expect("read"),
@@ -200,7 +225,10 @@ mod tests {
         );
 
         // With delete: overwrite succeeds.
-        assert!(finalize_upload(&dir, &staging, "Vacation/photo.jpg", true).expect("finalize"));
+        assert_eq!(
+            finalize_upload(&dir, &staging, "Vacation/photo.jpg", true).expect("finalize"),
+            UploadOutcome::Landed(std::ffi::OsString::from("photo.jpg"))
+        );
         assert_eq!(
             std::fs::read(root.join("Vacation/photo.jpg")).expect("read"),
             b"new-bytes"
@@ -328,7 +356,10 @@ mod tests {
         dir.write(&staging, b"uploaded-bytes")
             .expect("write staging");
 
-        assert!(finalize_upload(&dir, &staging, "photo.jpg", true).expect("finalize"));
+        assert_eq!(
+            finalize_upload(&dir, &staging, "photo.jpg", true).expect("finalize"),
+            UploadOutcome::Landed(std::ffi::OsString::from("Photo.JPG"))
+        );
 
         let entries: Vec<_> = std::fs::read_dir(&root)
             .expect("read dir")
@@ -363,6 +394,12 @@ mod tests {
     /// prove the fold-key half of this fix on every platform; it is only the filesystem-plumbing
     /// half (finalize actually overwriting rather than creating a second dirent) that stays
     /// unproven here on macOS.
+    ///
+    /// Updated when `finalize_upload` grew [`UploadOutcome`]: the `assert_eq!` on the returned
+    /// `Landed(nfc)` below IS platform-independent — it checks which name this function *chose*,
+    /// which no filesystem can paper over — so that assertion is load-bearing on macOS too
+    /// (verified by neutering: returning the requested name instead fails this test here). What
+    /// remains macOS-unprovable is only the `entries.len() == 1` disk check further down.
     #[test]
     fn finalize_upload_nfd_collision_overwrites_existing_dirent_not_requested_spelling() {
         let nfc = "caf\u{00E9}.txt"; // precomposed é (U+00E9)
@@ -388,7 +425,10 @@ mod tests {
         dir.write(&staging, b"uploaded-bytes")
             .expect("write staging");
 
-        assert!(finalize_upload(&dir, &staging, nfd, true).expect("finalize"));
+        assert_eq!(
+            finalize_upload(&dir, &staging, nfd, true).expect("finalize"),
+            UploadOutcome::Landed(std::ffi::OsString::from(nfc))
+        );
 
         let entries: Vec<_> = std::fs::read_dir(&root)
             .expect("read dir")
@@ -420,7 +460,10 @@ mod tests {
         dir.write(&staging, b"uploaded-bytes")
             .expect("write staging");
 
-        assert!(finalize_upload(&dir, &staging, "NewFile.txt", false).expect("finalize"));
+        assert_eq!(
+            finalize_upload(&dir, &staging, "NewFile.txt", false).expect("finalize"),
+            UploadOutcome::Landed(std::ffi::OsString::from("NewFile.txt"))
+        );
         assert!(root.join("NewFile.txt").exists());
         assert_eq!(
             std::fs::read(root.join("NewFile.txt")).expect("read final"),
@@ -443,7 +486,10 @@ mod tests {
         dir.write(&staging, b"uploaded-bytes")
             .expect("write staging");
 
-        assert!(!finalize_upload(&dir, &staging, "photo.jpg", false).expect("finalize"));
+        assert_eq!(
+            finalize_upload(&dir, &staging, "photo.jpg", false).expect("finalize"),
+            UploadOutcome::Refused
+        );
 
         let entries: Vec<_> = std::fs::read_dir(&root)
             .expect("read dir")
@@ -460,6 +506,39 @@ mod tests {
             std::fs::read(root.join("Photo.JPG")).expect("read"),
             b"original-bytes",
             "the existing file's contents must be untouched"
+        );
+    }
+
+    /// Proves the return value itself — not disk state — carries the pre-existing dirent's
+    /// spelling on a fold-collision overwrite. This is the one assertion that can actually catch
+    /// a caller-facing regression: this machine is macOS/APFS, which is case-insensitive and
+    /// whose `rename(2)` preserves the pre-existing dirent's case regardless of what
+    /// `finalize_upload` returns, so a disk-based assertion (reading back the directory entry's
+    /// name, as other tests in this file do) would pass whether or not `finalize_upload` reports
+    /// the landed name correctly — it would even pass if `finalize_upload` returned the
+    /// *requested* spelling by mistake. The `UploadOutcome` value under test here is what the
+    /// `spindle-host-core` caller actually consumes (to decide what to persist in the upload
+    /// ledger, DESIGN.md's `uploaded_files.subpath`), and it is platform-independent: asserting on
+    /// it is the only way this test can fail when the fix regresses.
+    #[test]
+    fn finalize_upload_returned_outcome_carries_existing_dirent_spelling_not_requested() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        let dir = open_share_root(&root).expect("open share root");
+        dir.write("Photo.JPG", b"original-bytes")
+            .expect("seed existing entry");
+
+        let staging = staging_name(&[0xee]);
+        dir.write(&staging, b"uploaded-bytes")
+            .expect("write staging");
+
+        let outcome =
+            finalize_upload(&dir, &staging, "photo.jpg", true).expect("finalize should land");
+        assert_eq!(
+            outcome,
+            UploadOutcome::Landed(std::ffi::OsString::from("Photo.JPG")),
+            "the landed name must be the pre-existing dirent's spelling, not the requested one"
         );
     }
 }
