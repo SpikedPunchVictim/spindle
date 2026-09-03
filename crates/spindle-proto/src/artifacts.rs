@@ -342,6 +342,21 @@ impl Envelope {
 /// - `sig` — Ed25519 by the **operating key** (the same key `op_cert` certifies) over the
 ///   capability's own `spindle-cap-v1` signing input, unchanged from before (only the field name
 ///   changed, from `sig_host` to `sig`, to match the decided schema literally).
+///
+/// Named `CAPABILITY_MIN_V`/`CAPABILITY_CURRENT_V` rather than following the `*_V1` naming used
+/// by `tags::CAPABILITY_V1` — that constant is an unrelated domain-separation *tag* (bytes), and
+/// `wire::ENVELOPE_V1` is a *version number* (`u8`) for a different artifact; reusing the `_V1`
+/// suffix here would add a third meaning to an already-overloaded name.
+///
+/// The floor is `1` today, matching the only version that exists — its whole value is being in
+/// place *before* a `v = 2` ships, per DESIGN.md §A7b ("Unknown `v` ⇒ reject"). Raising
+/// `CAPABILITY_MIN_V` in a future revision is how that revision is made mandatory (rejecting any
+/// `Capability` still claiming the old `v`).
+pub const CAPABILITY_MIN_V: u8 = 1;
+/// The `v` this crate emits when issuing a `Capability` today. See [`CAPABILITY_MIN_V`] for the
+/// naming rationale.
+pub const CAPABILITY_CURRENT_V: u8 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capability {
     pub v: u8,
@@ -680,6 +695,21 @@ impl RevocationRecord {
 /// covers a growing set of commands (mode switch, admit/evict, quota changes, key rotation…)
 /// whose argument shapes are not enumerated in DESIGN.md; this crate carries `args` through
 /// opaquely rather than pre-committing to a per-command schema at the wire-type level.
+///
+/// Named `ADMIN_COMMAND_MIN_V`/`ADMIN_COMMAND_CURRENT_V` rather than the `*_V1` pattern, for the
+/// same reason as [`CAPABILITY_MIN_V`]: `tags::ADMIN_COMMAND_V1` is a domain-separation tag, and
+/// `wire::ENVELOPE_V1` is an unrelated version-number constant — `_V1` already means two
+/// different things in this codebase, so a version-floor constant spells its purpose out in full
+/// instead of adding a third.
+///
+/// The floor is `1` today, matching the only version that exists — its whole value is being in
+/// place *before* a `v = 2` ships, per DESIGN.md §A7b ("Unknown `v` ⇒ reject"). Raising
+/// `ADMIN_COMMAND_MIN_V` in a future revision is how that revision is made mandatory.
+pub const ADMIN_COMMAND_MIN_V: u8 = 1;
+/// The `v` this crate emits when issuing an `AdminCommand` today. See [`ADMIN_COMMAND_MIN_V`] for
+/// the naming rationale.
+pub const ADMIN_COMMAND_CURRENT_V: u8 = 1;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdminCommand {
     pub v: u8,

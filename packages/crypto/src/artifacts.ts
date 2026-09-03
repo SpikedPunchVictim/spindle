@@ -19,8 +19,10 @@
 // time).
 
 import {
+  ADMIN_COMMAND_MIN_V,
   AdminCommand,
   AdmissionToken,
+  CAPABILITY_MIN_V,
   Capability,
   DeviceCertificate,
   HostDeviceCert,
@@ -51,15 +53,25 @@ export type ArtifactErrorKind =
   | "RootFingerprintMismatch"
   | "MalformedOpCert"
   | "DeviceFingerprintMismatch"
-  | "UnsupportedAlgId";
+  | "UnsupportedAlgId"
+  | "VersionTooLow";
 
 export class ArtifactError extends Error {
   readonly kind: ArtifactErrorKind;
+  /** Set for `VersionTooLow`. */
+  readonly found?: number;
+  readonly minimum?: number;
 
-  private constructor(kind: ArtifactErrorKind, message: string) {
+  private constructor(
+    kind: ArtifactErrorKind,
+    message: string,
+    extra?: { found?: number; minimum?: number },
+  ) {
     super(message);
     this.name = "ArtifactError";
     this.kind = kind;
+    this.found = extra?.found;
+    this.minimum = extra?.minimum;
   }
 
   static badSignature(): ArtifactError {
@@ -101,6 +113,13 @@ export class ArtifactError extends Error {
   static unsupportedAlgId(): ArtifactError {
     return new ArtifactError("UnsupportedAlgId", "alg_id is not a supported suite version");
   }
+  static versionTooLow(found: number, minimum: number): ArtifactError {
+    return new ArtifactError(
+      "VersionTooLow",
+      `artifact version ${found} is below the minimum ${minimum}`,
+      { found, minimum },
+    );
+  }
 }
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -113,6 +132,13 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 function absDiff(a: bigint, b: bigint): bigint {
   return a > b ? a - b : b - a;
+}
+
+/** The version-floor check shared by `verifyCapability` and `verifyAdminCommand` — deliberately
+ * the very first check either function runs (cheapest possible rejection, before any signature or
+ * expiry work). Mirrors `spindle-core`'s `check_min_v`. */
+function checkMinV(found: number, minimum: number): void {
+  if (found < minimum) throw ArtifactError.versionTooLow(found, minimum);
 }
 
 function checkExp(now: bigint, exp: bigint): void {
@@ -187,6 +213,10 @@ export async function verifyDeviceCertificate(
  * `verifyHostOpKeyCert`'s own variants for its half of the chain).
  */
 export async function verifyCapability(cap: Capability, now: bigint, opts?: BackendOption): Promise<void> {
+  // 0. Version floor — cheapest possible rejection, checked before any signature or expiry work
+  // (DESIGN.md §A7b: "Unknown `v` ⇒ reject").
+  checkMinV(cap.v, CAPABILITY_MIN_V);
+
   // 1. host_fp == SHA-256(host_root_pk) — self-consistency of the capability's own fields.
   requirePublicKeyLen(cap.host_root_pk);
   const expectedFp = await rootFpOf(cap.host_root_pk);
@@ -264,6 +294,10 @@ export async function verifyAdminCommand(
   now: bigint,
   opts?: BackendOption,
 ): Promise<void> {
+  // Version floor — cheapest possible rejection, checked before any signature or timestamp work
+  // (DESIGN.md §A7b: "Unknown `v` ⇒ reject").
+  checkMinV(command.v, ADMIN_COMMAND_MIN_V);
+
   requirePublicKeyLen(operatorPk);
   await verifySigOrThrow(operatorPk, AdminCommand.signingInput(command), command.sig, opts?.backend);
   checkSkew(now, command.ts, ADMIN_COMMAND_CLOCK_SKEW_SECS);

@@ -62,7 +62,8 @@ pub mod vfs_rpc;
 
 pub use artifacts::{
     AdminCommand, AdmissionToken, CapKind, Capability, DeviceCertificate, Envelope, HostOpKeyCert,
-    ProtoError, RevocationRecord,
+    ProtoError, RevocationRecord, ADMIN_COMMAND_CURRENT_V, ADMIN_COMMAND_MIN_V,
+    CAPABILITY_CURRENT_V, CAPABILITY_MIN_V,
 };
 pub use canonical::{canonical_decode, canonical_encode, CborError, CborValue, MAX_NESTING_DEPTH};
 pub use signaling::{

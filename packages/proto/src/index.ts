@@ -29,6 +29,10 @@ export {
   AdminCommand,
   HostOpKeyCert,
   HostDeviceCert,
+  CAPABILITY_MIN_V,
+  CAPABILITY_CURRENT_V,
+  ADMIN_COMMAND_MIN_V,
+  ADMIN_COMMAND_CURRENT_V,
 } from "./artifacts.js";
 export type { ProtoErrorKind } from "./artifacts.js";
 

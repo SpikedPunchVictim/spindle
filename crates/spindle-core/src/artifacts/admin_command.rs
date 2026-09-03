@@ -1,6 +1,6 @@
-use super::{check_skew, parse_signature, ArtifactError};
+use super::{check_min_v, check_skew, parse_signature, ArtifactError};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use spindle_proto::artifacts::AdminCommand;
+use spindle_proto::artifacts::{AdminCommand, ADMIN_COMMAND_MIN_V};
 use spindle_proto::canonical::CborValue;
 
 /// `|ts - now| <= 2 min` (DESIGN.md §A7b), same window as the envelope's clock-skew rule.
@@ -39,6 +39,10 @@ pub fn verify_admin_command(
     operator_pk: &VerifyingKey,
     now: u64,
 ) -> Result<(), ArtifactError> {
+    // Version floor — cheapest possible rejection, checked before any signature or timestamp
+    // work (DESIGN.md §A7b: "Unknown `v` ⇒ reject").
+    check_min_v(command.v, ADMIN_COMMAND_MIN_V)?;
+
     let sig = parse_signature(&command.sig)?;
     operator_pk
         .verify(&command.signing_input(), &sig)
@@ -94,5 +98,46 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ArtifactError::TimestampSkew);
+    }
+
+    #[test]
+    fn rejects_v_below_floor() {
+        let op = operator();
+        let mut cmd = sample(&op, 1_000);
+        cmd.v = 0;
+        let err = verify_admin_command(&cmd, &op.verifying_key(), 1_000).unwrap_err();
+        assert_eq!(
+            err,
+            ArtifactError::VersionTooLow {
+                found: 0,
+                minimum: ADMIN_COMMAND_MIN_V
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_v_at_floor() {
+        let op = operator();
+        let cmd = sample(&op, 1_000);
+        assert_eq!(cmd.v, ADMIN_COMMAND_MIN_V);
+        verify_admin_command(&cmd, &op.verifying_key(), 1_000).expect("v == floor must verify");
+    }
+
+    #[test]
+    fn version_check_fires_before_signature_check() {
+        // v below the floor AND a corrupted signature — the version error must win, pinning the
+        // "cheapest rejection first" ordering against a future refactor.
+        let op = operator();
+        let mut cmd = sample(&op, 1_000);
+        cmd.v = 0;
+        cmd.sig[0] ^= 0xff;
+        let err = verify_admin_command(&cmd, &op.verifying_key(), 1_000).unwrap_err();
+        assert_eq!(
+            err,
+            ArtifactError::VersionTooLow {
+                found: 0,
+                minimum: ADMIN_COMMAND_MIN_V
+            }
+        );
     }
 }

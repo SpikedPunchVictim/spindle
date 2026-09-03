@@ -335,6 +335,19 @@ export const Envelope = {
 // Capability (A4)
 // ============================================================================================
 
+/** Named `CAPABILITY_MIN_V`/`CAPABILITY_CURRENT_V` rather than the `*_V1` pattern used by
+ * `tags.CAPABILITY_V1` — that constant is an unrelated domain-separation tag, and this codebase
+ * separately uses `_V1` for version-number constants elsewhere (`vfsRpc.ts`'s protocol version),
+ * so a version-floor constant spells its purpose out in full instead of overloading `_V1` again.
+ *
+ * The floor is `1` today, matching the only version that exists — its whole value is being in
+ * place *before* a `v = 2` ships, per DESIGN.md §A7b ("Unknown `v` ⇒ reject"). Raising
+ * `CAPABILITY_MIN_V` in a future revision is how that revision is made mandatory. */
+export const CAPABILITY_MIN_V = 1;
+/** The `v` this package emits when issuing a `Capability` today. See `CAPABILITY_MIN_V` for the
+ * naming rationale. */
+export const CAPABILITY_CURRENT_V = 1;
+
 /** `Capability { v, host_fp, host_root_pk, op_cert, kind, subject, cap_epoch, exp, nonce, sig }`
  * (DESIGN.md §A4). */
 export interface Capability {
@@ -654,6 +667,18 @@ export const RevocationRecord = {
 // ============================================================================================
 // AdminCommand (A3b/A7b)
 // ============================================================================================
+
+/** Named `ADMIN_COMMAND_MIN_V`/`ADMIN_COMMAND_CURRENT_V` for the same reason as
+ * `CAPABILITY_MIN_V`: `tags.ADMIN_COMMAND_V1` is a domain-separation tag, not a version floor, so
+ * `_V1` is not reused for this constant.
+ *
+ * The floor is `1` today, matching the only version that exists — its whole value is being in
+ * place *before* a `v = 2` ships, per DESIGN.md §A7b ("Unknown `v` ⇒ reject"). Raising
+ * `ADMIN_COMMAND_MIN_V` in a future revision is how that revision is made mandatory. */
+export const ADMIN_COMMAND_MIN_V = 1;
+/** The `v` this package emits when issuing an `AdminCommand` today. See `ADMIN_COMMAND_MIN_V` for
+ * the naming rationale. */
+export const ADMIN_COMMAND_CURRENT_V = 1;
 
 /** `AdminCommand { v, cmd, args, signer_fp, seq, nonce, ts, sig }` (DESIGN.md §A3b/§A7b).
  *

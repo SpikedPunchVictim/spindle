@@ -69,6 +69,23 @@ pub enum ArtifactError {
     /// before crypto").
     #[error("alg_id is not a supported device key suite")]
     UnsupportedAlgId,
+    /// [`capability::verify_capability`] / [`admin_command::verify_admin_command`] (DESIGN.md
+    /// §A7b: "version byte `v`, ... Unknown `v` ⇒ reject"): the artifact's own `v` field is below
+    /// the module's version floor (`CAPABILITY_MIN_V` / `ADMIN_COMMAND_MIN_V`). Checked first,
+    /// before any signature or expiry work — the cheapest possible rejection, mirroring
+    /// [`crate::envelope::EnvelopeError::VersionTooLow`]'s ordering.
+    #[error("artifact version {found} is below the minimum {minimum}")]
+    VersionTooLow { found: u8, minimum: u8 },
+}
+
+/// The version-floor check shared by [`capability::verify_capability`] and
+/// [`admin_command::verify_admin_command`] — deliberately the very first check either function
+/// runs (cheapest possible rejection, before any signature or expiry work).
+pub(crate) fn check_min_v(found: u8, minimum: u8) -> Result<(), ArtifactError> {
+    if found < minimum {
+        return Err(ArtifactError::VersionTooLow { found, minimum });
+    }
+    Ok(())
 }
 
 pub(crate) fn check_exp(now: u64, exp: u64) -> Result<(), ArtifactError> {

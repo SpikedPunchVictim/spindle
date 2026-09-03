@@ -451,6 +451,46 @@ describe("capability.json", () => {
     });
     await expectArtifactError(() => verifyCapability(cap, 1_500n), "BadSignature");
   });
+
+  it("rejects a capability with v below the floor", async () => {
+    const host = await makeTestHost(0x51, 0x52, 10_000n);
+    const cap = await issueTestCapability({
+      hostRootPk: host.rootPk,
+      opCert: host.opCert,
+      opSignerSeed: host.opSeed,
+      capEpoch: 0n,
+      exp: 2_000n,
+    });
+    cap.v = 0;
+    await expectArtifactError(() => verifyCapability(cap, 1_500n), "VersionTooLow");
+  });
+
+  it("still verifies a capability with v at the floor", async () => {
+    const host = await makeTestHost(0x53, 0x54, 10_000n);
+    const cap = await issueTestCapability({
+      hostRootPk: host.rootPk,
+      opCert: host.opCert,
+      opSignerSeed: host.opSeed,
+      capEpoch: 0n,
+      exp: 2_000n,
+    });
+    expect(cap.v).toBe(1);
+    await expect(verifyCapability(cap, 1_500n)).resolves.toBeUndefined();
+  });
+
+  it("checks the version floor before the signature — v below the floor plus a corrupted signature must report VersionTooLow, not BadSignature", async () => {
+    const host = await makeTestHost(0x55, 0x56, 10_000n);
+    const cap = await issueTestCapability({
+      hostRootPk: host.rootPk,
+      opCert: host.opCert,
+      opSignerSeed: host.opSeed,
+      capEpoch: 0n,
+      exp: 2_000n,
+    });
+    cap.v = 0;
+    cap.sig[0] ^= 0xff;
+    await expectArtifactError(() => verifyCapability(cap, 1_500n), "VersionTooLow");
+  });
 });
 
 describe("host-op-key-cert.json", () => {
@@ -906,5 +946,27 @@ describe("admin-command.json", () => {
       () => verifyAdminCommand(cmd, operatorPk, cmd.ts + 121n),
       "TimestampSkew",
     );
+  });
+
+  it("rejects an admin command with v below the floor", async () => {
+    const args = argsFromCanonicalCbor(doc.cases[0].canonical_cbor_hex);
+    const cmd = parseAdminCommand(doc.cases[0].decoded, args);
+    cmd.v = 0;
+    await expectArtifactError(() => verifyAdminCommand(cmd, operatorPk, cmd.ts), "VersionTooLow");
+  });
+
+  it("still verifies an admin command with v at the floor", async () => {
+    const args = argsFromCanonicalCbor(doc.cases[0].canonical_cbor_hex);
+    const cmd = parseAdminCommand(doc.cases[0].decoded, args);
+    expect(cmd.v).toBe(1);
+    await expect(verifyAdminCommand(cmd, operatorPk, cmd.ts)).resolves.toBeUndefined();
+  });
+
+  it("checks the version floor before the signature — v below the floor plus a corrupted signature must report VersionTooLow, not BadSignature", async () => {
+    const args = argsFromCanonicalCbor(doc.cases[0].canonical_cbor_hex);
+    const cmd = parseAdminCommand(doc.cases[0].decoded, args);
+    cmd.v = 0;
+    cmd.sig[0] ^= 0xff;
+    await expectArtifactError(() => verifyAdminCommand(cmd, operatorPk, cmd.ts), "VersionTooLow");
   });
 });

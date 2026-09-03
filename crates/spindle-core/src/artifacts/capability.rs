@@ -1,9 +1,10 @@
 use super::{
-    check_exp, parse_signature, parse_verifying_key, verify_host_op_key_cert, ArtifactError,
+    check_exp, check_min_v, parse_signature, parse_verifying_key, verify_host_op_key_cert,
+    ArtifactError,
 };
 use crate::fingerprint::Fingerprint;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use spindle_proto::artifacts::{CapKind, Capability, HostOpKeyCert};
+use spindle_proto::artifacts::{CapKind, Capability, HostOpKeyCert, CAPABILITY_MIN_V};
 
 /// Issues a capability chained to the host **root** identity (DESIGN.md §A4's "host-signed,
 /// self-verifying" capability, as revised by decision A10.30, 2026-08-24).
@@ -71,6 +72,10 @@ pub fn issue_capability(
 /// rather than inventing a substitute `nbf` check (e.g. treating `cap_epoch` or `nonce` as a
 /// stand-in).
 pub fn verify_capability(cap: &Capability, now: u64) -> Result<(), ArtifactError> {
+    // 0. Version floor — cheapest possible rejection, checked before any signature or expiry
+    // work (DESIGN.md §A7b: "Unknown `v` ⇒ reject").
+    check_min_v(cap.v, CAPABILITY_MIN_V)?;
+
     // 1. host_fp == SHA-256(host_root_pk) — self-consistency of the capability's own fields.
     let host_root_pk = parse_verifying_key(&cap.host_root_pk)?;
     let expected_fp = Fingerprint::of_parts(&[host_root_pk.as_bytes()]);
@@ -272,5 +277,64 @@ mod tests {
         );
         let err = verify_capability(&cap, 1_500).unwrap_err();
         assert_eq!(err, ArtifactError::BadSignature);
+    }
+
+    #[test]
+    fn rejects_v_below_floor() {
+        let host = test_host([0x11; 32], [0x12; 32], 10_000);
+        let mut cap = issue(
+            &host,
+            CapKind::Member,
+            Fingerprint::of_parts(&[b"subject"]),
+            0,
+            2_000,
+        );
+        cap.v = 0;
+        let err = verify_capability(&cap, 1_500).unwrap_err();
+        assert_eq!(
+            err,
+            ArtifactError::VersionTooLow {
+                found: 0,
+                minimum: CAPABILITY_MIN_V
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_v_at_floor() {
+        let host = test_host([0x11; 32], [0x12; 32], 10_000);
+        let cap = issue(
+            &host,
+            CapKind::Member,
+            Fingerprint::of_parts(&[b"subject"]),
+            0,
+            2_000,
+        );
+        assert_eq!(cap.v, CAPABILITY_MIN_V);
+        verify_capability(&cap, 1_500).expect("v == floor must verify");
+    }
+
+    #[test]
+    fn version_check_fires_before_signature_check() {
+        // v below the floor AND a corrupted signature — the version error must win, pinning the
+        // "cheapest rejection first" ordering against a future refactor.
+        let host = test_host([0x11; 32], [0x12; 32], 10_000);
+        let mut cap = issue(
+            &host,
+            CapKind::Member,
+            Fingerprint::of_parts(&[b"subject"]),
+            0,
+            2_000,
+        );
+        cap.v = 0;
+        cap.sig[0] ^= 0xff;
+        let err = verify_capability(&cap, 1_500).unwrap_err();
+        assert_eq!(
+            err,
+            ArtifactError::VersionTooLow {
+                found: 0,
+                minimum: CAPABILITY_MIN_V
+            }
+        );
     }
 }
