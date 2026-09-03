@@ -861,8 +861,10 @@ impl Store {
         //
         // `Immediate`, not the default `Deferred`, for the same reason `schema::migrate` gives:
         // the write lock must be taken BEFORE the checks read, or both callers take a SHARED
-        // lock, both scan stale, and one then deadlocks on upgrade — which SQLite does *not*
-        // resolve by waiting on the busy handler.
+        // lock, both scan stale, and one then races the other to upgrade — which SQLite resolves
+        // as a forced `SQLITE_BUSY` failure for one side rather than a successful wait, hence
+        // `Immediate`, which takes the write lock up front and lets the loser simply wait its
+        // turn.
         //
         // `Transaction::new_unchecked` (rather than `Connection::transaction`, which needs
         // `&mut Connection`) because this method takes `&self`, matching the precedent already
@@ -1026,6 +1028,15 @@ impl Store {
     }
 
     pub fn add_share_exclude(&self, share_id: ShareId, glob: &str) -> Result<(), StoreError> {
+        // Same `Immediate` transaction discipline as `add_share` above, for the same reason and
+        // the same defect: the count check and the `INSERT` are otherwise separate autocommits,
+        // so two concurrent callers each adding a *distinct* glob both read a stale count under
+        // the cap and both insert, carrying the share past `max_excludes_per_share`.
+        // `INSERT OR IGNORE` does not cover this — it suppresses a duplicate glob, not a
+        // concurrent distinct one, and no SQL constraint can express "at most N rows per
+        // share_id". The `grants_version` bump joins the same transaction so the count and the
+        // version it advertises cannot disagree.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let current: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM share_excludes WHERE share_id = ?1",
             params![share_id.0 as i64],
@@ -1042,6 +1053,7 @@ impl Store {
             params![share_id.0 as i64, glob],
         )?;
         self.bump_grants_version()?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1810,9 +1822,17 @@ mod tests {
             .filter(|ok| *ok)
             .count();
 
-        let store = Store::open(&db).expect("reopen");
-        let shares = store.list_shares().expect("list");
+        // Assert the primary invariant BEFORE reopening. `Store::open` runs
+        // `check_persisted_share_overlaps`, so on a genuine race it returns
+        // `PersistedSharesOverlap` and would panic here first — making the assertions below
+        // unreachable and letting an unrelated pre-existing safety net, rather than this test's
+        // own invariant, be what reports the failure.
         assert_eq!(wins, 1, "exactly one concurrent add_share may succeed");
+
+        let store = Store::open(&db).unwrap_or_else(|e| {
+            panic!("both shares were persisted; Store::open rejected the result: {e:?}")
+        });
+        let shares = store.list_shares().expect("list");
         assert_eq!(shares.len(), 1, "only one share may be persisted");
     }
 
@@ -2007,6 +2027,75 @@ mod tests {
             err,
             StoreError::TooManyExcludeGlobs { limit: 1, .. }
         ));
+    }
+
+    #[test]
+    fn concurrent_add_share_exclude_cannot_exceed_the_cap() {
+        // Two threads, two independent `Store`s on one file, racing to add distinct exclude
+        // globs to the same share. Before `add_share_exclude` took a transaction, both scans saw
+        // the same stale under-cap count and both inserts committed, carrying the share one glob
+        // past `max_excludes_per_share`.
+        let limits = StoreLimits {
+            max_excludes_per_share: 2,
+            ..StoreLimits::default()
+        };
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("store.db");
+        let share_dir = tempdir().expect("share dir");
+        let share_id = Store::open_with_limits(&db, limits)
+            .expect("create")
+            // Seeded one glob below the cap, so a single further insert lands exactly on it —
+            // two concurrent inserts must not both land.
+            .add_share(
+                "Photos",
+                "Photos",
+                share_dir.path(),
+                ShareFlags::default(),
+                &["seed".to_string()],
+                0,
+            )
+            .expect("add_share");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        // Distinct globs, not the same one twice: `INSERT OR IGNORE` already suppresses a
+        // duplicate glob for one share, which would make the race untestable — only two distinct
+        // globs can expose a stale-count read that lets both inserts through.
+        for glob in ["alpha", "beta"] {
+            let db = db.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let store = Store::open_with_limits(&db, limits).expect("open");
+                barrier.wait();
+                store.add_share_exclude(share_id, glob).is_ok()
+            }));
+        }
+        let wins = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .filter(|ok| *ok)
+            .count();
+
+        // Assert the cap invariant directly, and before the `wins` assertion below: `wins == 1`
+        // only shows that two racers returned different `Result`s, which a wholly unrelated bug
+        // (e.g. one side hitting `SQLITE_BUSY`) could also produce. Reading the persisted excludes
+        // back and checking the cap is what actually proves — or disproves — the defect this test
+        // exists to catch.
+        let store = Store::open_with_limits(&db, limits).expect("reopen");
+        let excludes = store
+            .excludes_for_share(share_id)
+            .expect("excludes_for_share");
+        assert!(
+            excludes.len() <= limits.max_excludes_per_share,
+            "share exceeded max_excludes_per_share: {} > {}",
+            excludes.len(),
+            limits.max_excludes_per_share
+        );
+
+        assert_eq!(
+            wins, 1,
+            "exactly one concurrent add_share_exclude may succeed"
+        );
     }
 
     // ---- Invite nonce idempotent CAS ----
