@@ -18,6 +18,11 @@
 //!   #29).
 //! - [`fold`] — case/Unicode fold-key comparison and collision detection against existing dirents
 //!   (A12 #20, #31).
+//! - [`resolve`] — fold-aware virtual-path resolution ([`resolve::resolve_folded_path`]) that
+//!   walks a path using this crate's own fold identity rather than the host filesystem's
+//!   resolution behavior, so a caller (e.g. `crate::reconcile`) can tell "genuinely gone" apart
+//!   from "present under a differently-spelled name" even on filesystems (Linux) that don't fold
+//!   case/Unicode variants themselves.
 //! - [`upload`] — upload-relative path scoping and overwrite-requires-`delete` gating (A12 #23,
 //!   #31). Stage 6 slice 4 added the hidden upload-staging filename convention
 //!   ([`upload::staging_name`]/[`upload::is_staging_name`]) DESIGN.md §A8's transfer manager
@@ -39,6 +44,7 @@ pub mod fold;
 pub mod identity;
 pub mod listing;
 pub mod overlap;
+pub mod resolve;
 pub mod upload;
 pub mod windows;
 
@@ -49,6 +55,7 @@ pub use identity::{
 };
 pub use listing::{create_dir_confined, list_dir, remove_confined, RealDirEntry, RealEntryKind};
 pub use overlap::overlap_check;
+pub use resolve::resolve_folded_path;
 pub use upload::{
     finalize_upload, is_staging_name, staging_name, upload_target_path, write_is_authorized,
     UploadOutcome, WriteTarget,

@@ -26,6 +26,12 @@
 //! - [`audit`] — the tamper-evident, hash-chained audit log (DESIGN.md §A4b "Audit log"), backed
 //!   by the same connection as [`store::Store`] — see [`audit::Audit`]'s doc comment for the hash
 //!   chain, signed-head, and transaction-discipline design.
+//! - [`reconcile`] — heals DB-vs-filesystem skew in the upload ledger (td-2db67d): a composing
+//!   function over `store` and `confine` (not a `Store` method — `Store` stays pure DB) that walks
+//!   `uploaded_files` and repairs drift from a crash between a filesystem op and its ledger write,
+//!   or an owner editing an uploaded file out of band. See [`reconcile`]'s module doc comment for
+//!   why this is not the rejected directory-walk design and why owner-placed content is left
+//!   alone.
 //!
 //! # Stage 6 slice history
 //!
@@ -61,6 +67,7 @@ pub mod audit;
 pub mod confine;
 pub mod glob;
 pub mod model;
+pub mod reconcile;
 pub mod store;
 
 #[cfg(test)]

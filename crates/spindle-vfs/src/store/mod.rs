@@ -229,6 +229,18 @@ pub struct IssuedCapRecord {
     pub redeemed_at: u64,
 }
 
+/// One `uploaded_files` ledger row (td-2db67d): the uploader, the stored (possibly stale — see
+/// [`Store::list_uploads`]) subpath, and the byte size the ledger currently believes it has. This
+/// is the worklist `crate::reconcile::reconcile_uploads_against_disk` walks to heal DB-vs-
+/// filesystem skew; it carries no `fold_subpath` because that column exists only for SQLite's own
+/// matching and comparison, never for a caller to consume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadedFile {
+    pub member_id: MemberId,
+    pub subpath: String,
+    pub bytes: u64,
+}
+
 /// A durable, SQLite-backed host store (DESIGN.md §A4b). See the module doc comment for the
 /// invariants this type enforces (two-counter rule, secure-by-default, built-in group
 /// protection, overlap rejection, limits).
@@ -1490,6 +1502,38 @@ impl Store {
 
         tx.commit()?;
         Ok(())
+    }
+
+    /// Every `uploaded_files` row for `share_id` (td-2db67d): the bounded worklist
+    /// `crate::reconcile::reconcile_uploads_against_disk` walks to detect and heal DB-vs-
+    /// filesystem skew (a crash between the filesystem op and the ledger write, or the owner
+    /// editing an uploaded file's bytes directly on the real filesystem). This is a plain `SELECT`
+    /// — it neither reads nor touches the real filesystem itself, keeping `Store` pure DB per this
+    /// ticket's confirmed architecture (the composing sweep that combines this with `confine`'s
+    /// filesystem access lives in `crate::reconcile`, not here).
+    ///
+    /// Ordered by `fold_subpath` (not the literal, possibly-stale `subpath` column — see
+    /// [`Store::record_upload`]'s doc comment on why identity is folded, not literal) so a sweep
+    /// over this list, and any test asserting on it, sees a deterministic, reproducible row order
+    /// rather than SQLite's unspecified default.
+    pub fn list_uploads(&self, share_id: ShareId) -> Result<Vec<UploadedFile>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT member_id, subpath, bytes FROM uploaded_files \
+             WHERE share_id = ?1 ORDER BY fold_subpath",
+        )?;
+        let rows = stmt
+            .query_map(params![share_id.0 as i64], |r| {
+                let member_id: i64 = r.get(0)?;
+                let subpath: String = r.get(1)?;
+                let bytes: i64 = r.get(2)?;
+                Ok(UploadedFile {
+                    member_id: MemberId(member_id as u64),
+                    subpath,
+                    bytes: bytes as u64,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     // ---------------------------------------------------------------------------------------
