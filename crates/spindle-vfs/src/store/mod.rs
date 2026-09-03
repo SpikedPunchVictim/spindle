@@ -2141,6 +2141,37 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// td-93cee6 regression: `invite_nonces.member_id` was missing the `REFERENCES` clause every
+    /// sibling member-scoped table has (`devices.member_id`, `member_upload_bytes.member_id`,
+    /// ...), so burning an invite nonce for a member that does not exist silently succeeded. The
+    /// schema V5 migration (`super::schema::SCHEMA_V5`) adds the missing foreign key; this drives
+    /// the fix through the real public API rather than raw SQL, so it exercises the path a caller
+    /// actually takes.
+    #[test]
+    fn burn_invite_nonce_for_a_nonexistent_member_fails_the_foreign_key_check() {
+        let mut store = Store::open_in_memory().expect("open");
+        let no_such_member = MemberId(999_999);
+
+        let err = store
+            .burn_invite_nonce(&[0xAAu8; 8], no_such_member, b"cap-orphan", 1)
+            .expect_err("burning a nonce for a nonexistent member must now fail");
+
+        match err {
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(ffi_err, ref msg)) => {
+                assert_eq!(
+                    ffi_err.extended_code, 787,
+                    "expected SQLITE_CONSTRAINT_FOREIGNKEY (787), got {ffi_err:?}: {msg:?}"
+                );
+                let message = msg.clone().unwrap_or_default();
+                assert!(
+                    message.contains("FOREIGN KEY constraint failed"),
+                    "expected a foreign-key-constraint message, got: {message}"
+                );
+            }
+            other => panic!("expected StoreError::Sqlite(SqliteFailure), got {other:?}"),
+        }
+    }
+
     // ---- Devices: sign_pk (Stage 6 slice 4) ----
 
     #[test]

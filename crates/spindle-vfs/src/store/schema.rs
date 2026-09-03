@@ -171,6 +171,53 @@ const SCHEMA_V4: &str = r#"
 ALTER TABLE devices ADD COLUMN agree_pk BLOB;
 "#;
 
+/// Version 5 (td-93cee6) — fixes a missing `REFERENCES` on `invite_nonces.member_id`. V1's
+/// `invite_nonces` (DESIGN.md §A4 idempotent invite redemption: `nonce` is the sole CAS key,
+/// mirroring spindle-helper's `burned_admission_nonces` (`crates/spindle-helper/src/pg_store.rs`)
+/// shape — `INSERT ... ON CONFLICT (nonce) DO NOTHING` then a read-back in the same transaction,
+/// done in `crate::store::Store::burn_invite_nonce`) declared `member_id INTEGER NOT NULL` with no
+/// foreign key, unlike every other member-scoped table (`devices.member_id`,
+/// `member_groups.member_id`, `member_upload_bytes.member_id`). Because the bundled SQLite is
+/// built with `SQLITE_DEFAULT_FOREIGN_KEYS=1`, that omission was live, not decorative: burning an
+/// invite nonce for a nonexistent member silently succeeded where the equivalent orphan insert
+/// into `member_upload_bytes` already failed with a foreign-key violation (extended code 787).
+///
+/// SQLite has no `ALTER TABLE ... ADD CONSTRAINT`, so fixing an existing column's foreign key
+/// requires the standard rebuild: create a replacement table with the constraint, copy rows
+/// across, drop the old table, rename the replacement into place. `migrate()` runs each migration
+/// inside its own transaction, and `PRAGMA foreign_keys` is a no-op inside a transaction (per
+/// SQLite's docs), so unlike the "Making Other Kinds Of Table Schema Changes" recipe this rebuild
+/// cannot toggle FK enforcement off around itself — it runs with foreign keys enforced the entire
+/// time, which is why the copy below has to pre-filter rather than rely on disabling checks.
+///
+/// The copy filters out any row whose `member_id` no longer exists in `members`
+/// (`WHERE member_id IN (SELECT member_id FROM members)`) rather than letting the migration abort
+/// on an orphan row. This is intentionally close to vacuous: `burn_invite_nonce` has zero callers
+/// anywhere in the workspace outside its own two tests, so no shipped database can contain any
+/// `invite_nonces` row at all, let alone an orphaned one. But the filter is correct on its own
+/// terms even if that ever changes: an orphan invite nonce is a row whose member no longer
+/// exists, and such a row can never be matched by a legitimate redemption (there is no member left
+/// to redeem it for), so dropping it during the rebuild discards nothing a caller could observe.
+const SCHEMA_V5: &str = r#"
+CREATE TABLE invite_nonces_new (
+    nonce BLOB PRIMARY KEY,
+    member_id INTEGER NOT NULL REFERENCES members(member_id),
+    issued_cap BLOB NOT NULL,
+    redeemed_at INTEGER NOT NULL
+);
+
+-- See this migration's doc comment (SCHEMA_V5) for why orphan rows (member_id no longer present
+-- in `members`) are filtered out here instead of being allowed to abort the migration.
+INSERT INTO invite_nonces_new (nonce, member_id, issued_cap, redeemed_at)
+SELECT nonce, member_id, issued_cap, redeemed_at
+FROM invite_nonces
+WHERE member_id IN (SELECT member_id FROM members);
+
+DROP TABLE invite_nonces;
+
+ALTER TABLE invite_nonces_new RENAME TO invite_nonces;
+"#;
+
 /// Every schema version in order, oldest first. Appending a new `(N, SQL)` pair is the only way
 /// to evolve the schema — existing entries are never edited once shipped.
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -178,6 +225,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, SCHEMA_V2),
     (3, SCHEMA_V3),
     (4, SCHEMA_V4),
+    (5, SCHEMA_V5),
 ];
 
 /// Applies every migration strictly newer than the connection's current `user_version`, each in
@@ -266,6 +314,81 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM groups", [], |row| row.get(0))
             .expect("count groups");
         assert_eq!(count, 2, "Owner and Members must be seeded at init");
+    }
+
+    /// td-93cee6's upgrade-path check: build a database at the OLD (pre-V5) schema by hand,
+    /// insert a valid `invite_nonces` row through the unconstrained V1 table shape, then run
+    /// [`migrate`] and confirm the row survived the rebuild and the table now enforces the
+    /// foreign key that V1 was missing.
+    #[test]
+    fn migrate_v5_rebuild_preserves_rows_and_adds_the_missing_foreign_key() {
+        let mut conn = Connection::open_in_memory().expect("open");
+
+        // Hand-roll a database at schema version 4 (pre-V5) by applying V1..V4 directly, the
+        // same versions `MIGRATIONS` would have applied to any database created before this
+        // migration existed.
+        conn.execute_batch(SCHEMA_V1).expect("apply V1");
+        conn.execute_batch(SCHEMA_V2).expect("apply V2");
+        conn.execute_batch(SCHEMA_V3).expect("apply V3");
+        conn.execute_batch(SCHEMA_V4).expect("apply V4");
+        conn.execute_batch("PRAGMA user_version = 4")
+            .expect("set user_version to 4");
+
+        conn.execute(
+            "INSERT INTO members (root_fp, display_name, status, created) \
+             VALUES (?1, 'Alex', 'active', 0)",
+            [vec![0x11u8; 32]],
+        )
+        .expect("insert member under old schema");
+        let member_id = conn.last_insert_rowid();
+
+        // Under the V1 table shape (no REFERENCES on member_id) this insert has nothing to
+        // violate — it is the same row a real pre-V5 `burn_invite_nonce` call would have written.
+        conn.execute(
+            "INSERT INTO invite_nonces (nonce, member_id, issued_cap, redeemed_at) \
+             VALUES (?1, ?2, ?3, 1000)",
+            rusqlite::params![vec![0xAAu8; 16], member_id, vec![0x22u8; 8]],
+        )
+        .expect("insert invite_nonces row under old schema");
+
+        migrate(&mut conn).expect("migrate old schema up to latest");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
+
+        // The pre-existing row must have survived the create/copy/drop/rename rebuild intact.
+        let (stored_member_id, stored_cap, stored_redeemed_at): (i64, Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT member_id, issued_cap, redeemed_at FROM invite_nonces WHERE nonce = ?1",
+                [vec![0xAAu8; 16]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("row survived the V5 rebuild");
+        assert_eq!(stored_member_id, member_id);
+        assert_eq!(stored_cap, vec![0x22u8; 8]);
+        assert_eq!(stored_redeemed_at, 1000);
+
+        // And the table now enforces the foreign key V1 was missing: a fresh insert against a
+        // nonexistent member must fail, where it previously would have succeeded.
+        let no_such_member = member_id + 1000;
+        let err = conn
+            .execute(
+                "INSERT INTO invite_nonces (nonce, member_id, issued_cap, redeemed_at) \
+                 VALUES (?1, ?2, ?3, 2000)",
+                rusqlite::params![vec![0xBBu8; 16], no_such_member, vec![0x33u8; 8]],
+            )
+            .expect_err("orphan insert must now fail the foreign key check");
+        match err {
+            rusqlite::Error::SqliteFailure(ffi_err, ref msg) => {
+                assert_eq!(
+                    ffi_err.extended_code, 787,
+                    "expected SQLITE_CONSTRAINT_FOREIGNKEY (787), got {ffi_err:?}: {msg:?}"
+                );
+            }
+            other => panic!("expected SqliteFailure, got {other:?}"),
+        }
     }
 
     #[test]
