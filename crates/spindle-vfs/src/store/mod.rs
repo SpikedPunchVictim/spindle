@@ -1296,6 +1296,16 @@ impl Store {
     ///   counter grows by the full `bytes` (this is their file now). This is not the same as
     ///   applying the difference to one member's counter; get it wrong and one member's total
     ///   silently absorbs bytes that belong to the other.
+    ///
+    /// **Identity is by [`crate::confine::fold_key`], not by the literal `subpath` string**
+    /// (SCHEMA_V7) — both the existing-row lookup and the upsert's conflict target key on
+    /// `fold_subpath`, inheriting DESIGN.md §A4b's case/Unicode-fold overwrite rule
+    /// (`docs/DESIGN.md:370-371`) from the same function every other name comparison in this
+    /// crate already uses, instead of the ledger re-deciding that identity question on raw bytes.
+    /// The literal `subpath` column is still stored and still reported back to callers — on a
+    /// conflict it is overwritten to `excluded.subpath`, i.e. the newly-written spelling, so the
+    /// ledger always names the file by however it was *most recently* spelled, even though that
+    /// spelling no longer participates in matching.
     pub fn record_upload(
         &self,
         share_id: ShareId,
@@ -1305,11 +1315,13 @@ impl Store {
     ) -> Result<(), StoreError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
+        let fold_subpath = confine::fold_key(subpath);
+
         let existing: Option<(i64, i64)> = self
             .conn
             .query_row(
-                "SELECT member_id, bytes FROM uploaded_files WHERE share_id = ?1 AND subpath = ?2",
-                params![share_id.0 as i64, subpath],
+                "SELECT member_id, bytes FROM uploaded_files WHERE share_id = ?1 AND fold_subpath = ?2",
+                params![share_id.0 as i64, fold_subpath],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -1333,11 +1345,18 @@ impl Store {
         }
 
         self.conn.execute(
-            "INSERT INTO uploaded_files (share_id, member_id, subpath, bytes) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(share_id, subpath) \
-             DO UPDATE SET member_id = excluded.member_id, bytes = excluded.bytes",
-            params![share_id.0 as i64, member_id.0 as i64, subpath, new_bytes],
+            "INSERT INTO uploaded_files (share_id, member_id, subpath, fold_subpath, bytes) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(share_id, fold_subpath) \
+             DO UPDATE SET subpath = excluded.subpath, member_id = excluded.member_id, \
+                            bytes = excluded.bytes",
+            params![
+                share_id.0 as i64,
+                member_id.0 as i64,
+                subpath,
+                fold_subpath,
+                new_bytes
+            ],
         )?;
 
         tx.commit()?;
@@ -1379,6 +1398,16 @@ impl Store {
     /// `reconcile_upload_counters` recomputes *from* the ledger, so it faithfully preserves the
     /// inflation rather than healing it). Binding `length(?3)` on the same `?3` used by `substr`
     /// keeps both sides in the same unit, so do not "optimize" this back to a Rust-side length.
+    ///
+    /// **Both arms match on [`crate::confine::fold_key`], not on the literal `subpath`**
+    /// (SCHEMA_V7): `subpath` itself folds to `fold_key(subpath)`, and the descendant prefix is
+    /// `fold_key(subpath) + "/"`. That is deliberately equal to `fold_key(&format!("{subpath}/"))`
+    /// — `fold_key` never touches `/` (it only lowercases and strips/decomposes combining marks
+    /// and precomposed Latin letters), so folding before or after appending the separator gives
+    /// the same string; this comment exists so a reader isn't left wondering whether that order
+    /// matters. Folding here is what lets a `Delete` of virtual path `dossier` remove the ledger
+    /// rows under a real `Dossier/` directory, matching how `confine::remove_confined` already
+    /// resolves that same delete case-insensitively on disk.
     pub fn remove_uploads_under(
         &self,
         share_id: ShareId,
@@ -1386,14 +1415,15 @@ impl Store {
     ) -> Result<Vec<(MemberId, u64)>, StoreError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
-        let prefix = format!("{subpath}/");
+        let fold_subpath = confine::fold_key(subpath);
+        let prefix = format!("{fold_subpath}/");
 
         let mut stmt = self.conn.prepare(
             "SELECT member_id, bytes FROM uploaded_files \
-             WHERE share_id = ?1 AND (subpath = ?2 OR substr(subpath, 1, length(?3)) = ?3)",
+             WHERE share_id = ?1 AND (fold_subpath = ?2 OR substr(fold_subpath, 1, length(?3)) = ?3)",
         )?;
         let matches: Vec<(i64, i64)> = stmt
-            .query_map(params![share_id.0 as i64, subpath, prefix], |r| {
+            .query_map(params![share_id.0 as i64, fold_subpath, prefix], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?
             .collect::<Result<_, _>>()?;
@@ -1407,8 +1437,8 @@ impl Store {
 
         self.conn.execute(
             "DELETE FROM uploaded_files \
-             WHERE share_id = ?1 AND (subpath = ?2 OR substr(subpath, 1, length(?3)) = ?3)",
-            params![share_id.0 as i64, subpath, prefix],
+             WHERE share_id = ?1 AND (fold_subpath = ?2 OR substr(fold_subpath, 1, length(?3)) = ?3)",
+            params![share_id.0 as i64, fold_subpath, prefix],
         )?;
 
         let total_bytes: i64 = matches.iter().map(|(_, bytes)| bytes).sum();
@@ -2971,6 +3001,186 @@ mod tests {
             .record_upload(share_id, no_such_member, "a.txt", 10)
             .expect_err("a nonexistent member must fail the foreign key check");
         assert_foreign_key_violation(&err);
+    }
+
+    // ---- Upload ledger fold-key identity (SCHEMA_V7, this ticket) ----
+    //
+    // The two prior regression tests above (`..._does_not_over_match_percent_and_underscore...`,
+    // `..._matches_descendants_of_a_non_ascii_subpath`) each used inputs from only the character
+    // class their author was already thinking about: the percent/underscore test was pure ASCII
+    // and only proves the LIKE-vs-substr fix, and the non-ASCII test used one consistent spelling
+    // of "dossié" throughout and so passes even against the byte-comparison bug fixed here (it
+    // never asks whether two *different* spellings of the same name collide). The tests below
+    // specifically exercise the fold-identity rule DESIGN.md §A4b requires
+    // (`crate::confine::fold_key`), which those two did not.
+
+    /// Matrix case 1: uploading `Photo.JPG` then `photo.jpg` (case-only variants of the same
+    /// name) must be treated as one overwrite, not two independent files — exactly the collision
+    /// [`Store::record_upload`]'s "different member" branch already handles for a literal repeat
+    /// upload, now proven across a case-folded spelling change instead. Also asserts there is
+    /// really only one row in `uploaded_files`, not just that the counters happen to net out.
+    #[test]
+    fn record_upload_case_variant_spellings_collapse_to_one_row() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "Photo.JPG", 100)
+            .expect("member_a uploads Photo.JPG");
+        store
+            .record_upload(share_id, member_b, "photo.jpg", 100)
+            .expect("member_b overwrites via the case-variant spelling");
+
+        let row_count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM uploaded_files WHERE share_id = ?1",
+                params![share_id.0 as i64],
+                |r| r.get(0),
+            )
+            .expect("count uploaded_files rows");
+        assert_eq!(
+            row_count, 1,
+            "case-variant spellings of the same name must be one ledger row, not two"
+        );
+
+        assert_eq!(
+            store.member_upload_bytes(member_a).unwrap(),
+            0,
+            "member_a must be refunded — their file was overwritten"
+        );
+        assert_eq!(
+            store.member_upload_bytes(member_b).unwrap(),
+            100,
+            "member_b now owns the (only) 100 bytes"
+        );
+        assert_eq!(
+            store.share_upload_bytes(share_id).unwrap(),
+            100,
+            "the share must reflect exactly one 100-byte file, not 200"
+        );
+    }
+
+    /// Matrix case 2: the NFC/NFD pair. Both spellings of "café.txt" are constructed with
+    /// explicit escapes (never typed as a literal accented character) so this source file's own
+    /// encoding cannot make them accidentally byte-identical, and the fold-equality is asserted
+    /// directly before relying on it — mirroring `confine::fold::tests::unicode_nfd_collision_detected`'s
+    /// own sanity check.
+    #[test]
+    fn record_upload_nfc_and_nfd_spellings_collapse_to_one_row() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        let nfc = "caf\u{00E9}.txt"; // "café.txt", precomposed é (U+00E9)
+        let nfd = "cafe\u{0301}.txt"; // "café.txt", e (U+0065) + combining acute accent (U+0301)
+        assert_ne!(
+            nfc, nfd,
+            "sanity: the two byte-level spellings must actually differ"
+        );
+        assert_eq!(
+            crate::confine::fold_key(nfc),
+            crate::confine::fold_key(nfd),
+            "sanity: NFC and NFD spellings of café must fold equal before this test relies on it"
+        );
+
+        store
+            .record_upload(share_id, member_a, nfc, 100)
+            .expect("member_a uploads the NFC spelling");
+        store
+            .record_upload(share_id, member_b, nfd, 150)
+            .expect("member_b overwrites via the NFD spelling");
+
+        let row_count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM uploaded_files WHERE share_id = ?1",
+                params![share_id.0 as i64],
+                |r| r.get(0),
+            )
+            .expect("count uploaded_files rows");
+        assert_eq!(
+            row_count, 1,
+            "NFC and NFD spellings of the same name must be one ledger row, not two"
+        );
+
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
+        assert_eq!(store.member_upload_bytes(member_b).unwrap(), 150);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 150);
+    }
+
+    /// Matrix case 3: the exact scenario from [`Store::remove_uploads_under`]'s doc comment — a
+    /// `Delete` of a virtual path that differs in case from the real directory
+    /// `confine::remove_confined` actually resolved and removed on disk. Before this fix,
+    /// `remove_uploads_under("dossier")` matched zero rows here and stranded the counters forever.
+    #[test]
+    fn remove_uploads_under_matches_a_case_differing_directory() {
+        let (_sandbox, store, share_id, member_a, _member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "Dossier/x.txt", 700)
+            .expect("record Dossier/x.txt");
+
+        let removed = store
+            .remove_uploads_under(share_id, "dossier")
+            .expect("remove_uploads_under dossier (lowercase virtual path)");
+        assert_eq!(removed, vec![(member_a, 700)]);
+
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 0);
+    }
+
+    /// Matrix case 4: a directory removal whose *descendants* — not just the directory name
+    /// itself — differ in case from the removal prefix, including a nested descendant two levels
+    /// down. Both must be matched and refunded to their own (distinct) uploaders.
+    #[test]
+    fn remove_uploads_under_matches_descendants_whose_case_differs_from_the_removal_prefix() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "DOSSIER/A.TXT", 10)
+            .expect("record DOSSIER/A.TXT");
+        store
+            .record_upload(share_id, member_b, "dossier/SUB/B.txt", 20)
+            .expect("record dossier/SUB/B.txt");
+
+        let mut removed = store
+            .remove_uploads_under(share_id, "Dossier")
+            .expect("remove_uploads_under Dossier");
+        removed.sort_by_key(|(_, bytes)| *bytes);
+        assert_eq!(removed, vec![(member_a, 10), (member_b, 20)]);
+
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
+        assert_eq!(store.member_upload_bytes(member_b).unwrap(), 0);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 0);
+    }
+
+    /// Matrix case 5: the existing `dossiéX/keep.txt` boundary case
+    /// (`remove_uploads_under_matches_descendants_of_a_non_ascii_subpath`) still holds once the
+    /// prefix comparison is case-folded too — a fold-equal *textual* prefix must not match across
+    /// the `/` boundary. `DOSSIERX/keep.txt` fold-collides with `dossier` on every character up to
+    /// the point they diverge (`dossier` vs `dossierx`), but is not a descendant of it.
+    #[test]
+    fn remove_uploads_under_case_fold_prefix_does_not_cross_the_slash_boundary() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "Dossier/x.txt", 10)
+            .expect("record real descendant of Dossier");
+        store
+            .record_upload(share_id, member_b, "DOSSIERX/keep.txt", 30)
+            .expect("record unrelated sibling sharing only a fold-equal textual prefix");
+
+        let removed = store
+            .remove_uploads_under(share_id, "dossier")
+            .expect("remove_uploads_under dossier");
+        assert_eq!(removed, vec![(member_a, 10)]);
+
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
+        assert_eq!(
+            store.member_upload_bytes(member_b).unwrap(),
+            30,
+            "DOSSIERX/keep.txt must survive: a fold-equal textual prefix is not a '/'-bounded \
+             descendant relationship"
+        );
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 30);
     }
 
     // ---- Integration: store -> algebra survives a reopen ----

@@ -265,6 +265,69 @@ CREATE TABLE uploaded_files (
 );
 "#;
 
+/// Version 7 (this ticket, following the td-b940b1 review that rejected the original
+/// `uploaded_files` shape) — fixes the ledger re-deciding name identity instead of inheriting it.
+///
+/// `SCHEMA_V6`'s `PRIMARY KEY (share_id, subpath)` and every query against it compare `subpath`
+/// byte-for-byte, but DESIGN.md §A4b (`docs/DESIGN.md:370-371`) states "creating a name that
+/// collides case-insensitively or under Unicode normalization with an existing dirent **is** an
+/// overwrite" — the rule `crate::confine::fold_key` already implements for every other name
+/// comparison in this crate (`existing_entry_colliding`, `VirtualPath::descends_from_or_eq`,
+/// `crate::glob`). On a case-insensitive filesystem (macOS, Windows — this desktop host's primary
+/// targets) that mismatch meant: uploading `Photo.JPG` then `photo.jpg` produced **one** dirent on
+/// disk but **two** `uploaded_files` rows, permanently inflating `share_upload_bytes`/
+/// `member_upload_bytes` by the second row's size (and `reconcile_upload_counters` recomputes
+/// *from* the ledger, so it faithfully preserves that inflation rather than healing it); and
+/// deleting the one on-disk file by a case-differing virtual path matched **zero** ledger rows,
+/// stranding the inflated counter forever — the exact failure
+/// `Store::remove_uploads_under`'s own doc comment says its recursive form exists to prevent.
+///
+/// This migration adds `fold_subpath` and moves the PRIMARY KEY onto it, so the ledger's identity
+/// rule is now *inherited* from `crate::confine::fold_key` rather than restated. `subpath` remains
+/// as a plain (non-key) column recording the literal spelling last written — `record_upload`
+/// updates it to the new spelling on every conflict, so a caller reading `uploaded_files` still
+/// sees a real, on-disk-shaped name, just no longer one that participates in any comparison.
+///
+/// **This migration discards every existing `uploaded_files` row rather than migrating them,
+/// stated plainly rather than dressed up as anything else**: it is a `DROP TABLE` +
+/// `CREATE TABLE`, not a copy-and-rebuild like `SCHEMA_V5`. That is a deliberate, informed choice,
+/// not an oversight — `SCHEMA_V6` (which introduced this table at all) landed earlier the same
+/// day as this migration, Spindle has no deployment and no users, and there is no dev database
+/// anywhere worth preserving. There is therefore no fold-collision to detect or collapse, and
+/// nothing worth the complexity a real migration (a scalar function to compute `fold_key` in SQL,
+/// a rowid tie-break for which duplicate survives, a counter correction for the ones that don't)
+/// would need — that machinery would exist solely to protect rows nobody has. Both counter tables
+/// are zeroed alongside the drop: leaving them at whatever they held under the old, now-discarded
+/// ledger would immediately desynchronize the cache from the (now-empty) source of truth
+/// `reconcile_upload_counters` trusts, which is exactly the drift class this whole ticket exists
+/// to eliminate. Should this table ever need a real migrate-in-place treatment after real data
+/// exists, `SCHEMA_V5`'s rebuild (create replacement, copy, drop, rename) is the precedent to
+/// follow — not this one.
+///
+/// Same constraint `SCHEMA_V5`'s doc comment documents applies here too, for the record: `PRAGMA
+/// foreign_keys` is a no-op inside a transaction and `migrate()` runs every migration inside one.
+/// It doesn't matter for this migration specifically (there is no data being copied for it to
+/// enforce anything against), but the drop/recreate below still runs with foreign keys enforced
+/// the entire time like every other migration in this file.
+const SCHEMA_V7: &str = r#"
+DROP TABLE uploaded_files;
+
+CREATE TABLE uploaded_files (
+    share_id      INTEGER NOT NULL REFERENCES shares(share_id),
+    member_id     INTEGER NOT NULL REFERENCES members(member_id),
+    subpath       TEXT    NOT NULL,
+    fold_subpath  TEXT    NOT NULL,
+    bytes         INTEGER NOT NULL,
+    PRIMARY KEY (share_id, fold_subpath)
+);
+
+-- The dropped ledger was these counters' only source of truth (see this migration's doc comment
+-- for why it is discarded rather than migrated); leaving them at their pre-drop values would
+-- desynchronize the cache from a now-empty ledger, so both are reset to match it exactly.
+UPDATE member_upload_bytes SET bytes = 0;
+UPDATE share_upload_bytes  SET bytes = 0;
+"#;
+
 /// Every schema version in order, oldest first. Appending a new `(N, SQL)` pair is the only way
 /// to evolve the schema — existing entries are never edited once shipped.
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -274,6 +337,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, SCHEMA_V4),
     (5, SCHEMA_V5),
     (6, SCHEMA_V6),
+    (7, SCHEMA_V7),
 ];
 
 /// Applies every migration strictly newer than the connection's current `user_version`, each in
@@ -437,6 +501,112 @@ mod tests {
             }
             other => panic!("expected SqliteFailure, got {other:?}"),
         }
+    }
+
+    /// This ticket's upgrade-path check (fold-key ledger identity, SCHEMA_V7): build a database at
+    /// the OLD (pre-V7) schema by hand — directly from `SCHEMA_V1..V6`, not by migrating to latest
+    /// and then trying to undo V7, the same reason
+    /// `concurrent_opens_on_an_out_of_date_file_do_not_both_apply_the_same_migration`'s doc comment
+    /// gives for building its V3 fixture the same way (that test was already bitten once, when
+    /// SCHEMA_V6 landed, by an earlier revision that tried to strip a later version back off) —
+    /// seed a `uploaded_files` row and non-zero counters under the OLD shape, then run [`migrate`]
+    /// and confirm SCHEMA_V7's documented behavior: the table is rebuilt with `fold_subpath` as
+    /// part of its primary key, the old row is gone (this migration discards rather than migrates
+    /// the ledger — see SCHEMA_V7's doc comment for why that's acceptable pre-deployment), and both
+    /// counter tables are reset to 0 so the (now-empty) cache matches the (now-empty) ledger.
+    #[test]
+    fn migrate_v7_rebuilds_uploaded_files_and_zeroes_both_counters() {
+        let mut conn = Connection::open_in_memory().expect("open");
+
+        // Hand-roll a database at schema version 6 (pre-V7) by applying V1..V6 directly.
+        conn.execute_batch(SCHEMA_V1).expect("apply V1");
+        conn.execute_batch(SCHEMA_V2).expect("apply V2");
+        conn.execute_batch(SCHEMA_V3).expect("apply V3");
+        conn.execute_batch(SCHEMA_V4).expect("apply V4");
+        conn.execute_batch(SCHEMA_V5).expect("apply V5");
+        conn.execute_batch(SCHEMA_V6).expect("apply V6");
+        conn.execute_batch("PRAGMA user_version = 6")
+            .expect("set user_version to 6");
+
+        conn.execute(
+            "INSERT INTO members (root_fp, display_name, status, created) \
+             VALUES (?1, 'Alex', 'active', 0)",
+            [vec![0x11u8; 32]],
+        )
+        .expect("insert member alex");
+        let member_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO shares \
+             (name, mount_path, real_root, read_only, allow_upload, show_hidden, created) \
+             VALUES ('Drop', 'Drop', '/tmp/drop', 0, 1, 0, 0)",
+            [],
+        )
+        .expect("insert share");
+        let share_id = conn.last_insert_rowid();
+
+        // A row under the OLD (no `fold_subpath`) shape, plus the running counters a real pre-V7
+        // `record_upload` would have produced for it.
+        conn.execute(
+            "INSERT INTO uploaded_files (share_id, member_id, subpath, bytes) \
+             VALUES (?1, ?2, 'a.txt', 300)",
+            rusqlite::params![share_id, member_id],
+        )
+        .expect("insert pre-V7 uploaded_files row");
+        conn.execute(
+            "INSERT INTO member_upload_bytes (member_id, bytes) VALUES (?1, 300)",
+            [member_id],
+        )
+        .expect("seed member counter");
+        conn.execute(
+            "INSERT INTO share_upload_bytes (share_id, bytes) VALUES (?1, 300)",
+            [share_id],
+        )
+        .expect("seed share counter");
+
+        migrate(&mut conn).expect("migrate old schema up to latest");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
+
+        // The new shape exists (querying `fold_subpath` at all would error against the old
+        // table), and it is empty — SCHEMA_V7 discards the ledger rather than migrating it.
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM uploaded_files", [], |r| r.get(0))
+            .expect("count rows via the new fold_subpath-keyed shape");
+        assert_eq!(
+            row_count, 0,
+            "SCHEMA_V7 discards the pre-existing ledger outright — see its doc comment"
+        );
+
+        // Both counters must be reset to 0, matching the now-empty ledger they cache — not left
+        // at their pre-migration values, which would desynchronize the cache from its source of
+        // truth.
+        let member_bytes: i64 = conn
+            .query_row(
+                "SELECT bytes FROM member_upload_bytes WHERE member_id = ?1",
+                [member_id],
+                |r| r.get(0),
+            )
+            .expect("read member counter");
+        assert_eq!(
+            member_bytes, 0,
+            "member_upload_bytes must be zeroed alongside the discarded ledger"
+        );
+
+        let share_bytes: i64 = conn
+            .query_row(
+                "SELECT bytes FROM share_upload_bytes WHERE share_id = ?1",
+                [share_id],
+                |r| r.get(0),
+            )
+            .expect("read share counter");
+        assert_eq!(
+            share_bytes, 0,
+            "share_upload_bytes must be zeroed alongside the discarded ledger"
+        );
     }
 
     #[test]
