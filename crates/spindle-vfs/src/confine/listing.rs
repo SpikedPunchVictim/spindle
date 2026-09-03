@@ -11,7 +11,7 @@
 //! this module only knows how to talk to the real filesystem safely through the capability.
 
 use super::identity::stat_through_dir;
-use super::upload::{is_staging_name, upload_target_path};
+use super::upload::{is_staging_name, upload_target_path, WriteTarget};
 use super::ConfineError;
 use cap_std::fs::Dir;
 use std::path::{Path, PathBuf};
@@ -143,8 +143,18 @@ pub fn create_dir_confined(
             .map_err(|e| ConfineError::io(relative, e))?;
         &parent_dir
     };
-    if !super::upload::write_is_authorized(parent_ref, &name, can_upload, can_delete)? {
-        return Ok(false);
+    // `write_is_authorized` now surfaces the *existing* colliding entry's real on-disk name
+    // (`WriteTarget::Overwrites`) so `finalize_upload` can rename a file onto it instead of the
+    // requested spelling (td-48fb1d). That distinction doesn't apply here: `mkdir` either creates
+    // `target` or it doesn't — there is no second on-disk name to redirect onto, since creating a
+    // directory is not a rename. So `Overwrites(_)` is deliberately treated exactly like today's
+    // "authorized" `true`, discarding the name it carries; only `Denied` still blocks. Whether
+    // `mkdir` should even be allowed to "win" a collision like this at all is a separate, already
+    // -flagged question (this function's own doc comment above, :119-127) and not something this
+    // change revisits.
+    match super::upload::write_is_authorized(parent_ref, &name, can_upload, can_delete)? {
+        WriteTarget::Denied => return Ok(false),
+        WriteTarget::Fresh | WriteTarget::Overwrites(_) => {}
     }
     dir.create_dir(&target)
         .map_err(|e| ConfineError::io(relative, e))?;

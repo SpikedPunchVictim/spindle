@@ -57,6 +57,25 @@ pub fn is_staging_name(name: &str) -> bool {
     name.starts_with(STAGING_NAME_PREFIX)
 }
 
+/// The result of the overwrite-requires-`delete` collision gate ([`write_is_authorized`]) for a
+/// candidate write target name. Distinguishes "authorized, nothing existing is touched" from
+/// "authorized, but an existing dirent will be replaced" — and in the latter case carries that
+/// dirent's *actual* on-disk name, because on a filesystem that does not fold case/Unicode
+/// variants itself (Linux), that name can differ from `candidate_name`. A caller that authorizes
+/// a write and then throws this name away (writing to `candidate_name` instead) reopens exactly
+/// the collision this check exists to close: see [`finalize_upload`]'s doc comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteTarget {
+    /// `can_upload` is false, or a colliding entry exists and `can_delete` is false.
+    Denied,
+    /// No existing entry collides (by fold key, [`crate::confine::fold::fold_key`]) with the
+    /// candidate name: a write may proceed and should land under the requested spelling.
+    Fresh,
+    /// A colliding entry already exists under this on-disk name and `can_delete` is set: a write
+    /// may proceed, but must land under *this* name — see [`finalize_upload`].
+    Overwrites(std::ffi::OsString),
+}
+
 /// DESIGN.md §A4b entitlement rule: overwriting an existing entry (including one only reachable
 /// via a case/Unicode-folding collision, per [`existing_entry_colliding`]) requires `delete`;
 /// `upload` alone only ever creates a genuinely new dirent.
@@ -65,13 +84,19 @@ pub fn write_is_authorized(
     candidate_name: &str,
     can_upload: bool,
     can_delete: bool,
-) -> Result<bool, ConfineError> {
+) -> Result<WriteTarget, ConfineError> {
     if !can_upload {
-        return Ok(false);
+        return Ok(WriteTarget::Denied);
     }
     Ok(match existing_entry_colliding(dir, candidate_name)? {
-        Some(_) => can_delete,
-        None => true,
+        Some(existing_name) => {
+            if can_delete {
+                WriteTarget::Overwrites(existing_name)
+            } else {
+                WriteTarget::Denied
+            }
+        }
+        None => WriteTarget::Fresh,
     })
 }
 
@@ -87,6 +112,23 @@ pub fn write_is_authorized(
 /// its own parent directory's entries, not `dir`'s root. Returns `Ok(false)` (nothing moved) on a
 /// collision without `delete`, exactly like [`super::listing::create_dir_confined`]'s `mkdir`
 /// analogue.
+///
+/// **The staged file lands on the *existing* entry's name, not the requested spelling, when this
+/// is an overwrite** (DESIGN.md :370-371: a case/Unicode-fold collision with an existing dirent
+/// **is** an overwrite of that dirent). `write_is_authorized` already returns that dirent's real
+/// on-disk name ([`WriteTarget::Overwrites`]) precisely so this function does not have to guess
+/// it, and renaming onto it — rather than removing the colliding entry and renaming to the
+/// requested spelling — is deliberate for two reasons:
+/// 1. **Atomicity.** `Dir::rename` onto an existing name is a single syscall that atomically
+///    replaces the file's contents. Remove-then-rename has a window where neither the old nor the
+///    new file exists; a crash there loses bytes the user still had a moment before.
+/// 2. **It matches native behavior.** A case-insensitive filesystem (macOS, Windows) already
+///    preserves the original dirent's spelling when a write comes in through a case variant.
+///    Renaming onto the existing name makes Linux (which does not fold these names itself) behave
+///    the same way, rather than inventing a third, platform-specific behavior.
+///
+/// The visible consequence is that the uploader's chosen spelling is silently not honored once it
+/// collides — that is the intended reading of "collision is an overwrite", not a bug.
 pub fn finalize_upload(
     dir: &Dir,
     staging_name: &str,
@@ -104,10 +146,13 @@ pub fn finalize_upload(
             .map_err(|e| ConfineError::io(target_relative, e))?;
         &parent_dir
     };
-    if !write_is_authorized(parent_ref, &name, true, can_delete)? {
-        return Ok(false);
-    }
-    dir.rename(staging_name, parent_ref, &name)
+    let write_target_name: std::ffi::OsString =
+        match write_is_authorized(parent_ref, &name, true, can_delete)? {
+            WriteTarget::Denied => return Ok(false),
+            WriteTarget::Fresh => std::ffi::OsString::from(name),
+            WriteTarget::Overwrites(existing_name) => existing_name,
+        };
+    dir.rename(staging_name, parent_ref, &write_target_name)
         .map_err(|e| ConfineError::io(target_relative, e))?;
     Ok(true)
 }
@@ -115,6 +160,7 @@ pub fn finalize_upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::confine::fold::names_collide;
     use crate::confine::open_share_root;
     use tempfile::tempdir;
 
@@ -231,13 +277,175 @@ mod tests {
         dir.write("Photo.JPG", b"existing")
             .expect("seed existing entry");
 
-        assert!(!write_is_authorized(&dir, "Photo.JPG", true, false).expect("check"));
-        assert!(write_is_authorized(&dir, "Photo.JPG", true, true).expect("check"));
+        assert_eq!(
+            write_is_authorized(&dir, "Photo.JPG", true, false).expect("check"),
+            WriteTarget::Denied
+        );
+        assert_eq!(
+            write_is_authorized(&dir, "Photo.JPG", true, true).expect("check"),
+            WriteTarget::Overwrites(std::ffi::OsString::from("Photo.JPG"))
+        );
         // Case-fold collision counts as an overwrite too — still needs delete.
-        assert!(!write_is_authorized(&dir, "photo.jpg", true, false).expect("check"));
+        assert_eq!(
+            write_is_authorized(&dir, "photo.jpg", true, false).expect("check"),
+            WriteTarget::Denied
+        );
+        // ...and when authorized, surfaces the *existing* dirent's spelling, not the candidate's.
+        assert_eq!(
+            write_is_authorized(&dir, "photo.jpg", true, true).expect("check"),
+            WriteTarget::Overwrites(std::ffi::OsString::from("Photo.JPG"))
+        );
         // A genuinely new name needs only upload.
-        assert!(write_is_authorized(&dir, "new-name.jpg", true, false).expect("check"));
+        assert_eq!(
+            write_is_authorized(&dir, "new-name.jpg", true, false).expect("check"),
+            WriteTarget::Fresh
+        );
         // No upload permission at all: always rejected, regardless of delete or collisions.
-        assert!(!write_is_authorized(&dir, "new-name.jpg", false, true).expect("check"));
+        assert_eq!(
+            write_is_authorized(&dir, "new-name.jpg", false, true).expect("check"),
+            WriteTarget::Denied
+        );
+    }
+
+    /// The core fix for td-48fb1d: on a filesystem that does not fold case variants itself
+    /// (Linux; macOS folds them natively so this assertion is what actually distinguishes the
+    /// fixed behavior there too — see the dirent-count comment below), uploading `photo.jpg` when
+    /// `Photo.JPG` already exists must replace that file, not create a second, distinctly-spelled
+    /// one. Before the fix, `finalize_upload` authorized the write via the collision check but
+    /// then renamed onto the *requested* spelling, so `rename` created a brand new dirent next to
+    /// the untouched original — asserting only "`Photo.JPG` still exists" would not have caught
+    /// that, hence asserting on the directory's total entry count here.
+    #[test]
+    fn finalize_upload_case_collision_overwrites_existing_dirent_not_requested_spelling() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        let dir = open_share_root(&root).expect("open share root");
+        dir.write("Photo.JPG", b"original-bytes")
+            .expect("seed existing entry");
+
+        let staging = staging_name(&[0xaa]);
+        dir.write(&staging, b"uploaded-bytes")
+            .expect("write staging");
+
+        assert!(finalize_upload(&dir, &staging, "photo.jpg", true).expect("finalize"));
+
+        let entries: Vec<_> = std::fs::read_dir(&root)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["Photo.JPG".to_string()],
+            "exactly one entry must remain, spelled as the pre-existing dirent was"
+        );
+        assert_eq!(
+            std::fs::read(root.join("Photo.JPG")).expect("read final"),
+            b"uploaded-bytes",
+            "the surviving dirent's contents must be the newly uploaded bytes"
+        );
+    }
+
+    /// The NFC/NFD equivalent of the case-collision fix above: a precomposed "café" (é as a
+    /// single U+00E9 code point) and its decomposed spelling ("cafe" + combining U+0301) must
+    /// fold equal and finalize onto the pre-existing dirent's spelling.
+    #[test]
+    fn finalize_upload_nfd_collision_overwrites_existing_dirent_not_requested_spelling() {
+        let nfc = "caf\u{00E9}.txt"; // precomposed é (U+00E9)
+        let nfd = "cafe\u{0301}.txt"; // decomposed: e (U+0065) + combining acute accent (U+0301)
+        assert_ne!(
+            nfc, nfd,
+            "sanity: the two byte-level spellings must actually differ"
+        );
+        assert!(
+            names_collide(nfc, nfd),
+            "sanity: our fold key must treat NFC and NFD \"café\" as the same name before we \
+             rely on that below"
+        );
+
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        let dir = open_share_root(&root).expect("open share root");
+        dir.write(nfc, b"original-bytes")
+            .expect("seed existing NFC-named entry");
+
+        let staging = staging_name(&[0xbb]);
+        dir.write(&staging, b"uploaded-bytes")
+            .expect("write staging");
+
+        assert!(finalize_upload(&dir, &staging, nfd, true).expect("finalize"));
+
+        let entries: Vec<_> = std::fs::read_dir(&root)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one entry must remain");
+        assert_eq!(
+            entries[0],
+            std::ffi::OsString::from(nfc),
+            "the surviving dirent must keep the pre-existing (NFC) spelling"
+        );
+        assert_eq!(
+            std::fs::read(root.join(nfc)).expect("read final"),
+            b"uploaded-bytes",
+            "the surviving dirent's contents must be the newly uploaded bytes"
+        );
+    }
+
+    /// No regression for the common path: a genuinely fresh name still lands under the spelling
+    /// the uploader requested.
+    #[test]
+    fn finalize_upload_fresh_name_lands_under_requested_spelling() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        let dir = open_share_root(&root).expect("open share root");
+
+        let staging = staging_name(&[0xcc]);
+        dir.write(&staging, b"uploaded-bytes")
+            .expect("write staging");
+
+        assert!(finalize_upload(&dir, &staging, "NewFile.txt", false).expect("finalize"));
+        assert!(root.join("NewFile.txt").exists());
+        assert_eq!(
+            std::fs::read(root.join("NewFile.txt")).expect("read final"),
+            b"uploaded-bytes"
+        );
+    }
+
+    /// The permission gate must not weaken: a colliding entry without `can_delete` still refuses
+    /// the write and leaves the existing file completely untouched.
+    #[test]
+    fn finalize_upload_case_collision_without_delete_is_refused_and_existing_file_untouched() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        let dir = open_share_root(&root).expect("open share root");
+        dir.write("Photo.JPG", b"original-bytes")
+            .expect("seed existing entry");
+
+        let staging = staging_name(&[0xdd]);
+        dir.write(&staging, b"uploaded-bytes")
+            .expect("write staging");
+
+        assert!(!finalize_upload(&dir, &staging, "photo.jpg", false).expect("finalize"));
+
+        let entries: Vec<_> = std::fs::read_dir(&root)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().to_string())
+            .collect();
+        let mut sorted = entries.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![staging.clone(), "Photo.JPG".to_string()],
+            "the existing entry and the still-pending staging file must both remain untouched"
+        );
+        assert_eq!(
+            std::fs::read(root.join("Photo.JPG")).expect("read"),
+            b"original-bytes",
+            "the existing file's contents must be untouched"
+        );
     }
 }

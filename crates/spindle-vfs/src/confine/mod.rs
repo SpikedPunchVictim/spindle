@@ -51,6 +51,7 @@ pub use listing::{create_dir_confined, list_dir, remove_confined, RealDirEntry, 
 pub use overlap::overlap_check;
 pub use upload::{
     finalize_upload, is_staging_name, staging_name, upload_target_path, write_is_authorized,
+    WriteTarget,
 };
 
 /// Errors from the confinement layer. Each variant's doc comment on its emitting function names
