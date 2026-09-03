@@ -251,8 +251,8 @@ ALTER TABLE invite_nonces_new RENAME TO invite_nonces;
 /// before it (a real file on disk carries no metadata saying which member's upload put it there).
 /// Pre-migration uploads are therefore forgotten by `uploaded_files`, which is a one-time quota
 /// amnesty for bytes already counted in the running totals: those totals are left as-is (nothing
-/// in this migration touches them), only future `record_upload`/`remove_upload` calls and any
-/// later `reconcile_upload_counters` run affect what `uploaded_files` itself knows about. This is
+/// in this migration touches them), only future `record_upload`/`remove_uploads_under` calls and
+/// any later `reconcile_upload_counters` run affect what `uploaded_files` itself knows about. This is
 /// acceptable because device enrollment — the only path that can currently reach an upload commit
 /// — has zero production callers; no real deployment exists yet to lose data from.
 const SCHEMA_V6: &str = r#"

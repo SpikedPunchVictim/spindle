@@ -854,26 +854,42 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
             Ok(d) => d,
             Err(_) => return self.deny(ts, member, ctx, "delete", Some(path), "denied:not_found"),
         };
-        // Snapshot real bytes-on-disk before removal — Stage 6 slice 4: `share_upload_bytes` is
-        // kept exactly in sync with deletes regardless of who uploaded the content (see
-        // `spindle_vfs::store`'s upload-quota module doc comment). A directory's recursive size
-        // is not walked here (only a file's own size is tracked against the counter) — DESIGN.md
-        // does not require exact accounting for an entire deleted subtree, and doing so on every
-        // delete would be a full directory walk on this crate's hot path for something no test or
-        // DESIGN.md requirement asks for.
-        let bytes_removed = confine::stat_through_dir(&dir, &confine_relative(&subpath))
-            .ok()
-            .filter(|m| m.is_file())
-            .map(|m| m.len());
+        // Stage 6 slice 5 (uploaded_files ledger, `spindle_vfs::store::schema::SCHEMA_V6`): the
+        // counter decrement below now comes from `Store::remove_uploads_under` after the
+        // filesystem removal succeeds, not from a stat of the file(s) being removed. An earlier
+        // revision of this comment snapshotted real bytes-on-disk here because computing a
+        // directory's recursive size would be a full directory walk on this crate's hot path —
+        // that rationale no longer applies to the counter: `uploaded_files` gives the exact
+        // recursive total for any subtree via one indexed `DELETE`, with no filesystem walk at
+        // all, and (unlike a stat of the real file) it only ever counts bytes that were actually
+        // counted *up* by the upload path in the first place — see the `Ok(())` arm below.
         match confine::remove_confined(&dir, &subpath.to_path_string()) {
             Ok(()) => {
                 self.identity_cache
                     .forget(member.member_id, share.share_id, &subpath);
-                if let Some(bytes) = bytes_removed {
-                    let _ = self
-                        .store()
-                        .adjust_share_upload_bytes(share.share_id, -(bytes as i64));
-                }
+                // Drive the decrement from the ledger, not the filesystem: `remove_uploads_under`
+                // removes every `uploaded_files` row at or beneath `subpath` (matching
+                // `remove_confined`'s own `remove_dir_all` on a directory target) and refunds each
+                // row's own uploader. This is the actual bug fix over the old stat-based approach,
+                // which decremented `share_upload_bytes` by the on-disk size even for content the
+                // owner placed directly on the real filesystem — never counted *up* into the
+                // counter, so counting it down was an overcount (see `spindle_vfs::store`'s
+                // upload-quota module comment). It also refunds `member_upload_bytes` for the
+                // first time, previously out of scope because nothing recorded who the uploader
+                // was — closed by `uploaded_files`.
+                //
+                // The filesystem delete already succeeded by this point, so a ledger failure here
+                // must not fail the RPC (fail-open) — but per this ticket it must not be silently
+                // discarded either, so it is folded into this call's own audit outcome instead of
+                // a bare `let _ = ...`. Same reasoning `Store::audit`'s doc comment gives at
+                // :1597-1601 for audit-append failures themselves.
+                let ledger_outcome = match self
+                    .store()
+                    .remove_uploads_under(share.share_id, &subpath.to_path_string())
+                {
+                    Ok(_) => "ok",
+                    Err(_) => "ok:counter_drift",
+                };
                 self.audit(
                     ts,
                     Some(member.root_fp),
@@ -881,7 +897,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                     "delete",
                     Some(path),
                     None,
-                    "ok",
+                    ledger_outcome,
                 );
                 VfsReply::Delete
             }
@@ -1442,12 +1458,23 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 self.upload_sessions.remove(&session.id);
                 self.identity_cache
                     .forget(member.member_id, share.share_id, &session.subpath);
-                let _ = self
-                    .store()
-                    .adjust_member_upload_bytes(member.member_id, session.size as i64);
-                let _ = self
-                    .store()
-                    .adjust_share_upload_bytes(share.share_id, session.size as i64);
+                // `record_upload` upserts the `uploaded_files` ledger row and applies both
+                // counter deltas in one transaction, including the subtle different-uploader
+                // overwrite case (see its doc comment in `spindle_vfs::store`). The staged file
+                // has already been moved into place by this point, so a ledger failure here must
+                // not fail the RPC (fail-open) — but per this ticket it must not be silently
+                // discarded either, so it is folded into this call's own audit outcome instead of
+                // a bare `let _ = ...`. Same reasoning `Store::audit`'s doc comment gives at
+                // :1597-1601 for audit-append failures themselves.
+                let ledger_outcome = match self.store().record_upload(
+                    share.share_id,
+                    member.member_id,
+                    &session.subpath.to_path_string(),
+                    session.size,
+                ) {
+                    Ok(()) => "ok",
+                    Err(_) => "ok:counter_drift",
+                };
                 self.audit(
                     ts,
                     Some(member.root_fp),
@@ -1455,7 +1482,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                     "upload_commit",
                     Some(&path_str),
                     Some(session.size),
-                    "ok",
+                    ledger_outcome,
                 );
                 VfsReply::UploadCommit
             }
@@ -2467,6 +2494,203 @@ mod tests {
                 .expect("share_upload_bytes"),
             data.len() as u64
         );
+    }
+
+    /// Stage 6 slice 5 (uploaded_files ledger): an upload-commit followed by a `Delete` of the
+    /// same path must return both quota counters to exactly 0, now that the delete path refunds
+    /// via `Store::remove_uploads_under` (the ledger) instead of decrementing by a filesystem
+    /// stat.
+    #[test]
+    fn upload_then_delete_round_trip_returns_both_counters_to_zero() {
+        let fx = UploadFixture::new(Perms::UPLOAD | Perms::DELETE);
+        let server = fx.server();
+        let data = b"round trip".to_vec();
+        let session_id = fx.open(&server, 1, "Drop/trip.txt", &data);
+
+        server.handle(
+            &fx.ctx(),
+            2,
+            req(
+                1,
+                VfsRequest::UploadChunk {
+                    session_id: session_id.clone(),
+                    offset: 0,
+                    data: data.clone(),
+                },
+            ),
+        );
+        let commit_reply = server.handle(
+            &fx.ctx(),
+            3,
+            req(1, VfsRequest::UploadCommit { session_id }),
+        );
+        assert_eq!(commit_reply, VfsReply::UploadCommit);
+        assert_eq!(
+            fx.h.store.member_upload_bytes(fx.member_id).unwrap(),
+            data.len() as u64
+        );
+        assert_eq!(
+            fx.h.store.share_upload_bytes(fx.share_id).unwrap(),
+            data.len() as u64
+        );
+
+        let delete_reply = server.handle(
+            &fx.ctx(),
+            4,
+            req(
+                1,
+                VfsRequest::Delete {
+                    path: "Drop/trip.txt".to_string(),
+                },
+            ),
+        );
+        assert_eq!(delete_reply, VfsReply::Delete);
+        assert_eq!(fx.h.store.member_upload_bytes(fx.member_id).unwrap(), 0);
+        assert_eq!(fx.h.store.share_upload_bytes(fx.share_id).unwrap(), 0);
+    }
+
+    /// The bug fix this ticket exists to land: content the owner placed directly on the real
+    /// filesystem (bypassing the upload flow entirely, so `uploaded_files` has no row for it) has
+    /// never been counted *up* into `share_upload_bytes` — see `spindle_vfs::store`'s upload-quota
+    /// module comment. Deleting that file through the VFS must therefore leave the counter
+    /// exactly as it was. Under the old stat-based code, this decremented `share_upload_bytes` by
+    /// the raw file's on-disk size regardless of the ledger, which is the overcount this ticket
+    /// fixes — with a nonzero starting balance (from a real, separate upload) that overcount
+    /// would have been directly observable rather than masked by the zero-clamp.
+    #[test]
+    fn deleting_owner_placed_content_never_counted_up_leaves_share_upload_bytes_unchanged() {
+        let fx = UploadFixture::new(Perms::UPLOAD | Perms::DELETE);
+        let server = fx.server();
+
+        // A real upload gives the share a nonzero counter baseline, so an erroneous decrement
+        // from the unrelated raw-file delete below would be visible rather than clamped at 0.
+        let data = b"legitimate upload".to_vec();
+        let session_id = fx.open(&server, 1, "Drop/legit.txt", &data);
+        server.handle(
+            &fx.ctx(),
+            2,
+            req(
+                1,
+                VfsRequest::UploadChunk {
+                    session_id: session_id.clone(),
+                    offset: 0,
+                    data: data.clone(),
+                },
+            ),
+        );
+        server.handle(
+            &fx.ctx(),
+            3,
+            req(1, VfsRequest::UploadCommit { session_id }),
+        );
+        let baseline = fx.h.store.share_upload_bytes(fx.share_id).unwrap();
+        assert_eq!(baseline, data.len() as u64);
+
+        // Content placed directly on the real filesystem, never seen by any upload RPC call —
+        // no `uploaded_files` row exists for it.
+        std::fs::write(fx.real_root().join("owner_placed.bin"), vec![0u8; 999])
+            .expect("write owner-placed file directly to the real filesystem");
+
+        let delete_reply = server.handle(
+            &fx.ctx(),
+            4,
+            req(
+                1,
+                VfsRequest::Delete {
+                    path: "Drop/owner_placed.bin".to_string(),
+                },
+            ),
+        );
+        assert_eq!(delete_reply, VfsReply::Delete);
+        assert_eq!(
+            fx.h.store.share_upload_bytes(fx.share_id).unwrap(),
+            baseline,
+            "deleting content the ledger never counted up must not move the counter at all"
+        );
+    }
+
+    /// A directory delete must remove the ledger rows of every file uploaded beneath it (not
+    /// just files at the deleted path itself), returning both counters to 0 in one VFS delete —
+    /// exercising `Store::remove_uploads_under`'s recursive contract through the real RPC path
+    /// (`confine::remove_confined`'s `remove_dir_all` on a directory target).
+    #[test]
+    fn deleting_a_directory_removes_every_uploaded_files_row_beneath_it() {
+        let fx = UploadFixture::new(Perms::UPLOAD | Perms::DELETE);
+        let server = fx.server();
+
+        // `finalize_upload` opens the target's parent directory rather than creating it, so the
+        // nested real directories must already exist before uploading into them.
+        std::fs::create_dir_all(fx.real_root().join("sub/nested"))
+            .expect("create nested real directories");
+
+        let a = b"aaa".to_vec();
+        let session_a = fx.open(&server, 1, "Drop/sub/a.txt", &a);
+        server.handle(
+            &fx.ctx(),
+            2,
+            req(
+                1,
+                VfsRequest::UploadChunk {
+                    session_id: session_a.clone(),
+                    offset: 0,
+                    data: a.clone(),
+                },
+            ),
+        );
+        server.handle(
+            &fx.ctx(),
+            3,
+            req(
+                1,
+                VfsRequest::UploadCommit {
+                    session_id: session_a,
+                },
+            ),
+        );
+
+        let b = b"bbbbb".to_vec();
+        let session_b = fx.open(&server, 4, "Drop/sub/nested/b.txt", &b);
+        server.handle(
+            &fx.ctx(),
+            5,
+            req(
+                1,
+                VfsRequest::UploadChunk {
+                    session_id: session_b.clone(),
+                    offset: 0,
+                    data: b.clone(),
+                },
+            ),
+        );
+        server.handle(
+            &fx.ctx(),
+            6,
+            req(
+                1,
+                VfsRequest::UploadCommit {
+                    session_id: session_b,
+                },
+            ),
+        );
+
+        assert_eq!(
+            fx.h.store.share_upload_bytes(fx.share_id).unwrap(),
+            (a.len() + b.len()) as u64
+        );
+
+        let delete_reply = server.handle(
+            &fx.ctx(),
+            7,
+            req(
+                1,
+                VfsRequest::Delete {
+                    path: "Drop/sub".to_string(),
+                },
+            ),
+        );
+        assert_eq!(delete_reply, VfsReply::Delete);
+        assert_eq!(fx.h.store.member_upload_bytes(fx.member_id).unwrap(), 0);
+        assert_eq!(fx.h.store.share_upload_bytes(fx.share_id).unwrap(), 0);
     }
 
     #[test]

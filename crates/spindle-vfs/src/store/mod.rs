@@ -1202,11 +1202,14 @@ impl Store {
     // and its current size. `member_upload_bytes`/`share_upload_bytes` remain exactly as they were
     // (running counters, not recomputed on demand), but are now a **maintained cache** over that
     // table rather than the only record that exists: [`Store::record_upload`] upserts a row and
-    // applies the resulting counter deltas in one transaction, [`Store::remove_upload`] deletes a
-    // row and decrements both counters (returning the uploader and size that were removed, which
-    // is what lets a delete refund the *uploading* member even when a different member performed
-    // the delete — closing the old limitation rather than merely re-describing it), and
-    // [`Store::reconcile_upload_counters`] recomputes both counter tables from `uploaded_files`
+    // applies the resulting counter deltas in one transaction, [`Store::remove_uploads_under`]
+    // deletes every row at or beneath a subpath and decrements both counters accordingly
+    // (returning each removed row's uploader and size, which is what lets a delete refund the
+    // *uploading* member even when a different member performed the delete — closing the old
+    // limitation rather than merely re-describing it; it is recursive, not single-row, because
+    // `spindle_vfs::confine::remove_confined` can `remove_dir_all` a whole directory in one VFS
+    // delete), and [`Store::reconcile_upload_counters`] recomputes both counter tables from
+    // `uploaded_files`
     // outright, so drift from any bug elsewhere (a swallowed error, a bypassed call site) is
     // healable instead of permanent. The counters are still not recomputed *on every check* — a
     // `SUM` over a large share's `uploaded_files` rows before every chunk write has the same
@@ -1341,43 +1344,84 @@ impl Store {
         Ok(())
     }
 
-    /// Removes `uploaded_files`'s row for `(share_id, subpath)`, if any, decrementing both
-    /// counter caches by its recorded size in the same `Immediate` transaction, and returns the
-    /// `(member_id, bytes)` that were removed — the uploader and size a caller (`spindle-host-core`
-    /// on a delete) needs in order to refund the *uploading* member's quota, even when the delete
-    /// itself is performed by someone else. Returns `Ok(None)` and changes nothing if no row
-    /// exists for this `(share_id, subpath)` (e.g. the file was never uploaded through this path).
-    pub fn remove_upload(
+    /// Removes every `uploaded_files` row at `subpath` itself **or** anywhere beneath it (a
+    /// descendant subpath, i.e. one prefixed by `subpath` + `/`), decrementing both counter
+    /// caches accordingly in one `Immediate` transaction, and returns every removed
+    /// `(member_id, bytes)` pair — one entry per row removed, unmerged (a directory holding two
+    /// files uploaded by two different members returns two entries, not a per-member sum). This
+    /// is what lets a delete refund each removed file's *uploading* member's quota, even when the
+    /// delete itself is performed by someone else, or covers files uploaded by several different
+    /// members at once. Returns `Ok(vec![])` and changes nothing if no row matches (e.g. the
+    /// target was never uploaded through this path).
+    ///
+    /// This must be recursive rather than single-row: `spindle_vfs::confine::remove_confined`
+    /// (`crate::confine::listing`) calls `remove_dir_all` when the delete target is a directory,
+    /// so one VFS delete can remove many files' worth of real content in a single call. A
+    /// single-row version would strand every descendant's ledger row — permanently inflating both
+    /// counters, since [`Store::reconcile_upload_counters`] recomputes *from* the ledger and would
+    /// faithfully preserve rows that no longer correspond to anything on disk. A plain file delete
+    /// is simply the "exactly one matching row, zero descendants" case of this same query, so
+    /// there is no separate single-row entry point.
+    ///
+    /// Descendant matching is a literal `substr(subpath, 1, N) = prefix` comparison, **not**
+    /// `LIKE`: `subpath` can legitimately contain `%` and `_`, which `LIKE` treats as wildcards,
+    /// and using it here would let a subpath containing either character over-match unrelated
+    /// rows that only coincidentally resemble it once its own characters are read as wildcards
+    /// (see the `..._does_not_over_match_percent_and_underscore_via_like_wildcards` test).
+    ///
+    /// `N` must be computed by SQLite's own `length(?)` on the *same* bound prefix parameter,
+    /// never by Rust's `str::len()` passed in as a separate binding: SQLite's `substr`/`length`
+    /// count **characters** on a TEXT value, while Rust's `str::len()` counts **UTF-8 bytes**.
+    /// For any subpath containing a non-ASCII character the two units disagree — e.g. `"dossié/"`
+    /// is 7 characters but 8 bytes — so a Rust-computed byte length silently fails to match every
+    /// descendant of a non-ASCII directory, leaving their `uploaded_files` rows stranded and
+    /// permanently inflating both `member_upload_bytes` and `share_upload_bytes` (which
+    /// `reconcile_upload_counters` recomputes *from* the ledger, so it faithfully preserves the
+    /// inflation rather than healing it). Binding `length(?3)` on the same `?3` used by `substr`
+    /// keeps both sides in the same unit, so do not "optimize" this back to a Rust-side length.
+    pub fn remove_uploads_under(
         &self,
         share_id: ShareId,
         subpath: &str,
-    ) -> Result<Option<(MemberId, u64)>, StoreError> {
+    ) -> Result<Vec<(MemberId, u64)>, StoreError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
-        let existing: Option<(i64, i64)> = self
-            .conn
-            .query_row(
-                "SELECT member_id, bytes FROM uploaded_files WHERE share_id = ?1 AND subpath = ?2",
-                params![share_id.0 as i64, subpath],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+        let prefix = format!("{subpath}/");
 
-        let Some((member_id, bytes)) = existing else {
+        let mut stmt = self.conn.prepare(
+            "SELECT member_id, bytes FROM uploaded_files \
+             WHERE share_id = ?1 AND (subpath = ?2 OR substr(subpath, 1, length(?3)) = ?3)",
+        )?;
+        let matches: Vec<(i64, i64)> = stmt
+            .query_map(params![share_id.0 as i64, subpath, prefix], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+
+        if matches.is_empty() {
             // Nothing to remove; `tx` drops here without a commit, rolling back (there is nothing
-            // to roll back, but this keeps the "no row => no writes at all" contract exact).
-            return Ok(None);
-        };
+            // to roll back, but this keeps the "no match => no writes at all" contract exact).
+            return Ok(Vec::new());
+        }
 
         self.conn.execute(
-            "DELETE FROM uploaded_files WHERE share_id = ?1 AND subpath = ?2",
-            params![share_id.0 as i64, subpath],
+            "DELETE FROM uploaded_files \
+             WHERE share_id = ?1 AND (subpath = ?2 OR substr(subpath, 1, length(?3)) = ?3)",
+            params![share_id.0 as i64, subpath, prefix],
         )?;
-        self.adjust_share_upload_bytes(share_id, -bytes)?;
-        self.adjust_member_upload_bytes(MemberId(member_id as u64), -bytes)?;
+
+        let total_bytes: i64 = matches.iter().map(|(_, bytes)| bytes).sum();
+        self.adjust_share_upload_bytes(share_id, -total_bytes)?;
+
+        let mut removed = Vec::with_capacity(matches.len());
+        for (member_id, bytes) in matches {
+            self.adjust_member_upload_bytes(MemberId(member_id as u64), -bytes)?;
+            removed.push((MemberId(member_id as u64), bytes as u64));
+        }
 
         tx.commit()?;
-        Ok(Some((MemberId(member_id as u64), bytes as u64)))
+        Ok(removed)
     }
 
     /// Recomputes both `member_upload_bytes` and `share_upload_bytes` from `uploaded_files` —
@@ -2671,25 +2715,26 @@ mod tests {
     }
 
     #[test]
-    fn remove_upload_decrements_both_counters_and_returns_the_original_uploader() {
+    fn remove_uploads_under_removes_a_single_file_and_decrements_both_counters() {
         let (_sandbox, store, share_id, member_a, _member_b) = upload_ledger_fixture();
 
         store
             .record_upload(share_id, member_a, "a.txt", 500)
             .expect("record_upload");
 
+        // A plain file delete is the "one matching row, zero descendants" case of the same
+        // recursive query `remove_uploads_under` always runs.
         let removed = store
-            .remove_upload(share_id, "a.txt")
-            .expect("remove_upload")
-            .expect("a row existed to remove");
-        assert_eq!(removed, (member_a, 500));
+            .remove_uploads_under(share_id, "a.txt")
+            .expect("remove_uploads_under");
+        assert_eq!(removed, vec![(member_a, 500)]);
 
         assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
         assert_eq!(store.share_upload_bytes(share_id).unwrap(), 0);
     }
 
     #[test]
-    fn remove_upload_of_a_nonexistent_row_returns_none_and_changes_nothing() {
+    fn remove_uploads_under_of_a_nonexistent_subpath_returns_empty_and_changes_nothing() {
         let (_sandbox, store, share_id, member_a, _member_b) = upload_ledger_fixture();
 
         store
@@ -2697,13 +2742,170 @@ mod tests {
             .expect("record_upload");
 
         let removed = store
-            .remove_upload(share_id, "missing.txt")
-            .expect("remove_upload of a nonexistent row must not error");
-        assert_eq!(removed, None);
+            .remove_uploads_under(share_id, "missing.txt")
+            .expect("remove_uploads_under of a nonexistent subpath must not error");
+        assert_eq!(removed, Vec::new());
 
         // Unrelated state must be untouched.
         assert_eq!(store.member_upload_bytes(member_a).unwrap(), 42);
         assert_eq!(store.share_upload_bytes(share_id).unwrap(), 42);
+    }
+
+    /// Proves the recursive contract in [`Store::remove_uploads_under`]'s doc comment: deleting a
+    /// directory subpath removes every ledger row beneath it (not just an exact-match row),
+    /// refunds each removed row's own uploader, and leaves an unrelated sibling row and its
+    /// counters untouched. This mirrors the real trigger — `confine::remove_confined`'s
+    /// `remove_dir_all` on a directory target — that motivated making this recursive rather than
+    /// single-row in the first place.
+    #[test]
+    fn remove_uploads_under_removes_every_row_beneath_a_directory_and_leaves_others_untouched() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "d/a.txt", 100)
+            .expect("record d/a.txt");
+        store
+            .record_upload(share_id, member_b, "d/sub/b.txt", 250)
+            .expect("record d/sub/b.txt");
+        store
+            .record_upload(share_id, member_a, "e.txt", 60)
+            .expect("record unrelated e.txt");
+
+        let mut removed = store
+            .remove_uploads_under(share_id, "d")
+            .expect("remove_uploads_under d");
+        removed.sort_by_key(|(_, bytes)| *bytes);
+        assert_eq!(removed, vec![(member_a, 100), (member_b, 250)]);
+
+        assert_eq!(
+            store.member_upload_bytes(member_a).unwrap(),
+            60,
+            "member_a keeps only e.txt's bytes, refunded for d/a.txt"
+        );
+        assert_eq!(
+            store.member_upload_bytes(member_b).unwrap(),
+            0,
+            "member_b's only upload was under d, and must be fully refunded"
+        );
+        assert_eq!(
+            store.share_upload_bytes(share_id).unwrap(),
+            60,
+            "share counter drops by the sum removed from under d (100 + 250), leaving only e.txt"
+        );
+    }
+
+    /// Regression test for the literal-comparison requirement in [`Store::remove_uploads_under`]'s
+    /// doc comment: `subpath` can legitimately contain `%` and `_`, and a `LIKE`-based prefix
+    /// match would treat those as wildcards, over-matching unrelated rows that merely resemble
+    /// the deleted subpath once its own characters are read as wildcards rather than literal text.
+    #[test]
+    fn remove_uploads_under_does_not_over_match_percent_and_underscore_via_like_wildcards() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        // `%` case: the `LIKE` pattern "a%b/%" would match "aXXXb/evil.txt" (its `%` consuming
+        // "XXX"), even though "aXXXb" is not "a%b" and is not a descendant of it.
+        store
+            .record_upload(share_id, member_a, "a%b/real.txt", 10)
+            .expect("record real descendant of a%b");
+        store
+            .record_upload(share_id, member_b, "aXXXb/evil.txt", 20)
+            .expect("record unrelated sibling that a LIKE pattern would over-match");
+
+        // `_` case: the `LIKE` pattern "c_d/%" would match "cXd/evil.txt" (its `_` matching the
+        // single character "X"), even though "cXd" is not "c_d".
+        store
+            .record_upload(share_id, member_a, "c_d/real.txt", 30)
+            .expect("record real descendant of c_d");
+        store
+            .record_upload(share_id, member_b, "cXd/evil.txt", 40)
+            .expect("record unrelated sibling that a LIKE pattern would over-match");
+
+        let removed_percent = store
+            .remove_uploads_under(share_id, "a%b")
+            .expect("remove_uploads_under a%b");
+        assert_eq!(removed_percent, vec![(member_a, 10)]);
+
+        let removed_underscore = store
+            .remove_uploads_under(share_id, "c_d")
+            .expect("remove_uploads_under c_d");
+        assert_eq!(removed_underscore, vec![(member_a, 30)]);
+
+        // The unrelated siblings, which only a LIKE-based implementation would have swept up,
+        // must still be present with their counters intact.
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
+        assert_eq!(store.member_upload_bytes(member_b).unwrap(), 60);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 60);
+    }
+
+    #[test]
+    fn remove_uploads_under_matches_descendants_of_a_non_ascii_subpath() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        // `"dossié/"` is 7 characters but 8 UTF-8 bytes. A prefix-length computed by Rust's
+        // `str::len()` (bytes) and compared against SQLite's `substr(...)` (characters) would
+        // disagree here and silently fail to match either descendant below.
+        store
+            .record_upload(share_id, member_a, "dossié/a.txt", 10)
+            .expect("record direct child of dossié");
+        store
+            .record_upload(share_id, member_b, "dossié/sub/b.txt", 20)
+            .expect("record nested descendant of dossié");
+
+        // Unrelated sibling that only shares a prefix with "dossié", not a "/"-bounded
+        // descendant of it — must survive, proving the fix didn't degrade into a bare prefix
+        // match once character-counting was restored.
+        store
+            .record_upload(share_id, member_a, "dossiéX/keep.txt", 30)
+            .expect("record unrelated sibling sharing a textual prefix");
+
+        let removed = store
+            .remove_uploads_under(share_id, "dossié")
+            .expect("remove_uploads_under dossié");
+        assert_eq!(removed, vec![(member_a, 10), (member_b, 20)]);
+
+        // Both descendants' uploaders are refunded, and the share counter drops by their sum.
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 30);
+        assert_eq!(store.member_upload_bytes(member_b).unwrap(), 0);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 30);
+    }
+
+    /// Proves a subtree removal leaves the ledger and the counter caches consistent:
+    /// [`Store::reconcile_upload_counters`], which recomputes both counters from `uploaded_files`
+    /// outright, must be a no-op immediately after [`Store::remove_uploads_under`] — if the
+    /// removal's counter deltas and its `DELETE` ever drifted apart, this would catch it.
+    #[test]
+    fn reconcile_upload_counters_after_a_subtree_removal_leaves_counters_unchanged() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "d/a.txt", 100)
+            .expect("record d/a.txt");
+        store
+            .record_upload(share_id, member_b, "d/sub/b.txt", 250)
+            .expect("record d/sub/b.txt");
+        store
+            .record_upload(share_id, member_a, "e.txt", 60)
+            .expect("record unrelated e.txt");
+
+        store
+            .remove_uploads_under(share_id, "d")
+            .expect("remove_uploads_under d");
+
+        let member_a_before = store.member_upload_bytes(member_a).unwrap();
+        let member_b_before = store.member_upload_bytes(member_b).unwrap();
+        let share_before = store.share_upload_bytes(share_id).unwrap();
+
+        store.reconcile_upload_counters().expect("reconcile");
+
+        assert_eq!(
+            store.member_upload_bytes(member_a).unwrap(),
+            member_a_before
+        );
+        assert_eq!(
+            store.member_upload_bytes(member_b).unwrap(),
+            member_b_before
+        );
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), share_before);
     }
 
     /// Deliberately corrupts both counter tables with direct `adjust_*` calls that bypass the
