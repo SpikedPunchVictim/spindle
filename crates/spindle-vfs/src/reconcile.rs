@@ -73,10 +73,12 @@ pub enum ReconcileError {
 /// [`ReconcileReport::unresolved`], which needs the offending subpath to be actionable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
-    /// Ledger rows deleted because [`crate::confine::resolve_folded_path`] found no chain of
-    /// fold-matching dirents leading to them — the file is genuinely gone. Each removal already
+    /// Ledger rows deleted because either (a) [`crate::confine::resolve_folded_path`] found no
+    /// chain of fold-matching dirents leading to them — the file is genuinely gone — or (b) a
+    /// directory now occupies the name the ledger records as an uploaded file (td-836b2a: treated
+    /// as the same "gone" case, since the uploaded file is gone either way). Each removal already
     /// refunded its uploader's counter and decremented the share's counter, via
-    /// [`crate::store::Store::remove_uploads_under`]'s single transaction.
+    /// [`crate::store::Store::remove_upload_row`]'s single transaction.
     pub rows_removed: usize,
 
     /// Total bytes released back to quota accounting by `rows_removed` rows — the sum of each
@@ -95,11 +97,10 @@ pub struct ReconcileReport {
     pub rows_resized: usize,
 
     /// Rows this sweep could not settle one way or the other: a filesystem error other than "not
-    /// found" (permission denied, a race where the file vanished between resolution and the
-    /// follow-up stat, or a directory now occupying a name the ledger records as an uploaded
-    /// file), captured as `(row.subpath, error message)`. Left completely
-    /// untouched — neither deleted nor resized — rather than guessed at, so a caller can decide
-    /// whether to retry, investigate, or ignore.
+    /// found" (permission denied, or a race where the file vanished between resolution and the
+    /// follow-up stat), captured as `(row.subpath, error message)`. Left completely untouched —
+    /// neither deleted nor resized — rather than guessed at, so a caller can decide whether to
+    /// retry, investigate, or ignore.
     pub unresolved: Vec<(String, String)>,
 }
 
@@ -108,20 +109,27 @@ pub struct ReconcileReport {
 ///
 /// 1. **Resolve** the row's `subpath` through [`crate::confine::resolve_folded_path`] against
 ///    `share.real_root`. `None` means no fold-matching dirent chain reaches it — the file is
-///    genuinely gone: remove the row via [`crate::store::Store::remove_uploads_under`] (refunds
-///    the uploader and decrements the share counter in one transaction) and count it.
-/// 2. **Otherwise**, `stat` the *resolved* real path with [`crate::confine::stat_through_dir`] and
-///    compare its size to the row's recorded `bytes`:
-///    - equal: no-op.
-///    - different: call [`crate::store::Store::record_upload`] with the actual size (and the
-///      resolved path, repairing any stale `subpath` spelling for free), which applies the
-///      resulting delta to both counters — the same resize semantics an ordinary overwrite uses.
+///    genuinely gone: remove the row via [`crate::store::Store::remove_upload_row`] (refunds the
+///    uploader and decrements the share counter in one transaction) and count it.
+/// 2. **Otherwise**, `stat` the *resolved* real path with [`crate::confine::stat_through_dir`]:
+///    - a **directory** now occupies the name (td-836b2a, decided 2026-09-04): the uploaded file
+///      is gone exactly as in case 1 — an owner deleting it out of band and creating a directory
+///      spelled the same way leaves nothing less gone than an outright delete does — so this is
+///      routed through the *same* [`crate::store::Store::remove_upload_row`] removal, refunding
+///      the uploader and decrementing the share counter. The rejected alternative was leaving
+///      such rows in [`ReconcileReport::unresolved`] forever: every future sweep would repeat the
+///      same non-decision, permanently charging the uploader for bytes that are definitively
+///      gone. The sweep never touches the filesystem either way — the directory itself is left
+///      exactly where it is; only the ledger row is removed.
+///    - otherwise, compare the file's size to the row's recorded `bytes`:
+///      - equal: no-op.
+///      - different: call [`crate::store::Store::record_upload`] with the actual size (and the
+///        resolved path, repairing any stale `subpath` spelling for free), which applies the
+///        resulting delta to both counters — the same resize semantics an ordinary overwrite uses.
 ///
-/// A resolved path that turns out to be a **directory** is recorded in
-/// [`ReconcileReport::unresolved`] and left alone rather than resized: a ledger row always
-/// describes an uploaded file, and a directory's `metadata.len()` is its inode size, not a byte
-/// count that means anything to a quota (td-836b2a tracks whether that case should instead
-/// refund the uploader outright).
+/// **A directory's `metadata.len()` must never reach a quota counter.** It is the directory
+/// inode's own size (96 on APFS, 4096 on ext4) — a filesystem artifact with no relationship to
+/// any uploaded byte count — which is why the `is_dir` case above is a removal, never a resize.
 ///
 /// A stat failure after a successful resolution (a race, a permission error) does not abort the
 /// whole sweep — it is recorded in [`ReconcileReport::unresolved`] and the row is left untouched,
@@ -138,6 +146,19 @@ pub fn reconcile_uploads_against_disk(
 
     let mut report = ReconcileReport::default();
 
+    // Heals a row this sweep has decided is "gone" (file genuinely missing, or a directory now
+    // occupies its name) by removing exactly that ledger row — never a sibling or descendant, see
+    // `Store::remove_upload_row`'s doc comment — and folding the refund into `report`. Written
+    // once so the `Ok(None)` and `is_dir` branches below can't drift into different removal
+    // semantics.
+    let mut heal_as_gone = |subpath: &str| -> Result<(), ReconcileError> {
+        if let Some((_member_id, bytes)) = store.remove_upload_row(share.share_id, subpath)? {
+            report.rows_removed += 1;
+            report.bytes_reclaimed += bytes;
+        }
+        Ok(())
+    };
+
     for row in rows {
         let resolution = confine::resolve_folded_path(&dir, &row.subpath);
         let resolved_path = match resolution {
@@ -145,9 +166,7 @@ pub fn reconcile_uploads_against_disk(
             Ok(None) => {
                 // Genuinely gone: heal by deleting the ledger row, which refunds the uploader and
                 // decrements the share counter in one transaction.
-                let removed = store.remove_uploads_under(share.share_id, &row.subpath)?;
-                report.rows_removed += removed.len();
-                report.bytes_reclaimed += removed.iter().map(|(_, bytes)| bytes).sum::<u64>();
+                heal_as_gone(&row.subpath)?;
                 continue;
             }
             Err(e) => {
@@ -160,21 +179,15 @@ pub fn reconcile_uploads_against_disk(
             Ok(metadata) => {
                 // A ledger row always describes an uploaded *file*. If a directory now occupies
                 // that name — the owner deleted the file out of band and created a directory
-                // spelled the same way — then `metadata.len()` is the directory inode's own size
-                // (96 on APFS, 4096 on ext4, entirely filesystem-dependent), not any quantity of
-                // uploaded bytes. Resizing the row to it would write a meaningless number straight
-                // into both quota counters. Record it as unresolved and leave the row alone: the
-                // uploaded file is arguably gone and its uploader arguably owed a refund, but that
-                // is a semantic call this sweep should not make silently (td-836b2a).
+                // spelled the same way — the uploaded file is gone exactly as in the `Ok(None)`
+                // case above, so it is healed the same way (td-836b2a, decided 2026-09-04): remove
+                // the row and refund the uploader. The sweep does not touch the filesystem here —
+                // the directory itself is left exactly where it is; only the ledger row goes.
+                // `metadata.len()` on a directory is the inode's own size (96 on APFS, 4096 on
+                // ext4, entirely filesystem-dependent), never any quantity of uploaded bytes, so
+                // it must never be written into a quota counter — hence removal, never a resize.
                 if metadata.is_dir() {
-                    report.unresolved.push((
-                        row.subpath.clone(),
-                        format!(
-                            "a directory now occupies {resolved_path:?}, which the ledger \
-                             records as an uploaded file; refusing to resize the row to a \
-                             directory's inode size"
-                        ),
-                    ));
+                    heal_as_gone(&row.subpath)?;
                     continue;
                 }
                 let actual_size = metadata.len();
@@ -347,14 +360,17 @@ mod tests {
         assert_eq!(store.share_upload_bytes(share.share_id).unwrap(), 250);
     }
 
-    /// An uploaded file replaced out of band by a *directory* of the same name must not be
-    /// "resized" to that directory's inode size. `metadata.len()` on a directory is a
-    /// filesystem-dependent artifact (96 on APFS, 4096 on ext4) with no relationship to any
-    /// uploaded byte count, so writing it into the quota counters would be a meaningless number
-    /// in exactly the place this sweep exists to keep honest. The row is left untouched and
-    /// reported, rather than silently refunded — td-836b2a tracks that semantic decision.
+    /// An uploaded file replaced out of band by a *directory* of the same name is treated as the
+    /// file-missing case (td-836b2a, decided 2026-09-04): the row is removed, its uploader
+    /// refunded, and the share counter decremented — exactly as for an outright delete. What must
+    /// still hold, and is the reason this test exists rather than just deleting it: the removal
+    /// must never be a *resize*. `metadata.len()` on a directory is a filesystem-dependent
+    /// artifact (96 on APFS, 4096 on ext4) with no relationship to any uploaded byte count, and
+    /// writing it into a quota counter is exactly the wrong number this sweep exists to prevent —
+    /// so the counters below must land at zero, the row's own 400 bytes, never a directory's
+    /// inode size.
     #[test]
-    fn a_directory_occupying_a_ledger_rows_name_is_reported_not_resized() {
+    fn a_directory_occupying_a_ledger_rows_name_is_removed_and_refunded() {
         let (sandbox, store, share, member_a, _member_b) = fixture();
         std::fs::create_dir(sandbox.path().join("share/report.txt")).expect("mkdir over the name");
         std::fs::write(sandbox.path().join("share/report.txt/inner"), b"junk").expect("write");
@@ -363,18 +379,97 @@ mod tests {
             .expect("record_upload");
 
         let report = reconcile_uploads_against_disk(&store, &share).expect("reconcile");
-        assert_eq!(report.rows_removed, 0, "the row must not be removed");
-        assert_eq!(report.rows_resized, 0, "the row must not be resized");
+        assert_eq!(report.rows_removed, 1, "the row must be removed");
+        assert_eq!(report.bytes_reclaimed, 400);
         assert_eq!(
-            report.unresolved.len(),
-            1,
-            "the directory-over-a-file case must be reported to the caller"
+            report.rows_resized, 0,
+            "a directory occupying the name must never be treated as a resize"
         );
-        assert_eq!(report.unresolved[0].0, "report.txt");
+        assert!(
+            report.unresolved.is_empty(),
+            "this case is now settled by the sweep, not left for a caller to investigate"
+        );
 
-        // Neither counter moved: the ledger still says 400 bytes, not the directory's inode size.
-        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 400);
-        assert_eq!(store.share_upload_bytes(share.share_id).unwrap(), 400);
+        // The uploader is refunded and the share counter decremented — by exactly the row's own
+        // 400 bytes, never by a directory's inode size (96 on APFS, 4096 on ext4).
+        assert_eq!(
+            store.member_upload_bytes(member_a).unwrap(),
+            0,
+            "the uploader must be refunded"
+        );
+        assert_eq!(
+            store.share_upload_bytes(share.share_id).unwrap(),
+            0,
+            "the share counter must be decremented"
+        );
+        assert_eq!(
+            store.list_uploads(share.share_id).unwrap(),
+            Vec::new(),
+            "the ledger row must be gone"
+        );
+
+        // The sweep never touches the filesystem: the directory itself is left exactly where it
+        // is, only the ledger row goes.
+        assert!(
+            sandbox.path().join("share/report.txt").is_dir(),
+            "the directory on disk must be untouched"
+        );
+    }
+
+    /// Regression test for the Part 1 fix (td-836b2a): the sweep must remove EXACTLY the ledger
+    /// row it is looking at, never a sibling/descendant, even when healing routes through the
+    /// directory-occupies-the-name case. `photos` is a ledger row whose name is now a directory
+    /// on disk; `photos/a.jpg` is a *different*, legitimate ledger row for a real file that
+    /// exists inside that directory (e.g. uploaded through the VFS after the directory appeared).
+    /// Using a prefix-based removal (`Store::remove_uploads_under`) for the `photos` row would
+    /// delete `photos/a.jpg` too, refunding its uploader for a file sitting right there on disk.
+    /// This test proves that does not happen.
+    #[test]
+    fn healing_a_directory_row_does_not_remove_a_real_file_beneath_it() {
+        let (sandbox, store, share, member_a, member_b) = fixture();
+
+        // `photos` is a directory on disk containing a real, separately-uploaded file.
+        std::fs::create_dir(sandbox.path().join("share/photos")).expect("mkdir photos");
+        std::fs::write(sandbox.path().join("share/photos/a.jpg"), vec![0u8; 900])
+            .expect("write photos/a.jpg");
+
+        // A stale ledger row claims `photos` itself was an uploaded file.
+        store
+            .record_upload(share.share_id, member_a, "photos", 400)
+            .expect("record_upload photos");
+        // A legitimate ledger row for the real file inside it.
+        store
+            .record_upload(share.share_id, member_b, "photos/a.jpg", 900)
+            .expect("record_upload photos/a.jpg");
+
+        let report = reconcile_uploads_against_disk(&store, &share).expect("reconcile");
+        assert_eq!(
+            report.rows_removed, 1,
+            "only the photos row must be removed"
+        );
+        assert_eq!(report.bytes_reclaimed, 400);
+        assert_eq!(report.rows_resized, 0);
+        assert!(report.unresolved.is_empty());
+
+        // The photos row is gone and its uploader refunded.
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
+
+        // The photos/a.jpg row survives untouched, and its uploader is still charged.
+        let remaining = store.list_uploads(share.share_id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].subpath, "photos/a.jpg");
+        assert_eq!(remaining[0].bytes, 900);
+        assert_eq!(
+            store.member_upload_bytes(member_b).unwrap(),
+            900,
+            "the survivor's uploader must still be charged"
+        );
+
+        // The share counter moved by only the removed row's bytes (400), not both rows' (1300).
+        assert_eq!(store.share_upload_bytes(share.share_id).unwrap(), 900);
+
+        // The real file on disk is untouched.
+        assert!(sandbox.path().join("share/photos/a.jpg").exists());
     }
 
     #[test]

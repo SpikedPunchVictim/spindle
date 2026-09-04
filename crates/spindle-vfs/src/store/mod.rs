@@ -1469,6 +1469,74 @@ impl Store {
         Ok(removed)
     }
 
+    /// Removes exactly the `uploaded_files` row for `(share_id, fold_key(subpath))` — never a
+    /// descendant, never a sibling — decrementing both counter caches in one `Immediate`
+    /// transaction, and returns the removed row's `(member_id, bytes)`, or `None` if no such row
+    /// existed, in which case nothing is written at all.
+    ///
+    /// # Why this exists alongside [`Store::remove_uploads_under`]
+    ///
+    /// [`Store::remove_uploads_under`] is a **prefix** match by design: a VFS delete of a
+    /// directory must remove every ledger row beneath it in one call, because
+    /// `confine::remove_confined` can turn one virtual delete into a `remove_dir_all` covering
+    /// many real files at once (see that method's own doc comment). That is the right tool when
+    /// the caller is deleting a subtree and wants every row under it gone.
+    ///
+    /// `crate::reconcile::reconcile_uploads_against_disk` is not deleting a subtree — it
+    /// enumerates `uploaded_files` one row at a time and must heal exactly the row currently in
+    /// front of it, nothing else. Using `remove_uploads_under` there is a category error that
+    /// becomes a live bug the moment a directory occupies a healed row's old name: if ledger row
+    /// `photos` is healed (its file is gone, or a directory now occupies that name) while a
+    /// *different*, legitimate ledger row `photos/a.jpg` also exists — a real file uploaded after
+    /// the directory appeared — `remove_uploads_under(share, "photos")` would delete
+    /// `photos/a.jpg` too, refunding a member for a file that was never touched and still sits on
+    /// disk. `remove_upload_row` matches by equality only, so it can never reach a sibling or
+    /// descendant row.
+    ///
+    /// **Do not** "simplify" one of these into the other: a subtree caller switched to this method
+    /// strands every descendant row forever (the exact failure `remove_uploads_under`'s own doc
+    /// comment exists to prevent), and a single-row sweep caller switched to `remove_uploads_under`
+    /// reintroduces the over-deletion above.
+    ///
+    /// Matches on [`crate::confine::fold_key`], not the literal `subpath` (SCHEMA_V7) — the ledger
+    /// is keyed on `fold_subpath` everywhere else, and this must be no exception.
+    pub fn remove_upload_row(
+        &self,
+        share_id: ShareId,
+        subpath: &str,
+    ) -> Result<Option<(MemberId, u64)>, StoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+
+        let fold_subpath = confine::fold_key(subpath);
+
+        let row: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT member_id, bytes FROM uploaded_files \
+                 WHERE share_id = ?1 AND fold_subpath = ?2",
+                params![share_id.0 as i64, fold_subpath],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        let Some((member_id, bytes)) = row else {
+            // Nothing to remove; `tx` drops here without a commit, rolling back (there is nothing
+            // to roll back, but this keeps the "no match => no writes at all" contract exact).
+            return Ok(None);
+        };
+
+        self.conn.execute(
+            "DELETE FROM uploaded_files WHERE share_id = ?1 AND fold_subpath = ?2",
+            params![share_id.0 as i64, fold_subpath],
+        )?;
+
+        self.adjust_share_upload_bytes(share_id, -bytes)?;
+        self.adjust_member_upload_bytes(MemberId(member_id as u64), -bytes)?;
+
+        tx.commit()?;
+        Ok(Some((MemberId(member_id as u64), bytes as u64)))
+    }
+
     /// Recomputes both `member_upload_bytes` and `share_upload_bytes` from `uploaded_files` —
     /// the source of truth — in one `Immediate` transaction, so drift between the cache and the
     /// ledger (from a bug elsewhere, a bypassed call site, or manual DB surgery) is healable
@@ -2824,6 +2892,72 @@ mod tests {
         assert_eq!(removed, Vec::new());
 
         // Unrelated state must be untouched.
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 42);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 42);
+    }
+
+    /// Proves [`Store::remove_upload_row`] matches by equality only — the opposite contract from
+    /// [`Store::remove_uploads_under`]'s prefix match, proven separately by
+    /// `remove_uploads_under_removes_every_row_beneath_a_directory_and_leaves_others_untouched`.
+    /// A ledger row `photos` and an unrelated descendant row `photos/a.jpg` both exist;
+    /// `remove_upload_row(share, "photos")` must remove only the first, leave the second (and its
+    /// uploader's counter) completely untouched, and move the share counter by only the first
+    /// row's bytes. This is the exact distinction td-836b2a's Part 1 fix depends on: reconciling
+    /// one ledger row at a time must never reach into a sibling/descendant row the way a subtree
+    /// delete legitimately does. Also proves folding: the removal is requested as `"PHOTOS"`,
+    /// different case than the stored `"photos"`.
+    #[test]
+    fn remove_upload_row_removes_only_the_exact_row_not_descendants() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "photos", 400)
+            .expect("record_upload photos");
+        store
+            .record_upload(share_id, member_b, "photos/a.jpg", 900)
+            .expect("record_upload photos/a.jpg");
+
+        let removed = store
+            .remove_upload_row(share_id, "PHOTOS")
+            .expect("remove_upload_row")
+            .expect("the photos row must exist");
+        assert_eq!(
+            removed,
+            (member_a, 400),
+            "must return only the exact row's owner and bytes"
+        );
+
+        // The descendant row must survive, untouched, with its uploader still charged.
+        let remaining = store.list_uploads(share_id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].subpath, "photos/a.jpg");
+        assert_eq!(remaining[0].bytes, 900);
+        assert_eq!(
+            store.member_upload_bytes(member_b).unwrap(),
+            900,
+            "the descendant's uploader must not be refunded"
+        );
+
+        // The exact row's uploader must be refunded.
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
+
+        // The share counter must move by only the removed row's bytes (400), not both rows'.
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 900);
+    }
+
+    #[test]
+    fn remove_upload_row_of_a_nonexistent_subpath_returns_none_and_changes_nothing() {
+        let (_sandbox, store, share_id, member_a, _member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "kept.txt", 42)
+            .expect("record_upload");
+
+        let removed = store
+            .remove_upload_row(share_id, "missing.txt")
+            .expect("remove_upload_row of a nonexistent subpath must not error");
+        assert_eq!(removed, None);
+
         assert_eq!(store.member_upload_bytes(member_a).unwrap(), 42);
         assert_eq!(store.share_upload_bytes(share_id).unwrap(), 42);
     }
