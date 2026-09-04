@@ -1417,10 +1417,11 @@ impl Store {
     /// **Both arms match on [`crate::confine::fold_key`], not on the literal `subpath`**
     /// (SCHEMA_V7): `subpath` itself folds to `fold_key(subpath)`, and the descendant prefix is
     /// `fold_key(subpath) + "/"`. That is deliberately equal to `fold_key(&format!("{subpath}/"))`
-    /// — `fold_key` never touches `/` (it only lowercases and strips/decomposes combining marks
-    /// and precomposed Latin letters), so folding before or after appending the separator gives
-    /// the same string; this comment exists so a reader isn't left wondering whether that order
-    /// matters. Folding here is what lets a `Delete` of virtual path `dossier` remove the ledger
+    /// — `fold_key` never touches `/` (it only lowercases and canonically decomposes, NFD, the
+    /// rest — see `confine::fold::fold_key`'s doc comment), so folding before or after appending
+    /// the separator gives the same string; this comment exists so a reader isn't left wondering
+    /// whether that order matters. Folding here is what lets a `Delete` of virtual path `dossier`
+    /// remove the ledger
     /// rows under a real `Dossier/` directory, matching how `confine::remove_confined` already
     /// resolves that same delete case-insensitively on disk.
     pub fn remove_uploads_under(
@@ -3054,18 +3055,25 @@ mod tests {
 
         // The ledger's prefix match runs against `fold_key(subpath)`, not the raw input, so this
         // test only exercises the byte-vs-character bug if the input *survives folding* as
-        // multi-byte. It originally used "dossié", but `fold_key` maps Latin-1 accented letters
-        // to their base letter (see `LATIN1_DECOMPOSITIONS`), so "dossié/" folds to the
+        // multi-byte. It originally used "dossié", but at the time `fold_key` mapped Latin-1
+        // accented letters to their base letter and stripped the combining mark (the pre-
+        // td-47d24d `LATIN1_DECOMPOSITIONS` table, since deleted), so "dossié/" folded to the
         // pure-ASCII "dossie/" — 7 characters, 7 bytes, indistinguishable to a byte-length or a
         // character-length count. Once SCHEMA_V7 moved the comparison onto `fold_subpath`, this
         // input stopped discriminating anything and the test silently stopped catching its own
-        // bug. Cyrillic is used instead because `fold_key` only maps the 27 Latin-1 letters in
-        // `LATIN1_DECOMPOSITIONS` and strips combining marks U+0300..U+036F — Cyrillic passes
-        // through untouched, so "досье/" folds to itself: 6 characters but 11 UTF-8 bytes. A
-        // prefix-length computed by Rust's `str::len()` (bytes) and compared against SQLite's
-        // `substr(...)` (characters) still disagrees here, and would silently fail to match
-        // either descendant below. Anyone changing this input must re-check that the *folded*
-        // form is still multi-byte, not just the raw input.
+        // bug. Cyrillic was used instead because it passes through that old table untouched.
+        //
+        // td-47d24d (USER DECISION 2026-09-04) replaced that table with real NFD + lowercasing,
+        // which preserves combining marks rather than stripping them — so "dossié/" would now
+        // fold to itself (NFD: 7 code points, one of which — the combining acute — is 2 UTF-8
+        // bytes, so 8 bytes total) and would discriminate the bug again too. Cyrillic is kept
+        // regardless, since it still works and there is no reason to churn a passing test's
+        // input: "досье/" folds to itself under NFD + lowercasing (Cyrillic has no combining-mark
+        // decomposition in this word), 6 characters but 11 UTF-8 bytes. A prefix-length computed
+        // by Rust's `str::len()` (bytes) and compared against SQLite's `substr(...)` (characters)
+        // still disagrees here, and would silently fail to match either descendant below. Anyone
+        // changing this input must re-check that the *folded* form is still multi-byte, not just
+        // the raw input.
         store
             .record_upload(share_id, member_a, "досье/a.txt", 10)
             .expect("record direct child of досье");

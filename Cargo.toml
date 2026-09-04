@@ -111,6 +111,15 @@ cap-std = ">=3.4.1"
 # the resolved cap-std/cap-primitives (its own Cargo.toml requires an exact-matching
 # cap-primitives version internally) so the three stay in lockstep in the same 4.x family.
 cap-fs-ext = ">=4.0.3"
+# Real Unicode canonical-decomposition (NFD) + case folding for `spindle-vfs`'s
+# `confine::fold::fold_key` (td-47d24d, USER DECISION 2026-09-04): the crate's original hand-
+# rolled `LATIN1_DECOMPOSITIONS` table only covered 27 precomposed Latin-1 letters and, worse,
+# stripped combining marks outright rather than normalizing them — collapsing "café" and "cafe"
+# to the same name, which DESIGN.md:370-371's "collides under Unicode normalization" rule was
+# never meant to claim. `unicode-normalization` gives NFD for every Unicode block (Latin
+# Extended, Greek, Cyrillic, Vietnamese, ...), closing that gap correctly instead of by growing
+# the table further.
+unicode-normalization = "0.1"
 
 # OS / shell
 keyring = "2"

@@ -2,70 +2,44 @@
 //! §A4b: "cap-std does not canonicalize, case-fold, or normalize — Spindle does"). Closes A12
 //! #20 (exclusion/permission bypass via case or Unicode variants) and, combined with
 //! `crate::confine::upload`, A12 #31 (case/NFD upload collision overwrites without `delete`).
+//!
+//! The fold is real Unicode canonical decomposition (NFD) plus simple lowercasing, via the
+//! `unicode-normalization` crate — not the hand-rolled 27-entry Latin-1 table this module used
+//! to carry (td-47d24d, USER DECISION 2026-09-04). See [`fold_key`]'s doc comment for exactly
+//! what does and does not fold together under the current rule.
 
 use super::ConfineError;
 use cap_std::fs::Dir;
+use unicode_normalization::UnicodeNormalization;
 
-/// Precomposed Latin-1 Supplement letter -> (base letter, combining mark) decompositions.
+/// Folds `name` to a comparison key stable across case variance and NFC/NFD spelling variance —
+/// i.e. two spellings of the *same* sequence of base characters plus combining marks, however
+/// those marks are composed. The fold is canonical decomposition (Unicode NFD) followed by
+/// simple lowercasing: `"café"` (NFC, precomposed `é` = U+00E9) and `"cafe\u{0301}"` (NFD, `e` +
+/// combining acute accent U+0301) fold to the same key and are therefore the same dirent
+/// (DESIGN.md §A4b: a case-insensitive or Unicode-normalization collision with an existing
+/// dirent **is** an overwrite, not a new entry).
 ///
-/// **Scope limitation, carried over from the S11 spike verbatim**: this is *not* a general
-/// Unicode NFC/NFD implementation — it covers exactly the common Latin accented letters (the set
-/// needed to prove the "café" NFC/NFD case `docs/SPIKES.md` names, and the only Unicode folding
-/// this slice's test suite exercises). A future slice should replace this with a real Unicode
-/// normalization crate (e.g. `unicode-normalization`) rather than growing this table further;
-/// it stays hand-rolled here only because this slice's dependency budget is `cap-std` + `thiserror`
-/// (+ `spindle-core`), matching the spike's own no-extra-deps constraint.
-const LATIN1_DECOMPOSITIONS: &[(char, char, char)] = &[
-    ('à', 'a', '\u{0300}'),
-    ('á', 'a', '\u{0301}'),
-    ('â', 'a', '\u{0302}'),
-    ('ã', 'a', '\u{0303}'),
-    ('ä', 'a', '\u{0308}'),
-    ('å', 'a', '\u{030A}'),
-    ('ç', 'c', '\u{0327}'),
-    ('è', 'e', '\u{0300}'),
-    ('é', 'e', '\u{0301}'),
-    ('ê', 'e', '\u{0302}'),
-    ('ë', 'e', '\u{0308}'),
-    ('ì', 'i', '\u{0300}'),
-    ('í', 'i', '\u{0301}'),
-    ('î', 'i', '\u{0302}'),
-    ('ï', 'i', '\u{0308}'),
-    ('ñ', 'n', '\u{0303}'),
-    ('ò', 'o', '\u{0300}'),
-    ('ó', 'o', '\u{0301}'),
-    ('ô', 'o', '\u{0302}'),
-    ('õ', 'o', '\u{0303}'),
-    ('ö', 'o', '\u{0308}'),
-    ('ù', 'u', '\u{0300}'),
-    ('ú', 'u', '\u{0301}'),
-    ('û', 'u', '\u{0302}'),
-    ('ü', 'u', '\u{0308}'),
-    ('ý', 'y', '\u{0301}'),
-    ('ÿ', 'y', '\u{0308}'),
-];
-
-/// Folds `name` to a comparison key that is stable across simple case variance and NFC/NFD
-/// spelling variance of the Latin letters in [`LATIN1_DECOMPOSITIONS`]. Two names with equal fold
-/// keys must be treated as the same dirent (DESIGN.md §A4b: a case-insensitive or Unicode-
-/// normalization collision with an existing dirent **is** an overwrite, not a new entry). Also
-/// used by `crate::model::VirtualPath::descends_from_or_eq` and `crate::glob` for path-component
-/// comparison, so the same folding rule applies uniformly across confinement, the entitlement
-/// algebra, and exclusion matching.
+/// Diacritics themselves are **preserved**, deliberately: `"café"` and `"cafe"` fold to
+/// *different* keys and are different names. td-47d24d's predecessor implementation got this
+/// backwards — its hand-rolled table didn't normalize, it *stripped* combining marks outright,
+/// so `"café"`, `"cafe\u{0301}"`, and plain `"cafe"` all collided. That is broader than
+/// DESIGN.md:370-371's "collides under Unicode normalization" rule actually promises (which is
+/// about one name's NFC/NFD spellings, not about treating `é` and `e` as the same letter), and
+/// it was a real hazard: an upload literally named `resume.pdf` could silently overwrite an
+/// owner's `résumé.pdf`. The fix closes both directions at once — folding now covers every
+/// Unicode block NFD does (Latin Extended, Greek, Cyrillic, Vietnamese, ...), not just 27
+/// precomposed Latin-1 letters, while no longer erasing marks that make two names different.
+///
+/// This key is inherited by `crate::model::VirtualPath::descends_from_or_eq` and `crate::glob`
+/// in addition to the collision scan below, so confinement, the entitlement algebra, and
+/// exclusion matching all move together under any change to this function.
 pub fn fold_key(name: &str) -> String {
-    let lowered = name.to_lowercase();
-    let mut folded = String::with_capacity(lowered.len());
-    for ch in lowered.chars() {
-        if ('\u{0300}'..='\u{036F}').contains(&ch) {
-            continue; // strip a standalone combining diacritical mark (already-NFD input)
-        }
-        if let Some(&(_, base, _mark)) = LATIN1_DECOMPOSITIONS.iter().find(|&&(c, _, _)| c == ch) {
-            folded.push(base); // decompose, then drop the mark exactly as the branch above would
-        } else {
-            folded.push(ch);
-        }
-    }
-    folded
+    // Lowercase, then NFD. NFD runs last deliberately, so the output is canonically decomposed
+    // by construction, not by a property of today's Unicode tables. No pre-normalization pass is
+    // needed: lowercasing a single scalar value was verified to commute with decomposing it,
+    // across all 1,114,112 scalar values, against `unicode-normalization` 0.1.25.
+    name.to_lowercase().nfd().collect()
 }
 
 /// `true` when `a` and `b` fold to the same key and must therefore be treated as the same dirent.
@@ -208,6 +182,117 @@ mod tests {
             assert_eq!(
                 id_nfc, id_nfd,
                 "macOS APFS must normalize the NFD lookup onto the NFC-created dirent"
+            );
+        }
+    }
+
+    /// td-47d24d's named gap, closed: the old hand-rolled `LATIN1_DECOMPOSITIONS` table only knew
+    /// about 27 precomposed Latin-1 letters, so a Latin Extended-A letter like "ā" (U+0101) never
+    /// matched the table and its combining-mark strip only ran on the *already-decomposed*
+    /// spelling — the two forms folded to different keys ("ā" vs "a"). Real NFD has no such
+    /// per-letter allowlist.
+    #[test]
+    fn latin_extended_a_macron_collides() {
+        let precomposed = "\u{0101}"; // "ā", NFC
+        let decomposed = "a\u{0304}"; // "a" + combining macron (U+0304), NFD
+        assert_ne!(
+            precomposed, decomposed,
+            "sanity: byte-level spellings differ"
+        );
+        assert!(
+            names_collide(precomposed, decomposed),
+            "NFC and NFD spellings of \"ā\" must fold to the same key"
+        );
+    }
+
+    /// Non-Latin coverage the old 27-entry Latin-1-only table could never have handled: Greek and
+    /// Cyrillic precomposed/decomposed pairs both collide under real NFD.
+    #[test]
+    fn non_latin_scripts_collide_under_nfd() {
+        let greek_precomposed = "\u{03AC}"; // "ά", GREEK SMALL LETTER ALPHA WITH TONOS
+        let greek_decomposed = "\u{03B1}\u{0301}"; // alpha (U+03B1) + combining acute (U+0301)
+        assert!(
+            names_collide(greek_precomposed, greek_decomposed),
+            "NFC and NFD spellings of Greek \"ά\" must fold to the same key"
+        );
+
+        let cyrillic_precomposed = "\u{0439}"; // "й", CYRILLIC SMALL LETTER SHORT I
+        let cyrillic_decomposed = "\u{0438}\u{0306}"; // и (U+0438) + combining breve (U+0306)
+        assert!(
+            names_collide(cyrillic_precomposed, cyrillic_decomposed),
+            "NFC and NFD spellings of Cyrillic \"й\" must fold to the same key"
+        );
+    }
+
+    /// Vietnamese stacks two combining marks on one base letter (a tone mark plus a vowel
+    /// modifier) — a case the old table's single-(base, mark) triples structurally could not
+    /// represent even if it had been extended.
+    #[test]
+    fn vietnamese_double_diacritic_collides() {
+        let precomposed = "\u{1EA7}"; // "ầ", LATIN SMALL LETTER A WITH CIRCUMFLEX AND GRAVE
+        let decomposed = "a\u{0302}\u{0300}"; // a + combining circumflex (U+0302) + combining grave (U+0300)
+        assert!(
+            names_collide(precomposed, decomposed),
+            "NFC and NFD spellings of Vietnamese \"ầ\" must fold to the same key"
+        );
+    }
+
+    /// The deliberate behavior change (td-47d24d, USER DECISION 2026-09-04): diacritics are now
+    /// preserved, not stripped, so a plain-ASCII name and its accented counterpart are DIFFERENT
+    /// names. Do not "fix" this back — the old stripping behavior was the bug: an upload literally
+    /// named `resume.pdf` could silently overwrite an owner's `résumé.pdf`.
+    #[test]
+    fn accented_and_unaccented_names_are_distinct() {
+        assert!(
+            !names_collide("café", "cafe"),
+            "\"café\" and \"cafe\" must be distinct names — diacritics are preserved"
+        );
+        assert!(
+            !names_collide("résumé.pdf", "resume.pdf"),
+            "\"résumé.pdf\" and \"resume.pdf\" must be distinct names — diacritics are preserved"
+        );
+    }
+
+    /// Case and normalization variance together: an NFC uppercase spelling and an NFD lowercase
+    /// spelling of the same word must still collide.
+    #[test]
+    fn case_and_normalization_combine() {
+        let nfc_upper = "CAF\u{00C9}"; // "CAFÉ", NFC uppercase (precomposed É, U+00C9)
+        let nfd_lower = "cafe\u{0301}"; // "café", NFD lowercase
+        assert!(
+            names_collide(nfc_upper, nfd_lower),
+            "uppercase NFC and lowercase NFD spellings of \"café\" must fold to the same key"
+        );
+    }
+
+    /// `fold_key` must be idempotent — folding an already-folded key must be a no-op — because
+    /// `fold_key(fold_key(x)) == fold_key(x)` is exactly what the trailing `.nfd()` in `fold_key`
+    /// is there to guarantee (see that function's doc comment).
+    #[test]
+    fn fold_key_is_idempotent() {
+        let inputs = [
+            "café",
+            "cafe\u{0301}",
+            "CAFÉ",
+            "résumé.pdf",
+            "resume.pdf",
+            "\u{0101}",          // ā, NFC
+            "a\u{0304}",         // ā, NFD
+            "\u{03AC}",          // ά, NFC
+            "\u{03B1}\u{0301}",  // ά, NFD
+            "\u{0439}",          // й, NFC
+            "\u{0438}\u{0306}",  // й, NFD
+            "\u{1EA7}",          // ầ, NFC
+            "a\u{0302}\u{0300}", // ầ, NFD
+            "Photo.JPG",
+            "plain-ascii-name.txt",
+        ];
+        for input in inputs {
+            let once = fold_key(input);
+            let twice = fold_key(&once);
+            assert_eq!(
+                once, twice,
+                "fold_key must be idempotent for input {input:?}"
             );
         }
     }

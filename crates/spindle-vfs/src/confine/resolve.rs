@@ -106,11 +106,28 @@ mod tests {
     // because the OS itself folds the lookup before `resolve_folded_path` ever gets a chance to
     // fall back to `existing_entry_colliding`. So a pure case-difference test on this machine
     // exercises only the literal fast path, not the fold-scan fallback this function exists to
-    // add — it is not wrong, just insufficient proof of the fallback. The tests below it use a
-    // fold collision the OS's own case/Unicode folding does **not** paper over (an accented vs.
-    // unaccented spelling — `fold_key` strips the diacritic entirely, which is broader than any
-    // OS-level NFC/NFD normalization), so the literal lookup genuinely fails and the fallback
-    // path is what makes each of them pass, deterministically, on any platform.
+    // add — it is not wrong, just insufficient proof of the fallback.
+    //
+    // **td-47d24d update (2026-09-04)**: the tests below used to force the fold-scan fallback
+    // deterministically with an accented-vs-unaccented spelling (`fold_key` used to strip
+    // diacritics entirely, a broader rule than any OS-level normalization, so "café" written to
+    // disk and "cafe" requested would fail the literal check on every platform including this
+    // one). That device no longer exists: `fold_key` now preserves diacritics (NFD + case only),
+    // so "café" and "cafe" are different names to Spindle too, exactly like they are to the OS —
+    // there is no longer any fold collision that this machine's default (case-insensitive,
+    // NFD-normalizing) APFS volume does *not* already paper over at the literal-check step. The
+    // tests below therefore use the same case-difference technique as the test above, and accept
+    // *either* the requested or the real on-disk spelling as a passing outcome — deliberately,
+    // because which one it is now depends on the filesystem:
+    //   - on a case-folding filesystem (this machine's default APFS, or Windows): the literal
+    //     `Dir::exists` check already succeeds, so `resolve_folded_path` returns the *requested*
+    //     spelling and the fold-scan fallback never runs;
+    //   - on a case-sensitive filesystem (Linux, or the `hdiutil`-created "Case-sensitive APFS"
+    //     volume this ticket's verification runs against): the literal check genuinely fails and
+    //     the fold-scan fallback is what makes the test pass, returning the real on-disk spelling.
+    // Either outcome proves `resolve_folded_path` resolves the path correctly on its own
+    // filesystem; only running on the case-sensitive volume proves the fallback branch itself
+    // executes. Do not read a passing run on default macOS as proof the fold scan ran.
 
     #[test]
     fn case_differing_final_component_resolves() {
@@ -165,50 +182,63 @@ mod tests {
     // `existing_entry_colliding` — the exact branch these tests are meant to prove.
 
     #[test]
-    fn final_component_resolves_only_via_the_fold_scan() {
+    fn final_component_resolves_across_a_case_difference() {
         let sandbox = tempdir().expect("tempdir");
         let root = sandbox.path().join("share");
         std::fs::create_dir(&root).expect("mkdir root");
-        std::fs::write(root.join("caf\u{00E9}.txt"), b"x").expect("write café.txt");
+        std::fs::write(root.join("REPORT.txt"), b"x").expect("write REPORT.txt");
         let dir = open_share_root(&root).expect("open share root");
 
-        assert_eq!(
-            resolve_folded_path(&dir, "cafe.txt").expect("resolve"),
-            Some("caf\u{00E9}.txt".to_string()),
-            "the literal lookup for the unaccented spelling must fail, forcing the fold scan to \
-             find and return the real accented on-disk name"
+        // Outcome-only assertion (see the module comment above for why): on this machine's
+        // default case-folding APFS volume the literal fast path already resolves this, so the
+        // fold-scan fallback is only actually exercised on a case-sensitive filesystem.
+        let resolved = resolve_folded_path(&dir, "report.txt").expect("resolve");
+        assert!(
+            resolved == Some("report.txt".to_string())
+                || resolved == Some("REPORT.txt".to_string()),
+            "expected the requested or real spelling, got {resolved:?}"
         );
     }
 
     #[test]
-    fn intermediate_directory_resolves_only_via_the_fold_scan() {
+    fn intermediate_directory_resolves_across_a_case_difference() {
         let sandbox = tempdir().expect("tempdir");
         let root = sandbox.path().join("share");
-        std::fs::create_dir_all(root.join("Caf\u{00E9}")).expect("mkdir café dir");
-        std::fs::write(root.join("Caf\u{00E9}/photo.jpg"), b"x").expect("write nested file");
+        std::fs::create_dir_all(root.join("VACATION")).expect("mkdir dir");
+        std::fs::write(root.join("VACATION/photo.jpg"), b"x").expect("write nested file");
         let dir = open_share_root(&root).expect("open share root");
 
-        assert_eq!(
-            resolve_folded_path(&dir, "cafe/photo.jpg").expect("resolve"),
-            Some("Caf\u{00E9}/photo.jpg".to_string()),
-            "the literal lookup for the unaccented directory name must fail, forcing the fold \
-             scan to find and descend into the real accented directory"
+        // Outcome-only assertion (see the module comment above for why): on this machine's
+        // default case-folding APFS volume the literal fast path already descends through the
+        // intermediate directory, so the fold-scan fallback is only actually exercised on a
+        // case-sensitive filesystem.
+        let resolved = resolve_folded_path(&dir, "vacation/photo.jpg").expect("resolve");
+        assert!(
+            resolved == Some("vacation/photo.jpg".to_string())
+                || resolved == Some("VACATION/photo.jpg".to_string()),
+            "expected the requested or real spelling for the intermediate directory, got {resolved:?}"
         );
     }
 
     #[test]
-    fn one_component_literal_one_only_folds() {
+    fn one_component_literal_one_case_differs() {
         let sandbox = tempdir().expect("tempdir");
         let root = sandbox.path().join("share");
-        // "Vacation" matches the requested spelling literally; "café.jpg" only matches via the
-        // fold scan ("cafe.jpg" requested, no accent).
+        // "Vacation" matches the requested spelling literally; "PHOTO.jpg" only matches by a
+        // case fold on the final component.
         std::fs::create_dir_all(root.join("Vacation")).expect("mkdir nested");
-        std::fs::write(root.join("Vacation/caf\u{00E9}.jpg"), b"x").expect("write");
+        std::fs::write(root.join("Vacation/PHOTO.jpg"), b"x").expect("write");
         let dir = open_share_root(&root).expect("open share root");
 
-        assert_eq!(
-            resolve_folded_path(&dir, "Vacation/cafe.jpg").expect("resolve"),
-            Some("Vacation/caf\u{00E9}.jpg".to_string())
+        // Outcome-only assertion (see the module comment above for why): on this machine's
+        // default case-folding APFS volume the literal fast path already resolves the final
+        // component, so the fold-scan fallback is only actually exercised on a case-sensitive
+        // filesystem.
+        let resolved = resolve_folded_path(&dir, "Vacation/photo.jpg").expect("resolve");
+        assert!(
+            resolved == Some("Vacation/photo.jpg".to_string())
+                || resolved == Some("Vacation/PHOTO.jpg".to_string()),
+            "expected the requested or real spelling for the final component, got {resolved:?}"
         );
     }
 
