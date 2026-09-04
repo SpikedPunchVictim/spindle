@@ -24,7 +24,7 @@ use spindle_proto::{
 };
 use spindle_vfs::algebra::{AccessDecision, EffectiveGrants, GrantsVersion};
 use spindle_vfs::audit::AuditEntry;
-use spindle_vfs::confine::{self, identity as confine_identity, UploadOutcome};
+use spindle_vfs::confine::{self, identity as confine_identity, MkdirOutcome, UploadOutcome};
 use spindle_vfs::model::{Member, MemberStatus, Perms, Share, VirtualPath};
 use spindle_vfs::store::Store;
 use std::borrow::Borrow;
@@ -774,7 +774,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         };
         let can_delete = decision.perms().contains(Perms::DELETE);
         match confine::create_dir_confined(&dir, &subpath.to_path_string(), true, can_delete) {
-            Ok(true) => {
+            Ok(MkdirOutcome::Created) => {
                 self.audit(
                     ts,
                     Some(member.root_fp),
@@ -786,12 +786,32 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 );
                 VfsReply::Mkdir
             }
+            // td-789f11 (2026-09-04 decision): the name fold-collided with a directory that is
+            // already exactly what was asked for — a no-op success, not a denial. Distinct from
+            // `Refused` below (a type-mismatch collision, or no upload permission): a caller must
+            // be able to tell "it already existed" (this arm; the reply is a plain success, same
+            // wire shape as `Created`, matching `mkdir`'s ordinary idempotent-success contract)
+            // from "you may not" (the `Refused` arm's `denied:exists_needs_delete`).
+            Ok(MkdirOutcome::AlreadyExists) => {
+                self.audit(
+                    ts,
+                    Some(member.root_fp),
+                    Some(ctx.device_fp),
+                    "mkdir",
+                    Some(path),
+                    None,
+                    "ok:already_exists",
+                );
+                VfsReply::Mkdir
+            }
             // v0.9.10 remap (was `VfsErrorCode::UploadRejected` as a slice-3 stopgap, before
             // `already_exists` existed on the wire — see `spindle_proto::vfs_rpc`'s module doc
-            // comment "Remapped from slice 3"): a name collision without `delete` is exactly
-            // DESIGN.md §A4b's "collision == overwrite; overwrite requires delete" rule, which now
-            // has its own dedicated code.
-            Ok(false) => self.deny_with_code(
+            // comment "Remapped from slice 3"): a same-type name collision without `delete`, or
+            // (td-789f11, 2026-09-04) a type-mismatch collision with an existing *file* — always
+            // refused, regardless of `delete` (see `confine::MkdirOutcome::Refused`'s doc comment;
+            // `can_upload` is hardcoded `true` at this call site, already gated above, so that leg
+            // of `Refused` cannot actually surface here).
+            Ok(MkdirOutcome::Refused) => self.deny_with_code(
                 ts,
                 member,
                 ctx,
@@ -3037,6 +3057,84 @@ mod tests {
         );
     }
 
+    /// td-d5b098: uploading onto a name that fold-collides with an existing **directory** must
+    /// refuse cleanly, not destroy the upload session. This is the actual P2 this ticket exists
+    /// for: before the fix, `finalize_upload` authorized the write as an "overwrite"
+    /// (`WriteTarget::Overwrites`), the subsequent `dir.rename` failed with `IsADirectory` (a
+    /// file can never rename onto a directory), and the RPC handler's `Err` arm called
+    /// `abort_and_gc` — destroying the session AND the already-staged bytes — then replied
+    /// `denied:not_found`, giving no indication a colliding directory was the cause and no way to
+    /// retry without re-uploading. Uses a member WITH `delete` deliberately: taken literally,
+    /// DESIGN.md's "collision == overwrite; overwrite requires delete" rule would say this member
+    /// is entitled to overwrite, which is exactly the reading the user rejected (it would require
+    /// recursively deleting the whole directory subtree to make room for the file). Proves
+    /// `can_delete` does not matter for a type mismatch, and that the session survives so the
+    /// client can retry after deleting the right thing.
+    #[test]
+    fn upload_commit_over_existing_directory_is_already_exists_and_session_survives() {
+        let fx = UploadFixture::new(Perms::UPLOAD | Perms::DELETE);
+        let root = fx.real_root();
+        std::fs::create_dir(root.join("existing")).expect("seed existing directory");
+        std::fs::write(root.join("existing/keepsake.txt"), b"do-not-touch")
+            .expect("seed directory contents");
+        let server = fx.server();
+        let data = b"uploaded bytes".to_vec();
+        let session_id = fx.open(&server, 1, "Drop/existing", &data);
+        server.handle(
+            &fx.ctx(),
+            2,
+            req(
+                1,
+                VfsRequest::UploadChunk {
+                    session_id: session_id.clone(),
+                    offset: 0,
+                    data: data.clone(),
+                },
+            ),
+        );
+        let reply = server.handle(
+            &fx.ctx(),
+            3,
+            req(
+                1,
+                VfsRequest::UploadCommit {
+                    session_id: session_id.clone(),
+                },
+            ),
+        );
+        assert_eq!(
+            reply,
+            VfsReply::Error {
+                code: VfsErrorCode::AlreadyExists
+            },
+            "a directory type mismatch must be a clean refusal, not not_found"
+        );
+        assert!(
+            root.join("existing").is_dir(),
+            "the existing directory must survive"
+        );
+        assert_eq!(
+            std::fs::read(root.join("existing/keepsake.txt")).expect("read"),
+            b"do-not-touch",
+            "the directory's contents must be completely untouched"
+        );
+
+        // The session must survive this refusal — before the fix, `abort_and_gc` destroyed it on
+        // exactly this path, discarding the staged bytes and forcing a full re-upload.
+        let reply_again = server.handle(
+            &fx.ctx(),
+            4,
+            req(1, VfsRequest::UploadCommit { session_id }),
+        );
+        assert_eq!(
+            reply_again,
+            VfsReply::Error {
+                code: VfsErrorCode::AlreadyExists
+            },
+            "retrying must still refuse the same way — the session was not destroyed"
+        );
+    }
+
     #[test]
     fn upload_commit_fold_key_collision_counts_as_overwrite() {
         let fx = UploadFixture::new(Perms::UPLOAD); // no delete
@@ -3366,9 +3464,58 @@ mod tests {
     }
 
     #[test]
-    fn mkdir_over_existing_without_delete_is_already_exists() {
+    fn mkdir_over_existing_file_without_delete_is_already_exists() {
         // v0.9.10 remap regression test: byte-level assertion that the wire error is
-        // `already_exists`, not the slice-3 `upload_rejected` stopgap.
+        // `already_exists`, not the slice-3 `upload_rejected` stopgap. Collides with a FILE, not
+        // a directory: td-789f11 (2026-09-04 decision) changed the directory-collision case into
+        // a no-op success instead of a denial — see `mkdir_over_existing_directory_is_a_no_op_success`
+        // below for that case. A file collision is still always refused, with or without `delete`
+        // (mkdir can never turn a file into a directory).
+        let h = Harness::new();
+        let (member_id, _) = h.add_active_member("Alex");
+        let share_id = h.add_share(
+            "Drop",
+            "Drop",
+            ShareFlags {
+                read_only: false,
+                allow_upload: true,
+                show_hidden: false,
+            },
+        );
+        let root = h.share_real_root(share_id);
+        std::fs::write(root.join("NewAlbum"), b"a file, not a directory")
+            .expect("seed existing file");
+        h.grant(member_id, share_id, "", Perms::UPLOAD);
+
+        let server = h.server();
+        let reply = server.handle(
+            &h.ctx(member_id),
+            1,
+            req(
+                1,
+                VfsRequest::Mkdir {
+                    path: "Drop/NewAlbum".to_string(),
+                },
+            ),
+        );
+        assert_eq!(
+            reply,
+            VfsReply::Error {
+                code: VfsErrorCode::AlreadyExists
+            }
+        );
+        assert_eq!(
+            std::fs::read(root.join("NewAlbum")).expect("read"),
+            b"a file, not a directory",
+            "the existing file must survive a refused mkdir untouched"
+        );
+    }
+
+    /// td-789f11 (2026-09-04 decision): `mkdir` asking for a directory that already exists is a
+    /// no-op success, not a denial — regardless of `delete` (this fixture grants only `upload`).
+    /// Distinct from the file-collision case above, which is always refused.
+    #[test]
+    fn mkdir_over_existing_directory_is_a_no_op_success() {
         let h = Harness::new();
         let (member_id, _) = h.add_active_member("Alex");
         let share_id = h.add_share(
@@ -3395,11 +3542,16 @@ mod tests {
                 },
             ),
         );
+        assert_eq!(reply, VfsReply::Mkdir);
+
+        let entries: Vec<_> = std::fs::read_dir(&root)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
         assert_eq!(
-            reply,
-            VfsReply::Error {
-                code: VfsErrorCode::AlreadyExists
-            }
+            entries,
+            vec![std::ffi::OsString::from("NewAlbum")],
+            "nothing was created or destroyed — exactly the pre-existing directory remains"
         );
     }
 

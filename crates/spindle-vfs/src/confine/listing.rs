@@ -11,7 +11,7 @@
 //! this module only knows how to talk to the real filesystem safely through the capability.
 
 use super::identity::stat_through_dir;
-use super::upload::{is_staging_name, upload_target_path, WriteTarget};
+use super::upload::{is_staging_name, upload_target_path, WriteKind, WriteTarget};
 use super::ConfineError;
 use cap_std::fs::Dir;
 use std::path::{Path, PathBuf};
@@ -111,27 +111,56 @@ pub(super) fn split_parent_and_name(target: &Path) -> (PathBuf, String) {
     (parent, name)
 }
 
+/// The outcome of [`create_dir_confined`]: three-way, because a fold-colliding name can mean two
+/// very different things depending on what it collides *with* (see [`WriteTarget`]'s doc
+/// comment). A caller must be able to tell "nothing needed doing" apart from "you may not" — a
+/// plain `bool` collapsed both into the same `false`, which is exactly what td-789f11 was open
+/// about (a directory collision and a file collision were indistinguishable, and on macOS/Windows
+/// the directory case didn't even reach this far cleanly — it surfaced as an `EEXIST` `Err`
+/// instead of either boolean).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MkdirOutcome {
+    /// No existing entry collided; a new, empty directory was created at `relative`.
+    Created,
+    /// td-789f11: the name fold-collided with an existing **directory** — exactly the thing
+    /// `mkdir` was asked to ensure exists. Nothing was created or touched; this is a success, not
+    /// a denial.
+    AlreadyExists,
+    /// `can_upload` is false, or the name fold-collided with an existing **file** (td-789f11: a
+    /// type mismatch is always refused, never overwritten — see [`WriteTarget::TypeMismatch`]).
+    Refused,
+}
+
 /// Creates a directory at `relative` (DESIGN.md §A8 `mkdir`). `relative` is validated the same
 /// way an upload target is ([`upload_target_path`]) — no `..`, no absolute/rooted component, not
 /// empty — since `mkdir` is exactly as capable of a path-traversal attempt as `upload` is, and
 /// DESIGN.md draws no distinction between the two for path-safety purposes.
 ///
 /// **Design note (interpretation, not explicit in DESIGN.md)**: this crate treats `mkdir`'s
-/// permission and overwrite requirements identically to `upload`'s — creating a directory needs
-/// `upload`, and creating one whose name collides (including a case/Unicode fold collision) with
-/// an existing entry needs `delete` too, via the same [`super::upload::write_is_authorized`] gate
-/// a file upload uses. DESIGN.md §A8 lists `mkdir` as one of the six RPC calls but never states
-/// which permission bit governs it or whether its overwrite behavior matches `upload`'s; treating
-/// directory creation as "just another kind of write" is this implementation's choice, flagged
-/// per the task brief rather than resolved silently. The parent directory must already exist
-/// (this is `create_dir`, not `create_dir_all` — DESIGN.md's virtual tree has no notion of
-/// implicitly creating intermediate directories on `mkdir`).
+/// permission requirement identically to `upload`'s — creating a directory needs `upload`.
+/// DESIGN.md §A8 lists `mkdir` as one of the six RPC calls but never states which permission bit
+/// governs it; that part is this implementation's choice, flagged per the task brief rather than
+/// resolved silently. The parent directory must already exist (this is `create_dir`, not
+/// `create_dir_all` — DESIGN.md's virtual tree has no notion of implicitly creating intermediate
+/// directories on `mkdir`).
+///
+/// **Collision semantics (resolved 2026-09-04, td-789f11)**: routed through the same
+/// [`super::upload::write_is_authorized`] gate `upload` uses, with [`WriteKind::Directory`] so it
+/// applies `mkdir`'s rule rather than `upload`'s: a fold-colliding **directory** is a no-op success
+/// ([`MkdirOutcome::AlreadyExists`]) regardless of `can_delete` (creating a directory that already
+/// exists destroys nothing, so there is nothing for `delete` to gate), while a fold-colliding
+/// **file** is always refused ([`MkdirOutcome::Refused`]) regardless of `can_delete` too (there is
+/// no atomic "overwrite a file with a directory" operation, and `remove` + `create_dir` would
+/// destroy the file's contents for an operation nobody asked to be destructive). Keeping this
+/// decision inside `write_is_authorized` — rather than re-deriving it here from `WriteTarget`'s
+/// variants — is what keeps `upload` and `mkdir` from re-stating (and risking drift on) the same
+/// type-mismatch-is-always-refused rule; see that function's doc comment.
 pub fn create_dir_confined(
     dir: &Dir,
     relative: &str,
     can_upload: bool,
     can_delete: bool,
-) -> Result<bool, ConfineError> {
+) -> Result<MkdirOutcome, ConfineError> {
     let target = upload_target_path(relative)?;
     let (parent, name) = split_parent_and_name(&target);
     let parent_dir;
@@ -143,22 +172,26 @@ pub fn create_dir_confined(
             .map_err(|e| ConfineError::io(relative, e))?;
         &parent_dir
     };
-    // `write_is_authorized` now surfaces the *existing* colliding entry's real on-disk name
-    // (`WriteTarget::Overwrites`) so `finalize_upload` can rename a file onto it instead of the
-    // requested spelling (td-48fb1d). That distinction doesn't apply here: `mkdir` either creates
-    // `target` or it doesn't — there is no second on-disk name to redirect onto, since creating a
-    // directory is not a rename. So `Overwrites(_)` is deliberately treated exactly like today's
-    // "authorized" `true`, discarding the name it carries; only `Denied` still blocks. Whether
-    // `mkdir` should even be allowed to "win" a collision like this at all is a separate, already
-    // -flagged question (this function's own doc comment above, :119-127) and not something this
-    // change revisits.
-    match super::upload::write_is_authorized(parent_ref, &name, can_upload, can_delete)? {
-        WriteTarget::Denied => return Ok(false),
-        WriteTarget::Fresh | WriteTarget::Overwrites(_) => {}
+    match super::upload::write_is_authorized(
+        parent_ref,
+        &name,
+        WriteKind::Directory,
+        can_upload,
+        can_delete,
+    )? {
+        WriteTarget::Fresh => {}
+        WriteTarget::AlreadyExists => return Ok(MkdirOutcome::AlreadyExists),
+        // `Denied`: no `can_upload`. `TypeMismatch`: collided with a file. `Overwrites(_)` never
+        // occurs for `WriteKind::Directory` (it's `write_is_authorized`'s `WriteKind::File`-only
+        // outcome), listed here only so this match stays exhaustive against future `WriteTarget`
+        // variants; refusing is the safe fallback.
+        WriteTarget::Denied | WriteTarget::TypeMismatch | WriteTarget::Overwrites(_) => {
+            return Ok(MkdirOutcome::Refused)
+        }
     }
     dir.create_dir(&target)
         .map_err(|e| ConfineError::io(relative, e))?;
-    Ok(true)
+    Ok(MkdirOutcome::Created)
 }
 
 /// Deletes the file or directory at `relative` (DESIGN.md §A8 `delete`). Path-validated the same
@@ -235,19 +268,96 @@ mod tests {
         let dir = open_share_root(&root).expect("open");
 
         // No upload perm: refused, nothing created.
-        assert!(!create_dir_confined(&dir, "NewAlbum", false, false).expect("check"));
+        assert_eq!(
+            create_dir_confined(&dir, "NewAlbum", false, false).expect("check"),
+            MkdirOutcome::Refused
+        );
         assert!(!root.join("NewAlbum").exists());
 
         // Upload perm, new name: created.
-        assert!(create_dir_confined(&dir, "NewAlbum", true, false).expect("check"));
+        assert_eq!(
+            create_dir_confined(&dir, "NewAlbum", true, false).expect("check"),
+            MkdirOutcome::Created
+        );
         assert!(root.join("NewAlbum").is_dir());
 
-        // mkdir over an existing name without delete: refused (overwrite-requires-delete).
-        assert!(!create_dir_confined(&dir, "NewAlbum", true, false).expect("check"));
+        // mkdir over an existing DIRECTORY (td-789f11): no-op success, no delete needed.
+        assert_eq!(
+            create_dir_confined(&dir, "NewAlbum", true, false).expect("check"),
+            MkdirOutcome::AlreadyExists
+        );
 
         // Traversal attempt rejected outright.
         let err = create_dir_confined(&dir, "../escape", true, true).unwrap_err();
         assert!(matches!(err, ConfineError::UnsafeUploadPath(_)));
+    }
+
+    /// td-789f11, NEW behavior 3: `mkdir` whose name fold-collides with an existing **directory**
+    /// (via an accent/no-accent spelling difference `fold_key` folds but no OS-level case/Unicode
+    /// normalization does — see `resolve.rs`'s test module for why this is the technique that
+    /// actually proves the fold-scan path runs, rather than the OS's own folding papering over a
+    /// pure case difference) succeeds as a no-op, and afterwards there is exactly one dirent,
+    /// spelled as the pre-existing one.
+    #[test]
+    fn mkdir_onto_existing_directory_is_no_op_success_with_one_surviving_dirent() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("mkdir root");
+        let nfc = "caf\u{00E9}"; // precomposed "café"
+        let nfd = "cafe\u{0301}"; // decomposed "café": e + combining acute accent
+        std::fs::create_dir(root.join(nfc)).expect("seed existing directory");
+        let dir = open_share_root(&root).expect("open");
+
+        assert_eq!(
+            create_dir_confined(&dir, nfd, true, false).expect("check"),
+            MkdirOutcome::AlreadyExists,
+            "a fold-colliding mkdir must be a no-op success, not an error or a second dirent"
+        );
+        assert_eq!(
+            create_dir_confined(&dir, nfd, true, true).expect("check"),
+            MkdirOutcome::AlreadyExists,
+            "can_delete must not change this outcome — nothing needs deleting"
+        );
+
+        let entries: Vec<_> = std::fs::read_dir(&root)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from(nfc)],
+            "exactly one dirent must remain, spelled as the pre-existing one"
+        );
+    }
+
+    /// td-789f11, NEW behavior 4: `mkdir` whose name fold-collides with an existing **file** is
+    /// refused, and the file is left completely untouched.
+    #[test]
+    fn mkdir_onto_existing_file_is_refused_and_file_untouched() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("mkdir root");
+        let nfc = "caf\u{00E9}.txt";
+        let nfd = "cafe\u{0301}.txt";
+        std::fs::write(root.join(nfc), b"original-contents").expect("seed existing file");
+        let dir = open_share_root(&root).expect("open");
+
+        assert_eq!(
+            create_dir_confined(&dir, nfd, true, false).expect("check"),
+            MkdirOutcome::Refused
+        );
+        assert_eq!(
+            create_dir_confined(&dir, nfd, true, true).expect("check"),
+            MkdirOutcome::Refused,
+            "can_delete must not turn this into an overwrite — mkdir never replaces a file"
+        );
+
+        assert!(root.join(nfc).is_file(), "the existing file must survive");
+        assert_eq!(
+            std::fs::read(root.join(nfc)).expect("read"),
+            b"original-contents",
+            "the existing file's contents must be completely unchanged"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.20) + Execution Plan
+# Spindle — System Design Document (draft v0.9.21) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -48,6 +48,8 @@
 > 2026-09-02).
 > v0.9.20: `spindle-hostd` drops its binary target — library-only until Stage 7 lands host key custody (user
 > decision, 2026-09-02).
+> v0.9.21: §A4b edge rules — a fold collision between different *kinds* of entry is refused, never overwritten
+> (user decision, 2026-09-04).
 
 ---
 
@@ -368,7 +370,11 @@ Members ↔ groups many-to-many. Invites may name an initial group ("Invite Alex
 - **Edge rules**: `browse` on P implies *traversal* of P's ancestors (ancestors list only the path toward P);
   `upload` on P implies resolution of P without listing it (drop-box); `delete` does **not** imply `download`;
   overwrite of an existing entry requires `delete`; creating a name that collides case-insensitively or under
-  Unicode normalization with an existing dirent **is** an overwrite.
+  Unicode normalization with an existing dirent **is** an overwrite. A collision between different *kinds* of
+  entry is **refused, never overwritten** (user decision 2026-09-04): an upload never replaces a colliding
+  directory and `mkdir` never replaces a colliding file — both answer `already_exists`, leaving the existing
+  entry untouched, so destroying a directory tree always takes an explicit `delete`. `mkdir` onto a colliding
+  *directory* succeeds as a no-op, since the entry it asks for already exists.
 - **Secure by default**: new share → no grants; new member → `Members` group with no grants. Nothing is visible until
   granted.
 
@@ -1051,6 +1057,18 @@ hardened web delivery → A2/ADR-008/S17 (user decision); LAN non-goal + abuse p
 Deferred: mDNS local signaling (v2); member-level operator remedies (would break ZK); license choice (A10.24 open).
 
 # Part D — Change log
+
+- **v0.9.21 (2026-09-04)** — §A4b edge rules: a fold collision between different *kinds* of entry is refused
+  rather than overwritten (user decision). An upload never replaces a colliding directory and `mkdir` never
+  replaces a colliding file; both answer `already_exists` and leave the existing entry untouched. `mkdir` onto a
+  colliding directory is a no-op success. Why: the previous wording said only that a collision "**is** an
+  overwrite", and read literally that authorized a file upload to destroy a whole directory subtree — since an
+  overwrite requires `delete` and a member holding `delete` would qualify. Refusing type mismatches means
+  destroying a directory tree always takes an explicit `delete` call that names it. The implementation had
+  already diverged from the literal reading in the worst way: it authorized the overwrite, then failed on
+  `rename(2)`, discarding the member's uploaded bytes and reporting `not_found` (td-d5b098). The same rule was
+  simultaneously unenforced for `mkdir`, which created a second dirent on case-sensitive filesystems
+  (td-789f11).
 
 - **v0.9.20 (2026-09-02)** — `spindle-hostd` drops its binary target; the crate is library-only until Stage 7
   (user decision). Why: the entry point could only ever have been the always-failing stub v0.9.19 described, since

@@ -48,17 +48,22 @@ pub mod resolve;
 pub mod upload;
 pub mod windows;
 
-pub use fold::{existing_entry_colliding, fold_key, names_collide};
+pub use fold::{
+    existing_entry_colliding, existing_entry_colliding_typed, fold_key, names_collide,
+    CollidingEntry,
+};
 pub use identity::{
     file_identity, identity_of_ambient_path, nlink_guard, read_confined_with_identity_check,
     resolve_identity, stat_through_dir, FileIdentity,
 };
-pub use listing::{create_dir_confined, list_dir, remove_confined, RealDirEntry, RealEntryKind};
+pub use listing::{
+    create_dir_confined, list_dir, remove_confined, MkdirOutcome, RealDirEntry, RealEntryKind,
+};
 pub use overlap::overlap_check;
 pub use resolve::resolve_folded_path;
 pub use upload::{
     finalize_upload, is_staging_name, staging_name, upload_target_path, write_is_authorized,
-    UploadOutcome, WriteTarget,
+    UploadOutcome, WriteKind, WriteTarget,
 };
 
 /// Errors from the confinement layer. Each variant's doc comment on its emitting function names

@@ -73,26 +73,71 @@ pub fn names_collide(a: &str, b: &str) -> bool {
     fold_key(a) == fold_key(b)
 }
 
-/// Scans `dir`'s top-level entries for one whose name fold-collides with `candidate_name`.
-/// Returns the colliding entry's actual on-disk name, if any. This is the identity-agnostic half
-/// of collision detection — it works even on filesystems (e.g. Linux) that keep case/Unicode
-/// variants as distinct, non-colliding dirents at the OS level, which is exactly why Spindle must
-/// do this check itself rather than relying on the filesystem.
-pub fn existing_entry_colliding(
+/// A fold-colliding entry found by [`existing_entry_colliding_typed`]: its actual on-disk name,
+/// plus whether it is a directory. The upload/mkdir overwrite gate
+/// ([`super::upload::write_is_authorized`]) needs the kind to tell a same-type collision (an
+/// overwrite) apart from a type mismatch (always refused, per DESIGN.md :370-371's collision rule
+/// as narrowed by the user's 2026-09-04 decision on td-d5b098/td-789f11); plain name-only lookups
+/// ([`resolve_folded_path`](super::resolve::resolve_folded_path), via
+/// [`existing_entry_colliding`]) don't care about kind at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollidingEntry {
+    pub name: std::ffi::OsString,
+    pub is_dir: bool,
+}
+
+/// Scans `dir`'s top-level entries for one whose name fold-collides with `candidate_name`,
+/// returning its on-disk name and whether it is a directory. This is the one fold-comparison scan
+/// in this crate — [`existing_entry_colliding`] (name only) and [`existing_entry_colliding_typed`]
+/// (name + kind) both call it rather than re-implementing the comparison, so there is no risk of
+/// the two ever disagreeing on what counts as a collision. Works even on filesystems (e.g. Linux)
+/// that keep case/Unicode variants as distinct, non-colliding dirents at the OS level, which is
+/// exactly why Spindle must do this check itself rather than relying on the filesystem.
+///
+/// If the colliding entry's type cannot be determined (e.g. a race where it vanished between the
+/// readdir syscall and this follow-up `file_type()` call), it is reported as *not* a directory —
+/// matching this function's pre-existing behavior when kind wasn't tracked at all, and erring
+/// toward the file/overwrite path rather than silently authorizing a directory no-op or refusing a
+/// write that would otherwise have succeeded.
+fn scan_for_collision(
     dir: &Dir,
     candidate_name: &str,
-) -> Result<Option<std::ffi::OsString>, ConfineError> {
+) -> Result<Option<CollidingEntry>, ConfineError> {
     let target_key = fold_key(candidate_name);
     for entry in dir.entries().map_err(|e| ConfineError::io(".", e))? {
         let entry = entry.map_err(|e| ConfineError::io(".", e))?;
         let name = entry.file_name();
         if let Some(name_str) = name.to_str() {
             if fold_key(name_str) == target_key {
-                return Ok(Some(name));
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                return Ok(Some(CollidingEntry { name, is_dir }));
             }
         }
     }
     Ok(None)
+}
+
+/// Scans `dir`'s top-level entries for one whose name fold-collides with `candidate_name`.
+/// Returns the colliding entry's actual on-disk name, if any. This is the identity-agnostic half
+/// of collision detection — it works even on filesystems (e.g. Linux) that keep case/Unicode
+/// variants as distinct, non-colliding dirents at the OS level, which is exactly why Spindle must
+/// do this check itself rather than relying on the filesystem. Callers that need to know whether
+/// the collision is a directory (the upload/mkdir overwrite gate) should use
+/// [`existing_entry_colliding_typed`] instead — both share the same underlying scan.
+pub fn existing_entry_colliding(
+    dir: &Dir,
+    candidate_name: &str,
+) -> Result<Option<std::ffi::OsString>, ConfineError> {
+    Ok(scan_for_collision(dir, candidate_name)?.map(|entry| entry.name))
+}
+
+/// Like [`existing_entry_colliding`], but also reports whether the colliding entry is a
+/// directory — see [`CollidingEntry`].
+pub fn existing_entry_colliding_typed(
+    dir: &Dir,
+    candidate_name: &str,
+) -> Result<Option<CollidingEntry>, ConfineError> {
+    scan_for_collision(dir, candidate_name)
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 //! #23 (upload outside granted subpath / overwrite) and, via [`write_is_authorized`]'s use of
 //! `crate::confine::fold`, A12 #31 (case/NFD upload collision overwrites without `delete`).
 
-use super::fold::existing_entry_colliding;
+use super::fold::existing_entry_colliding_typed;
 use super::listing::split_parent_and_name;
 use super::ConfineError;
 use cap_std::fs::Dir;
@@ -57,23 +57,49 @@ pub fn is_staging_name(name: &str) -> bool {
     name.starts_with(STAGING_NAME_PREFIX)
 }
 
+/// What kind of dirent the caller intends to create at the candidate name — passed to
+/// [`write_is_authorized`] so it can tell a same-type collision (an overwrite) apart from a type
+/// mismatch (always refused). `upload` always creates a file; `mkdir` always creates a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteKind {
+    File,
+    Directory,
+}
+
 /// The result of the overwrite-requires-`delete` collision gate ([`write_is_authorized`]) for a
-/// candidate write target name. Distinguishes "authorized, nothing existing is touched" from
-/// "authorized, but an existing dirent will be replaced" — and in the latter case carries that
-/// dirent's *actual* on-disk name, because on a filesystem that does not fold case/Unicode
-/// variants itself (Linux), that name can differ from `candidate_name`. A caller that authorizes
-/// a write and then throws this name away (writing to `candidate_name` instead) reopens exactly
-/// the collision this check exists to close: see [`finalize_upload`]'s doc comment.
+/// candidate write target name.
+///
+/// The user's 2026-09-04 decision on td-d5b098/td-789f11 narrows DESIGN.md :370-371's "collision
+/// == overwrite" rule: that rule only ever meant a collision between two dirents of the *same*
+/// kind. A type mismatch — a file landing on an existing directory's name, or a directory landing
+/// on an existing file's name — is never an overwrite, because neither operation can honestly
+/// replace the other in place (a file can't atomically become a directory via `rename`, and
+/// blowing away a directory's subtree just to make room for a same-named directory destroys data
+/// nobody asked to delete). So a type mismatch is always [`TypeMismatch`](Self::TypeMismatch),
+/// refused unconditionally — `can_delete` never enters into it, unlike the same-type case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteTarget {
-    /// `can_upload` is false, or a colliding entry exists and `can_delete` is false.
+    /// `can_upload` is false, or a same-type colliding entry exists and `can_delete` is false
+    /// (this second case only ever arises for [`WriteKind::File`] — see [`AlreadyExists`](Self::AlreadyExists)
+    /// for [`WriteKind::Directory`]'s no-delete-needed collision outcome).
     Denied,
     /// No existing entry collides (by fold key, [`crate::confine::fold::fold_key`]) with the
     /// candidate name: a write may proceed and should land under the requested spelling.
     Fresh,
-    /// A colliding entry already exists under this on-disk name and `can_delete` is set: a write
-    /// may proceed, but must land under *this* name — see [`finalize_upload`].
+    /// [`WriteKind::File`] only: a colliding **file** already exists under this on-disk name and
+    /// `can_delete` is set: a write may proceed, but must land under *this* name — see
+    /// [`finalize_upload`].
     Overwrites(std::ffi::OsString),
+    /// [`WriteKind::Directory`] only: a colliding **directory** already exists. Creating a
+    /// directory that is already there destroys nothing and needs no permission beyond what
+    /// getting here already required, so this is authorized unconditionally (`can_delete`
+    /// irrelevant) — the caller should treat this as a no-op success, not create anything, and
+    /// not touch the existing directory.
+    AlreadyExists,
+    /// The candidate name fold-collides with an existing entry of the *other* kind than the
+    /// caller intends to create (a file's name colliding with an existing directory, or vice
+    /// versa). Always refused, regardless of `can_delete` — see this type's doc comment.
+    TypeMismatch,
 }
 
 /// The outcome of [`finalize_upload`]: either the staged file landed on disk (carrying the name
@@ -90,23 +116,41 @@ pub enum UploadOutcome {
 }
 
 /// DESIGN.md §A4b entitlement rule: overwriting an existing entry (including one only reachable
-/// via a case/Unicode-folding collision, per [`existing_entry_colliding`]) requires `delete`;
-/// `upload` alone only ever creates a genuinely new dirent.
+/// via a case/Unicode-folding collision, per [`existing_entry_colliding_typed`]) requires
+/// `delete`; `upload`/`mkdir` alone only ever creates a genuinely new dirent. `kind` is the type of
+/// dirent `candidate_name` would create ([`WriteKind::File`] for `upload`, [`WriteKind::Directory`]
+/// for `mkdir`) — both callers (`finalize_upload`, `create_dir_confined`) route through this one
+/// function so the type-mismatch-is-always-refused rule (see [`WriteTarget`]'s doc comment) lives
+/// in exactly one place instead of being restated, and potentially drifting, in each caller.
 pub fn write_is_authorized(
     dir: &Dir,
     candidate_name: &str,
+    kind: WriteKind,
     can_upload: bool,
     can_delete: bool,
 ) -> Result<WriteTarget, ConfineError> {
     if !can_upload {
         return Ok(WriteTarget::Denied);
     }
-    Ok(match existing_entry_colliding(dir, candidate_name)? {
-        Some(existing_name) => {
-            if can_delete {
-                WriteTarget::Overwrites(existing_name)
+    Ok(match existing_entry_colliding_typed(dir, candidate_name)? {
+        Some(existing) => {
+            let same_kind = match kind {
+                WriteKind::File => !existing.is_dir,
+                WriteKind::Directory => existing.is_dir,
+            };
+            if !same_kind {
+                WriteTarget::TypeMismatch
             } else {
-                WriteTarget::Denied
+                match kind {
+                    WriteKind::File => {
+                        if can_delete {
+                            WriteTarget::Overwrites(existing.name)
+                        } else {
+                            WriteTarget::Denied
+                        }
+                    }
+                    WriteKind::Directory => WriteTarget::AlreadyExists,
+                }
             }
         }
         None => WriteTarget::Fresh,
@@ -124,7 +168,13 @@ pub fn write_is_authorized(
 /// parent/name-splitting so a nested target (`"Vacation/photo.jpg"`) is collision-checked against
 /// its own parent directory's entries, not `dir`'s root. Returns [`UploadOutcome::Refused`]
 /// (nothing moved) on a collision without `delete`, exactly like
-/// [`super::listing::create_dir_confined`]'s `mkdir` analogue.
+/// [`super::listing::create_dir_confined`]'s `mkdir` analogue — and, per the user's 2026-09-04
+/// td-d5b098 decision, also on a collision with an existing **directory**, regardless of
+/// `can_delete`: a directory is the wrong kind of thing for a file upload to land on, and the only
+/// alternative (recursively deleting the directory to make room) was explicitly rejected as too
+/// destructive for a single mistyped upload. The session and staged bytes survive a `Refused`
+/// outcome either way, so the caller can retry after deleting the right thing (or nothing, if the
+/// type mismatch was itself the mistake).
 ///
 /// **The staged file lands on the *existing* entry's name, not the requested spelling, when this
 /// is an overwrite** (DESIGN.md :370-371: a case/Unicode-fold collision with an existing dirent
@@ -166,10 +216,17 @@ pub fn finalize_upload(
         &parent_dir
     };
     let write_target_name: std::ffi::OsString =
-        match write_is_authorized(parent_ref, &name, true, can_delete)? {
-            WriteTarget::Denied => return Ok(UploadOutcome::Refused),
+        match write_is_authorized(parent_ref, &name, WriteKind::File, true, can_delete)? {
             WriteTarget::Fresh => std::ffi::OsString::from(name),
             WriteTarget::Overwrites(existing_name) => existing_name,
+            // `Denied`: collision without `delete`. `TypeMismatch`: the collision is a directory
+            // (td-d5b098) — a file upload can never land on one, regardless of `can_delete`.
+            // `AlreadyExists` never occurs for `WriteKind::File` (it's `write_is_authorized`'s
+            // `WriteKind::Directory`-only outcome), listed here only so this match stays
+            // exhaustive against future `WriteTarget` variants; refusing is the safe fallback.
+            WriteTarget::Denied | WriteTarget::TypeMismatch | WriteTarget::AlreadyExists => {
+                return Ok(UploadOutcome::Refused)
+            }
         };
     dir.rename(staging_name, parent_ref, &write_target_name)
         .map_err(|e| ConfineError::io(target_relative, e))?;
@@ -306,32 +363,101 @@ mod tests {
             .expect("seed existing entry");
 
         assert_eq!(
-            write_is_authorized(&dir, "Photo.JPG", true, false).expect("check"),
+            write_is_authorized(&dir, "Photo.JPG", WriteKind::File, true, false).expect("check"),
             WriteTarget::Denied
         );
         assert_eq!(
-            write_is_authorized(&dir, "Photo.JPG", true, true).expect("check"),
+            write_is_authorized(&dir, "Photo.JPG", WriteKind::File, true, true).expect("check"),
             WriteTarget::Overwrites(std::ffi::OsString::from("Photo.JPG"))
         );
         // Case-fold collision counts as an overwrite too — still needs delete.
         assert_eq!(
-            write_is_authorized(&dir, "photo.jpg", true, false).expect("check"),
+            write_is_authorized(&dir, "photo.jpg", WriteKind::File, true, false).expect("check"),
             WriteTarget::Denied
         );
         // ...and when authorized, surfaces the *existing* dirent's spelling, not the candidate's.
         assert_eq!(
-            write_is_authorized(&dir, "photo.jpg", true, true).expect("check"),
+            write_is_authorized(&dir, "photo.jpg", WriteKind::File, true, true).expect("check"),
             WriteTarget::Overwrites(std::ffi::OsString::from("Photo.JPG"))
         );
         // A genuinely new name needs only upload.
         assert_eq!(
-            write_is_authorized(&dir, "new-name.jpg", true, false).expect("check"),
+            write_is_authorized(&dir, "new-name.jpg", WriteKind::File, true, false).expect("check"),
             WriteTarget::Fresh
         );
         // No upload permission at all: always rejected, regardless of delete or collisions.
         assert_eq!(
-            write_is_authorized(&dir, "new-name.jpg", false, true).expect("check"),
+            write_is_authorized(&dir, "new-name.jpg", WriteKind::File, false, true).expect("check"),
             WriteTarget::Denied
+        );
+    }
+
+    /// td-d5b098: a file upload whose name fold-collides with an existing **directory** must be
+    /// refused unconditionally — `can_delete` never makes it an overwrite, because a file can
+    /// never atomically replace a directory. Covers both permission states, which is exactly the
+    /// distinction the truth table draws from the same-type-file case above (there, `can_delete`
+    /// flips `Denied` to `Overwrites`; here it must not flip anything).
+    #[test]
+    fn write_is_authorized_refuses_file_onto_existing_directory_regardless_of_delete() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        let dir = open_share_root(&root).expect("open share root");
+        std::fs::create_dir(root.join("Photo.JPG")).expect("seed existing directory");
+
+        assert_eq!(
+            write_is_authorized(&dir, "Photo.JPG", WriteKind::File, true, false).expect("check"),
+            WriteTarget::TypeMismatch
+        );
+        assert_eq!(
+            write_is_authorized(&dir, "Photo.JPG", WriteKind::File, true, true).expect("check"),
+            WriteTarget::TypeMismatch,
+            "can_delete must not turn a directory collision into an overwrite"
+        );
+    }
+
+    /// td-789f11: `mkdir` whose name fold-collides with an existing **directory** is authorized as
+    /// a no-op (nothing to create, nothing to touch) regardless of `can_delete` — the directory
+    /// asked for already exists.
+    #[test]
+    fn write_is_authorized_mkdir_onto_existing_directory_is_already_exists_regardless_of_delete() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        let dir = open_share_root(&root).expect("open share root");
+        std::fs::create_dir(root.join("Album")).expect("seed existing directory");
+
+        assert_eq!(
+            write_is_authorized(&dir, "album", WriteKind::Directory, true, false).expect("check"),
+            WriteTarget::AlreadyExists
+        );
+        assert_eq!(
+            write_is_authorized(&dir, "album", WriteKind::Directory, true, true).expect("check"),
+            WriteTarget::AlreadyExists
+        );
+    }
+
+    /// td-789f11: `mkdir` whose name fold-collides with an existing **file** is always refused —
+    /// there is no sense in which creating a directory "overwrites" a file, so `can_delete` never
+    /// enters into it.
+    #[test]
+    fn write_is_authorized_mkdir_onto_existing_file_is_type_mismatch_regardless_of_delete() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        let dir = open_share_root(&root).expect("open share root");
+        dir.write("Notes.txt", b"contents")
+            .expect("seed existing file");
+
+        assert_eq!(
+            write_is_authorized(&dir, "notes.txt", WriteKind::Directory, true, false)
+                .expect("check"),
+            WriteTarget::TypeMismatch
+        );
+        assert_eq!(
+            write_is_authorized(&dir, "notes.txt", WriteKind::Directory, true, true)
+                .expect("check"),
+            WriteTarget::TypeMismatch
         );
     }
 
@@ -539,6 +665,80 @@ mod tests {
             outcome,
             UploadOutcome::Landed(std::ffi::OsString::from("Photo.JPG")),
             "the landed name must be the pre-existing dirent's spelling, not the requested one"
+        );
+    }
+
+    /// td-d5b098, NEW behavior 1: uploading a file whose target name collides with an existing
+    /// **directory**, with `delete`, must be refused rather than authorized as an "overwrite" —
+    /// `rename(2)` cannot replace a directory with a file, and the rejected alternative
+    /// (`remove_dir_all` the directory to make room) would destroy an arbitrarily large subtree
+    /// nobody asked to delete. The directory, its contents, and the staged bytes must all survive
+    /// untouched so the session can retry. The collision here needs no case/Unicode trickery —
+    /// the target name is byte-identical to the existing directory's, which collides under any
+    /// fold key on every platform, so this test does not depend on the host filesystem's own
+    /// case/Unicode folding behavior at all (unlike the file/file collision tests above).
+    #[test]
+    fn finalize_upload_onto_existing_directory_is_refused_with_delete() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        std::fs::create_dir(root.join("Photos")).expect("seed existing directory");
+        std::fs::write(root.join("Photos/keepsake.jpg"), b"do-not-touch")
+            .expect("seed directory contents");
+        let dir = open_share_root(&root).expect("open share root");
+
+        let staging = staging_name(&[0x01, 0x02]);
+        dir.write(&staging, b"uploaded-bytes")
+            .expect("write staging");
+
+        assert_eq!(
+            finalize_upload(&dir, &staging, "Photos", true).expect("finalize"),
+            UploadOutcome::Refused,
+            "a file can never land onto an existing directory, even with delete"
+        );
+
+        assert!(
+            root.join("Photos").is_dir(),
+            "the existing directory must survive"
+        );
+        assert_eq!(
+            std::fs::read(root.join("Photos/keepsake.jpg")).expect("read"),
+            b"do-not-touch",
+            "the directory's contents must be completely untouched"
+        );
+        assert!(
+            root.join(&staging).exists(),
+            "the staged bytes must survive so the session can retry without re-uploading"
+        );
+    }
+
+    /// td-d5b098, NEW behavior 2: the same directory collision, but without `delete` — refused for
+    /// the same reason (`can_delete` never enters into a type-mismatch decision), staged bytes and
+    /// the directory both survive.
+    #[test]
+    fn finalize_upload_onto_existing_directory_is_refused_without_delete() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        std::fs::create_dir(root.join("Photos")).expect("seed existing directory");
+        let dir = open_share_root(&root).expect("open share root");
+
+        let staging = staging_name(&[0x03, 0x04]);
+        dir.write(&staging, b"uploaded-bytes")
+            .expect("write staging");
+
+        assert_eq!(
+            finalize_upload(&dir, &staging, "Photos", false).expect("finalize"),
+            UploadOutcome::Refused
+        );
+
+        assert!(
+            root.join("Photos").is_dir(),
+            "the existing directory must survive"
+        );
+        assert!(
+            root.join(&staging).exists(),
+            "the staged bytes must survive so the session can retry without re-uploading"
         );
     }
 }
