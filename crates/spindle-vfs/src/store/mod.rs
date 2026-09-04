@@ -1100,6 +1100,17 @@ impl Store {
     /// enforces exactly the same construction-time invariant the pure model already does — no
     /// duplicated logic. Replaces (upserts) any existing entitlement for the same
     /// `(group_id, share_id, subpath)`.
+    ///
+    /// **Identity is by [`crate::confine::fold_key`], not by the literal `subpath` string**
+    /// (SCHEMA_V8, td-ea075e) — the upsert's conflict target keys on `fold_subpath`, inheriting
+    /// DESIGN.md §A4b's case/Unicode-fold overwrite rule (`docs/DESIGN.md:370-371`) from the same
+    /// function `crate::algebra::EffectiveGrants` already uses (via
+    /// `VirtualPath::descends_from_or_eq`) to evaluate these very rows, instead of this table
+    /// re-deciding that identity question on raw bytes. **On a fold-collision, the pre-existing
+    /// literal `subpath` spelling wins** — the conflict arm updates only `perms`, never `subpath`
+    /// — the same rule commit `b0c2f3f` established for a fold-collision upload landing on the
+    /// existing dirent: the row's *name* is decided once, by whichever spelling created it, and
+    /// only its *permissions* are ever replaced afterward.
     pub fn add_entitlement(
         &self,
         group_id: GroupId,
@@ -1128,13 +1139,18 @@ impl Store {
             share.flags.allow_upload,
         )?;
 
+        let subpath_str = entitlement.subpath.to_path_string();
+        let fold_subpath = confine::fold_key(&subpath_str);
+
         self.conn.execute(
-            "INSERT INTO entitlements (group_id, share_id, subpath, perms) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (group_id, share_id, subpath) DO UPDATE SET perms = excluded.perms",
+            "INSERT INTO entitlements (group_id, share_id, subpath, fold_subpath, perms) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (group_id, share_id, fold_subpath) DO UPDATE SET perms = excluded.perms",
             params![
                 entitlement.group_id.0 as i64,
                 entitlement.share_id.0 as i64,
-                entitlement.subpath.to_path_string(),
+                subpath_str,
+                fold_subpath,
                 entitlement.perms.bits() as i64,
             ],
         )?;
@@ -1142,19 +1158,22 @@ impl Store {
         Ok(())
     }
 
+    /// Matches on [`crate::confine::fold_key`], not the literal `subpath` (SCHEMA_V8, td-ea075e) —
+    /// entitlements are keyed on `fold_subpath` everywhere else (see [`Store::add_entitlement`]'s
+    /// doc comment), and a revocation is the one place this must never be an exception: matching
+    /// on raw bytes here let `add_entitlement(g, s, "Photos")` followed by
+    /// `remove_entitlement(g, s, "photos")` delete zero rows while still reporting success,
+    /// leaving the grant in force under a revocation the caller believed had succeeded.
     pub fn remove_entitlement(
         &self,
         group_id: GroupId,
         share_id: ShareId,
         subpath: &VirtualPath,
     ) -> Result<(), StoreError> {
+        let fold_subpath = confine::fold_key(&subpath.to_path_string());
         self.conn.execute(
-            "DELETE FROM entitlements WHERE group_id = ?1 AND share_id = ?2 AND subpath = ?3",
-            params![
-                group_id.0 as i64,
-                share_id.0 as i64,
-                subpath.to_path_string()
-            ],
+            "DELETE FROM entitlements WHERE group_id = ?1 AND share_id = ?2 AND fold_subpath = ?3",
+            params![group_id.0 as i64, share_id.0 as i64, fold_subpath],
         )?;
         self.bump_grants_version()?;
         Ok(())
@@ -1875,6 +1894,159 @@ mod tests {
             v4,
             "bump_cap_epoch must never bump grants_version"
         );
+    }
+
+    // ---- Entitlement identity is fold-key, not literal bytes (SCHEMA_V8, td-ea075e) ----
+
+    /// Shared fixture for the entitlement fold-key tests below: an in-memory store with one
+    /// custom (grantable) group and one share.
+    fn entitlement_fixture() -> (Store, GroupId, ShareId) {
+        let store = Store::open_in_memory().expect("open");
+        let group_id = store
+            .create_custom_group("Family")
+            .expect("create_custom_group");
+        let share_id = store
+            .add_share(
+                "Photos",
+                "Photos",
+                Path::new("/tmp/does-not-need-to-exist-for-this-check"),
+                ShareFlags::default(),
+                &[],
+                0,
+            )
+            .expect("add_share");
+        (store, group_id, share_id)
+    }
+
+    /// The security regression test: this is the ticket's exact scenario. Granting `"Photos"`
+    /// then revoking `"photos"` must actually remove the grant — before this fix,
+    /// `remove_entitlement` matched on the literal `subpath` while `EffectiveGrants` evaluates
+    /// through the folding `VirtualPath::descends_from_or_eq`, so the revocation deleted zero rows
+    /// and silently left the grant in force.
+    #[test]
+    fn remove_entitlement_revokes_a_grant_added_under_a_different_case_spelling() {
+        let (store, group_id, share_id) = entitlement_fixture();
+
+        store
+            .add_entitlement(group_id, share_id, &vp("Photos"), Perms::BROWSE)
+            .expect("add_entitlement Photos");
+        store
+            .remove_entitlement(group_id, share_id, &vp("photos"))
+            .expect("remove_entitlement photos");
+
+        let entitlements = store.list_entitlements().expect("list");
+        assert!(
+            entitlements.is_empty(),
+            "the grant must be gone — a fold-equal revocation must not silently no-op, got \
+             {entitlements:?}"
+        );
+    }
+
+    /// The `ON CONFLICT` mirror of the test above: adding `"Photos"` then `"photos"` must upsert
+    /// one row, not insert a second — and per `add_entitlement`'s doc comment, the pre-existing
+    /// literal spelling (`"Photos"`) wins over the later one, while `perms` still updates to the
+    /// later call's value.
+    #[test]
+    fn add_entitlement_upserts_a_fold_equal_spelling_keeping_the_original_literal_subpath() {
+        let (store, group_id, share_id) = entitlement_fixture();
+
+        store
+            .add_entitlement(group_id, share_id, &vp("Photos"), Perms::BROWSE)
+            .expect("add_entitlement Photos");
+        store
+            .add_entitlement(
+                group_id,
+                share_id,
+                &vp("photos"),
+                Perms::BROWSE | Perms::DOWNLOAD,
+            )
+            .expect("add_entitlement photos (fold-equal upsert)");
+
+        let entitlements = store.list_entitlements().expect("list");
+        assert_eq!(
+            entitlements.len(),
+            1,
+            "a fold-equal spelling must upsert one row, not insert a second, got {entitlements:?}"
+        );
+        let e = &entitlements[0];
+        assert_eq!(
+            e.perms,
+            Perms::BROWSE | Perms::DOWNLOAD,
+            "perms must update to the second call's value"
+        );
+        assert_eq!(
+            e.subpath.to_path_string(),
+            "Photos",
+            "the pre-existing literal spelling must win over the later one (see \
+             add_entitlement's doc comment / commit b0c2f3f)"
+        );
+    }
+
+    /// Normalization, not just case: `fold_key` has folded NFC/NFD spellings together since
+    /// `09b560f`. Adding via the NFC spelling of an accented path and removing via its NFD
+    /// spelling must revoke the grant, exactly as the case-only scenario above does. Both byte
+    /// spellings are built with explicit escapes (never typed as a literal accented character) so
+    /// this source file's own encoding cannot make them accidentally byte-identical, and the
+    /// fold-equality is asserted directly before relying on it — mirroring
+    /// `record_upload_nfc_and_nfd_spellings_collapse_to_one_row`'s own sanity check.
+    #[test]
+    fn remove_entitlement_revokes_a_grant_added_under_a_different_normalization() {
+        let (store, group_id, share_id) = entitlement_fixture();
+
+        let nfc_spelling = "Caf\u{00E9}"; // "Café", precomposed é (U+00E9)
+        let nfd_spelling = "Cafe\u{0301}"; // "Café", e (U+0065) + combining acute accent (U+0301)
+        assert_ne!(
+            nfc_spelling, nfd_spelling,
+            "sanity: the two byte-level spellings must actually differ"
+        );
+        assert_eq!(
+            crate::confine::fold_key(nfc_spelling),
+            crate::confine::fold_key(nfd_spelling),
+            "sanity: NFC and NFD spellings of Café must fold equal before this test relies on it"
+        );
+
+        store
+            .add_entitlement(group_id, share_id, &vp(nfc_spelling), Perms::BROWSE)
+            .expect("add_entitlement via the NFC spelling");
+        store
+            .remove_entitlement(group_id, share_id, &vp(nfd_spelling))
+            .expect("remove_entitlement via the NFD spelling");
+
+        let entitlements = store.list_entitlements().expect("list");
+        assert!(
+            entitlements.is_empty(),
+            "an NFD-spelled revocation of an NFC-spelled grant must remove it, got \
+             {entitlements:?}"
+        );
+    }
+
+    /// The deliberate non-collision: since `09b560f`, `fold_key` preserves diacritics rather than
+    /// stripping them, so `"café"` and `"cafe"` fold to *different* keys and are genuinely
+    /// different names (see `crate::confine::fold_key`'s doc comment). Adding `"café"` and then
+    /// attempting to remove it via `"cafe"` must leave the grant untouched. This is deliberate,
+    /// not a gap to "fix" — a revocation for `"cafe"` was never a revocation for `"café"`.
+    #[test]
+    fn remove_entitlement_does_not_collide_diacritic_and_plain_spellings() {
+        let (store, group_id, share_id) = entitlement_fixture();
+
+        let accented = "caf\u{00E9}"; // "café", precomposed é (U+00E9)
+        store
+            .add_entitlement(group_id, share_id, &vp(accented), Perms::BROWSE)
+            .expect("add_entitlement café");
+
+        // "cafe" (no accent) is a genuinely different name — removing it must not touch "café".
+        store
+            .remove_entitlement(group_id, share_id, &vp("cafe"))
+            .expect("remove_entitlement cafe (no matching row, must be a no-op)");
+
+        let entitlements = store.list_entitlements().expect("list");
+        assert_eq!(
+            entitlements.len(),
+            1,
+            "café's grant must survive a revocation of the unaccented 'cafe' — they are \
+             different names, got {entitlements:?}"
+        );
+        assert_eq!(entitlements[0].subpath.to_path_string(), accented);
     }
 
     #[test]

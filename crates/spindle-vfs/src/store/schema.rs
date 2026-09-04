@@ -329,6 +329,65 @@ UPDATE member_upload_bytes SET bytes = 0;
 UPDATE share_upload_bytes  SET bytes = 0;
 "#;
 
+/// Version 8 (td-ea075e) — the same fold-key identity fix as `SCHEMA_V7`, one table over.
+///
+/// `entitlements`' `UNIQUE (group_id, share_id, subpath)` and both of `Store::add_entitlement`'s
+/// `ON CONFLICT` and `Store::remove_entitlement`'s `WHERE` compared `subpath` byte-for-byte, but
+/// `crate::algebra::EffectiveGrants` evaluates those same rows through
+/// `VirtualPath::descends_from_or_eq` (`model.rs`), which folds via `crate::confine::fold_key` —
+/// the same DESIGN.md §A4b (`docs/DESIGN.md:370-371`) identity rule `SCHEMA_V7` already restored
+/// for `uploaded_files`. The mismatch was live in both directions: granting `"Photos"` then
+/// revoking `"photos"` deleted zero rows and reported success, leaving the grant in force after a
+/// revocation the caller believed had succeeded; granting `"Photos"` then `"photos"` created two
+/// rows instead of updating one, and a member matching either spelling received the union of
+/// both. This is the fourth layer found keying on a path without folding — the standing rule
+/// stays: any layer keying on a path must use `fold_key` or it silently re-decides
+/// DESIGN.md:370-371.
+///
+/// Fixed the same way `SCHEMA_V7` fixed `uploaded_files`: add `fold_subpath`, move the `UNIQUE`
+/// constraint onto it, and keep `subpath` as the literal (non-key) spelling last written.
+///
+/// **This migration `DROP TABLE`s `entitlements` outright rather than copying rows across, for
+/// reasons beyond "no deployment exists yet" alone**:
+///
+/// - A copy-migration cannot work here even in principle, not merely as a matter of avoided
+///   effort: the new `fold_subpath` column's value is `crate::confine::fold_key(subpath)`, and
+///   `fold_key` is a Rust function — Unicode-aware lowercasing plus NFD decomposition via the
+///   `unicode-normalization` crate — that plain migration SQL running inside `rusqlite` has no way
+///   to call. There is no SQL expression equivalent to fall back on.
+/// - Even given a way to compute it, a copy could still *fail* rather than merely being
+///   unnecessary: if both `"Photos"` and `"photos"` rows already existed for the same
+///   `(group_id, share_id)`, inserting both under the new `UNIQUE (group_id, share_id,
+///   fold_subpath)` collides. Resolving that collision means choosing which row's `perms` a member
+///   keeps and which is discarded — a permissions decision, not a schema decision — and making
+///   that choice silently inside a migration is not acceptable.
+/// - Unlike `SCHEMA_V7`'s `uploaded_files` (a rebuildable byte-counter cache over ledger rows),
+///   dropping `entitlements` drops **permission grants** — the actual record of who can access
+///   what. That is a heavier consequence than `SCHEMA_V7` accepted, said here plainly rather than
+///   glossed over. It is acceptable only because there is nothing deployed: Spindle has no
+///   deployment and no users, and it was verified separately that no persistent `Store` exists
+///   outside test tempdirs, so no real grant is lost.
+///
+/// The drop strands nothing: `entitlement_id` is referenced nowhere else in the Rust code, and
+/// nothing foreign-keys to `entitlements`.
+///
+/// Same `PRAGMA foreign_keys`-inside-a-transaction constraint `SCHEMA_V5`/`SCHEMA_V7`'s doc
+/// comments already document applies here too — irrelevant to this migration specifically (there
+/// is no data being copied for it to enforce anything against), but noted for the record.
+const SCHEMA_V8: &str = r#"
+DROP TABLE entitlements;
+
+CREATE TABLE entitlements (
+    entitlement_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id       INTEGER NOT NULL REFERENCES groups(group_id),
+    share_id       INTEGER NOT NULL REFERENCES shares(share_id),
+    subpath        TEXT    NOT NULL,
+    fold_subpath   TEXT    NOT NULL,
+    perms          INTEGER NOT NULL,
+    UNIQUE (group_id, share_id, fold_subpath)
+);
+"#;
+
 /// Every schema version in order, oldest first. Appending a new `(N, SQL)` pair is the only way
 /// to evolve the schema — existing entries are never edited once shipped.
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -339,6 +398,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, SCHEMA_V5),
     (6, SCHEMA_V6),
     (7, SCHEMA_V7),
+    (8, SCHEMA_V8),
 ];
 
 /// Applies every migration strictly newer than the connection's current `user_version`, each in
@@ -614,6 +674,69 @@ mod tests {
         assert_eq!(
             share_bytes, 0,
             "share_upload_bytes must be zeroed alongside the discarded ledger"
+        );
+    }
+
+    /// This ticket's upgrade-path check (fold-key entitlement identity, SCHEMA_V8): build a
+    /// database at the OLD (pre-V8) schema by hand — directly from `SCHEMA_V1..V7`, for the same
+    /// reason `migrate_v7_rebuilds_uploaded_files_and_zeroes_both_counters`'s doc comment gives —
+    /// seed an `entitlements` row under the OLD shape, then run [`migrate`] and confirm SCHEMA_V8's
+    /// documented behavior: the table is rebuilt with `fold_subpath` as part of its `UNIQUE`
+    /// constraint, and the pre-existing row is gone (this migration discards rather than migrates
+    /// the table — see SCHEMA_V8's doc comment for why that's acceptable pre-deployment).
+    #[test]
+    fn migrate_v8_rebuilds_entitlements_with_fold_subpath() {
+        let mut conn = Connection::open_in_memory().expect("open");
+
+        // Hand-roll a database at schema version 7 (pre-V8) by applying V1..V7 directly.
+        conn.execute_batch(SCHEMA_V1).expect("apply V1");
+        conn.execute_batch(SCHEMA_V2).expect("apply V2");
+        conn.execute_batch(SCHEMA_V3).expect("apply V3");
+        conn.execute_batch(SCHEMA_V4).expect("apply V4");
+        conn.execute_batch(SCHEMA_V5).expect("apply V5");
+        conn.execute_batch(SCHEMA_V6).expect("apply V6");
+        conn.execute_batch(SCHEMA_V7).expect("apply V7");
+        conn.execute_batch("PRAGMA user_version = 7")
+            .expect("set user_version to 7");
+
+        conn.execute(
+            "INSERT INTO shares \
+             (name, mount_path, real_root, read_only, allow_upload, show_hidden, created) \
+             VALUES ('Drop', 'Drop', '/tmp/drop', 0, 1, 0, 0)",
+            [],
+        )
+        .expect("insert share");
+        let share_id = conn.last_insert_rowid();
+
+        // A row under the OLD (no `fold_subpath`) shape — group_id 2 is the built-in Members
+        // group, seeded by SCHEMA_V1.
+        conn.execute(
+            "INSERT INTO entitlements (group_id, share_id, subpath, perms) \
+             VALUES (2, ?1, 'Photos', 1)",
+            [share_id],
+        )
+        .expect("insert pre-V8 entitlements row");
+
+        migrate(&mut conn).expect("migrate old schema up to latest");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
+
+        // The query itself names `fold_subpath` (it would error against the OLD table, which has
+        // no such column), and it comes back empty — SCHEMA_V8 discards the pre-existing table
+        // rather than migrating it.
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entitlements WHERE fold_subpath IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count rows via the new fold_subpath-keyed shape");
+        assert_eq!(
+            row_count, 0,
+            "SCHEMA_V8 discards the pre-existing entitlements table outright — see its doc comment"
         );
     }
 
