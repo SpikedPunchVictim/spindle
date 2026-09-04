@@ -13,11 +13,15 @@
 //! `crate::server::SessionContext`.
 
 use spindle_vfs::confine::identity::FileIdentity;
-use spindle_vfs::model::{MemberId, ShareId, VirtualPath};
+use spindle_vfs::model::{FoldedPath, MemberId, ShareId, VirtualPath};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-type Key = (MemberId, ShareId, VirtualPath);
+/// Keyed on [`FoldedPath`], not the literal `VirtualPath` — td-9bf38d: a member who reads
+/// `Photo.JPG` then uploads to `photo.jpg` (which, since `b0c2f3f`, overwrites the same dirent
+/// and produces a new inode) must have that baseline found and cleared by a `forget` for either
+/// spelling, since both name the same dirent.
+type Key = (MemberId, ShareId, FoldedPath);
 
 pub(crate) struct IdentityCache {
     last_seen: RefCell<HashMap<Key, FileIdentity>>,
@@ -41,7 +45,7 @@ impl IdentityCache {
     ) {
         self.last_seen
             .borrow_mut()
-            .insert((member_id, share_id, path.clone()), identity);
+            .insert((member_id, share_id, path.folded()), identity);
     }
 
     /// `true` only when a prior observation exists for this key *and* it differs from `current`.
@@ -58,7 +62,7 @@ impl IdentityCache {
     ) -> bool {
         self.last_seen
             .borrow()
-            .get(&(member_id, share_id, path.clone()))
+            .get(&(member_id, share_id, path.folded()))
             .is_some_and(|prev| prev != current)
     }
 
@@ -68,7 +72,7 @@ impl IdentityCache {
     pub(crate) fn forget(&self, member_id: MemberId, share_id: ShareId, path: &VirtualPath) {
         self.last_seen
             .borrow_mut()
-            .remove(&(member_id, share_id, path.clone()));
+            .remove(&(member_id, share_id, path.folded()));
     }
 }
 
@@ -109,5 +113,42 @@ mod tests {
         let path = VirtualPath::parse("img.jpg").unwrap();
         cache.record(MemberId(1), ShareId(1), &path, identity(1, 2));
         assert!(!cache.mismatches(MemberId(2), ShareId(1), &path, &identity(9, 9)));
+    }
+
+    /// td-9bf38d: a baseline recorded under `"Photo.JPG"` must be cleared by `forget` called with
+    /// the fold-colliding spelling `"photo.jpg"` — since `b0c2f3f`, an upload to one overwrites
+    /// the other's dirent, so they are the same identity baseline, not two.
+    #[test]
+    fn forget_clears_a_baseline_recorded_under_a_fold_colliding_spelling() {
+        let cache = IdentityCache::new();
+        let recorded_as = VirtualPath::parse("Photo.JPG").unwrap();
+        let forgotten_as = VirtualPath::parse("photo.jpg").unwrap();
+
+        cache.record(MemberId(1), ShareId(1), &recorded_as, identity(1, 2));
+        cache.forget(MemberId(1), ShareId(1), &forgotten_as);
+
+        // No baseline remains under either spelling: a subsequent `mismatches` with a completely
+        // different identity must report no mismatch, because there is nothing left to compare
+        // against.
+        assert!(!cache.mismatches(MemberId(1), ShareId(1), &recorded_as, &identity(9, 9)));
+        assert!(!cache.mismatches(MemberId(1), ShareId(1), &forgotten_as, &identity(9, 9)));
+    }
+
+    /// Deliberate non-collision: since `09b560f`, `fold_key` preserves diacritics, so `"café"`
+    /// and `"cafe"` are genuinely different names and must not share a cache key.
+    #[test]
+    fn diacritic_distinct_names_do_not_share_a_cache_key() {
+        let cache = IdentityCache::new();
+        let accented = VirtualPath::parse("café.jpg").unwrap();
+        let plain = VirtualPath::parse("cafe.jpg").unwrap();
+
+        cache.record(MemberId(1), ShareId(1), &accented, identity(1, 2));
+
+        // No baseline exists yet for `plain`, so it is not a mismatch against any identity.
+        assert!(!cache.mismatches(MemberId(1), ShareId(1), &plain, &identity(9, 9)));
+
+        // Forgetting `plain` must not touch `accented`'s baseline.
+        cache.forget(MemberId(1), ShareId(1), &plain);
+        assert!(cache.mismatches(MemberId(1), ShareId(1), &accented, &identity(9, 9)));
     }
 }

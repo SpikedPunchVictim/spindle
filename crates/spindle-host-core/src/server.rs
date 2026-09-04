@@ -3616,4 +3616,117 @@ mod tests {
             }
         );
     }
+
+    /// td-9bf38d end-to-end regression: a member reads `Photo.JPG` (recording an identity
+    /// baseline), then uploads `photo.jpg` — which, since `b0c2f3f`, overwrites the same dirent
+    /// and produces a new inode. Before the fix, `identity_cache`'s key was the literal
+    /// `VirtualPath`, so `upload_commit`'s `forget("photo.jpg")` missed the baseline recorded
+    /// under `"Photo.JPG"`; the member's very next read of `Photo.JPG` then hit the stale
+    /// baseline and was refused `denied:identity_changed` / `FileChanged` for a change the member
+    /// made themself. It must not be refused.
+    #[test]
+    fn self_caused_fold_collision_overwrite_does_not_deny_the_next_read() {
+        let h = Harness::new();
+        let (member_id, _) = h.add_active_member("Alex");
+        let (device_fp, signing_key) = h.add_signing_device(member_id, "alex-phone");
+        let share_id = h.add_share(
+            "Drop",
+            "Drop",
+            ShareFlags {
+                read_only: false,
+                allow_upload: true,
+                show_hidden: false,
+            },
+        );
+        h.grant(
+            member_id,
+            share_id,
+            "",
+            Perms::BROWSE | Perms::DOWNLOAD | Perms::UPLOAD | Perms::DELETE,
+        );
+        let root = h.share_real_root(share_id);
+        std::fs::write(root.join("Photo.JPG"), vec![1u8; 10]).expect("write Photo.JPG");
+
+        let server = h.server();
+        let ctx = h.ctx_with_device(member_id, device_fp);
+
+        // Establish the identity baseline under the requested spelling, "Photo.JPG".
+        let baseline = server.handle(
+            &ctx,
+            1,
+            req(
+                1,
+                VfsRequest::Read {
+                    path: "Drop/Photo.JPG".to_string(),
+                    offset: 0,
+                    len: 5,
+                },
+            ),
+        );
+        assert!(
+            matches!(baseline, VfsReply::Read { .. }),
+            "expected a successful baseline read, got {baseline:?}"
+        );
+
+        // Upload to the fold-colliding spelling "photo.jpg" — same dirent, new content, new
+        // inode once committed.
+        let new_data = vec![2u8; 20];
+        let hash = sha256(&new_data);
+        let sig = sign_manifest(&signing_key, "Drop/photo.jpg", new_data.len() as u64, &hash);
+        let opened = server.handle(
+            &ctx,
+            2,
+            req(
+                1,
+                VfsRequest::UploadOpen {
+                    path: "Drop/photo.jpg".to_string(),
+                    size: new_data.len() as u64,
+                    hash,
+                    manifest_sig: sig,
+                },
+            ),
+        );
+        let session_id = match opened {
+            VfsReply::UploadOpen { session_id, .. } => session_id,
+            other => panic!("expected UploadOpen, got {other:?}"),
+        };
+        let chunk_reply = server.handle(
+            &ctx,
+            3,
+            req(
+                1,
+                VfsRequest::UploadChunk {
+                    session_id: session_id.clone(),
+                    offset: 0,
+                    data: new_data.clone(),
+                },
+            ),
+        );
+        assert_eq!(
+            chunk_reply,
+            VfsReply::UploadChunk {
+                offset: new_data.len() as u64
+            }
+        );
+        let commit_reply = server.handle(&ctx, 4, req(1, VfsRequest::UploadCommit { session_id }));
+        assert_eq!(commit_reply, VfsReply::UploadCommit);
+
+        // The member's own overwrite must not deny their next read of the original spelling.
+        let after = server.handle(
+            &ctx,
+            5,
+            req(
+                1,
+                VfsRequest::Read {
+                    path: "Drop/Photo.JPG".to_string(),
+                    offset: 0,
+                    len: 5,
+                },
+            ),
+        );
+        assert!(
+            matches!(after, VfsReply::Read { .. }),
+            "self-caused fold-collision overwrite must not deny the next read as identity_changed, got {after:?}"
+        );
+    }
 }

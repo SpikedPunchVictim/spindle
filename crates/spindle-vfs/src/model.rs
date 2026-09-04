@@ -58,8 +58,34 @@ id_type!(
 /// exactly as `crate::confine` folds real dirent names — so a grant expressed with one
 /// case/Unicode spelling still applies to a path reached with a different, colliding spelling of
 /// the same name.
+///
+/// **`Eq`/`Hash` are deliberately literal, not folded** — this is an asymmetry with
+/// `descends_from_or_eq`, and that asymmetry is a trap this codebase has fallen into repeatedly
+/// (td-9bf38d is the fifth/sixth instance: `spindle-host-core`'s identity cache and its upload
+/// session table both keyed/compared on the literal `VirtualPath` and so treated two
+/// fold-colliding spellings — e.g. `"Photo.JPG"` and `"photo.jpg"` — of what is, since `b0c2f3f`,
+/// the *same on-disk dirent* as two unrelated paths). The literal `Eq` is kept anyway: a folded
+/// `Eq` would make every `assert_eq!` comparing two `VirtualPath`s blind to a spelling change,
+/// silently weakening tests — this repo has already shipped that failure mode twice (a byte-vs-
+/// character regression test that stopped discriminating, and a fold-scan technique that died the
+/// same way). **Anything that keys or matches on a path's identity — a map/set key, an `==`
+/// comparison meant to mean "same dirent", `contains`/`find`/`retain`/`position` — must go through
+/// [`VirtualPath::folded`] instead of comparing `VirtualPath` directly.**
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct VirtualPath(Vec<String>);
+
+/// A case/Unicode-folded virtual path, for use as a map/set key or in an identity comparison —
+/// see the warning on [`VirtualPath`]'s doc comment. Built via [`VirtualPath::folded`].
+///
+/// Folding the whole `/`-joined string (rather than folding each component and rejoining) is
+/// equivalent here: `/` is neither cased nor case-ignorable, so it is as hard a boundary for
+/// Rust's context-dependent final-sigma lowercasing rule as a string edge is, and NFD's canonical
+/// reordering only acts within contiguous combining-mark runs, which a `/` always breaks. So
+/// whole-string folding cannot fold marks or casing *across* a component boundary that
+/// per-component folding would have kept separate. (Verified empirically during td-ea075e's
+/// review.)
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FoldedPath(String);
 
 impl VirtualPath {
     /// The root path (zero components).
@@ -96,6 +122,15 @@ impl VirtualPath {
     /// value since components are already validated non-empty/non-`.`/non-`..`.
     pub fn to_path_string(&self) -> String {
         self.0.join("/")
+    }
+
+    /// The folded key for this path — see [`FoldedPath`] and the warning on this type's doc
+    /// comment. Two `VirtualPath`s that are `descends_from_or_eq` each other at equal depth (i.e.
+    /// component-wise fold-equal) produce equal `FoldedPath`s; anything that needs to know "is
+    /// this the same dirent" rather than "is this the same spelling" should compare `folded()`
+    /// values instead of the `VirtualPath`s themselves.
+    pub fn folded(&self) -> FoldedPath {
+        FoldedPath(fold_key(&self.to_path_string()))
     }
 
     pub fn is_root(&self) -> bool {

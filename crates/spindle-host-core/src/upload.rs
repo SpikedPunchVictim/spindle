@@ -102,7 +102,11 @@ impl UploadSessions {
         if let Some(existing) = sessions.values_mut().find(|s| {
             s.member_id == member_id
                 && s.share_id == share_id
-                && s.subpath == *subpath
+                // Folded, not literal — td-9bf38d: `Photo.JPG` and `photo.jpg` fold-collide and
+                // therefore name the same dirent (since `b0c2f3f`, an upload to one overwrites
+                // the other), so a re-open with either spelling must resume the same session
+                // rather than opening a second one that stages competing bytes for one dirent.
+                && s.subpath.folded() == subpath.folded()
                 && s.size == size
                 && s.hash == hash
                 && s.expires > now
@@ -263,6 +267,88 @@ mod tests {
         assert_eq!(second.id, first.id, "must resume, not create a new session");
         assert_eq!(second.offset, 40, "resumed session keeps its progress");
         assert_eq!(sessions.len(), 1);
+    }
+
+    /// td-9bf38d: `Photo.JPG` and `photo.jpg` fold-collide, and since `b0c2f3f` an upload to one
+    /// overwrites the other's dirent — so a re-open with the other spelling (same size/hash) must
+    /// resume the *same* session, not open a second one racing to stage bytes for one dirent.
+    #[test]
+    fn open_or_resume_resumes_across_a_fold_colliding_spelling() {
+        let sessions = UploadSessions::new();
+        let first = sessions.open_or_resume(
+            MemberId(1),
+            ShareId(1),
+            &vp("Photo.JPG"),
+            100,
+            &[1, 2, 3],
+            &[9, 9],
+            None,
+            1000,
+            48 * 60 * 60,
+            0,
+            0,
+        );
+        sessions.set_offset(&first.id, 40);
+
+        let second = sessions.open_or_resume(
+            MemberId(1),
+            ShareId(1),
+            &vp("photo.jpg"),
+            100,
+            &[1, 2, 3],
+            &[9, 9],
+            None,
+            2000,
+            48 * 60 * 60,
+            0,
+            0,
+        );
+        assert_eq!(
+            second.id, first.id,
+            "fold-colliding spellings of the same dirent must resume the same session"
+        );
+        assert_eq!(second.offset, 40);
+        assert_eq!(sessions.len(), 1);
+    }
+
+    /// Deliberate non-collision: since `09b560f`, `fold_key` preserves diacritics, so `"café"`
+    /// and `"cafe"` are genuinely different names, not a fold collision — they must NOT resume
+    /// each other.
+    #[test]
+    fn open_or_resume_does_not_resume_diacritic_distinct_names() {
+        let sessions = UploadSessions::new();
+        let accented = sessions.open_or_resume(
+            MemberId(1),
+            ShareId(1),
+            &vp("café.bin"),
+            100,
+            &[1, 2, 3],
+            &[9, 9],
+            None,
+            1000,
+            48 * 60 * 60,
+            0,
+            0,
+        );
+
+        let plain = sessions.open_or_resume(
+            MemberId(1),
+            ShareId(1),
+            &vp("cafe.bin"),
+            100,
+            &[1, 2, 3],
+            &[9, 9],
+            None,
+            2000,
+            48 * 60 * 60,
+            0,
+            0,
+        );
+        assert_ne!(
+            plain.id, accented.id,
+            "café and cafe are different names and must not share a session"
+        );
+        assert_eq!(sessions.len(), 2);
     }
 
     #[test]
