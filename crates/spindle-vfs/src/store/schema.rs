@@ -270,7 +270,7 @@ CREATE TABLE uploaded_files (
 /// `uploaded_files` shape) — fixes the ledger re-deciding name identity instead of inheriting it.
 ///
 /// `SCHEMA_V6`'s `PRIMARY KEY (share_id, subpath)` and every query against it compare `subpath`
-/// byte-for-byte, but DESIGN.md §A4b (`docs/DESIGN.md:370-371`) states "creating a name that
+/// byte-for-byte, but DESIGN.md §A4b (`docs/DESIGN.md:372-373`) states "creating a name that
 /// collides case-insensitively or under Unicode normalization with an existing dirent **is** an
 /// overwrite" — the rule `crate::confine::fold_key` already implements for every other name
 /// comparison in this crate (`existing_entry_colliding`, `VirtualPath::descends_from_or_eq`,
@@ -335,14 +335,14 @@ UPDATE share_upload_bytes  SET bytes = 0;
 /// `ON CONFLICT` and `Store::remove_entitlement`'s `WHERE` compared `subpath` byte-for-byte, but
 /// `crate::algebra::EffectiveGrants` evaluates those same rows through
 /// `VirtualPath::descends_from_or_eq` (`model.rs`), which folds via `crate::confine::fold_key` —
-/// the same DESIGN.md §A4b (`docs/DESIGN.md:370-371`) identity rule `SCHEMA_V7` already restored
+/// the same DESIGN.md §A4b (`docs/DESIGN.md:372-373`) identity rule `SCHEMA_V7` already restored
 /// for `uploaded_files`. The mismatch was live in both directions: granting `"Photos"` then
 /// revoking `"photos"` deleted zero rows and reported success, leaving the grant in force after a
 /// revocation the caller believed had succeeded; granting `"Photos"` then `"photos"` created two
 /// rows instead of updating one, and a member matching either spelling received the union of
 /// both. This is the fourth layer found keying on a path without folding — the standing rule
 /// stays: any layer keying on a path must use `fold_key` or it silently re-decides
-/// DESIGN.md:370-371.
+/// DESIGN.md:372-373.
 ///
 /// Fixed the same way `SCHEMA_V7` fixed `uploaded_files`: add `fold_subpath`, move the `UNIQUE`
 /// constraint onto it, and keep `subpath` as the literal (non-key) spelling last written.

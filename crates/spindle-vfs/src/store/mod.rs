@@ -1103,7 +1103,7 @@ impl Store {
     ///
     /// **Identity is by [`crate::confine::fold_key`], not by the literal `subpath` string**
     /// (SCHEMA_V8, td-ea075e) — the upsert's conflict target keys on `fold_subpath`, inheriting
-    /// DESIGN.md §A4b's case/Unicode-fold overwrite rule (`docs/DESIGN.md:370-371`) from the same
+    /// DESIGN.md §A4b's case/Unicode-fold overwrite rule (`docs/DESIGN.md:372-373`) from the same
     /// function `crate::algebra::EffectiveGrants` already uses (via
     /// `VirtualPath::descends_from_or_eq`) to evaluate these very rows, instead of this table
     /// re-deciding that identity question on raw bytes. **On a fold-collision, the pre-existing
@@ -1334,7 +1334,7 @@ impl Store {
     /// **Identity is by [`crate::confine::fold_key`], not by the literal `subpath` string**
     /// (SCHEMA_V7) — both the existing-row lookup and the upsert's conflict target key on
     /// `fold_subpath`, inheriting DESIGN.md §A4b's case/Unicode-fold overwrite rule
-    /// (`docs/DESIGN.md:370-371`) from the same function every other name comparison in this
+    /// (`docs/DESIGN.md:372-373`) from the same function every other name comparison in this
     /// crate already uses, instead of the ledger re-deciding that identity question on raw bytes.
     /// The literal `subpath` column is still stored and still reported back to callers — on a
     /// conflict it is overwritten to `excluded.subpath`, i.e. the newly-written spelling, so the

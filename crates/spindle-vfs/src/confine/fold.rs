@@ -24,7 +24,7 @@ use unicode_normalization::UnicodeNormalization;
 /// *different* keys and are different names. td-47d24d's predecessor implementation got this
 /// backwards — its hand-rolled table didn't normalize, it *stripped* combining marks outright,
 /// so `"café"`, `"cafe\u{0301}"`, and plain `"cafe"` all collided. That is broader than
-/// DESIGN.md:370-371's "collides under Unicode normalization" rule actually promises (which is
+/// DESIGN.md:372-373's "collides under Unicode normalization" rule actually promises (which is
 /// about one name's NFC/NFD spellings, not about treating `é` and `e` as the same letter), and
 /// it was a real hazard: an upload literally named `resume.pdf` could silently overwrite an
 /// owner's `résumé.pdf`. The fix closes both directions at once — folding now covers every
