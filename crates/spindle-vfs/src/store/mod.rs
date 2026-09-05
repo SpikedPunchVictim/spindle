@@ -142,6 +142,22 @@ pub enum StoreError {
     #[error("device {0} not found")]
     DeviceNotFound(Fingerprint),
 
+    /// [`Store::repair_device_keys`]'s fail-fast check: `device_fp` is `H(DEVICE_FP_DOMAIN,
+    /// alg_id, sign_pk, agree_pk)` (`spindle_core::identity::device_fp_of`), so a device's keys
+    /// are determined by its fingerprint. If the supplied keys do not rehash to `device_fp`, they
+    /// are simply the wrong keys for this device (transposed, corrupted, or belonging to a
+    /// different device entirely) — not a storage failure, and not something a caller should
+    /// retry against this store. `authorize.rs` performs the identical rehash independently at
+    /// connect time and would have denied the connection anyway; this variant exists so an
+    /// operator learns the mistake at repair time, by name, instead of as an indistinguishable
+    /// silent deny later.
+    #[error(
+        "supplied keys do not rehash to device {device_fp}'s own device_fp; these are the wrong \
+         keys for this device (device_fp = H(DEVICE_FP_DOMAIN, alg_id, sign_pk, agree_pk), so \
+         the keys are determined by the fingerprint)"
+    )]
+    DeviceKeyBindingMismatch { device_fp: Fingerprint },
+
     /// DESIGN.md §A4b member status: "invited|active|revoked"; revoked is terminal.
     #[error(
         "invalid member status transition {from:?} -> {to:?} (DESIGN.md §A4b: revoked is \
@@ -603,6 +619,80 @@ impl Store {
                 keys.map(|k| k.agree_pk.clone()),
             ],
         )?;
+        Ok(())
+    }
+
+    /// Repairs a device row's stored key halves — the primitive `SCHEMA_V4`'s un-backfilled
+    /// `agree_pk` column left missing (td-b2c16b). A device row written before `SCHEMA_V4` has
+    /// `agree_pk = NULL` and is permanently denied by `authorize.rs`'s fail-closed "either key
+    /// missing" check (correct, deliberate, and untouched by this method) — but until now there
+    /// was no way to *fix* such a row: `add_device` fails with `UNIQUE constraint failed:
+    /// devices.device_fp` on a device that already exists, and no setter existed for its key
+    /// columns. This is that setter.
+    ///
+    /// Unlike a plain setter, this method verifies the `device_fp` binding before writing
+    /// anything: it parses `keys.sign_pk`/`keys.agree_pk` and recomputes
+    /// `spindle_core::identity::device_fp_of(ALG_ID_V1, &sign_pk, &agree_pk)`, refusing with
+    /// [`StoreError::DeviceKeyBindingMismatch`] unless that equals `device_fp`. `device_fp` is
+    /// `H(DEVICE_FP_DOMAIN, alg_id, sign_pk, agree_pk)`
+    /// (`spindle_core::identity::device_fp_of`), so the keys are *determined* by the fingerprint —
+    /// checking the binding means this method is structurally incapable of writing keys that do
+    /// not rehash to the very `device_fp` naming the row, closing the same transposition hazard
+    /// [`Store::add_device`]'s doc comment warns about ("an accidental transposition of two
+    /// same-typed byte slices is not a type error"). A useful side effect of checking the binding
+    /// rather than trusting the caller: this method can repair a row that already has *wrong* key
+    /// bytes on file, not only a `NULL` row, because the check accepts exactly the one key pair
+    /// that is correct for `device_fp` and rejects everything else, including whatever wrong bytes
+    /// were there before.
+    ///
+    /// This does not change fail-closed authorization at all — `authorize.rs` already rehashes
+    /// this same binding independently and denies on mismatch, with or without this method
+    /// existing. The point of checking here too is fail-*fast*: an operator repairing a device
+    /// with the wrong keys learns that immediately, as a named error, rather than discovering it
+    /// later at connect time as a deny indistinguishable from any other deny.
+    ///
+    /// `alg_id` is hardcoded to `ALG_ID_V1` because the `devices` table does not persist `alg_id`
+    /// — exactly the assumption `authorize.rs` already makes when it authorizes a connection.
+    /// td-6c01e3 tracks adding a persisted `alg_id` column; if it lands, this method should read
+    /// `alg_id` from the row instead of assuming it.
+    ///
+    /// Deliberately out of scope: `add_device` is not changed to perform this same binding check.
+    /// A caller can still enroll a device whose stored keys do not rehash to its `device_fp`
+    /// (store/mod.rs's own tests exercise exactly that, storing deliberate junk key bytes to
+    /// verify byte-for-byte round-tripping); closing that mirror-path half of this bug class is
+    /// its own decision, not folded into this repair primitive.
+    pub fn repair_device_keys(
+        &self,
+        device_fp: Fingerprint,
+        keys: &DevicePublicKeys,
+    ) -> Result<(), StoreError> {
+        let sign_pk_arr: [u8; 32] = keys
+            .sign_pk
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::DeviceKeyBindingMismatch { device_fp })?;
+        let sign_pk = spindle_core::VerifyingKey::from_bytes(&sign_pk_arr)
+            .map_err(|_| StoreError::DeviceKeyBindingMismatch { device_fp })?;
+        let agree_pk_arr: [u8; 32] = keys
+            .agree_pk
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::DeviceKeyBindingMismatch { device_fp })?;
+        let agree_pk = spindle_core::X25519PublicKey::from(agree_pk_arr);
+
+        if spindle_core::identity::device_fp_of(spindle_core::ALG_ID_V1, &sign_pk, &agree_pk)
+            != device_fp
+        {
+            return Err(StoreError::DeviceKeyBindingMismatch { device_fp });
+        }
+
+        let changed = self.conn.execute(
+            "UPDATE devices SET sign_pk = ?1, agree_pk = ?2 WHERE device_fp = ?3",
+            params![keys.sign_pk, keys.agree_pk, device_fp.to_vec()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::DeviceNotFound(device_fp));
+        }
         Ok(())
     }
 
@@ -2822,6 +2912,207 @@ mod tests {
             ),
             "test fixture sanity: DeviceKey::device_fp must equal device_fp_of over its own keys"
         );
+    }
+
+    // ---- Devices: repair_device_keys (td-b2c16b) ----
+
+    #[test]
+    fn repair_device_keys_fills_in_a_pre_schema_v4_row_that_was_added_with_none_keys() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let dev = spindle_core::identity::DeviceKey::from_seeds([0x40; 32], [0x41; 32]);
+        let device_fp = dev.device_fp();
+        store
+            .add_device(member_id, device_fp, "Laptop", 0, None)
+            .expect("add_device with no keys, simulating a pre-SCHEMA_V4 row");
+
+        let keys = DevicePublicKeys {
+            sign_pk: dev.sign_public_key().as_bytes().to_vec(),
+            agree_pk: dev.agree_public_key().as_bytes().to_vec(),
+        };
+        store
+            .repair_device_keys(device_fp, &keys)
+            .expect("repair_device_keys must accept the keys the fingerprint was computed from");
+
+        let member = store
+            .member_for_device_fp(device_fp)
+            .expect("lookup")
+            .expect("device is known");
+        let device = member
+            .devices
+            .iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("owning member's devices include the repaired device");
+        assert_eq!(device.sign_pk.as_deref(), Some(keys.sign_pk.as_slice()));
+        assert_eq!(device.agree_pk.as_deref(), Some(keys.agree_pk.as_slice()));
+    }
+
+    #[test]
+    fn repair_device_keys_rejects_keys_that_do_not_rehash_to_the_device_fp_and_writes_nothing() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let dev1 = spindle_core::identity::DeviceKey::from_seeds([0x50; 32], [0x51; 32]);
+        let dev2 = spindle_core::identity::DeviceKey::from_seeds([0x52; 32], [0x53; 32]);
+        let device_fp = dev1.device_fp();
+        store
+            .add_device(member_id, device_fp, "Laptop", 0, None)
+            .expect("add_device with no keys");
+
+        // dev2's sign_pk paired with dev1's agree_pk does not rehash to dev1's device_fp — both
+        // halves parse fine, so this exercises the binding check itself, not a parse failure.
+        let mismatched_keys = DevicePublicKeys {
+            sign_pk: dev2.sign_public_key().as_bytes().to_vec(),
+            agree_pk: dev1.agree_public_key().as_bytes().to_vec(),
+        };
+        let err = store
+            .repair_device_keys(device_fp, &mismatched_keys)
+            .expect_err("keys that don't rehash to device_fp must be rejected");
+        assert!(
+            matches!(err, StoreError::DeviceKeyBindingMismatch { device_fp: fp } if fp == device_fp),
+            "expected DeviceKeyBindingMismatch for {device_fp}, got {err:?}"
+        );
+
+        let member = store
+            .member_for_device_fp(device_fp)
+            .expect("lookup")
+            .expect("device is known");
+        let device = member
+            .devices
+            .iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("owning member's devices include the device");
+        assert_eq!(
+            device.sign_pk, None,
+            "a rejected repair must not write the sign_pk half"
+        );
+        assert_eq!(
+            device.agree_pk, None,
+            "a rejected repair must not write the agree_pk half"
+        );
+    }
+
+    #[test]
+    fn repair_device_keys_fixes_a_row_that_already_has_wrong_key_bytes_on_file() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let dev = spindle_core::identity::DeviceKey::from_seeds([0x60; 32], [0x61; 32]);
+        let device_fp = dev.device_fp();
+        store
+            .add_device(
+                member_id,
+                device_fp,
+                "Laptop",
+                0,
+                Some(&DevicePublicKeys {
+                    sign_pk: vec![0xAB; 32],
+                    agree_pk: vec![0xCD; 32],
+                }),
+            )
+            .expect("add_device with wrong key bytes on file");
+
+        let correct_keys = DevicePublicKeys {
+            sign_pk: dev.sign_public_key().as_bytes().to_vec(),
+            agree_pk: dev.agree_public_key().as_bytes().to_vec(),
+        };
+        store
+            .repair_device_keys(device_fp, &correct_keys)
+            .expect("supplying the correct keys must repair a row that has wrong keys on file");
+
+        let member = store
+            .member_for_device_fp(device_fp)
+            .expect("lookup")
+            .expect("device is known");
+        let device = member
+            .devices
+            .iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("owning member's devices include the repaired device");
+        assert_eq!(
+            device.sign_pk.as_deref(),
+            Some(correct_keys.sign_pk.as_slice())
+        );
+        assert_eq!(
+            device.agree_pk.as_deref(),
+            Some(correct_keys.agree_pk.as_slice())
+        );
+    }
+
+    #[test]
+    fn repair_device_keys_on_a_device_fp_that_was_never_added_returns_device_not_found() {
+        let store = Store::open_in_memory().expect("open");
+        let dev = spindle_core::identity::DeviceKey::from_seeds([0x70; 32], [0x71; 32]);
+        let device_fp = dev.device_fp();
+        let keys = DevicePublicKeys {
+            sign_pk: dev.sign_public_key().as_bytes().to_vec(),
+            agree_pk: dev.agree_public_key().as_bytes().to_vec(),
+        };
+
+        let err = store
+            .repair_device_keys(device_fp, &keys)
+            .expect_err("repairing a device_fp that was never added must fail");
+        assert!(
+            matches!(err, StoreError::DeviceNotFound(fp) if fp == device_fp),
+            "expected DeviceNotFound({device_fp}), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn repair_device_keys_converges_on_the_same_row_add_device_with_correct_keys_would_have_stored()
+    {
+        let dev = spindle_core::identity::DeviceKey::from_seeds([0x80; 32], [0x81; 32]);
+        let device_fp = dev.device_fp();
+        let keys = DevicePublicKeys {
+            sign_pk: dev.sign_public_key().as_bytes().to_vec(),
+            agree_pk: dev.agree_public_key().as_bytes().to_vec(),
+        };
+
+        // Path A: a pre-SCHEMA_V4 row (added with no keys), then repaired.
+        let repaired_store = Store::open_in_memory().expect("open");
+        let repaired_member = repaired_store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        repaired_store
+            .add_device(repaired_member, device_fp, "Laptop", 0, None)
+            .expect("add_device with no keys");
+        repaired_store
+            .repair_device_keys(device_fp, &keys)
+            .expect("repair with the correct keys");
+        let repaired = repaired_store
+            .member_for_device_fp(device_fp)
+            .expect("lookup")
+            .expect("device is known")
+            .devices
+            .into_iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("repaired device present");
+
+        // Path B: freshly enrolled directly with the correct keys.
+        let enrolled_store = Store::open_in_memory().expect("open");
+        let enrolled_member = enrolled_store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        enrolled_store
+            .add_device(enrolled_member, device_fp, "Laptop", 0, Some(&keys))
+            .expect("add_device with correct keys");
+        let enrolled = enrolled_store
+            .member_for_device_fp(device_fp)
+            .expect("lookup")
+            .expect("device is known")
+            .devices
+            .into_iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("directly-enrolled device present");
+
+        assert_eq!(repaired.device_fp, enrolled.device_fp);
+        assert_eq!(repaired.sign_pk, enrolled.sign_pk);
+        assert_eq!(repaired.agree_pk, enrolled.agree_pk);
+        assert_eq!(repaired.revoked, enrolled.revoked);
     }
 
     #[test]
