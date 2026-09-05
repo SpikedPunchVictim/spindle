@@ -149,7 +149,8 @@ says ICE losses are "tolerated/retried" — a retried ICE envelope either reuses
 a receiver must reject as replay) or burns a new one (making the retry a different envelope);
 gaps are permitted by "strictly increasing" but reordering is not. This likely needs a §A6/§A7
 amendment once the spike settles it.
-**Note**: 2026-08-31 slice progress. Slices 1-3 are complete; slice 4 has not started.
+**Note**: 2026-08-31 slice progress. Slices 1-3 are complete and slice 4 is in progress — see
+the 2026-09-02 note below.
 - **Slice 1 (spike S2)** — done. Leg A steps A and B both ran against the composed stack:
   step A 8/8 checks, step B a full trickle-ICE-to-QUIC connect with medians (n=7, loopback)
   of 14.65 ms offer->answer, 7.15 ms answer->ICE-selected, 3.62 ms selected->QUIC-complete,
@@ -188,7 +189,37 @@ amendment once the spike settles it.
   1's step-B numbers because it is the same loopback rig.
 - **Still unproven**: ICE is loopback-only (coturn is up in the compose stack but unused,
   so no NAT is traversed); S2's across-NATs number still does not exist; `seq` under real
-  reordering is still unmeasured; and slice 4 has not started.
+  reordering is still unmeasured.
+**Note**: 2026-09-02 slice 4 progress. S9 is MET; S14 and S18 remain.
+- **Slice 4** began at commit `aceafb9` ("Stage 5 slice 4: live S9 test — revoke -> kick ->
+  reject under the < 5 s bar"), followed by `3ad8070` ("Fix two false-greens in the live S9
+  reject leg"), `532f67f` ("Stage 5 slice 4: spindle-hostd + spindle-test-fixtures crates")
+  and `6f29890` ("Stage 5 slice 4: live test driving the production authorizer").
+- **S9 is met.** The test is
+  `live_revocation_kicks_and_then_refuses_the_devices_reconnect_within_the_five_second_bar`
+  at `crates/spindle-net/tests/live_signaling.rs:750`, `#[ignore]`d, driven against the
+  composed `deploy/docker-compose.yml` stack. Measured 2026-09-02: revoke publish -> confirmed
+  KICK **263.7 ms**; revoke publish -> reconnect conclusively refused **272.5 ms**; against
+  S9's 5000 ms bar.
+- The subtlety that makes the test meaningful: a kicked NATS client auto-reconnects on its
+  own, so a kick alone cuts nobody off. The load-bearing assertion is that a brand-new connect
+  presenting the same now-revoked identity is refused by the callout (t1), and that
+  t1 - t0 < 5 s. The kick advisory only counts when its `reason` is exactly `"Kicked"` —
+  `"Client Closed"` is not a kick, and `spikes/s9-revoke-kick/RESULTS.md` was bitten by
+  exactly that false green.
+- Also proven live on the same 2026-09-02 run: `crates/spindle-hostd/tests/live_hostd.rs`
+  (2 tests) drives the production `HostConnectAuthorizer` over `SqliteDeviceLookup` against
+  the real stack — the first execution of that authorizer outside its own unit tests.
+- S2 numbers re-measured on that run, n=5 medians, loopback: 4.65 ms offer->answer, 4.26 ms
+  answer->ICE-selected, 2.77 ms selected->QUIC, **12.33 ms offer->usable stream**. This is the
+  loopback rig, so it does NOT satisfy S2's across-NATs leg — that number still does not exist.
+- **Remaining in slice 4**: S14 (revoke while host offline; tracked as td-b5d50c) and S18
+  (cap lifecycle: expiry -> connect-only -> E2E re-issue, device bootstrap state bundle,
+  second-device refetch; tracked as td-c74122). Stage 5 cannot be marked Complete until both
+  land.
+- **Forward-looking**: Stage 7's success criterion S15 ("backs up phrase; adds a second
+  device; recovers on a fresh device unaided") is the usability test of S18's machinery, so
+  S18 is a hard prerequisite for S15 and therefore for Stage 7's completion.
 
 ## Stage 6: spindle-vfs + host-core
 **Goal**: Implement the shares/groups/entitlements engine and the VFS RPC server in

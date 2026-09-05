@@ -8,6 +8,13 @@ It runs against the composed reference deployment (`deploy/docker-compose.yml`'s
 restarted/rebuilt/torn down for this spike). **The full S9 end-to-end revoke → kick → reject
 timing run is a later step, not attempted here.**
 
+[**Amendment, 2026-09-04**: that later step has since happened. It was built as
+`live_revocation_kicks_and_then_refuses_the_devices_reconnect_within_the_five_second_bar` in
+`crates/spindle-net/tests/live_signaling.rs:750` and run against the composed stack on
+2026-09-02, measuring 263.7 ms revoke -> confirmed KICK and 272.5 ms revoke -> reconnect
+conclusively refused, against the 5000 ms bar. So S9's actual deliverable is met; this spike
+settled the wire mechanics it depends on.]
+
 ## Method
 
 `spikes/s9-revoke-kick/src/main.rs`: a standalone throwaway binary (no fixtures reused — this
@@ -262,4 +269,5 @@ trusted its bottom-line verdict instead of reading the raw evidence above it.
   here at all — this spike only proves the wire mechanics work; it does not exercise the helper's
   own revocation-store lookup, does not measure end-to-end latency from a revocation write to the
   target's connection actually dropping, and does not test the callout's refusal of the
-  auto-reconnect noted above.
+  auto-reconnect noted above. This gap was closed on 2026-09-02 by the live test named in the
+  amendment above; see IMPLEMENTATION_PLAN.md's Stage 5 notes for the measured numbers.
