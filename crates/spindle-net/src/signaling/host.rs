@@ -262,6 +262,11 @@ where
             ufrag: local_ice.ufrag.clone(),
             pwd: local_ice.pwd.clone(),
             cert_fp: cert.fingerprint(),
+            // Populated in td-c74122 slice B, once `ConnectDecision::Allow` carries the cap the
+            // host's authorizer minted. `None` here is not a placeholder for "not implemented":
+            // it is the honest answer for a host with no cap-signing key, which is every host
+            // today (`spindle-hostd/src/main.rs` is a stub pending A4 key custody).
+            member_cap: None,
         };
         let (session_key, answer_env) =
             opened.seal_answer(&self.device, self.device_fp, &answer_payload);

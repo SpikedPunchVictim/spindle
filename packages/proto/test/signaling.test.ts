@@ -24,7 +24,7 @@ import {
   type CborValue as CborValueType,
 } from "../src/canonical.js";
 import { bytesToHex, hexToBytes } from "../src/hex.js";
-import { ProtoError } from "../src/artifacts.js";
+import { CAPABILITY_CURRENT_V, CapKind, Capability, ProtoError } from "../src/artifacts.js";
 import {
   AnswerPayload,
   CERT_FP_LEN,
@@ -233,6 +233,23 @@ function sampleAnswer(): AnswerPayload {
   };
 }
 
+/** A `Capability` with every field populated with distinct, recognizable filler — nested inside
+ * an `AnswerPayload.member_cap` in the tests below. Mirrors `signaling.rs`'s `sample_capability`. */
+function sampleCapability(): Capability {
+  return {
+    v: CAPABILITY_CURRENT_V,
+    host_fp: new Uint8Array(32).fill(0x01),
+    host_root_pk: new Uint8Array(32).fill(0x02),
+    op_cert: new Uint8Array(16).fill(0x03),
+    kind: CapKind.Member,
+    subject: new Uint8Array(32).fill(0x04),
+    cap_epoch: 7n,
+    exp: 1_800_000_000n,
+    nonce: new Uint8Array(16).fill(0x05),
+    sig: new Uint8Array(64).fill(0x06),
+  };
+}
+
 describe("round trips (signaling.rs parity)", () => {
   it("offer round-trips both transports", () => {
     for (const transport of [Transport.Quic, Transport.WebRtc]) {
@@ -250,6 +267,78 @@ describe("round trips (signaling.rs parity)", () => {
       const decoded = AnswerPayload.fromCanonicalBytes(bytes);
       expect(normalize(decoded)).toEqual(normalize(answer));
     }
+  });
+
+  it("answer round-trips with member_cap present", () => {
+    const answer: AnswerPayload = { ...sampleAnswer(), member_cap: sampleCapability() };
+    const bytes = AnswerPayload.toCanonicalBytes(answer);
+    const decoded = AnswerPayload.fromCanonicalBytes(bytes);
+    expect(normalize(decoded)).toEqual(normalize(answer));
+  });
+
+  it("answer round-trips with member_cap absent and omits the key", () => {
+    const answer: AnswerPayload = { ...sampleAnswer(), member_cap: undefined };
+    const bytes = AnswerPayload.toCanonicalBytes(answer);
+    const decoded = AnswerPayload.fromCanonicalBytes(bytes);
+    expect(normalize(decoded)).toEqual(normalize(answer));
+
+    // `member_cap` must be omitted (key omission), not encoded as CBOR null — decode the encoded
+    // bytes back into a CborValue tree and assert the key is genuinely absent, rather than
+    // grepping the byte string (a `null`-emitting implementation would still round-trip above, so
+    // that assertion alone would not catch it).
+    const decodedCbor = canonicalDecode(bytes);
+    if (decodedCbor.kind !== "map") throw new Error("expected a map");
+    expect(decodedCbor.value.some(([k]) => k.kind === "text" && k.value === "member_cap")).toBe(
+      false,
+    );
+  });
+
+  it("rejects a null member_cap", () => {
+    // The optional-field convention is key omission, never CBOR `null` — an answer whose
+    // `member_cap` is explicitly `null` must be rejected, not silently treated as absent.
+    const cbor = AnswerPayload.toCbor({ ...sampleAnswer(), member_cap: sampleCapability() });
+    if (cbor.kind !== "map") throw new Error("expected a map");
+    const mutatedEntries: Array<[CborValueType, CborValueType]> = cbor.value.map(([k, v]) =>
+      k.kind === "text" && k.value === "member_cap" ? [k, CborValue.null()] : [k, v],
+    );
+    const bytes = canonicalEncode({ kind: "map", value: mutatedEntries });
+    const err = expectThrows(SignalingError, () => AnswerPayload.fromCanonicalBytes(bytes));
+    expect(err.kind).toBe("Proto");
+    expect(err.protoError?.kind).toBe("NotAMap");
+  });
+
+  it("rejects an unrecognized field on answer", () => {
+    const cbor = AnswerPayload.toCbor(sampleAnswer());
+    const mutated = addUnknownKey(cbor, "bogus", CborValue.uint(0));
+    const err = expectThrows(SignalingError, () => AnswerPayload.fromCanonicalBytes(mutated));
+    expect(err.kind).toBe("Proto");
+    expect(err.protoError?.kind).toBe("UnknownField");
+    expect(err.protoError?.field).toBe("bogus");
+  });
+
+  it("rejects a malformed member_cap instead of silently dropping it", () => {
+    // A `member_cap` whose nested Capability map is missing a required field must surface as a
+    // decode error, not be swallowed into `undefined` — an implementation that caught and
+    // discarded the inner error would turn a corrupt cap into "no cap", a silent-downgrade bug
+    // indistinguishable on the wire from a host that legitimately had no cap to give.
+    const capCbor = Capability.toCbor(sampleCapability());
+    if (capCbor.kind !== "map") throw new Error("expected a map");
+    const prunedCap: CborValueType = {
+      kind: "map",
+      value: capCbor.value.filter(([k]) => !(k.kind === "text" && k.value === "sig")),
+    };
+    const cbor = CborValue.map([
+      ["transport", CborValue.uint(Transport.WebRtc)],
+      ["ufrag", CborValue.text("hostufrag1")],
+      ["pwd", CborValue.text("hostpassword1234567890abcd")],
+      ["cert_fp", CborValue.bytes(fp(0x22))],
+      ["member_cap", prunedCap],
+    ]);
+    const bytes = canonicalEncode(cbor);
+    const err = expectThrows(SignalingError, () => AnswerPayload.fromCanonicalBytes(bytes));
+    expect(err.kind).toBe("Proto");
+    expect(err.protoError?.kind).toBe("MissingField");
+    expect(err.protoError?.field).toBe("sig");
   });
 
   it("ice round-trips a real candidate", () => {

@@ -1294,28 +1294,70 @@ fn signaling_vectors() -> Json {
         ),
     ];
 
+    // The member cap embedded in `answer_quic_with_member_cap` below — the host's re-issued
+    // capability for this device's root, carried per DESIGN.md §A4/:286's opportunistic-refresh
+    // rule and :289-290's renewal-in-the-reply path (see `AnswerPayload::member_cap`'s doc
+    // comment). `spindle-proto` has no crypto dependency, so `sig`/`op_cert` here are the same
+    // kind of dummy byte pattern every other such field in this file uses (see module docs), not
+    // a valid signature/cert chain.
+    let answer_member_cap = Capability {
+        v: 1,
+        host_fp: rep(0x60, 32),
+        host_root_pk: rep(0x61, 32),
+        op_cert: rep(0x62, 16),
+        kind: CapKind::Member,
+        subject: rep(0x63, 32),
+        cap_epoch: 3,
+        exp: 1_759_017_600,
+        nonce: rep(0x64, 16),
+        sig: rep(0x65, 64),
+    };
+
     let answers = vec![
         signaling_case(
             "answer_quic",
             "Host connect answer for a native↔native QUIC session — mirrors the offer's \
              transport/ufrag/pwd/cert_fp shape, minus `inbox` (the answer travels as the \
-             `connect` request's own reply, needing no reply-subject of its own).",
+             `connect` request's own reply, needing no reply-subject of its own). `member_cap` \
+             absent (key omission, not CBOR null) — the host had no cap-signing key available to \
+             mint one this session.",
             AnswerPayload {
                 transport: Transport::Quic,
                 ufrag: "9pQr".to_string(),
                 pwd: "zL4mNq82vwTsYbXeR1oPdCkH".to_string(),
                 cert_fp: rep32(0xdd),
+                member_cap: None,
             }
             .to_cbor(),
         ),
         signaling_case(
             "answer_webrtc",
-            "Host connect answer for a WebRTC session.",
+            "Host connect answer for a WebRTC session. `member_cap` absent (key omission, not \
+             CBOR null).",
             AnswerPayload {
                 transport: Transport::WebRtc,
                 ufrag: "2FgH".to_string(),
                 pwd: "vB6nKq93wRtYcXsE2pQdAjLm".to_string(),
                 cert_fp: rep32(0xee),
+                member_cap: None,
+            }
+            .to_cbor(),
+        ),
+        signaling_case(
+            "answer_quic_with_member_cap",
+            "Host connect answer carrying a re-issued `member_cap` (DESIGN.md §A4/:286's \
+             opportunistic-refresh rule: member caps are \"refreshed opportunistically on every \
+             successful session\"; :289-290's renewal-in-the-reply path for a \
+             connect-only-permissioned device presenting an expired-but-signature-valid cap). \
+             Present on every successful answer the host can mint one for — this is the only \
+             shape of case that distinguishes `AnswerPayload` from the pre-A4-refresh wire \
+             format.",
+            AnswerPayload {
+                transport: Transport::Quic,
+                ufrag: "9pQr".to_string(),
+                pwd: "zL4mNq82vwTsYbXeR1oPdCkH".to_string(),
+                cert_fp: rep32(0xdd),
+                member_cap: Some(answer_member_cap),
             }
             .to_cbor(),
         ),

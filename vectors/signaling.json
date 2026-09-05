@@ -185,7 +185,7 @@
   "answers": [
     {
       "name": "answer_quic",
-      "description": "Host connect answer for a native↔native QUIC session — mirrors the offer's transport/ufrag/pwd/cert_fp shape, minus `inbox` (the answer travels as the `connect` request's own reply, needing no reply-subject of its own).",
+      "description": "Host connect answer for a native↔native QUIC session — mirrors the offer's transport/ufrag/pwd/cert_fp shape, minus `inbox` (the answer travels as the `connect` request's own reply, needing no reply-subject of its own). `member_cap` absent (key omission, not CBOR null) — the host had no cap-signing key available to mint one this session.",
       "decoded": {
         "type": "map",
         "value": [
@@ -235,7 +235,7 @@
     },
     {
       "name": "answer_webrtc",
-      "description": "Host connect answer for a WebRTC session.",
+      "description": "Host connect answer for a WebRTC session. `member_cap` absent (key omission, not CBOR null).",
       "decoded": {
         "type": "map",
         "value": [
@@ -282,6 +282,167 @@
         ]
       },
       "canonical_cbor_hex": "a46370776478187642366e4b713933775274596358734532705164416a4c6d657566726167643246674867636572745f66705820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee697472616e73706f727401"
+    },
+    {
+      "name": "answer_quic_with_member_cap",
+      "description": "Host connect answer carrying a re-issued `member_cap` (DESIGN.md §A4/:286's opportunistic-refresh rule: member caps are \"refreshed opportunistically on every successful session\"; :289-290's renewal-in-the-reply path for a connect-only-permissioned device presenting an expired-but-signature-valid cap). Present on every successful answer the host can mint one for — this is the only shape of case that distinguishes `AnswerPayload` from the pre-A4-refresh wire format.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "transport"
+            },
+            "value": {
+              "type": "uint",
+              "value": 0
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "ufrag"
+            },
+            "value": {
+              "type": "text",
+              "value": "9pQr"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "pwd"
+            },
+            "value": {
+              "type": "text",
+              "value": "zL4mNq82vwTsYbXeR1oPdCkH"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cert_fp"
+            },
+            "value": {
+              "type": "bytes",
+              "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "member_cap"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "v"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_fp"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "6060606060606060606060606060606060606060606060606060606060606060"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_root_pk"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "6161616161616161616161616161616161616161616161616161616161616161"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "op_cert"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "62626262626262626262626262626262"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "subject"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "6363636363636363636363636363636363636363636363636363636363636363"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "cap_epoch"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 3
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "exp"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1759017600
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "nonce"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "64646464646464646464646464646464"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "sig"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "65656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a56370776478187a4c346d4e713832767754735962586552316f5064436b48657566726167643970517267636572745f66705820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd697472616e73706f7274006a6d656d6265725f636170aa617601636578701a68d87a8063736967584065656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565646b696e6401656e6f6e6365506464646464646464646464646464646467686f73745f667058206060606060606060606060606060606060606060606060606060606060606060676f705f636572745062626262626262626262626262626262677375626a65637458206363636363636363636363636363636363636363636363636363636363636363696361705f65706f6368036c686f73745f726f6f745f706b58206161616161616161616161616161616161616161616161616161616161616161"
     }
   ],
   "ice": [

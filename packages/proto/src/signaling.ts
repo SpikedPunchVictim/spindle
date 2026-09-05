@@ -17,7 +17,7 @@
 // from `crates/spindle-proto/src/signaling.rs` and cross-checked against every case in
 // `vectors/signaling.json` (see `test/signaling.test.ts`).
 
-import { MapReader, ProtoError, decodeCanonicalOrThrow } from "./artifacts.js";
+import { Capability, MapReader, ProtoError, decodeCanonicalOrThrow } from "./artifacts.js";
 import { CborValue, canonicalEncode } from "./canonical.js";
 
 /** Length of a `cert_fp` field in bytes — a SHA-256 digest (DESIGN.md §A10.32). */
@@ -226,24 +226,41 @@ export const OfferPayload = {
 
 /** The host's connect answer (DESIGN.md §A6: `env{eph_pk_h, answer, ...}`) — mirrors Rust's
  * `AnswerPayload`. Mirrors `OfferPayload`'s fields minus `inbox` (the answer travels as the
- * `connect` request's own reply). */
+ * `connect` request's own reply).
+ *
+ * `member_cap` is the host's current `Capability` for this device's root, included on **every**
+ * successful answer — DESIGN.md §A4/:286's member caps are "refreshed opportunistically on every
+ * successful session", and this is the only channel a connect-only device (an
+ * expired-but-signature-valid cap earns connect-only NATS permissions, per DESIGN.md:289-290) can
+ * ever receive a re-issued cap over: it can reach `host.<h>.connect` and read the sealed answer on
+ * its own inbox, and nothing else — never ICE, never QUIC. DESIGN.md:289-290: "the host verifies
+ * the device over the E2E channel and re-issues the current cap in the reply." There is no
+ * staleness negotiation; the host always includes its current cap when it has one to give.
+ * `undefined` only when the host has no cap-signing key available to mint one — which is why this
+ * is optional on the wire rather than mandatory. Represented by key omission when absent, never
+ * CBOR null — same convention as `IcePayload.candidate`/`Envelope.eph_pk`. */
 export interface AnswerPayload {
   transport: Transport;
   ufrag: string;
   pwd: string;
   cert_fp: Uint8Array;
+  member_cap?: Capability;
 }
 
-const ANSWER_FIELDS = ["transport", "ufrag", "pwd", "cert_fp"] as const;
+const ANSWER_FIELDS = ["transport", "ufrag", "pwd", "cert_fp", "member_cap"] as const;
 
 export const AnswerPayload = {
   toCbor(p: AnswerPayload): CborValue {
-    return CborValue.map([
+    const entries: Array<[string, CborValue]> = [
       ["transport", transportToCbor(p.transport)],
       ["ufrag", CborValue.text(p.ufrag)],
       ["pwd", CborValue.text(p.pwd)],
       ["cert_fp", CborValue.bytes(p.cert_fp)],
-    ]);
+    ];
+    if (p.member_cap !== undefined) {
+      entries.push(["member_cap", Capability.toCbor(p.member_cap)]);
+    }
+    return CborValue.map(entries);
   },
 
   toCanonicalBytes(p: AnswerPayload): Uint8Array {
@@ -254,11 +271,14 @@ export const AnswerPayload = {
     return wrapProtoErrors(() => {
       const m = new MapReader(v);
       m.denyUnknownFields(ANSWER_FIELDS);
+      const rawMemberCap = m.get("member_cap");
+      const member_cap = rawMemberCap !== undefined ? Capability.fromCbor(rawMemberCap) : undefined;
       return {
         transport: transportFromU64(m.u64("transport")),
         ufrag: readCappedText(m, "ufrag", MAX_UFRAG_LEN),
         pwd: readCappedText(m, "pwd", MAX_PWD_LEN),
         cert_fp: readCertFp(m),
+        member_cap,
       };
     });
   },

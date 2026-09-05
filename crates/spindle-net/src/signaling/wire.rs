@@ -404,6 +404,7 @@ mod tests {
             ufrag: "hostufrag".to_string(),
             pwd: "hostpassword1234567890abcd".to_string(),
             cert_fp: [0x22; 32],
+            member_cap: None,
         }
     }
 

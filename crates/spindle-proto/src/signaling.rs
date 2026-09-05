@@ -50,6 +50,7 @@
 //! |---|---|
 //! | Wire shape | One flat CBOR map per payload type, field names as short text keys — same convention as every other type in this crate. No shared "kind" discriminant field inside the payload itself: [`KIND_OFFER`]/[`KIND_ANSWER`]/[`KIND_ICE`] are `Envelope.kind` values a caller sets on the *envelope* that carries the payload, not a field of the payload's own CBOR (mirrors the spike's `KIND_OFFER`/`KIND_ANSWER`/`KIND_ICE` constants exactly — DESIGN.md's `Envelope.kind` is already the discriminant DESIGN.md specifies; inventing a second one inside the payload would be redundant). |
 //! | `IcePayload.candidate` | `Option<String>`, represented by key omission when `None` — this crate's established optional-field convention (see `lib.rs`'s schema table; `Envelope.eph_pk` is the precedent), not CBOR `null`. |
+//! | `AnswerPayload.member_cap` | `Option<crate::artifacts::Capability>` (a map nested inside the answer's own map), represented by key omission when `None` — same convention as `IcePayload.candidate`/`Envelope.eph_pk` above, not CBOR `null`. The host's current member cap for this device's root, included on every successful answer (DESIGN.md §A4/:286's opportunistic refresh, :289-290's renewal-in-the-reply path); `None` only when the host has no cap-signing key available to mint one. |
 //! | `IcePayload.end_of_candidates` | Plain `bool`, always present (never omitted) — unlike `candidate`, this field has no "absent" state; the spike's `#[serde(default)]` was a JSON-only convenience with no equivalent needed here since the field is always written. |
 //! | Error type | A dedicated [`SignalingError`] rather than reusing [`crate::artifacts::ProtoError`] directly, because this module's decode strictness needs two rejection kinds `ProtoError` has no variant for: a string field over its length cap, and a fixed-size byte field (`cert_fp`) of the wrong length. [`SignalingError::Proto`] wraps `ProtoError` for every other rejection (missing/unknown field, wrong type, invalid enum, non-canonical CBOR) so the shared [`MapReader`]/`canonical` decoding machinery is reused unchanged, exactly as `vfs_rpc.rs` reuses `ProtoError` itself rather than re-implementing field extraction. |
 
@@ -285,24 +286,43 @@ impl OfferPayload {
 /// [`OfferPayload`]'s new fields exactly (the host's own `ufrag`/`pwd`/`cert_fp`) minus `inbox`
 /// (the answer is delivered as the `connect` request's reply; it needs no reply-subject of its
 /// own).
+///
+/// `member_cap` is the host's current [`crate::artifacts::Capability`] for this device's root,
+/// included on **every** successful answer — DESIGN.md §A4/:286's member caps are "refreshed
+/// opportunistically on every successful session", and this is the only channel a connect-only
+/// device (an expired-but-signature-valid cap earns connect-only NATS permissions, per
+/// DESIGN.md:289-290) can ever receive a re-issued cap over: it can reach `host.<h>.connect` and
+/// read the sealed answer on its own inbox, and nothing else — never ICE, never QUIC. DESIGN.md
+/// :289-290: "the host verifies the device over the E2E channel and re-issues the current cap in
+/// the reply." There is no staleness negotiation; the host always includes its current cap when
+/// it has one to give. `None` only when the host has no cap-signing key available to mint one —
+/// which is why this is optional on the wire rather than mandatory. Represented by key omission
+/// when absent, never CBOR `null` — this crate's established optional-field convention (see the
+/// module doc comment's schema-choices table; [`crate::artifacts::Envelope::eph_pk`] and
+/// [`IcePayload::candidate`] are the precedents).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnswerPayload {
     pub transport: Transport,
     pub ufrag: String,
     pub pwd: String,
     pub cert_fp: [u8; CERT_FP_LEN],
+    pub member_cap: Option<crate::artifacts::Capability>,
 }
 
-const ANSWER_FIELDS: &[&str] = &["transport", "ufrag", "pwd", "cert_fp"];
+const ANSWER_FIELDS: &[&str] = &["transport", "ufrag", "pwd", "cert_fp", "member_cap"];
 
 impl AnswerPayload {
     pub fn to_cbor(&self) -> CborValue {
-        CborValue::map(vec![
+        let mut entries = vec![
             ("transport", self.transport.to_cbor()),
             ("ufrag", CborValue::text(self.ufrag.clone())),
             ("pwd", CborValue::text(self.pwd.clone())),
             ("cert_fp", CborValue::bytes(self.cert_fp.to_vec())),
-        ])
+        ];
+        if let Some(cap) = &self.member_cap {
+            entries.push(("member_cap", cap.to_cbor()));
+        }
+        CborValue::map(entries)
     }
 
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
@@ -312,11 +332,16 @@ impl AnswerPayload {
     pub fn from_cbor(v: &CborValue) -> Result<Self, SignalingError> {
         let m = MapReader::new(v)?;
         m.deny_unknown_fields(ANSWER_FIELDS)?;
+        let member_cap = match m.get("member_cap") {
+            None => None,
+            Some(val) => Some(crate::artifacts::Capability::from_cbor(val)?),
+        };
         Ok(AnswerPayload {
             transport: Transport::from_u64(m.u64("transport")?)?,
             ufrag: read_capped_text(&m, "ufrag", MAX_UFRAG_LEN)?,
             pwd: read_capped_text(&m, "pwd", MAX_PWD_LEN)?,
             cert_fp: read_cert_fp(&m)?,
+            member_cap,
         })
     }
 
@@ -407,6 +432,26 @@ mod tests {
             ufrag: "hostufrag1".to_string(),
             pwd: "hostpassword1234567890abcd".to_string(),
             cert_fp: fp(0x22),
+            member_cap: None,
+        }
+    }
+
+    /// A `Capability` with every field populated with distinct, recognizable filler — nested
+    /// inside an `AnswerPayload.member_cap` in the tests below. Field values are opaque to this
+    /// crate (see `artifacts.rs`'s module doc comment), so any well-typed values exercise the
+    /// nesting; nothing here needs to be cryptographically valid.
+    fn sample_capability() -> crate::artifacts::Capability {
+        crate::artifacts::Capability {
+            v: crate::artifacts::CAPABILITY_CURRENT_V,
+            host_fp: vec![0x01; 32],
+            host_root_pk: vec![0x02; 32],
+            op_cert: vec![0x03; 16],
+            kind: crate::artifacts::CapKind::Member,
+            subject: vec![0x04; 32],
+            cap_epoch: 7,
+            exp: 1_800_000_000,
+            nonce: vec![0x05; 16],
+            sig: vec![0x06; 64],
         }
     }
 
@@ -438,6 +483,104 @@ mod tests {
             assert_eq!(decoded, answer);
             assert_eq!(decoded.to_canonical_bytes(), bytes);
         }
+    }
+
+    #[test]
+    fn answer_round_trips_with_member_cap_present() {
+        let answer = AnswerPayload {
+            member_cap: Some(sample_capability()),
+            ..sample_answer()
+        };
+        let bytes = answer.to_canonical_bytes();
+        let decoded = AnswerPayload::from_canonical_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, answer);
+        assert_eq!(decoded.to_canonical_bytes(), bytes);
+    }
+
+    #[test]
+    fn answer_round_trips_with_member_cap_absent_and_omits_the_key() {
+        let answer = AnswerPayload {
+            member_cap: None,
+            ..sample_answer()
+        };
+        let bytes = answer.to_canonical_bytes();
+        let decoded = AnswerPayload::from_canonical_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, answer);
+        assert_eq!(decoded.to_canonical_bytes(), bytes);
+
+        // `member_cap` must be omitted (key omission), not encoded as CBOR null — decode the
+        // encoded bytes back into a `CborValue` and assert the key is genuinely absent, rather
+        // than grepping the byte string (a `null`-emitting implementation would still round-trip
+        // above, so that assertion alone would not catch it).
+        let decoded_cbor = canonical_decode(&bytes).expect("decode cbor");
+        if let CborValue::Map(entries) = decoded_cbor {
+            assert!(
+                !entries
+                    .iter()
+                    .any(|(k, _)| k.as_text() == Some("member_cap")),
+                "member_cap key must be omitted when None, not present with any value"
+            );
+        } else {
+            panic!("expected a map");
+        }
+    }
+
+    #[test]
+    fn rejects_null_member_cap() {
+        // The optional-field convention is key omission, never CBOR `null` — an answer whose
+        // `member_cap` is explicitly `null` must be rejected, not silently treated as `None`.
+        let mut cbor = AnswerPayload {
+            member_cap: Some(sample_capability()),
+            ..sample_answer()
+        }
+        .to_cbor();
+        if let CborValue::Map(entries) = &mut cbor {
+            for (k, v) in entries.iter_mut() {
+                if k.as_text() == Some("member_cap") {
+                    *v = CborValue::Null;
+                }
+            }
+        }
+        let bytes = canonical_encode(&cbor);
+        let err = AnswerPayload::from_canonical_bytes(&bytes).unwrap_err();
+        assert_eq!(err, SignalingError::Proto(ProtoError::NotAMap));
+    }
+
+    #[test]
+    fn rejects_unknown_field_on_answer() {
+        let mut cbor = sample_answer().to_cbor();
+        if let CborValue::Map(entries) = &mut cbor {
+            entries.push((CborValue::text("bogus"), CborValue::uint(1)));
+        }
+        let bytes = canonical_encode(&cbor);
+        let err = AnswerPayload::from_canonical_bytes(&bytes).unwrap_err();
+        assert_eq!(
+            err,
+            SignalingError::Proto(ProtoError::UnknownField("bogus".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_member_cap_instead_of_silently_dropping_it() {
+        // A `member_cap` whose nested Capability map is missing a required field must surface as
+        // a decode error, not be swallowed into `None` — an implementation using `.ok()` instead
+        // of `?` on the inner `Capability::from_cbor` call would turn a corrupt cap into "no
+        // cap", a silent-downgrade bug indistinguishable on the wire from a host that legitimately
+        // had no cap to give.
+        let mut cap_cbor = sample_capability().to_cbor();
+        if let CborValue::Map(entries) = &mut cap_cbor {
+            entries.retain(|(k, _)| k.as_text() != Some("sig")); // drop a required field
+        }
+        let cbor = CborValue::map(vec![
+            ("transport", Transport::WebRtc.to_cbor()),
+            ("ufrag", CborValue::text("hostufrag1")),
+            ("pwd", CborValue::text("hostpassword1234567890abcd")),
+            ("cert_fp", CborValue::bytes(fp(0x22).to_vec())),
+            ("member_cap", cap_cbor),
+        ]);
+        let bytes = canonical_encode(&cbor);
+        let err = AnswerPayload::from_canonical_bytes(&bytes).unwrap_err();
+        assert_eq!(err, SignalingError::Proto(ProtoError::MissingField("sig")));
     }
 
     #[test]
