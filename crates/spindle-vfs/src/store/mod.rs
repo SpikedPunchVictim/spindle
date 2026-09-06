@@ -821,6 +821,66 @@ impl Store {
         self.get_member(MemberId(member_id as u64))
     }
 
+    /// Reads `device_fp`'s owning member and the host's `cap_epoch` as one consistent snapshot —
+    /// the only correct way to gather both values when a caller is about to mint a capability
+    /// from them (`spindle-host-core::authorize::DeviceLookup::member_and_cap_epoch`'s doc comment
+    /// spells out the exploit this closes: a member snapshot from before a revoke, paired with a
+    /// `cap_epoch` from after it, is indistinguishable from a legitimately fresh capability).
+    ///
+    /// This exists here, and cannot be built by a caller in `spindle-host-core`, because a
+    /// `Mutex<Store>` around two separate calls is **not** a snapshot: `Store` wraps a single
+    /// rusqlite `Connection`, and `spindle-hostd` deliberately opens multiple independent
+    /// connections to the same database file (its module doc comment explains why). Two
+    /// autocommit statements — even issued back-to-back while holding an in-process lock — each
+    /// release SQLite's SHARED lock the instant they finish (this repo runs default rollback-
+    /// journal mode; nothing sets `journal_mode`), so one of `Store::revoke_member_and_bump_epoch`
+    /// / `Store::revoke_device_and_bump_epoch` committing on a *different* connection can land in
+    /// the gap between the two reads. The in-process mutex never sees that commit — it only ever
+    /// excludes other threads holding the *same* `Store` handle, not other connections to the same
+    /// file — so it cannot close this race no matter how it's held. The fix has to be a real
+    /// database-level transaction, and `Store::connection()` is `pub(crate)` (this file only), so
+    /// this method is the only place that can wrap the reads correctly.
+    ///
+    /// The transaction also fixes a second, smaller inconsistency for free:
+    /// [`Store::member_for_device_fp`] is itself multi-statement (a device-to-member-id lookup,
+    /// then [`Store::get_member`], which itself issues separate queries for the member row, its
+    /// devices, and its groups), so outside of a transaction it could already return an internally
+    /// torn `Member` if another connection's write landed mid-sequence. Wrapping the whole read in
+    /// one `unchecked_transaction` makes every statement inside it see one consistent database
+    /// state, not just the two top-level reads.
+    ///
+    /// Read order is deliberate defense in depth: `cap_epoch` is read **before** the member, not
+    /// after (the reverse of the naive order). If this transaction were ever weakened or removed
+    /// by a future refactor, reading the epoch first makes the residual race fail **safe**: a
+    /// revoke committing in the window between the two reads would then pair a *pre*-revoke member
+    /// with the *pre*-bump epoch, producing a capability the host's now-higher `cap_epoch` rejects
+    /// on sight. The opposite order fails **open** instead — a pre-revoke member paired with a
+    /// post-bump epoch looks exactly like a freshly-issued, still-valid capability, which is the
+    /// defect this method exists to eliminate. The transaction should make the order moot in
+    /// practice, but a fail-safe order costs nothing and removes one more way a future change could
+    /// silently reopen this hole.
+    ///
+    /// Uses `unchecked_transaction` rather than `rusqlite::Connection::transaction`, matching
+    /// [`Store::revoke_member_and_bump_epoch`]'s house style and for the same reason (see that
+    /// method's doc comment): every `Store` method takes `&self`, and `transaction()` requires
+    /// `&mut Connection`, which would ripple a breaking API change through this whole file and
+    /// every caller in `spindle-host-core`.
+    pub fn member_and_cap_epoch(
+        &self,
+        device_fp: Fingerprint,
+    ) -> Result<(Option<Member>, u64), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        // Epoch first, member second — see the doc comment above for why this order is the
+        // fail-safe one.
+        let cap_epoch = self.cap_epoch()?;
+        let member = self.member_for_device_fp(device_fp)?;
+        // Nothing was written, so commit and rollback are equivalent here; commit is clearest and
+        // matches this file's other read/write transactions (e.g.
+        // `Store::revoke_member_and_bump_epoch`'s no-op branch).
+        tx.commit()?;
+        Ok((member, cap_epoch))
+    }
+
     // ---------------------------------------------------------------------------------------
     // Groups
     // ---------------------------------------------------------------------------------------
@@ -3139,6 +3199,128 @@ mod tests {
         assert!(
             device.revoked,
             "the authorizer must be able to tell 'revoked' apart from 'unknown'"
+        );
+    }
+
+    // ---- member_and_cap_epoch (td security fix: one-mutex was not a snapshot) ----
+
+    /// Behaviour-preservation in the quiescent case: with no concurrent writer, the fused,
+    /// transactional [`Store::member_and_cap_epoch`] must return exactly the same pair a caller
+    /// would get from the two separate, pre-existing calls it replaces at connect time. This does
+    /// not prove the transaction excludes another connection's write (that needs a deterministic
+    /// interleave, which this repo cannot build without rusqlite's `hooks`/`trace` features — see
+    /// the two tests below and their doc comments); it proves the refactor did not change the
+    /// answer when there is nothing to race against.
+    #[test]
+    fn member_and_cap_epoch_matches_the_two_separate_reads_it_replaces() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        store.activate_member(member_id).expect("activate_member");
+        let device_fp = Fingerprint::of_parts(&[b"alex-laptop"]);
+        store
+            .add_device(member_id, device_fp, "Laptop", 0, None)
+            .expect("add_device");
+
+        let separate_member = store
+            .member_for_device_fp(device_fp)
+            .expect("member_for_device_fp");
+        let separate_epoch = store.cap_epoch().expect("cap_epoch");
+
+        let (fused_member, fused_epoch) = store
+            .member_and_cap_epoch(device_fp)
+            .expect("member_and_cap_epoch");
+
+        // `Member` derives neither `PartialEq` nor `Eq` (it holds a `Vec<Device>`, which itself
+        // doesn't derive `PartialEq`), so compare the fields that matter for this assertion
+        // directly rather than the whole struct.
+        let separate_member = separate_member.expect("device is known");
+        let fused_member = fused_member.expect("device is known");
+        assert_eq!(fused_member.member_id, separate_member.member_id);
+        assert_eq!(fused_member.root_fp, separate_member.root_fp);
+        assert_eq!(fused_member.display_name, separate_member.display_name);
+        assert_eq!(fused_member.status, separate_member.status);
+        assert_eq!(fused_member.created, separate_member.created);
+        assert_eq!(
+            fused_member.devices.len(),
+            separate_member.devices.len(),
+            "same set of devices"
+        );
+        assert_eq!(fused_epoch, separate_epoch);
+    }
+
+    /// [`Store::member_and_cap_epoch`] on an unknown `device_fp` still returns the live
+    /// `cap_epoch` paired with `None` — the same "unknown device, but the epoch is not itself
+    /// unprovable" shape [`Store::member_for_device_fp`] gives on its own, now proven through the
+    /// fused call too.
+    #[test]
+    fn member_and_cap_epoch_returns_none_member_and_the_live_epoch_for_an_unknown_device() {
+        let store = Store::open_in_memory().expect("open");
+        store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let epoch_before = store.cap_epoch().expect("cap_epoch");
+
+        let (member, epoch) = store
+            .member_and_cap_epoch(Fingerprint::of_parts(&[b"never-added"]))
+            .expect("member_and_cap_epoch");
+
+        assert!(member.is_none());
+        assert_eq!(epoch, epoch_before);
+    }
+
+    /// The one deterministic, hooks-free proof available that `member_and_cap_epoch` reads a
+    /// consistent snapshot: seed an active member with an enrolled device on connection A (the
+    /// same "two independent connections to one file" shape as
+    /// `authorize::tests::cap_epoch_is_read_live_not_cached`), then bump the epoch AND revoke the
+    /// member from connection B, fully, before connection A ever calls
+    /// `member_and_cap_epoch`. This cannot exercise the mid-transaction interleave itself (that
+    /// needs rusqlite's `hooks`/`trace` features, which `Cargo.toml` deliberately does not enable
+    /// — a dependency decision reserved for the repo owner, not this fix). What it does prove:
+    /// connection A observes connection B's fully-committed write as one atomic pair — a `Revoked`
+    /// member matched with the POST-bump epoch that revoke produced, never a stale pre-bump epoch
+    /// left over from a cached/prior read on connection A. A regression that silently dropped the
+    /// transaction and went back to two autocommit statements would still pass this particular
+    /// assertion (SQLite still serializes each individual commit), which is exactly why the
+    /// "neuter check" in this fix's verification step — deleting the `unchecked_transaction` call
+    /// and confirming which tests notice — is the honest way to report this test's real coverage
+    /// rather than overclaiming it here.
+    #[test]
+    fn member_and_cap_epoch_observes_a_fully_committed_revoke_from_another_connection_atomically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("host.sqlite3");
+
+        let store_a = Store::open(&path).expect("open connection A");
+        let member_id = store_a
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        store_a.activate_member(member_id).expect("activate_member");
+        let device_fp = Fingerprint::of_parts(&[b"alex-laptop"]);
+        store_a
+            .add_device(member_id, device_fp, "Laptop", 0, None)
+            .expect("add_device");
+        let epoch_before = store_a.cap_epoch().expect("cap_epoch before revoke");
+
+        let store_b = Store::open(&path).expect("open connection B, same file");
+        let new_epoch = store_b
+            .revoke_member_and_bump_epoch(member_id)
+            .expect("revoke_member_and_bump_epoch")
+            .expect("member was Active, so this must bump, not no-op");
+        assert_eq!(new_epoch, epoch_before + 1);
+
+        let (member, epoch) = store_a
+            .member_and_cap_epoch(device_fp)
+            .expect("member_and_cap_epoch on connection A after B's commit");
+
+        assert_eq!(
+            epoch, new_epoch,
+            "connection A must see connection B's committed epoch bump"
+        );
+        assert_eq!(
+            member.expect("device is still known").status,
+            MemberStatus::Revoked,
+            "connection A must see connection B's committed revoke, not a stale Active snapshot"
         );
     }
 

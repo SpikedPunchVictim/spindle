@@ -100,10 +100,17 @@ pub trait DeviceLookup: Send + Sync {
     /// [`HostConnectAuthorizer::authorize`]'s own comment at its call site for the concrete
     /// exploit shape this closes.
     ///
-    /// An implementation must take **one** lock/snapshot covering both reads — a `member_for_device_fp`
-    /// call followed by a separate `cap_epoch` call inside this method's body would reproduce the
-    /// exact race this method exists to eliminate, not fix it. See
-    /// [`SqliteDeviceLookup::member_and_cap_epoch`] for the one acceptable shape.
+    /// An implementation must take one **database-level transaction** covering both reads, not
+    /// merely one in-process lock: an in-process `Mutex`/lock only ever excludes other threads
+    /// holding the *same* handle, and `spindle-hostd` deliberately opens multiple independent
+    /// connections to the same database file (see its module doc comment), so a lock held around
+    /// two separate autocommit reads is not a snapshot — another connection's
+    /// `revoke_member_and_bump_epoch` / `revoke_device_and_bump_epoch` can still commit in the gap
+    /// between them regardless of how long the lock is held. `SqliteDeviceLookup` cannot build
+    /// that transaction itself (`Store::connection()` is `pub(crate)` to `spindle-vfs`), so the
+    /// real snapshot has to be constructed inside `spindle-vfs` and exposed as one call —
+    /// `Store::member_and_cap_epoch` — that this method's implementation must delegate to under
+    /// its lock. See [`SqliteDeviceLookup::member_and_cap_epoch`] for that shape.
     ///
     /// Any caller that is about to mint a capability from the result **must** use this method
     /// rather than [`Self::member_for_device_fp`] plus [`Self::cap_epoch`]. Callers that only need
@@ -170,22 +177,29 @@ impl DeviceLookup for SqliteDeviceLookup {
         &self,
         device_fp: Fingerprint,
     ) -> Result<(Option<Member>, Option<u64>), LookupError> {
-        // One `lock()` call covering both reads — this is the entire fix `DeviceLookup::
-        // member_and_cap_epoch`'s doc comment describes. Two `store.lock()` calls in this body,
-        // even back to back, would let another connection's `revoke_*_and_bump_epoch`
-        // transaction commit between them and reproduce the exact race this method exists to
-        // close.
-        //
-        // The two reads are NOT symmetric in how their failures are handled, and that asymmetry
-        // is deliberate (see this method's doc comment): a failed `member_for_device_fp` means
-        // membership is unprovable, so it propagates via `?` and denies the connect. A failed
-        // `cap_epoch` — reachable via a transient `SQLITE_BUSY` on `meta`, since `spindle-hostd`
-        // holds multiple independent connections to the same database file — costs only the
-        // freshly-minted cap, via `.ok()`, never the connect itself.
+        // The `Mutex` here only excludes other threads holding *this* `Store` handle — it says
+        // nothing about `spindle-hostd`'s other, independent connections to the same database
+        // file, so it cannot by itself be the snapshot this method promises. The actual snapshot
+        // is `Store::member_and_cap_epoch`'s database-level transaction; the lock's only job is to
+        // make `!Sync` `Store` safe to call from here at all (see the module doc comment's
+        // `DeviceLookup` seam section).
         let store = self.store.lock().map_err(|_| LookupError::LockPoisoned)?;
-        let member = store.member_for_device_fp(device_fp)?;
-        let cap_epoch = store.cap_epoch().ok();
-        Ok((member, cap_epoch))
+        match store.member_and_cap_epoch(device_fp) {
+            Ok((member, cap_epoch)) => Ok((member, Some(cap_epoch))),
+            Err(_) => {
+                // `Store::member_and_cap_epoch` failed as a whole — most plausibly a transient
+                // `SQLITE_BUSY` opening the transaction while another of `spindle-hostd`'s
+                // connections holds a write lock. Preserve the deliberate asymmetry this trait's
+                // doc comment describes: a failed *membership* read must deny the connect, but a
+                // failed *epoch* read must cost only the capability. A whole-call error conflates
+                // the two, so fall back to the plain, single-statement `member_for_device_fp` —
+                // if membership can be read on its own, the connect proceeds with no fresh cap
+                // (`None`); if it can't, `?` propagates and denies, exactly as it would have if
+                // the fused read had never been attempted.
+                let member = store.member_for_device_fp(device_fp)?;
+                Ok((member, None))
+            }
+        }
     }
 }
 
