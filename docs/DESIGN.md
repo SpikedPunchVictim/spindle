@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.21) + Execution Plan
+# Spindle — System Design Document (draft v0.9.22) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -50,6 +50,9 @@
 > decision, 2026-09-02).
 > v0.9.21: §A4b edge rules — a fold collision between different *kinds* of entry is refused, never overwritten
 > (user decision, 2026-09-04).
+> v0.9.22: device bootstrap state bundle specified — the entry drops the derivable `host_fp` and names the host's
+> envelope keys explicitly, the bundle is **unsigned** and QR-channel-only, and the QR's measured host ceiling is
+> stated; §A4's per-cap size corrected from an estimate to the measured value (user decision, 2026-09-06).
 
 ---
 
@@ -288,10 +291,11 @@ cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp
   useless without the device key). **Renewal path (no lockout)**: a cap that is expired or stale-epoch but
   signature-valid still earns **connect-only** NATS permissions (same as an invite); the host verifies the device
   over the E2E channel and re-issues the current cap in the reply. Only *revoked* subjects are refused outright.
-- **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (~330 B each, chain-carrying, v0.9.5,
-  base64url). nats-server's default `max_control_line` is 4 KiB, so the registry sets it to **32 KiB** (A10.10) and
-  clients present **only the caps for hosts they will use this session** (pinned/open hosts), max **32** per
-  connection (A10.5). S12 measures.
+- **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (**466 B each, measured** [v0.9.22; the
+  earlier ~330 B was an estimate], chain-carrying, v0.9.5, base64url). nats-server's default `max_control_line` is 4
+  KiB, so the registry sets it to **32 KiB** (A10.10) and clients present **only the caps for hosts they will use this
+  session** (pinned/open hosts), max **32** per connection (A10.5). A full 32-cap CONNECT token measures **19,106 B**,
+  42% under the 32 KiB ceiling. S12 measures.
 
 **NATS authentication = Auth Callout for every connection**
 1. Device connects signing the server nonce with its session nkey and presents: device certificate (root-signed),
@@ -311,9 +315,22 @@ cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp
 **Enrollment / first run (primary device)**: generate root (show recovery phrase; commit next-root hash) + device key;
 native: optional short-lived cert from the private CA (hardened profile). Redeem an invite → member of that host.
 **Adding a device (device bootstrap)**: new device shows QR; the **primary** device signs its certificate **and
-returns a state bundle** `{registry endpoint, [{host_fp, host_pk, member_cap}…]}` — the QR transfers state, not just
-a signature. All hosts accept the new device automatically (they pinned `root_fp`) and notify the owner ("Alex added
-*iPhone*"). Any root-certified device can also **re-fetch its cap** from a host directly (connect-only → E2E
+returns a state bundle** `{registry endpoint, [{sign_pk, agree_pk, member_cap}…]}` — the QR transfers state, not just
+a signature. The entry names the host's **envelope** keys explicitly [v0.9.22]: the earlier `host_pk` was ambiguous
+between the host's root key and the envelope keys a client actually pins. `host_fp` and the host's `device_fp` are
+**derived, never carried**: `host_fp = SHA-256(cap.host_root_pk)` (the check `verify_capability` already performs)
+and `device_fp = device_fp_of(sign_pk, agree_pk)`, so no field of an entry can disagree with another. The bundle is
+**unsigned** and deliberately absent from §A7b's catalog: its only consumer is the new device, over the same local
+QR channel that conveys the root identity itself, so a signature would have no verifier that channel does not
+already establish, and the one security-bearing value inside it — `member_cap` — is an independently verifiable
+signed artifact. **This holds only while the bundle stays on that channel**: relaying it over the network, cloud
+sync, or a file export makes it a signed artifact requiring a §A7b entry with its own tag, time rule, and replay
+rule. **QR ceiling**: an entry is ~530 B (two 32-byte keys plus a 466-byte cap), so a version-40 QR carries **4**
+hosts at EC level M and **5** at level L, against the 32-host presentation cap in §A4. Bundle construction fails
+loudly when the host list does not fit, naming the hosts left out, and the owner re-invites the new device to the
+remainder; multi-frame QR is held in reserve, unbuilt, pending evidence that a real host list needs it. All hosts
+accept the new device automatically (they pinned `root_fp`) and notify the owner ("Alex added *iPhone*"). Any
+root-certified device can also **re-fetch its cap** from a host directly (connect-only → E2E
 re-issue, above). A browser is enrolled the same way and is never primary. **Recovery without the primary device**:
 the recovery phrase restores the root but *not* the host list — the person re-learns hosts from saved invite links
 or by re-invite; the signup UI says this. Device certificates carry `exp` (1 year, re-signed by the primary on
