@@ -337,22 +337,58 @@ than one.
   crate was added and the version pin did not move; the pin's existing reasoning
   (`libsqlite3-sys` overlap with `sqlx-sqlite` under Cargo's `links = "sqlite3"` single-version
   rule) is untouched. Feature approved by the repo owner.
-- **Ticket state**: td-34520e (the TOCTOU) is fixed across the three commits with a deterministic
-  test in place, not yet approved pending a final review. **td-c74122 stays OPEN** — 2026-09-06
-  user decision: it remains the umbrella for all of S18 until the device bootstrap bundle lands,
-  and its acceptance criteria were NOT narrowed by slices A-D landing; do not approve it on the
-  strength of those slices alone. New: **td-af2752** (P3) — `HostConnectAuthorizer` does not
-  rate-limit the pre-authentication minting path, which
-  `crates/spindle-net/src/signaling/host.rs:160-169` states as an explicit contract on
+- A final independent adversarial review of `0306dea` + `21723f7` **cleared the code**: the
+  transaction is real and load-bearing, and the deterministic test discriminates it for the right
+  reason — it independently confirmed 699/0/15 and reran the torn-pair test 30 more times (30/30),
+  and it killed eight of its own candidate findings empirically, including the two most dangerous:
+  that a DEFERRED transaction takes no lock at `BEGIN` (it does, on first read, retaining SHARED
+  across the statement boundary), and that the test's authorizer callback perturbs what it
+  observes (it fires at prepare time and only widens an already-real gap). It did NOT clear the
+  prose: `92e59b1` fixed four wrong doc-comment mechanisms, two of them the author's own and
+  already copied into commit messages. (1) The fail-safe read-order rationale was wrong twice —
+  it claimed the torn pair on removal is a pre-revoke member with the pre-bump epoch "producing a
+  capability the host's now-higher `cap_epoch` rejects"; actually epoch-first means the member is
+  read AFTER the revoke, so the pair is `(Revoked, epoch_before)`, and nothing is minted at all
+  because `liveness_checks` check 3 refuses a non-Active member before the mint call is reached —
+  strictly stronger than the claimed outcome, though the ordering decision itself stands. (2)
+  `0306dea`'s commit message claimed three transaction sites in `store/mod.rs` from a grep pattern
+  that structurally cannot match `Transaction::new_unchecked`; there are nine, six invisible to
+  that pattern. The conclusion ("no read path had one") survived; the count and "house style"
+  framing did not — the same failure mode [[dependency-guards-defeat-repo-only-greps]] already
+  warns about. Also recorded: `DeviceLookup::cap_epoch` now has zero callers anywhere, tests
+  included — it survives only because implementing the trait requires it; left in place, removal
+  is a separate decision.
+- **A third lesson, alongside the two above**: the code was right and the prose describing it was
+  wrong, in four places at once, and two of those wrong mechanisms had already been copied into
+  commit messages where they become permanent. Reviewing a fix has to include reviewing what the
+  fix claims about itself, not just what it does.
+- **Ticket state**: **td-34520e is APPROVED and closed**, reviewed by the independent adversarial
+  sub-agent. One recorded AC deviation: the Store-level deterministic test covers the
+  member-revoked axis only, not both axes, because the transaction excludes concurrent writers
+  regardless of which revoke runs — both axes ARE covered at the `authorize` level by the
+  call-counting race tests; the AC's wording "asserts no cap is minted" was approved on the
+  property rather than the letter. **td-c74122 stays OPEN** — 2026-09-06 user decision: it remains
+  the umbrella for all of S18 until the device bootstrap bundle lands, and its acceptance criteria
+  were NOT narrowed by slices A-D landing; do not approve it on the strength of those slices alone.
+  td-af2752 (P3) — `HostConnectAuthorizer` does not rate-limit the pre-authentication minting
+  path, which `crates/spindle-net/src/signaling/host.rs:160-169` states as an explicit contract on
   `ConnectAuthorizer` implementers, and is also a timing oracle (Allow does an Ed25519 sign, Deny
   does not). Reach is narrower than the original review claimed: publishing to `host.<h>.connect`
   needs helper-issued NATS credentials, and `reply_prefix_ok` pins the reply subject to the
   claimed `from_fp`'s own inbox, so the driver is an enrolled device, not an arbitrary peer.
-  td-0f4fb6 (device bootstrap bundle) is still unbuilt.
-- Gate at `21723f7`: 699 passed / 0 failed / 15 ignored (was 695/0/15 at `e69d6a7`). TypeScript
-  unchanged: 368 `@spindle/proto` + 129 `@spindle/crypto`. Head is `21723f7`; `origin/main` is at
-  `3822a05`, so there are 4 unpushed local commits (`3c92522`, `e69d6a7`, `0306dea`, `21723f7`).
-  Stage 5's own Status stays **In Progress**.
+  Unchanged, still open. **New: td-db6541** (P3) — `SqliteDeviceLookup`'s fallback swallows its
+  error with no log or metric, and `spindle-host-core` has zero `tracing::` usage anywhere; a
+  persistent `meta` read failure (e.g. `QueryReturnedNoRows` from `Store::cap_epoch`) degrades the
+  host to "never mints a capability" while every connect keeps succeeding — invisible until caps
+  expire, and `MEMBER_CAP_DEFAULT_TTL_SECS` is 6 weeks, so the failure would surface as an
+  unexplained fleet-wide lockout six weeks after the fault. Fixing it needs either adopting
+  `tracing` or building a counter — an open dependency decision for the repo owner. td-0f4fb6
+  (device bootstrap bundle) is still unbuilt.
+- Gate at `92e59b1`: 699 passed / 0 failed / 15 ignored, independently reconfirmed by the final
+  review. TypeScript unchanged: 368 `@spindle/proto` + 129 `@spindle/crypto`. DESIGN version
+  unchanged at v0.9.22. Head is `92e59b1`; `origin/main` is at `3822a05`, so there are 6 unpushed
+  local commits (`3c92522`, `e69d6a7`, `0306dea`, `21723f7`, `0dc559b`, `92e59b1`). Stage 5's own
+  Status stays **In Progress**.
 
 ## Stage 6: spindle-vfs + host-core
 **Goal**: Implement the shares/groups/entitlements engine and the VFS RPC server in
