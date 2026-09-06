@@ -222,7 +222,8 @@ below; S14 remains.
   device; recovers on a fresh device unaided") is the usability test of S18's machinery, so
   S18 is a hard prerequisite for S15 and therefore for Stage 7's completion.
 **Note**: 2026-09-06 S18. The renewal path is met and live-proven; the device bootstrap bundle
-is designed but not built.
+is designed but not built. The minting path itself shipped a real TOCTOU defect found after this
+note was written — see the follow-on note below.
 - S18 landed as four slices: `cdbf84f` ("feat(proto): carry a re-issued member cap in the
   connect answer (td-c74122)") added `member_cap: Option<Capability>` to `AnswerPayload` with
   the Rust+TS twins and vectors; `729303a` ("Stage 5 S18 slice B: relay the host's member cap
@@ -274,6 +275,84 @@ is designed but not built.
   bundle (td-0f4fb6). Stage 5 cannot be marked Complete until both land. Stage 5's Status stays
   **In Progress**.
 - Gate at `3822a05`: 691 passed / 0 failed / 15 ignored (Rust), 368 (TS `@spindle/proto`).
+**Note**: 2026-09-06 S18 minting path — shipped defective, fixed in three commits. The S18
+minting path recorded live-proven above had a real defect, closed across three commits rather
+than one.
+- An independent adversarial review of the S18 minting path found a TOCTOU in
+  `HostConnectAuthorizer::authorize`: it took two separate, non-atomic reads of the store —
+  `member_for_device_fp`, then, after checks 6-8 ran, an independent `cap_epoch()` — and minted a
+  capability combining the member from read #1 with the epoch from read #2.
+  `Store::revoke_member_and_bump_epoch`/`revoke_device_and_bump_epoch` each flip status and bump
+  `cap_epoch` atomically in one transaction; nothing stopped that transaction committing between
+  the two reads. When it did, the host minted a capability for a subject that was by then revoked,
+  stamped with the POST-bump `cap_epoch` — indistinguishable from a legitimately fresh cap to any
+  consumer that checks `cap.cap_epoch` against the host's current epoch, defeating `cap_epoch`'s
+  whole purpose as the revocation-invalidation mechanism. Filed as td-34520e.
+- `e69d6a7` ("mint the member cap from one atomic store snapshot") added
+  `DeviceLookup::member_and_cap_epoch`, reading both under one `Mutex<Store>`. It passed the full
+  gate (695/0/15) and was WRONG: `Store` wraps a single rusqlite `Connection`, and neither read
+  opened a transaction — `Store::cap_epoch` is a bare autocommit `query_row`, and
+  `member_for_device_fp` is itself roughly five independent autocommit reads. No `journal_mode` is
+  set anywhere in the repo, so this is default rollback-journal mode, where a reader's SHARED lock
+  is released at the end of each statement, and `spindle-hostd` opens three independent
+  connections to the same file — a revoke committing on one of those never touches the mutex. An
+  independent adversarial review reproduced the torn pair empirically with the repo's own types.
+  The comment `e69d6a7` shipped inside that method even said `spindle-hostd` "holds multiple
+  independent connections to the same database file" — the reason the approach could not work was
+  written into the approach.
+- `0306dea` ("make the cap-minting snapshot a real transaction, not a mutex") is the real fix: the
+  snapshot moved into `Store::member_and_cap_epoch`, wrapping both reads in one
+  `unchecked_transaction()` — the only layer with `conn` access, since `Store::connection()` is
+  `pub(crate)` — matching the house style of `revoke_member_and_bump_epoch`. It reads `cap_epoch`
+  FIRST and the member second as defence in depth: if the transaction were ever weakened or
+  removed, epoch-first fails SAFE (a revoke landing in the residual window pairs a stale pre-bump
+  epoch with the member, and the host's now-higher epoch rejects that cap), where member-first —
+  what `e69d6a7` did — fails OPEN. It also corrected doc comments `e69d6a7` had shipped backwards,
+  which told implementers that an in-process lock sufficed and pointed at the mutex shape as "the
+  one acceptable shape."
+- `0306dea` shipped a stated known gap: commenting out the `unchecked_transaction` left the whole
+  suite green (698/0/15; independently neuter-verified, 292 tests across spindle-vfs and
+  spindle-host-core still passed). `21723f7` ("deterministically prove the cap-snapshot
+  transaction holds") closed it with a test keyed on `Connection::authorizer`, which fires at
+  statement *prepare* time — keying on the first read of the `devices` table puts the callback in
+  the real gap: after `cap_epoch`'s read of `meta` has finalized, before `member_for_device_fp`'s
+  opening SELECT executes, a gap locked only in the transactional version. A `progress_handler`
+  was tried first and does NOT discriminate — it fires mid-statement, where rollback-journal mode
+  holds SHARED either way; both variants were built and run to establish this rather than reasoned
+  about.
+- **Lesson, worth keeping: the gate cannot see this class of bug.** Both wrong versions passed
+  fmt, clippy, and the full test suite. What caught them was adversarial review plus neutering —
+  three separate times this session, reviewing a fix found a defect in the fix. Separately, **an
+  assertion can pass against the bug it targets**: the deterministic test's first draft was
+  specified to assert "never an Active member paired with the bumped epoch," which would have
+  passed against the neutered code, because the epoch-first read order tears the other way, into
+  `(Revoked, epoch_before)`, not the `(Active, bumped)` pair one intuitively expects. The shipped
+  assertion instead requires the returned pair to be one of the only two states the database was
+  ever in, `(Active, epoch_before)` or `(Revoked, epoch_before + 1)`, and also asserts the
+  authorizer actually fired, so it cannot pass vacuously.
+- rusqlite's `hooks` feature is now enabled, narrowly, on `spindle-vfs`'s `[dev-dependencies]`
+  only, not the workspace dependency — verified with `cargo tree -e normal -f "{p} [{f}]"` rather
+  than assumed: `spindle-hostd` links `[bundled,modern_sqlite]` while `spindle-vfs`'s test targets
+  get `[bundled,hooks,modern_sqlite]`. `hooks = []` is an empty feature in rusqlite 0.32.1, so no
+  crate was added and the version pin did not move; the pin's existing reasoning
+  (`libsqlite3-sys` overlap with `sqlx-sqlite` under Cargo's `links = "sqlite3"` single-version
+  rule) is untouched. Feature approved by the repo owner.
+- **Ticket state**: td-34520e (the TOCTOU) is fixed across the three commits with a deterministic
+  test in place, not yet approved pending a final review. **td-c74122 stays OPEN** — 2026-09-06
+  user decision: it remains the umbrella for all of S18 until the device bootstrap bundle lands,
+  and its acceptance criteria were NOT narrowed by slices A-D landing; do not approve it on the
+  strength of those slices alone. New: **td-af2752** (P3) — `HostConnectAuthorizer` does not
+  rate-limit the pre-authentication minting path, which
+  `crates/spindle-net/src/signaling/host.rs:160-169` states as an explicit contract on
+  `ConnectAuthorizer` implementers, and is also a timing oracle (Allow does an Ed25519 sign, Deny
+  does not). Reach is narrower than the original review claimed: publishing to `host.<h>.connect`
+  needs helper-issued NATS credentials, and `reply_prefix_ok` pins the reply subject to the
+  claimed `from_fp`'s own inbox, so the driver is an enrolled device, not an arbitrary peer.
+  td-0f4fb6 (device bootstrap bundle) is still unbuilt.
+- Gate at `21723f7`: 699 passed / 0 failed / 15 ignored (was 695/0/15 at `e69d6a7`). TypeScript
+  unchanged: 368 `@spindle/proto` + 129 `@spindle/crypto`. Head is `21723f7`; `origin/main` is at
+  `3822a05`, so there are 4 unpushed local commits (`3c92522`, `e69d6a7`, `0306dea`, `21723f7`).
+  Stage 5's own Status stays **In Progress**.
 
 ## Stage 6: spindle-vfs + host-core
 **Goal**: Implement the shares/groups/entitlements engine and the VFS RPC server in
