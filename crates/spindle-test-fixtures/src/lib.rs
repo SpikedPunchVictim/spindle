@@ -134,7 +134,16 @@ pub mod fixtures {
         /// operating key -> capability). Built fresh per call with a dummy `nats_fp` and a
         /// never-expiring `exp`: this is an issuance-time cert, not the one the host presents on
         /// its own CONNECT.
-        fn capability_op_cert(&self) -> HostOpKeyCert {
+        ///
+        /// `pub` (rather than private, as this started) so a live test can build a real
+        /// `spindle_host_core::RootKeyCapIssuer` from this same fixture (td-c74122 slice D):
+        /// `RootKeyCapIssuer::new` needs exactly this op cert, this struct's own `root.public_key()`,
+        /// and its already-`pub` `op_signing` field — `verify_capability` never inspects an op
+        /// cert's `nats_fp` (it only checks that the cert decodes, chains to `host_root_pk`, and
+        /// has not expired — see `spindle_core::artifacts::capability::verify_capability`), so the
+        /// same dummy-`nats_fp` cert [`Self::member_capability`] already builds for itself is
+        /// exactly the right thing for an issuer to use too, not a distinct fixture-only shape.
+        pub fn capability_op_cert(&self) -> HostOpKeyCert {
             issue_host_op_key_cert(
                 &self.root,
                 &self.op_signing.verifying_key(),

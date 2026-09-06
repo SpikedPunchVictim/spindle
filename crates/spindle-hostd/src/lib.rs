@@ -94,7 +94,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use spindle_core::identity::DeviceKey;
 use spindle_core::Fingerprint;
 use spindle_host_core::{
-    HostConnectAuthorizer, SqliteDeviceLookup, SqliteStoreFactory, StoreFactory, VfsSessionHandler,
+    CapIssuer, HostConnectAuthorizer, SqliteDeviceLookup, SqliteStoreFactory, StoreFactory,
+    VfsSessionHandler,
 };
 use spindle_net::signaling::host::SignalingHost;
 use spindle_net::signaling::SignalingError;
@@ -174,6 +175,10 @@ pub struct HostDaemon {
     host_fp: Fingerprint,
     store_path: PathBuf,
     now_fn: BoxedNowFn,
+    /// The optional cap-issuing seam (td-c74122 slice D). `None` by default — see
+    /// [`Self::with_cap_issuer`]'s doc comment for why this crate never builds a
+    /// [`spindle_host_core::RootKeyCapIssuer`] on its own.
+    issuer: Option<Box<dyn CapIssuer>>,
 }
 
 impl HostDaemon {
@@ -208,6 +213,43 @@ impl HostDaemon {
             host_fp,
             store_path: store_path.into(),
             now_fn: Box::new(now_fn),
+            issuer: None,
+        }
+    }
+
+    /// Installs a [`spindle_host_core::CapIssuer`] so [`Self::run`] wires
+    /// [`HostConnectAuthorizer::with_issuer`] instead of [`HostConnectAuthorizer::new`] — every
+    /// successful connect this daemon serves then carries a freshly-minted member capability in
+    /// its answer (DESIGN.md:286's "refreshed opportunistically on every successful session").
+    /// Without this call, [`Self::run`] falls back to no issuer at all and every answer's
+    /// `member_cap` is `None`, exactly as [`HostConnectAuthorizer::new`]'s own doc comment
+    /// describes.
+    ///
+    /// # Why the daemon takes an issuer rather than building one from key material
+    ///
+    /// Constructing a real [`spindle_host_core::RootKeyCapIssuer`] needs three pieces of this
+    /// host's own signing material: its root public key, its current operating-key certificate,
+    /// and — the sensitive one — the operating **signing** key itself. Per DESIGN.md §A4, custody
+    /// of that key belongs in an OS keystore, and (per this module's own doc comment's "Why this
+    /// crate ships no binary (yet)" section) that keystore integration is unresolved Stage 7
+    /// work — the same blocker recorded against td-539ffa and S13. If `HostDaemon` reached into
+    /// key material to build its own issuer, this crate would need to either grow that keystore
+    /// dependency itself or fall back to a dishonest stand-in (seeds from the environment, say),
+    /// neither of which this crate should do on its caller's behalf. Taking `Box<dyn CapIssuer>`
+    /// instead keeps key custody entirely on the caller's side of the boundary: today, this
+    /// crate's own live integration test builds a [`spindle_host_core::RootKeyCapIssuer`] from
+    /// test-fixture key material and installs it here; once Stage 7's keystore lands, the real
+    /// caller (a binary here, or `apps/host`'s Tauri shell per this module's doc comment) does the
+    /// same with real key material, and this crate's own code does not change at all.
+    ///
+    /// Chainable, matching [`spindle_host_core::RootKeyCapIssuer::new`]'s own builder shape
+    /// (`new(...).with_now_fn(...)`), not this struct's own alternative-constructor shape
+    /// (`HostDaemon::new` / `HostDaemon::with_now_fn`) — this is a single optional knob added onto
+    /// an already-built `HostDaemon`, not a second way to construct one from scratch.
+    pub fn with_cap_issuer(self, issuer: Box<dyn CapIssuer>) -> Self {
+        HostDaemon {
+            issuer: Some(issuer),
+            ..self
         }
     }
 
@@ -232,6 +274,7 @@ impl HostDaemon {
             host_fp,
             store_path,
             now_fn,
+            issuer,
         } = self;
 
         let factory = SqliteStoreFactory::new(&store_path);
@@ -239,7 +282,14 @@ impl HostDaemon {
         // Independent connection #1: the connect path's own lookup (never the RPC path's) — see
         // `SqliteDeviceLookup`'s doc comment and this module's doc comment.
         let connect_store = factory.open()?;
-        let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(connect_store));
+        let connect_lookup = SqliteDeviceLookup::new(connect_store);
+        let authorizer = match issuer {
+            // `with_cap_issuer`'s doc comment explains why this crate never builds this seam
+            // itself: a real `RootKeyCapIssuer` needs this host's operating signing key, and that
+            // key's custody (an OS keystore) is unresolved Stage 7 work.
+            Some(issuer) => HostConnectAuthorizer::with_issuer(connect_lookup, issuer),
+            None => HostConnectAuthorizer::new(connect_lookup),
+        };
 
         // Independent connection #2: the session handler's own lookup. `HostConnectAuthorizer`
         // consumed the first `SqliteDeviceLookup` by value above, so `VfsSessionHandler` needs a

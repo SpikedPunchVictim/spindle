@@ -107,7 +107,10 @@ mod ratelimit;
 pub mod revoke;
 mod upload;
 
-pub use authorize::{DeviceLookup, HostConnectAuthorizer, LookupError, SqliteDeviceLookup};
+pub use authorize::{
+    CapIssuer, DeviceLookup, HostConnectAuthorizer, LookupError, RootKeyCapIssuer,
+    SqliteDeviceLookup, MEMBER_CAP_DEFAULT_TTL_SECS,
+};
 pub use revoke::{
     revoke_device_and_mint, revoke_member_and_mint, RevocationPublication, RevokeError,
 };

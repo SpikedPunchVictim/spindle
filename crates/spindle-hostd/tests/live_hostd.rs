@@ -74,10 +74,13 @@
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+use spindle_core::artifacts::verify_capability;
 use spindle_core::identity::DeviceKey;
+use spindle_host_core::{RootKeyCapIssuer, MEMBER_CAP_DEFAULT_TTL_SECS};
 use spindle_hostd::{HostDaemon, HostOptions};
 use spindle_net::framing::{read_frame, write_frame};
 use spindle_net::signaling::{ConnectOptions, HostIdentity, SignalingClient};
+use spindle_proto::artifacts::CapKind;
 use spindle_proto::{VfsReply, VfsRequest, VfsRequestEnvelope};
 use spindle_vfs::model::DevicePublicKeys;
 use spindle_vfs::store::Store;
@@ -137,11 +140,16 @@ async fn whoami(
     }
 }
 
-/// Seeds `store_path` with one active member and one enrolled, non-revoked device — real
-/// `sign_pk`/`agree_pk` on file, exactly as `crate::authorize`'s own `enroll_device` test helper
-/// does, so `HostConnectAuthorizer`'s check 8 (the `device_fp_of` binding rehash) holds. Returns
-/// nothing: the caller already has every identity it needs (`device`'s fingerprint, the display
-/// name it chose).
+/// Seeds `store_path` with one active member and one or more enrolled, non-revoked devices of
+/// that same member — real `sign_pk`/`agree_pk` on file for every device, exactly as
+/// `crate::authorize`'s own `enroll_device` test helper does, so `HostConnectAuthorizer`'s check 8
+/// (the `device_fp_of` binding rehash) holds for each. Returns nothing: every caller already has
+/// every identity it needs (each device's own fingerprint, the display name it chose).
+///
+/// Generalized (td-c74122 slice D) from a single-device helper to accept a slice of devices, so a
+/// test can seed a second device of the *same* member — every `DeviceIdentity` passed in must
+/// therefore share one `root_fp` (i.e. be built from the same `root_seed`, with different device
+/// seeds), or this would silently seed two separate members instead of two devices of one.
 ///
 /// Runs entirely synchronously (no `.await` inside) and the `Store` handle is dropped when this
 /// function returns, before `HostDaemon` ever opens its own connection to the same file. This is a
@@ -151,29 +159,53 @@ async fn whoami(
 /// `SqliteDeviceLookup`'s and `SqliteStoreFactory`'s own doc comments already lean on to justify
 /// opening independent connections to a host's live store. Closing this one first simply avoids
 /// any possibility of lock contention during the daemon's own startup, for free.
+fn seed_active_member_with_devices(
+    store_path: &std::path::Path,
+    devices: &[&DeviceIdentity],
+    display_name: &str,
+) {
+    assert!(
+        !devices.is_empty(),
+        "seed_active_member_with_devices: at least one device is required"
+    );
+    let root_fp = devices[0].root_fp();
+    assert!(
+        devices.iter().all(|d| d.root_fp() == root_fp),
+        "seed_active_member_with_devices: every device must share one root_fp (the same \
+         root_seed, different device seeds) to be devices of one member — got a mix, which would \
+         seed two separate members instead of two devices of one"
+    );
+
+    let store = Store::open(store_path).expect("open a fresh SQLite store to seed");
+    let member_id = store
+        .add_member(root_fp, display_name, fixtures::now())
+        .expect("add_member");
+    store.activate_member(member_id).expect("activate_member");
+    for (i, device) in devices.iter().enumerate() {
+        let keys = device.device_key();
+        store
+            .add_device(
+                member_id,
+                device.device_fp,
+                &format!("test-device-{i}"),
+                fixtures::now(),
+                Some(&DevicePublicKeys {
+                    sign_pk: keys.sign_public_key().as_bytes().to_vec(),
+                    agree_pk: keys.agree_public_key().as_bytes().to_vec(),
+                }),
+            )
+            .expect("add_device");
+    }
+}
+
+/// Single-device convenience wrapper over [`seed_active_member_with_devices`], for the two
+/// existing tests that only ever seed one device per member.
 fn seed_active_member_with_device(
     store_path: &std::path::Path,
     device: &DeviceIdentity,
     display_name: &str,
 ) {
-    let store = Store::open(store_path).expect("open a fresh SQLite store to seed");
-    let member_id = store
-        .add_member(device.root_fp(), display_name, fixtures::now())
-        .expect("add_member");
-    store.activate_member(member_id).expect("activate_member");
-    let keys = device.device_key();
-    store
-        .add_device(
-            member_id,
-            device.device_fp,
-            "test-device",
-            fixtures::now(),
-            Some(&DevicePublicKeys {
-                sign_pk: keys.sign_public_key().as_bytes().to_vec(),
-                agree_pk: keys.agree_public_key().as_bytes().to_vec(),
-            }),
-        )
-        .expect("add_device");
+    seed_active_member_with_devices(store_path, &[device], display_name);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -378,6 +410,206 @@ async fn live_connect_denied_when_the_production_authorizer_finds_the_device_rev
 
     assert_no_permission_violation(&host_events, "host");
     assert_no_permission_violation(&revoked_events, "revoked client");
+
+    host_task.abort();
+}
+
+/// td-c74122 slice D: proves DESIGN.md:286's renewal path ("refreshed opportunistically on every
+/// successful session") end to end against the live stack, and the S18 acceptance criterion "a
+/// second device reaches all hosts unaided" — not merely that `HostConnectAuthorizer` *can* mint a
+/// cap (`crate::authorize`'s own unit tests already prove that against an in-memory store), but
+/// that a `HostDaemon` built with a real [`RootKeyCapIssuer`] mints a cap over the live NATS Auth
+/// Callout that a *different* device of the same member can then use to reach this exact host on
+/// its own, with no help from the device that fetched it.
+///
+/// Five acts:
+///
+/// 1. Two devices of one member (`device_a`, `device_b`: same `root_seed`, different device
+///    seeds — see [`seed_active_member_with_devices`]'s doc comment), both enrolled with real
+///    `sign_pk`/`agree_pk` on file.
+/// 2. `HostDaemon::with_cap_issuer` installs a real [`RootKeyCapIssuer`] built from this test's own
+///    `HostRootIdentity` fixture — the same identity already used for this host's NATS auth — so
+///    `HostConnectAuthorizer::with_issuer` is the assembly under test, not `::new`.
+/// 3. Device B connects presenting a member capability whose `exp` is already in the past. Per
+///    `crates/spindle-helper/src/authz.rs`'s `Err(ArtifactError::Expired)` arm (~line 435), a
+///    signature-valid-but-expired capability still earns a NATS CONNECT, just downgraded to
+///    connect-only permissions — the exact lockout state this whole feature exists to escape. This
+///    test drives that real downgrade path rather than simulating a "locked out" device by fiat.
+/// 4. Device B calls `refresh_capability` and gets back a fresh, verifying `Member` capability
+///    whose `subject` is the *member's* `root_fp` — not device B's `device_fp`, and not device A's
+///    either.
+/// 5. Device A — which never refreshed anything of its own — connects presenting the cap device B
+///    just fetched, and completes a real `whoami` VFS RPC over the resulting QUIC control stream.
+///    That RPC naming the seeded member is what makes "a second device reaches all hosts unaided"
+///    true rather than merely asserted: B's refreshed cap is actually accepted by the live NATS
+///    callout for a *different* device of the same person, all the way through to a served RPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live stack required: run `docker compose -f deploy/docker-compose.yml up -d` first, \
+            then `cargo test -p spindle-hostd --test live_hostd -- --ignored --nocapture`. \
+            When run, an unreachable stack fails loudly — this test never skips."]
+async fn live_expired_device_gets_a_fresh_cap_that_a_second_device_of_the_same_member_can_use() {
+    let url = nats_url();
+    let exp = fixtures::now() + 3600;
+    // Already in the past -- signature-valid, but expired, per `verify_capability`'s own `exp`
+    // check (checked last, after the host-fp/op-cert/sig chain -- see
+    // `spindle_core::artifacts::capability::verify_capability`'s doc comment).
+    let already_expired = fixtures::now().saturating_sub(3600);
+
+    const MEMBER_DISPLAY_NAME: &str = "Renewal Path Member";
+
+    // ---- identities: two devices of ONE member (same root_seed, different device seeds) --------
+    let host_root = HostRootIdentity::new([0x81; 32], [0x82; 32]);
+    let host_device = DeviceKey::from_seeds([0x83; 32], [0x84; 32]);
+    let host_device_fp = host_device.device_fp();
+    let host_device_sign_pk = host_device.sign_public_key();
+    let host_device_agree_pk = host_device.agree_public_key();
+
+    let member_root_seed = [0x85; 32];
+    let device_a = DeviceIdentity::new(member_root_seed, [0x86; 32], [0x87; 32]);
+    let device_b = DeviceIdentity::new(member_root_seed, [0x88; 32], [0x89; 32]);
+    assert_eq!(
+        device_a.root_fp(),
+        device_b.root_fp(),
+        "test fixture bug: device_a and device_b must share one root_fp to be two devices of one \
+         member -- this test proves nothing about the renewal path otherwise"
+    );
+    assert_ne!(
+        device_a.device_fp, device_b.device_fp,
+        "test fixture bug: two distinct devices must have distinct device_fp values"
+    );
+
+    println!("[ids] host_fp={} (NATS subject scope)", host_root.host_fp);
+    println!("[ids] member root_fp={}", device_a.root_fp());
+    println!("[ids] device_a device_fp={}", device_a.device_fp);
+    println!("[ids] device_b device_fp={}", device_b.device_fp);
+
+    // ---- seed the real SQLite store: one active member, both devices enrolled -------------------
+    let store_dir = tempfile::tempdir().expect("tempdir for the host's SQLite store");
+    let store_path = store_dir.path().join("host.db");
+    seed_active_member_with_devices(&store_path, &[&device_a, &device_b], MEMBER_DISPLAY_NAME);
+    let seeded_cap_epoch = {
+        let store = Store::open(&store_path).expect("re-open the seeded store to read cap_epoch");
+        store.cap_epoch().expect("cap_epoch")
+    };
+
+    // ---- live, callout-authenticated host NATS connection -----------------------------------
+    let (host_nats, host_events) = connect_host(&url, &host_root, exp).await;
+
+    // ---- the real HostDaemon, with a real RootKeyCapIssuer installed via with_cap_issuer --------
+    // built from the same HostRootIdentity fixture already authenticating this host's own NATS
+    // connection -- not a second, unrelated identity.
+    let issuer = RootKeyCapIssuer::new(
+        host_root.root.public_key(),
+        host_root.capability_op_cert(),
+        host_root.op_signing.clone(),
+    );
+    let daemon = HostDaemon::new(host_nats, host_device, host_root.host_fp, store_path)
+        .with_cap_issuer(Box::new(issuer));
+    let host_task = tokio::spawn(daemon.run(host_opts()));
+    // Let the host's connect subscription land server-side before the first offer.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_no_permission_violation(&host_events, "host");
+
+    let host_identity = HostIdentity {
+        host_fp: host_root.host_fp,
+        device_fp: host_device_fp,
+        sign_pk: host_device_sign_pk,
+        agree_pk: host_device_agree_pk,
+    };
+
+    // ---- act 3: device B arrives locked out -- a signature-valid but already-expired member cap
+    // downgrades this connection to connect-only NATS permissions (crates/spindle-helper/src/
+    // authz.rs:435), which is exactly enough to publish a connect offer and read the answer but
+    // never enough to open a session. ------------------------------------------------------------
+    let expired_cap = host_root.member_capability(device_b.root_fp(), already_expired, vec![0xB1]);
+    let (b_nats, b_events, _b_user_pk) = connect_device(&url, &device_b, &[expired_cap], exp).await;
+    let b_client = SignalingClient::new(b_nats, device_b.device_key());
+
+    // ---- act 4: device B refreshes ---------------------------------------------------------------
+    let refreshed = b_client
+        .refresh_capability(&host_identity, client_opts())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "refresh_capability failed: {e} -- with a real CapIssuer installed and a live, \
+                 non-revoked member device, this must succeed on the offer/answer exchange alone"
+            )
+        });
+    let cap = refreshed.expect(
+        "HostDaemon::with_cap_issuer installed a real RootKeyCapIssuer, and device_b is a live, \
+         non-revoked member device, so the answer must carry a fresh member_cap -- None here means \
+         either the issuer seam is not wired (HostConnectAuthorizer::new was used instead of \
+         ::with_issuer) or issuance itself silently failed",
+    );
+
+    verify_capability(&cap, fixtures::now())
+        .expect("the refreshed cap must verify its own root -> op-key -> sig chain right now");
+    assert_eq!(
+        cap.kind,
+        CapKind::Member,
+        "refresh_capability must hand back a member-kind capability"
+    );
+    assert!(
+        device_a.root_fp().matches(&cap.subject),
+        "DESIGN.md:286: subject must be the member's root_fp, so every root-certified device of \
+         this person may use it"
+    );
+    assert!(
+        !device_b.device_fp.matches(&cap.subject),
+        "the refreshed cap's subject must NOT be device_b's own device_fp -- scoping it to the \
+         connecting device instead of the member would defeat the whole renewal path"
+    );
+    assert!(
+        !device_a.device_fp.matches(&cap.subject),
+        "the refreshed cap's subject must NOT be device_a's device_fp either -- it is not the \
+         device that connected at all"
+    );
+    assert_eq!(
+        cap.cap_epoch, seeded_cap_epoch,
+        "the refreshed cap must carry the store's current cap_epoch, read live via DeviceLookup"
+    );
+    let now = fixtures::now();
+    let expected_exp = now + MEMBER_CAP_DEFAULT_TTL_SECS;
+    let slack_secs: u64 = 300; // 5 minutes -- a live test races a real wall clock
+    assert!(
+        cap.exp.abs_diff(expected_exp) <= slack_secs,
+        "cap.exp ({}) should be within {slack_secs}s of now + MEMBER_CAP_DEFAULT_TTL_SECS ({})",
+        cap.exp,
+        expected_exp
+    );
+
+    assert_no_permission_violation(&b_events, "device B (expired cap, connect-only)");
+
+    // ---- act 5: the unaided-second-device leg -- the point of this whole slice. Device A, which
+    // never performed a refresh of its own, connects presenting the cap device B just fetched, and
+    // completes a full connect + a real whoami VFS RPC over the resulting QUIC control stream. ---
+    let (a_nats, a_events, _a_user_pk) =
+        connect_device(&url, &device_a, std::slice::from_ref(&cap), exp).await;
+    let a_client = SignalingClient::new(a_nats, device_a.device_key());
+    let mut control = a_client
+        .connect(&host_identity, client_opts())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "device A's connect using device B's freshly-refreshed cap failed: {e} -- this is \
+                 the entire point of this test: one device's refreshed member cap must be accepted \
+                 by the live NATS callout for a different device of the same member"
+            )
+        });
+
+    let (member_display, _effective_paths) =
+        whoami(&mut control, "device A using device B's refreshed cap").await;
+    assert_eq!(
+        member_display, MEMBER_DISPLAY_NAME,
+        "device A must resolve to the seeded member via the cap device B refreshed -- a different \
+         member_display would mean the connect succeeded for the wrong reason"
+    );
+
+    control.connection.close(0u32.into(), b"done");
+    drop(control);
+
+    assert_no_permission_violation(&host_events, "host");
+    assert_no_permission_violation(&a_events, "device A (using device B's refreshed cap)");
 
     host_task.abort();
 }
