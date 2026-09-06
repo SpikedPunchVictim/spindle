@@ -453,6 +453,10 @@ mod tests {
             ) -> Result<Option<Member>, LookupError> {
                 Err(LookupError::LockPoisoned)
             }
+
+            fn cap_epoch(&self) -> Result<u64, LookupError> {
+                Err(LookupError::LockPoisoned)
+            }
         }
 
         let handler = handler_for(AlwaysFails);
