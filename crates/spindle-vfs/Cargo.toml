@@ -37,3 +37,14 @@ winapi-util = "0.1"
 # disposable sandbox directory tree; this never becomes a runtime dependency of spindle-vfs.
 [dev-dependencies]
 tempfile = "3"
+# Same pinned workspace rusqlite, plus the `hooks` feature — enabled HERE (a dev-dependency of
+# this one crate) rather than on the workspace dependency, so it applies only when test/bench
+# targets are built. Under resolver = "2" (workspace root Cargo.toml) features enabled solely by
+# a dev-dependency are not unified into `cargo build`/`cargo check` of the library itself, so no
+# non-test consumer of spindle-vfs gains `hooks`. `hooks = []` in rusqlite 0.32.1's Cargo.toml is
+# an empty feature (verified in the vendored source), so this pulls in no additional crates — it
+# only un-gates `Connection::authorizer` (rusqlite src/hooks/mod.rs), which
+# `store::tests::member_and_cap_epoch_never_returns_a_torn_member_epoch_pair_under_a_concurrent_revoke`
+# uses to interleave a second connection's write at a deterministic point. It does NOT change the
+# rusqlite version, so the 0.32 pin rationale in the workspace manifest is unaffected.
+rusqlite = { workspace = true, features = ["hooks"] }

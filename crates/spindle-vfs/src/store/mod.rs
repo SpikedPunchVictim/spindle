@@ -3207,10 +3207,11 @@ mod tests {
     /// Behaviour-preservation in the quiescent case: with no concurrent writer, the fused,
     /// transactional [`Store::member_and_cap_epoch`] must return exactly the same pair a caller
     /// would get from the two separate, pre-existing calls it replaces at connect time. This does
-    /// not prove the transaction excludes another connection's write (that needs a deterministic
-    /// interleave, which this repo cannot build without rusqlite's `hooks`/`trace` features — see
-    /// the two tests below and their doc comments); it proves the refactor did not change the
-    /// answer when there is nothing to race against.
+    /// not prove the transaction excludes another connection's write — that needs a deterministic
+    /// interleave, which
+    /// `member_and_cap_epoch_never_returns_a_torn_member_epoch_pair_under_a_concurrent_revoke`
+    /// (last in this section) builds with rusqlite's `hooks` feature. This one proves the refactor
+    /// did not change the answer when there is nothing to race against.
     #[test]
     fn member_and_cap_epoch_matches_the_two_separate_reads_it_replaces() {
         let store = Store::open_in_memory().expect("open");
@@ -3270,22 +3271,20 @@ mod tests {
         assert_eq!(epoch, epoch_before);
     }
 
-    /// The one deterministic, hooks-free proof available that `member_and_cap_epoch` reads a
-    /// consistent snapshot: seed an active member with an enrolled device on connection A (the
-    /// same "two independent connections to one file" shape as
+    /// The hooks-free proof that `member_and_cap_epoch` reads a consistent snapshot of a *settled*
+    /// database: seed an active member with an enrolled device on connection A (the same "two
+    /// independent connections to one file" shape as
     /// `authorize::tests::cap_epoch_is_read_live_not_cached`), then bump the epoch AND revoke the
-    /// member from connection B, fully, before connection A ever calls
-    /// `member_and_cap_epoch`. This cannot exercise the mid-transaction interleave itself (that
-    /// needs rusqlite's `hooks`/`trace` features, which `Cargo.toml` deliberately does not enable
-    /// — a dependency decision reserved for the repo owner, not this fix). What it does prove:
-    /// connection A observes connection B's fully-committed write as one atomic pair — a `Revoked`
-    /// member matched with the POST-bump epoch that revoke produced, never a stale pre-bump epoch
-    /// left over from a cached/prior read on connection A. A regression that silently dropped the
-    /// transaction and went back to two autocommit statements would still pass this particular
-    /// assertion (SQLite still serializes each individual commit), which is exactly why the
-    /// "neuter check" in this fix's verification step — deleting the `unchecked_transaction` call
-    /// and confirming which tests notice — is the honest way to report this test's real coverage
-    /// rather than overclaiming it here.
+    /// member from connection B, fully, before connection A ever calls `member_and_cap_epoch`.
+    /// This does not exercise the mid-transaction interleave — the test below it does, using
+    /// rusqlite's `hooks` feature. What it proves on its own: connection A observes connection B's
+    /// fully-committed write as one atomic pair — a `Revoked` member matched with the POST-bump
+    /// epoch that revoke produced, never a stale pre-bump epoch left over from a cached/prior read
+    /// on connection A. A regression that silently dropped the transaction and went back to two
+    /// autocommit statements would still pass this particular assertion (SQLite still serializes
+    /// each individual commit), which is stated here rather than left implied: this test's real
+    /// coverage stops at "A is not caching", and the torn-pair test below is the one that fails
+    /// when the `unchecked_transaction` is removed.
     #[test]
     fn member_and_cap_epoch_observes_a_fully_committed_revoke_from_another_connection_atomically() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3321,6 +3320,139 @@ mod tests {
             member.expect("device is still known").status,
             MemberStatus::Revoked,
             "connection A must see connection B's committed revoke, not a stale Active snapshot"
+        );
+    }
+
+    /// The deterministic proof that [`Store::member_and_cap_epoch`]'s transaction is load-bearing,
+    /// not decoration — the test the three above could not be: it drives another connection's
+    /// revoke **into the gap between this method's two reads** and asserts the returned pair is
+    /// still self-consistent.
+    ///
+    /// Why an authorizer and not a progress handler (this was established by running both, not
+    /// by reasoning): the interleave point has to be one where the lock state genuinely differs
+    /// between the transactional and the non-transactional shape. In SQLite's default rollback-
+    /// journal mode (nothing here sets `journal_mode`) connection A holds a SHARED lock for the
+    /// duration of *any* statement, transaction or no transaction — so a `progress_handler`,
+    /// which fires *during* statement execution, sees an identical lock state either way and
+    /// cannot tell the two apart. The difference lives in the **gap between** statement 1
+    /// (`cap_epoch`) and statement 2 (the `devices` lookup that opens `member_for_device_fp`):
+    /// inside a transaction A keeps SHARED across that gap until `COMMIT`; without one, A drops
+    /// every lock the moment statement 1 finalizes and the gap is wide open. `Connection::
+    /// authorizer` fires at statement *prepare* time, i.e. after statement 1 has been finalized
+    /// and before statement 2 begins executing — exactly in that gap — so keying on the first
+    /// `Read` of the `devices` table lands the interleave on the discriminating moment.
+    ///
+    /// The assertion is deliberately about the **property, not the mechanism**. It does not
+    /// assert `SQLITE_BUSY`, because whether B is refused outright or merely serialized outside
+    /// the window is SQLite's business and varies with journal mode; what the method promises its
+    /// caller is that the `(member, cap_epoch)` pair it returns describes **one** database state.
+    /// Only two pairs satisfy that here: `(Active, epoch_before)` — none of B's write is visible —
+    /// or `(Revoked, epoch_before + 1)` — all of it is. Anything else is a torn read, and a torn
+    /// read is a security defect: `spindle-host-core`'s authorize path mints a capability stamped
+    /// with the `cap_epoch` this call returns for the `Member` this call returns, so a pair
+    /// straddling a revoke either mints a live capability for a member the owner just revoked
+    /// (fail-open) or stamps a still-valid member with an epoch the host will reject on sight
+    /// (fail-closed, but still wrong). Removing the `unchecked_transaction`/`commit` pair from
+    /// `member_and_cap_epoch` makes this test fail with the second, fail-closed pair — see the
+    /// read-order rationale in that method's doc comment for why it is that one and not the
+    /// first.
+    #[test]
+    fn member_and_cap_epoch_never_returns_a_torn_member_epoch_pair_under_a_concurrent_revoke() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("host.sqlite3");
+
+        let store_a = Store::open(&path).expect("open connection A");
+        let member_id = store_a
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        store_a.activate_member(member_id).expect("activate_member");
+        let device_fp = Fingerprint::of_parts(&[b"alex-laptop"]);
+        store_a
+            .add_device(member_id, device_fp, "Laptop", 0, None)
+            .expect("add_device");
+        let epoch_before = store_a
+            .cap_epoch()
+            .expect("cap_epoch before the interleave");
+
+        let store_b = Store::open(&path).expect("open connection B, same file");
+        // rusqlite sets a 5s busy timeout at open; with the transaction in place B's write is
+        // blocked for as long as A's read transaction lives, and since A's read is *waiting on
+        // this callback*, waiting would deadlock until the timeout expires. Zero makes a blocked
+        // write fail immediately instead.
+        store_b
+            .connection()
+            .busy_timeout(Duration::from_millis(0))
+            .expect("drop B's busy timeout to zero");
+
+        // The callback runs on A's connection while A is inside `member_and_cap_epoch`, so it
+        // cannot use `store_a` (that would re-enter SQLite on a connection mid-statement-prepare)
+        // and cannot unwind (a panic across the C FFI boundary is UB). It moves `store_b` in and
+        // parks the outcome here for the test body to inspect after the hook is removed.
+        #[allow(clippy::type_complexity)]
+        let revoke_outcome: Arc<Mutex<Option<Result<Option<u64>, StoreError>>>> =
+            Arc::new(Mutex::new(None));
+        let outcome_slot = Arc::clone(&revoke_outcome);
+        let mut already_fired = false;
+        store_a
+            .connection()
+            .authorizer(Some(move |ctx: AuthContext<'_>| {
+                if !already_fired {
+                    // `devices` is read only by `member_for_device_fp`'s opening SELECT — the
+                    // second statement of `member_and_cap_epoch`. `cap_epoch` reads `meta`, so
+                    // this fires strictly after statement 1 has finalized. B is a different
+                    // connection, so nothing B does re-enters this authorizer.
+                    if let AuthAction::Read { table_name, .. } = ctx.action {
+                        if table_name == "devices" {
+                            already_fired = true;
+                            *outcome_slot.lock().expect("outcome mutex") =
+                                Some(store_b.revoke_member_and_bump_epoch(member_id));
+                        }
+                    }
+                }
+                Authorization::Allow
+            }));
+
+        let (member, epoch) = store_a
+            .member_and_cap_epoch(device_fp)
+            .expect("member_and_cap_epoch on connection A");
+
+        // Remove the hook (dropping the closure, and with it connection B) before asserting, so a
+        // failure reports cleanly rather than while A still has a callback armed.
+        store_a
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+        let outcome = revoke_outcome.lock().expect("outcome mutex").take().expect(
+            "the authorizer never fired on a `devices` read, so no interleave happened and \
+                 this test proved nothing — check that `member_and_cap_epoch` still reaches \
+                 `member_for_device_fp`",
+        );
+        let status = member
+            .expect("the device is enrolled, so it is findable whether or not B's revoke landed")
+            .status;
+
+        let self_consistent = match status {
+            // None of B's write is visible, so its epoch bump must not be either.
+            MemberStatus::Active => epoch == epoch_before,
+            // B's revoke is visible, so the bump it performed in the same transaction must be too.
+            MemberStatus::Revoked => epoch == epoch_before + 1,
+            MemberStatus::Invited => false,
+        };
+        assert!(
+            self_consistent,
+            "torn (member, cap_epoch) pair: status = {status:?} with cap_epoch = {epoch}, but the \
+             only self-consistent answers are (Active, {epoch_before}) — B's revoke not visible — \
+             or (Revoked, {}) — B's revoke fully visible. Anything in between means the two reads \
+             saw two different database states, i.e. another connection's revoke committed in the \
+             gap between them, which is exactly what `member_and_cap_epoch`'s transaction exists \
+             to prevent: the authorize path stamps the capability it mints for this `Member` with \
+             this `cap_epoch`, so a straddling pair mints a capability that does not correspond to \
+             any state the database was ever in. (B's revoke returned {outcome:?}.)",
+            epoch_before + 1,
         );
     }
 
