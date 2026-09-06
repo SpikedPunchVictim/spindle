@@ -190,7 +190,8 @@ the 2026-09-02 note below.
 - **Still unproven**: ICE is loopback-only (coturn is up in the compose stack but unused,
   so no NAT is traversed); S2's across-NATs number still does not exist; `seq` under real
   reordering is still unmeasured.
-**Note**: 2026-09-02 slice 4 progress. S9 is MET; S14 and S18 remain.
+**Note**: 2026-09-02 slice 4 progress. S9 is MET; S18 is partly met as of the 2026-09-06 note
+below; S14 remains.
 - **Slice 4** began at commit `aceafb9` ("Stage 5 slice 4: live S9 test — revoke -> kick ->
   reject under the < 5 s bar"), followed by `3ad8070` ("Fix two false-greens in the live S9
   reject leg"), `532f67f` ("Stage 5 slice 4: spindle-hostd + spindle-test-fixtures crates")
@@ -216,10 +217,63 @@ the 2026-09-02 note below.
 - **Remaining in slice 4**: S14 (revoke while host offline; tracked as td-b5d50c) and S18
   (cap lifecycle: expiry -> connect-only -> E2E re-issue, device bootstrap state bundle,
   second-device refetch; tracked as td-c74122). Stage 5 cannot be marked Complete until both
-  land.
+  land. Superseded in part by the 2026-09-06 note below.
 - **Forward-looking**: Stage 7's success criterion S15 ("backs up phrase; adds a second
   device; recovers on a fresh device unaided") is the usability test of S18's machinery, so
   S18 is a hard prerequisite for S15 and therefore for Stage 7's completion.
+**Note**: 2026-09-06 S18. The renewal path is met and live-proven; the device bootstrap bundle
+is designed but not built.
+- S18 landed as four slices: `cdbf84f` ("feat(proto): carry a re-issued member cap in the
+  connect answer (td-c74122)") added `member_cap: Option<Capability>` to `AnswerPayload` with
+  the Rust+TS twins and vectors; `729303a` ("Stage 5 S18 slice B: relay the host's member cap
+  in the connect answer") had `ConnectDecision::Allow` carry it and added
+  `SignalingClient::refresh_capability`; `8c8b493` ("Stage 5 S18 slice C: HostConnectAuthorizer
+  mints the member cap") added the `CapIssuer` seam and `RootKeyCapIssuer`; `88f4910` ("Stage 5
+  S18 slice D: live-prove the renewal path end to end") added `HostDaemon::with_cap_issuer` and
+  the live test.
+- **The wire placement was decided, then reversed on evidence.** The cap re-issue was first
+  scoped to a separate pre-VFS exchange on the established QUIC control stream. Static reading
+  then proved that unreachable: `client_connect_only_permissions`
+  (`crates/spindle-helper/src/permissions.rs:146-157`) grants exactly `pub host.<h>.connect`
+  plus `sub _INBOX_<own_device_fp>.>`, while `SignalingClient::connect` subscribes the `.h2c`
+  session subject before publishing its offer and trickles ICE on `.c2h` — neither granted. A
+  connect-only device can only do the sealed offer/answer exchange on its own inbox, so the cap
+  rides unconditionally in the connect answer, which is what DESIGN.md:289-290 said all along.
+- **S18's renewal and refetch legs are met, live.** The test is
+  `live_expired_device_gets_a_fresh_cap_that_a_second_device_of_the_same_member_can_use` in
+  `crates/spindle-hostd/tests/live_hostd.rs`, `#[ignore]`d, run against the composed stack on
+  2026-09-06. Device B arrives already locked out presenting a signature-valid but expired cap,
+  so the helper's real connect-only downgrade (`crates/spindle-helper/src/authz.rs:418-447`) is
+  exercised rather than simulated; B refreshes; then device A, which never refreshed, presents
+  B's cap and completes a full connect plus a real `whoami` RPC. That is the "second device
+  reaches all hosts unaided" bar, observed rather than asserted.
+- All 7 live tests pass against the stack (4 in `live_signaling.rs`, 3 in `live_hostd.rs`).
+  This run was also the first ever execution of
+  `live_refresh_capability_returns_the_hosts_member_cap`, which was written in `729303a` but
+  never run until 2026-09-06.
+- **A coverage hazard worth stating plainly**: `HostDaemon::new` requires an already-connected
+  `async_nats::Client`, and `async_nats` has no constructor that avoids dialing, so no test
+  under `cargo test --workspace` can construct a `HostDaemon` or call `run` at all. Two neuters
+  proved invisible to the offline gate: making `run` drop the installed issuer leaves both
+  `cargo test --workspace` and `cargo clippy -D warnings` green, and is caught only by the live
+  test; and minting `subject` as the connecting device's fp instead of `member.root_fp` (with
+  the subject assertions silenced so execution reaches the last leg) makes device A fail to
+  authenticate to NATS at all — the live callout refuses it, which is precisely the lockout the
+  path exists to prevent. The hostd issuer seam therefore has **zero offline regression
+  protection**; any future change to `run`'s authorizer assembly must be re-verified against
+  the live stack.
+- **Still not built**: the device bootstrap QR state bundle. Its design is settled in
+  DESIGN.md v0.9.22 (`3822a05`) and implementation is tracked as td-0f4fb6. Measured while
+  designing it: a member cap is **466 B** of canonical CBOR, not the ~330 B §A4 claimed (a 41%
+  understatement in the figure the CONNECT budget rests on); a full 32-cap CONNECT token
+  measures **19,106 B** against A10.10's 32 KiB `max_control_line`, so that decision survives
+  on real evidence; and at ~530 B per bundle entry a version-40 QR carries only **4** hosts at
+  EC level M and **5** at L, against the 32-host presentation cap — which is why the bundle now
+  fails loudly rather than truncating, with multi-frame QR held in reserve.
+- **Remaining in slice 4**: S14 (revoke while host offline; td-b5d50c) and S18's bootstrap
+  bundle (td-0f4fb6). Stage 5 cannot be marked Complete until both land. Stage 5's Status stays
+  **In Progress**.
+- Gate at `3822a05`: 691 passed / 0 failed / 15 ignored (Rust), 368 (TS `@spindle/proto`).
 
 ## Stage 6: spindle-vfs + host-core
 **Goal**: Implement the shares/groups/entitlements engine and the VFS RPC server in
