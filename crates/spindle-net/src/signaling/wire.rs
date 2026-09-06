@@ -408,6 +408,25 @@ mod tests {
         }
     }
 
+    /// A dummy `Capability` -- opaque bytes as far as this module is concerned (`spindle-net`
+    /// never mints, inspects, or validates a member cap; see
+    /// `super::authorize::ConnectDecision::Allow::member_cap`'s doc comment). Same
+    /// distinct-repeated-byte-per-field convention `spindle-proto`'s own `gen_vectors.rs` uses.
+    fn sample_capability() -> spindle_proto::artifacts::Capability {
+        spindle_proto::artifacts::Capability {
+            v: 1,
+            host_fp: vec![0xA1; 32],
+            host_root_pk: vec![0xA2; 32],
+            op_cert: vec![0xA3; 16],
+            kind: spindle_proto::artifacts::CapKind::Member,
+            subject: vec![0xA4; 32],
+            cap_epoch: 3,
+            exp: 1_759_017_600,
+            nonce: vec![0xA5; 16],
+            sig: vec![0xA6; 64],
+        }
+    }
+
     // ---- full offer -> answer round trip ----
 
     #[test]
@@ -454,6 +473,55 @@ mod tests {
 
         assert_eq!(decoded_answer, answer_payload);
         assert_eq!(host_k1.as_bytes(), client_k1.as_bytes());
+    }
+
+    /// td-c74122 slice B: a present `member_cap` survives the *real* k1 seal/open path, not just
+    /// `AnswerPayload`'s own CBOR encoder/decoder (`spindle-proto`'s own tests already pin the
+    /// latter). This is the evidence that the cap comes out the other end of the E2E-sealed
+    /// envelope byte-for-byte identical to what the host put in.
+    #[test]
+    fn offer_then_answer_round_trip_preserves_a_present_member_cap() {
+        let client = peer(0x64, 0x65);
+        let host = peer(0x74, 0x75);
+
+        let ctx = new_offer_context();
+        let offer_env = seal_offer(
+            &ctx,
+            &client.device,
+            client.fp,
+            host.fp,
+            &host.device.agree_public_key(),
+            &sample_offer_payload(),
+        );
+        let opened = open_offer(
+            &offer_env,
+            &host.device,
+            host.fp,
+            &client.device.sign_public_key(),
+            &client.device.agree_public_key(),
+        )
+        .expect("offer opens");
+
+        let cap = sample_capability();
+        let answer_payload = AnswerPayload {
+            member_cap: Some(cap.clone()),
+            ..sample_answer_payload()
+        };
+        let (_host_k1, answer_env) = opened.seal_answer(&host.device, host.fp, &answer_payload);
+
+        let (_client_k1, decoded_answer) = open_answer(
+            &answer_env,
+            &ctx,
+            &client.device,
+            client.fp,
+            host.fp,
+            &host.device.sign_public_key(),
+            &host.device.agree_public_key(),
+        )
+        .expect("answer opens");
+
+        assert_eq!(decoded_answer.member_cap, Some(cap));
+        assert_eq!(decoded_answer, answer_payload);
     }
 
     // ---- offer: negative tests, one per MUST-check surfaced through this wrapper ----

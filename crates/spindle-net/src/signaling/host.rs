@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use spindle_core::identity::DeviceKey;
 use spindle_core::Fingerprint;
-use spindle_proto::artifacts::Envelope;
+use spindle_proto::artifacts::{Capability, Envelope};
 use spindle_proto::signaling::{AnswerPayload, IcePayload, Transport};
 
 use crate::quic::{ControlStream, QuicServer, SessionCert};
@@ -115,9 +115,36 @@ pub struct SignalingHost<A, H> {
     handler: H,
 }
 
+/// Builds the [`AnswerPayload`] `handle_connect` seals and returns to the client.
+///
+/// Extracted so the unit tests construct the answer through the *same* code the production path
+/// does. This is not ceremony: when the `member_cap` relay was first written, the tests hand-rolled
+/// their own `AnswerPayload` mirroring this one, so setting `member_cap: None` on the production
+/// construction passed the entire suite. A test that builds its own copy of the value under test
+/// can never notice the real one dropping a field.
+///
+/// `transport` is fixed to [`Transport::Quic`]: this crate answers native<->native connects only
+/// (DESIGN.md A10.31 scopes WebRTC to browser peers, which arrive in Stage 8).
+fn build_answer_payload(
+    ufrag: String,
+    pwd: String,
+    cert_fp: [u8; spindle_proto::signaling::CERT_FP_LEN],
+    member_cap: Option<Capability>,
+) -> AnswerPayload {
+    AnswerPayload {
+        transport: Transport::Quic,
+        ufrag,
+        pwd,
+        cert_fp,
+        member_cap,
+    }
+}
+
 /// Verifies every §A7/§A5/§A6 receiver-side check on one raw connect-offer message and returns the
-/// opened offer, without touching NATS/ICE/QUIC — the richest unit-testable surface for this half
-/// of the host flow (see this crate's report for what a live run still needs to prove beyond this).
+/// opened offer plus the authorizer's `member_cap` decision (td-c74122: the cap `handle_connect`
+/// puts in the answer, per DESIGN.md:286/:289-290 — see `ConnectDecision::Allow::member_cap`'s doc
+/// comment), without touching NATS/ICE/QUIC — the richest unit-testable surface for this half of
+/// the host flow (see this crate's report for what a live run still needs to prove beyond this).
 ///
 /// The reply-prefix check runs first — it is cheap and needs no crypto. The §A10.36 `inbox`
 /// equality check is the third and last routing check, and is structurally forced to run after
@@ -146,7 +173,7 @@ pub async fn process_offer<A: ConnectAuthorizer>(
     host_device: &DeviceKey,
     host_device_fp: Fingerprint,
     authorizer: &A,
-) -> Result<OpenedOffer, SignalingError> {
+) -> Result<(OpenedOffer, Option<Capability>), SignalingError> {
     let env = Envelope::from_canonical_bytes(payload)?;
     let from_fp = Fingerprint::from_slice(&env.from_fp)?;
 
@@ -154,8 +181,12 @@ pub async fn process_offer<A: ConnectAuthorizer>(
         return Err(SignalingError::BadReplyPrefix);
     }
 
-    let (sign_pk, agree_pk) = match authorizer.authorize(&from_fp).await {
-        ConnectDecision::Allow { sign_pk, agree_pk } => (sign_pk, agree_pk),
+    let (sign_pk, agree_pk, member_cap) = match authorizer.authorize(&from_fp).await {
+        ConnectDecision::Allow {
+            sign_pk,
+            agree_pk,
+            member_cap,
+        } => (sign_pk, agree_pk, member_cap),
         ConnectDecision::Deny => return Err(SignalingError::Denied),
     };
 
@@ -170,7 +201,7 @@ pub async fn process_offer<A: ConnectAuthorizer>(
         return Err(SignalingError::ReplyInboxMismatch);
     }
 
-    Ok(opened)
+    Ok((opened, member_cap))
 }
 
 impl<A, H> SignalingHost<A, H>
@@ -239,7 +270,7 @@ where
         opts: HostOptions,
     ) -> Result<(), SignalingError> {
         let reply_subject = msg.reply.clone().ok_or(SignalingError::BadReplyPrefix)?;
-        let opened = process_offer(
+        let (opened, member_cap) = process_offer(
             &msg.payload,
             Some(reply_subject.as_str()),
             &self.device,
@@ -257,17 +288,18 @@ where
         // matches `s2-connect.rs`'s convention).
         let mut local_ice = start_local_ice(false, opts.bind_ip).await?;
 
-        let answer_payload = AnswerPayload {
-            transport: Transport::Quic,
-            ufrag: local_ice.ufrag.clone(),
-            pwd: local_ice.pwd.clone(),
-            cert_fp: cert.fingerprint(),
-            // Populated in td-c74122 slice B, once `ConnectDecision::Allow` carries the cap the
-            // host's authorizer minted. `None` here is not a placeholder for "not implemented":
-            // it is the honest answer for a host with no cap-signing key, which is every host
-            // today (`spindle-hostd/src/main.rs` is a stub pending A4 key custody).
-            member_cap: None,
-        };
+        // `member_cap` is the authorizer's own per-connect decision (td-c74122 slice B) — see
+        // `ConnectDecision::Allow::member_cap`'s doc comment for what `None` means and why. This
+        // crate never mints, inspects, or validates the cap; it only relays whatever the injected
+        // `ConnectAuthorizer` supplied, unconditionally, on every successful connect
+        // (DESIGN.md:286's "refreshed opportunistically on every successful session" and
+        // :289-290's renewal-in-the-reply path — one mechanism satisfies both).
+        let answer_payload = build_answer_payload(
+            local_ice.ufrag.clone(),
+            local_ice.pwd.clone(),
+            cert.fingerprint(),
+            member_cap,
+        );
         let (session_key, answer_env) =
             opened.seal_answer(&self.device, self.device_fp, &answer_payload);
 
@@ -427,6 +459,10 @@ mod tests {
     struct KeyAuthorizer {
         sign_pk: VerifyingKey,
         agree_pk: X25519PublicKey,
+        /// td-c74122 slice B: the `member_cap` this fixture hands back on every `Allow`. `None`
+        /// in every existing test (mirroring every host today, which has no cap-signing key);
+        /// `Some(cap)` only in the tests that specifically pin the cap-relay behavior below.
+        member_cap: Option<Capability>,
     }
 
     impl ConnectAuthorizer for KeyAuthorizer {
@@ -434,6 +470,7 @@ mod tests {
             ConnectDecision::Allow {
                 sign_pk: self.sign_pk,
                 agree_pk: self.agree_pk,
+                member_cap: self.member_cap.clone(),
             }
         }
     }
@@ -486,10 +523,11 @@ mod tests {
         let authorizer = KeyAuthorizer {
             sign_pk: client.device.sign_public_key(),
             agree_pk: client.device.agree_public_key(),
+            member_cap: None,
         };
         let reply = client_inbox(&client.fp);
 
-        let opened = process_offer(
+        let (opened, member_cap) = process_offer(
             &offer_env.to_canonical_bytes(),
             Some(reply.as_str()),
             &host.device,
@@ -501,6 +539,7 @@ mod tests {
 
         assert_eq!(opened.offer, payload);
         assert_eq!(opened.from_fp, client.fp);
+        assert_eq!(member_cap, None);
     }
 
     #[tokio::test]
@@ -549,6 +588,7 @@ mod tests {
         let authorizer = KeyAuthorizer {
             sign_pk: client.device.sign_public_key(),
             agree_pk: client.device.agree_public_key(),
+            member_cap: None,
         };
         // Well-formed _INBOX subject, but scoped to a different device than the offer's own
         // from_fp -- the exact NATS-level spoof `reply_prefix_ok` exists to catch.
@@ -592,6 +632,7 @@ mod tests {
         let authorizer = KeyAuthorizer {
             sign_pk: client.device.sign_public_key(),
             agree_pk: client.device.agree_public_key(),
+            member_cap: None,
         };
         // A different, but still validly-prefixed, inbox of the same client's -- what a
         // substituting broker would report as `msg.reply` instead of the signed `inbox`.
@@ -632,9 +673,10 @@ mod tests {
         let authorizer = KeyAuthorizer {
             sign_pk: client.device.sign_public_key(),
             agree_pk: client.device.agree_public_key(),
+            member_cap: None,
         };
 
-        let opened = process_offer(
+        let (opened, _member_cap) = process_offer(
             &offer_env.to_canonical_bytes(),
             Some(signed_inbox.as_str()),
             &host.device,
@@ -663,6 +705,7 @@ mod tests {
         let authorizer = KeyAuthorizer {
             sign_pk: client.device.sign_public_key(),
             agree_pk: client.device.agree_public_key(),
+            member_cap: None,
         };
 
         // `reply_prefix_ok(None, _)` is unconditionally false (`Option::is_some_and`) -- a missing
@@ -703,6 +746,7 @@ mod tests {
         let authorizer = KeyAuthorizer {
             sign_pk: impostor.device.sign_public_key(), // wrong pinned key
             agree_pk: client.device.agree_public_key(),
+            member_cap: None,
         };
         let reply = client_inbox(&client.fp);
 
@@ -756,5 +800,167 @@ mod tests {
             !spy.was_called(),
             "the authorizer must not be consulted before the reply-prefix check passes, but it was called"
         );
+    }
+
+    // ---- td-c74122 slice B: the authorizer's `member_cap` decision flows into the answer ----
+
+    /// A dummy `Capability` — never verified by anything in this test, only carried as opaque
+    /// bytes (see `ConnectDecision::Allow::member_cap`'s doc comment: `spindle-net` never mints,
+    /// inspects, or validates this value). Field values follow the same "distinct repeated byte
+    /// per field" convention `spindle-proto`'s own `gen_vectors.rs` uses for its dummy caps.
+    fn sample_capability() -> Capability {
+        Capability {
+            v: 1,
+            host_fp: vec![0x91; 32],
+            host_root_pk: vec![0x92; 32],
+            op_cert: vec![0x93; 16],
+            kind: spindle_proto::artifacts::CapKind::Member,
+            subject: vec![0x94; 32],
+            cap_epoch: 3,
+            exp: 1_759_017_600,
+            nonce: vec![0x95; 16],
+            sig: vec![0x96; 64],
+        }
+    }
+
+    /// DESIGN.md:286/:289-290, end to end through this crate's own plumbing (not just the wire
+    /// type slice A already pinned): an authorizer that `Allow`s with `member_cap: Some(cap)`
+    /// must produce a sealed answer that decodes back to that exact cap. Goes all the way through
+    /// `opened.seal_answer`/`wire::open_answer` -- the real E2E sealing path, not a bare CBOR
+    /// round trip -- so this is also evidence the cap survives the k1 envelope, not merely
+    /// `AnswerPayload`'s own encoder/decoder.
+    #[tokio::test]
+    async fn allow_with_a_member_cap_flows_into_the_sealed_answer() {
+        let client = peer(0x60, 0x61);
+        let host = peer(0x62, 0x63);
+        let ctx = wire::new_offer_context();
+        let reply = client_inbox(&client.fp);
+        let offer_env = wire::seal_offer(
+            &ctx,
+            &client.device,
+            client.fp,
+            host.fp,
+            &host.device.agree_public_key(),
+            &sample_offer_payload(&reply),
+        );
+        let cap = sample_capability();
+        let authorizer = KeyAuthorizer {
+            sign_pk: client.device.sign_public_key(),
+            agree_pk: client.device.agree_public_key(),
+            member_cap: Some(cap.clone()),
+        };
+
+        let (opened, member_cap) = process_offer(
+            &offer_env.to_canonical_bytes(),
+            Some(reply.as_str()),
+            &host.device,
+            host.fp,
+            &authorizer,
+        )
+        .await
+        .expect("a well-formed offer from an authorized sender must open");
+        assert_eq!(
+            member_cap,
+            Some(cap.clone()),
+            "process_offer must hand back the exact member_cap the authorizer returned"
+        );
+
+        let answer_payload = build_answer_payload(
+            "hostufrag".to_string(),
+            "hostpassword1234567890abcd".to_string(),
+            [0x22; 32],
+            member_cap,
+        );
+        let (_session_key, answer_env) = opened.seal_answer(&host.device, host.fp, &answer_payload);
+
+        let (_client_k1, decoded_answer) = wire::open_answer(
+            &answer_env,
+            &ctx,
+            &client.device,
+            client.fp,
+            host.fp,
+            &host.device.sign_public_key(),
+            &host.device.agree_public_key(),
+        )
+        .expect("answer opens");
+
+        assert_eq!(
+            decoded_answer.member_cap,
+            Some(cap),
+            "the client must see the exact cap the host's authorizer supplied, through the real \
+             seal/open path"
+        );
+    }
+
+    /// The negative twin: an authorizer that `Allow`s with `member_cap: None` (every host today,
+    /// per that field's doc comment) must produce an answer that both decodes to `None` and
+    /// genuinely omits the `member_cap` key on the wire -- not a `null`-emitting encoder that
+    /// would also decode back to `None` (see `spindle-proto`'s own
+    /// `answer_round_trips_with_member_cap_absent_and_omits_the_key`, which this test's assertion
+    /// on the raw CBOR mirrors at this crate's own construction site).
+    #[tokio::test]
+    async fn allow_with_no_member_cap_produces_an_answer_that_omits_the_key() {
+        let client = peer(0x64, 0x65);
+        let host = peer(0x66, 0x67);
+        let ctx = wire::new_offer_context();
+        let reply = client_inbox(&client.fp);
+        let offer_env = wire::seal_offer(
+            &ctx,
+            &client.device,
+            client.fp,
+            host.fp,
+            &host.device.agree_public_key(),
+            &sample_offer_payload(&reply),
+        );
+        let authorizer = KeyAuthorizer {
+            sign_pk: client.device.sign_public_key(),
+            agree_pk: client.device.agree_public_key(),
+            member_cap: None,
+        };
+
+        let (opened, member_cap) = process_offer(
+            &offer_env.to_canonical_bytes(),
+            Some(reply.as_str()),
+            &host.device,
+            host.fp,
+            &authorizer,
+        )
+        .await
+        .expect("a well-formed offer from an authorized sender must open");
+        assert_eq!(member_cap, None);
+
+        let answer_payload = build_answer_payload(
+            "hostufrag".to_string(),
+            "hostpassword1234567890abcd".to_string(),
+            [0x22; 32],
+            member_cap,
+        );
+        let (_session_key, answer_env) = opened.seal_answer(&host.device, host.fp, &answer_payload);
+
+        let (_client_k1, decoded_answer) = wire::open_answer(
+            &answer_env,
+            &ctx,
+            &client.device,
+            client.fp,
+            host.fp,
+            &host.device.sign_public_key(),
+            &host.device.agree_public_key(),
+        )
+        .expect("answer opens");
+        assert_eq!(decoded_answer.member_cap, None);
+
+        let decoded_cbor = spindle_proto::canonical_decode(&answer_payload.to_canonical_bytes())
+            .expect("decode cbor");
+        if let spindle_proto::CborValue::Map(entries) = decoded_cbor {
+            assert!(
+                !entries
+                    .iter()
+                    .any(|(k, _)| k.as_text() == Some("member_cap")),
+                "member_cap key must be omitted when the authorizer supplies None, not present \
+                 with any value"
+            );
+        } else {
+            panic!("expected a map");
+        }
     }
 }

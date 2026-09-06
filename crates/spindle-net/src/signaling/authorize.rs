@@ -29,6 +29,20 @@ pub enum ConnectDecision {
     Allow {
         sign_pk: spindle_core::VerifyingKey,
         agree_pk: X25519PublicKey,
+        /// The host's current member capability for this device's root, to be returned in the
+        /// connect answer (DESIGN.md:286 — member caps are "refreshed opportunistically on every
+        /// successful session" — and :289-290's renewal path, which re-issues "the current cap in
+        /// the reply"). `None` when the host has no cap-signing key online to mint with, which is
+        /// every host today (`spindle-hostd/src/main.rs` is a stub pending A4 key custody per
+        /// td-539ffa) — `None` is the honest answer for that case, not a placeholder for
+        /// "unimplemented".
+        ///
+        /// `spindle-net` never mints, inspects, or validates this value: it is opaque bytes the
+        /// injected authorizer supplies, and this crate only relays it into the answer envelope.
+        /// Minting requires host key material (the root public key, the capability op cert, the
+        /// op signing key) that A9c boundary rule 3 keeps out of this crate — see this module's
+        /// doc comment.
+        member_cap: Option<spindle_proto::artifacts::Capability>,
     },
     /// `from_fp` is unknown, not (yet) a member, or revoked. The caller must drop the offer with
     /// no distinguishable reply (DESIGN.md §A5's uniform-silent-drop philosophy) — see
@@ -72,6 +86,10 @@ mod tests {
                 ConnectDecision::Allow {
                     sign_pk: self.device.sign_public_key(),
                     agree_pk: self.device.agree_public_key(),
+                    // This fixture models a bare registry lookup, not cap issuance -- see
+                    // `ConnectDecision::Allow::member_cap`'s doc comment for why `None` is the
+                    // honest answer whenever no cap-signing key is wired in.
+                    member_cap: None,
                 }
             } else {
                 ConnectDecision::Deny
@@ -86,9 +104,14 @@ mod tests {
         let authorizer = FixedAuthorizer { allowed, device };
 
         match authorizer.authorize(&allowed).await {
-            ConnectDecision::Allow { sign_pk, agree_pk } => {
+            ConnectDecision::Allow {
+                sign_pk,
+                agree_pk,
+                member_cap,
+            } => {
                 assert_eq!(sign_pk, authorizer.device.sign_public_key());
                 assert_eq!(agree_pk, authorizer.device.agree_public_key());
+                assert_eq!(member_cap, None);
             }
             ConnectDecision::Deny => panic!("expected Allow for the registered device_fp"),
         }

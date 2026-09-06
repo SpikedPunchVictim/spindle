@@ -135,6 +135,7 @@ use spindle_net::signaling::{
     ConnectAuthorizer, ConnectDecision, ConnectOptions, HostIdentity, HostOptions, SessionHandler,
     SignalingClient, SignalingHost,
 };
+use spindle_proto::artifacts::Capability;
 use x25519_dalek::PublicKey as X25519PublicKey;
 
 // The callout bootstrap fixtures (`fixtures::*`), the live-stack connection helpers
@@ -169,6 +170,11 @@ struct AuthorizeCall {
 struct RegistryAuthorizer {
     registry: HashMap<Fingerprint, (VerifyingKey, X25519PublicKey)>,
     calls: Arc<Mutex<Vec<AuthorizeCall>>>,
+    /// td-c74122 slice B: the `member_cap` this authorizer hands back on every `Allow`. `None` in
+    /// this file's other two live tests (mirroring every host today, which has no cap-signing key
+    /// online); `Some(cap)` only in `live_refresh_capability_returns_the_hosts_member_cap`, via
+    /// [`Self::with_member_cap`].
+    member_cap: Option<spindle_proto::artifacts::Capability>,
 }
 
 impl RegistryAuthorizer {
@@ -185,9 +191,16 @@ impl RegistryAuthorizer {
             Self {
                 registry,
                 calls: calls.clone(),
+                member_cap: None,
             },
             calls,
         )
+    }
+
+    /// Builder: sets the `member_cap` this authorizer returns on every subsequent `Allow`.
+    fn with_member_cap(mut self, cap: spindle_proto::artifacts::Capability) -> Self {
+        self.member_cap = Some(cap);
+        self
     }
 }
 
@@ -202,7 +215,11 @@ impl ConnectAuthorizer for RegistryAuthorizer {
                 allowed: hit.is_some(),
             });
         match hit {
-            Some((sign_pk, agree_pk)) => ConnectDecision::Allow { sign_pk, agree_pk },
+            Some((sign_pk, agree_pk)) => ConnectDecision::Allow {
+                sign_pk,
+                agree_pk,
+                member_cap: self.member_cap.clone(),
+            },
             None => ConnectDecision::Deny,
         }
     }
@@ -456,6 +473,119 @@ async fn live_connect_round_trips_bytes_and_reports_latency() {
             .iter()
             .all(|c| c.from_fp == client.device_fp && c.allowed),
         "every authorize call must name the real client device_fp and be allowed, got {calls:?}"
+    );
+
+    assert_no_permission_violation(&host_events, "host");
+    assert_no_permission_violation(&client_events, "client");
+
+    host_task.abort();
+}
+
+/// td-c74122 (S18) slice B: [`SignalingClient::refresh_capability`] against the real composed
+/// stack. Proves the shape of the whole no-lockout mechanism end to end -- a genuine offer/answer
+/// exchange over live NATS, a genuine `ConnectAuthorizer::Allow { member_cap: Some(cap), .. }`
+/// decision, a genuine `SignalingHost` answer, and the exact cap coming back out of
+/// `refresh_capability` -- without ever touching ICE or QUIC, which this method must not do (see
+/// its own doc comment for why: those are exactly the permissions a connect-only device lacks).
+///
+/// This test does not construct an actually-expired/stale-epoch capability for the connecting
+/// device (that would additionally exercise `spindle-helper`'s callout-side connect-only grant,
+/// `client_connect_only_permissions` -- already covered by this crate's own scoping notes as
+/// "ALREADY DONE" and not this slice's job to re-prove). The device here holds an ordinary,
+/// unexpired member cap, which is NATS-permitted for everything `connect_timed` needs too; what
+/// this test isolates is `refresh_capability`'s own mechanics -- that it stops after the answer,
+/// never reaches the `SessionHandler`, and returns the authorizer's cap byte-for-byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live stack required: run `docker compose -f deploy/docker-compose.yml up -d` first, \
+            then `cargo test -p spindle-net --test live_signaling -- --ignored --nocapture`. \
+            When run, an unreachable stack fails loudly — this test never skips."]
+async fn live_refresh_capability_returns_the_hosts_member_cap() {
+    let url = nats_url();
+    let exp = fixtures::now() + 3600;
+
+    let host_root = HostRootIdentity::new([0x11; 32], [0x12; 32]);
+    let host_device = DeviceKey::from_seeds([0x13; 32], [0x14; 32]);
+    let host_device_fp = host_device.device_fp();
+    let host_device_sign_pk = host_device.sign_public_key();
+    let host_device_agree_pk = host_device.agree_public_key();
+    let client = DeviceIdentity::new([0x15; 32], [0x16; 32], [0x17; 32]);
+    // What earns this connection its NATS permissions in the first place -- unrelated to the cap
+    // the authorizer re-issues below, and deliberately given a different `nonce` so the two can
+    // never be confused with each other in a failing assertion's output.
+    let cap_for_connect = host_root.member_capability(client.root_fp(), exp, vec![0xD0]);
+    // The re-issued cap the host's authorizer hands back in the answer -- a genuinely different
+    // `Capability` value (different nonce) than `cap_for_connect`, so this test cannot pass by
+    // accident (e.g. by the host echoing back whatever let the client connect at all).
+    let reissued_cap = host_root.member_capability(client.root_fp(), exp, vec![0xD1]);
+
+    let (host_nats, host_events) = connect_host(&url, &host_root, exp).await;
+    let (client_nats, client_events, _client_user_pk) =
+        connect_device(&url, &client, &[cap_for_connect], exp).await;
+
+    let (authorizer, authorize_calls) = RegistryAuthorizer::new(&[&client]);
+    let authorizer = authorizer.with_member_cap(reissued_cap.clone());
+    let sessions = Arc::new(AtomicUsize::new(0));
+    let session_peers = Arc::new(Mutex::new(Vec::new()));
+    let host = Arc::new(SignalingHost::new(
+        host_nats,
+        host_device,
+        host_root.host_fp,
+        authorizer,
+        EchoHandler {
+            sessions: sessions.clone(),
+            peers: session_peers.clone(),
+        },
+    ));
+    let host_task = tokio::spawn({
+        let host = host.clone();
+        async move { host.run(host_opts()).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_no_permission_violation(&host_events, "host");
+
+    let signaling_client = SignalingClient::new(client_nats, client.device_key());
+    let host_identity = HostIdentity {
+        host_fp: host_root.host_fp,
+        device_fp: host_device_fp,
+        sign_pk: host_device_sign_pk,
+        agree_pk: host_device_agree_pk,
+    };
+
+    let got: Option<Capability> = signaling_client
+        .refresh_capability(&host_identity, client_opts())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "refresh_capability failed: {e} -- it must succeed on the offer/answer exchange \
+                 alone, without ever reaching ICE or QUIC"
+            )
+        });
+    assert_eq!(
+        got,
+        Some(reissued_cap),
+        "refresh_capability must return exactly the member_cap the host's ConnectAuthorizer \
+         supplied in the answer"
+    );
+
+    // refresh_capability must never subscribe h2c, never trickle ICE, and never reach the
+    // SessionHandler -- the host's own ICE gather times out on its own schedule after this test
+    // has already finished with the answer.
+    assert_eq!(
+        sessions.load(Ordering::SeqCst),
+        0,
+        "refresh_capability must never hand a session to the SessionHandler"
+    );
+
+    let calls = authorize_calls
+        .lock()
+        .expect("authorize call log mutex")
+        .clone();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.from_fp == client.device_fp && c.allowed),
+        "the ConnectAuthorizer must have been consulted with the real client device_fp and \
+         allowed it, got {calls:?}"
     );
 
     assert_no_permission_violation(&host_events, "host");

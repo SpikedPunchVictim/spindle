@@ -210,7 +210,16 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
             return ConnectDecision::Deny;
         }
 
-        ConnectDecision::Allow { sign_pk, agree_pk }
+        // td-c74122 slice C mints a cap here via an injected cap-issuing seam; this authorizer
+        // has none yet, so `None` is the honest answer (see
+        // `ConnectDecision::Allow::member_cap`'s doc comment) -- not "unimplemented", since a
+        // host with no cap-signing key online is expected to supply `None` forever, not just
+        // until slice C lands.
+        ConnectDecision::Allow {
+            sign_pk,
+            agree_pk,
+            member_cap: None,
+        }
     }
 }
 
@@ -259,9 +268,18 @@ mod tests {
         let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store));
 
         match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { sign_pk, agree_pk } => {
+            ConnectDecision::Allow {
+                sign_pk,
+                agree_pk,
+                member_cap,
+            } => {
                 assert_eq!(sign_pk, device.sign_public_key());
                 assert_eq!(agree_pk, device.agree_public_key());
+                assert_eq!(
+                    member_cap, None,
+                    "HostConnectAuthorizer has no cap-issuing seam yet (td-c74122 slice C) -- it \
+                     must supply None, never fabricate a cap"
+                );
             }
             ConnectDecision::Deny => panic!("expected Allow for an active member's own device"),
         }
