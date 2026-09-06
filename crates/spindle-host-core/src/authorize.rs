@@ -43,8 +43,22 @@ pub trait DeviceLookup: Send + Sync {
     /// `spindle_vfs::store::Store::member_for_device_fp` performs.
     fn member_for_device_fp(&self, device_fp: Fingerprint) -> Result<Option<Member>, LookupError>;
 
-    /// The host's current `cap_epoch` (`spindle_vfs::store::Store::cap_epoch`) — the value a
-    /// freshly-minted member capability must be stamped with.
+    /// The host's current `cap_epoch` (`spindle_vfs::store::Store::cap_epoch`), read on its own,
+    /// independent of any membership read.
+    ///
+    /// **Must NOT be used to source the epoch a freshly-minted member capability is stamped
+    /// with.** That was this method's original purpose, but it is exactly the split-read shape
+    /// [`Self::member_and_cap_epoch`]'s doc comment warns against: calling this method and
+    /// [`Self::member_for_device_fp`] as two independent reads reopens the TOCTOU a revoke can
+    /// land inside of, pairing a pre-revoke member with a post-bump epoch. Any caller about to
+    /// mint a capability **must** use [`Self::member_and_cap_epoch`] instead, which reads both
+    /// values from one atomic snapshot. As of this writing this method has no caller left at all,
+    /// production or test: `HostConnectAuthorizer::authorize` reads the epoch exclusively via
+    /// `self.lookup.member_and_cap_epoch(..)`, and [`SqliteDeviceLookup::member_and_cap_epoch`]'s
+    /// own implementation delegates straight to `Store::member_and_cap_epoch` rather than calling
+    /// this method. It is still implemented — by [`SqliteDeviceLookup`] and by several test
+    /// doubles in this crate's `#[cfg(test)]` modules — only because implementing [`DeviceLookup`]
+    /// requires it; nothing anywhere invokes it.
     ///
     /// Deliberately read through this same [`DeviceLookup`] rather than a second `Store` handle:
     /// `Store::bump_cap_epoch` (the *only* path that increments the epoch — see its own doc
@@ -288,9 +302,15 @@ fn liveness_checks(member: Option<Member>, device_fp: Fingerprint) -> Option<Mem
 pub trait CapIssuer: Send + Sync {
     /// Issues a `member`-kind capability for `subject` (see [`RootKeyCapIssuer`]'s doc comment
     /// for why `subject` must be the member's `root_fp`, never a device fp), stamped with
-    /// `cap_epoch` — the caller (`HostConnectAuthorizer::authorize`) is responsible for reading
-    /// that epoch live via [`DeviceLookup::cap_epoch`] rather than caching it, so a cap minted
-    /// moments after a revocation bump always carries the new epoch.
+    /// `cap_epoch` — the caller (`HostConnectAuthorizer::authorize`) reads that epoch live via
+    /// [`DeviceLookup::member_and_cap_epoch`], in the same snapshot as the membership check that
+    /// gated this call, rather than caching it. Reading it via [`DeviceLookup::cap_epoch`] as a
+    /// second, independent call — alongside a separate membership read — is precisely the TOCTOU
+    /// this method's caller was rewritten to close: a revoke committing between the two reads
+    /// would let this method mint a validly-signed capability for a subject the store has already
+    /// revoked, stamped with an epoch that makes it indistinguishable from a legitimately fresh
+    /// one. See [`DeviceLookup::member_and_cap_epoch`]'s own doc comment for the full shape of
+    /// that race.
     fn issue_member_cap(&self, subject: Fingerprint, cap_epoch: u64) -> Option<Capability>;
 }
 

@@ -851,20 +851,57 @@ impl Store {
     ///
     /// Read order is deliberate defense in depth: `cap_epoch` is read **before** the member, not
     /// after (the reverse of the naive order). If this transaction were ever weakened or removed
-    /// by a future refactor, reading the epoch first makes the residual race fail **safe**: a
-    /// revoke committing in the window between the two reads would then pair a *pre*-revoke member
-    /// with the *pre*-bump epoch, producing a capability the host's now-higher `cap_epoch` rejects
-    /// on sight. The opposite order fails **open** instead — a pre-revoke member paired with a
-    /// post-bump epoch looks exactly like a freshly-issued, still-valid capability, which is the
-    /// defect this method exists to eliminate. The transaction should make the order moot in
-    /// practice, but a fail-safe order costs nothing and removes one more way a future change could
-    /// silently reopen this hole.
+    /// by a future refactor, reading the epoch first makes the residual race fail **safe** — but
+    /// not for the reason "the epoch looks pre-bump" suggests. A revoke committing in the window
+    /// between the two reads has already been captured by the first read as `cap_epoch`'s
+    /// *pre*-bump value; the member read that follows now happens *after* the revoke, so it comes
+    /// back `Revoked`. The torn pair this order produces is `(Revoked, epoch_before)` — a revoked
+    /// member, not a live one. `spindle-host-core::authorize::liveness_checks` refuses that member
+    /// outright (its check 3: `if member.status != MemberStatus::Active { return None; }`), so
+    /// `HostConnectAuthorizer::authorize` returns `ConnectDecision::Deny` before it ever reaches
+    /// the mint call — no capability is produced at all, let alone one the host's own `cap_epoch`
+    /// would later reject. The opposite order fails **open** instead: a revoke landing in the same
+    /// window is invisible to a member read that happens *first*, so that torn pair comes out
+    /// `(Active, epoch_after)` — a still-live-looking member paired with the *post*-bump epoch.
+    /// Check 3 has nothing to refuse there, so `authorize` goes on to mint a validly-signed
+    /// capability for a subject the store has, by that point, already revoked, stamped with an
+    /// epoch that makes it indistinguishable from a legitimately fresh one. "Denied, nothing
+    /// minted" versus "minted a capability for a revoked subject" is the entire asymmetry this
+    /// ordering buys. The transaction should make the order moot in practice, but a fail-safe
+    /// order costs nothing and removes one more way a future change could silently reopen this
+    /// hole.
     ///
-    /// Uses `unchecked_transaction` rather than `rusqlite::Connection::transaction`, matching
-    /// [`Store::revoke_member_and_bump_epoch`]'s house style and for the same reason (see that
-    /// method's doc comment): every `Store` method takes `&self`, and `transaction()` requires
-    /// `&mut Connection`, which would ripple a breaking API change through this whole file and
-    /// every caller in `spindle-host-core`.
+    /// Uses `unchecked_transaction` rather than `rusqlite::Connection::transaction`. "Every
+    /// `Store` method takes `&self`, and `transaction()` requires `&mut Connection`" is true but
+    /// incomplete as a reason, because `&mut Connection` is not the only alternative avoided —
+    /// this file's dominant transaction idiom is actually `Transaction::new_unchecked`, which also
+    /// takes `&self`. Counting every other transaction site in this file: two —
+    /// [`Store::revoke_member_and_bump_epoch`] and [`Store::revoke_device_and_bump_epoch`] — use
+    /// `unchecked_transaction` like this method; one — [`Store::burn_invite_nonce`] — takes
+    /// `&mut self` and uses `self.conn.transaction()`; and six — [`Store::add_share`],
+    /// [`Store::add_share_exclude`], [`Store::record_upload`], [`Store::remove_uploads_under`],
+    /// [`Store::remove_upload_row`], and [`Store::reconcile_upload_counters`] — take `&self` and
+    /// use `Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)`. So the
+    /// question this method actually has to answer is not "`&self` or `&mut self`" —
+    /// `Transaction::new_unchecked` would have satisfied `&self` just as well — but DEFERRED
+    /// versus IMMEDIATE, since `unchecked_transaction` and `Transaction::new_unchecked` differ
+    /// only in which behavior they request.
+    ///
+    /// DEFERRED is the correct answer for this method, and IMMEDIATE would be a regression.
+    /// IMMEDIATE takes a RESERVED lock at `BEGIN` unconditionally, which is right for the six
+    /// share/upload sites above because they are about to write and want that lock claimed up
+    /// front — but this method never writes, so the same RESERVED lock would only serialize this
+    /// read against every writer on the file for no benefit. DEFERRED instead takes nothing until
+    /// the first statement actually runs, and then only a SHARED lock — and it keeps that SHARED
+    /// lock held across the gap between this method's two reads, all the way to `COMMIT`. That
+    /// retention across the statement boundary is the entire isolation guarantee this method
+    /// relies on, not anything about what `BEGIN` itself acquires. Verified against rusqlite
+    /// 0.32.1's source (`transaction.rs`): `Connection::unchecked_transaction` calls
+    /// `Transaction::new_unchecked(self, self.transaction_behavior)`, and every `Connection`
+    /// constructor in that crate defaults `transaction_behavior` to `TransactionBehavior::
+    /// Deferred`, which `new_unchecked` turns into exactly `"BEGIN DEFERRED"`. Nothing in this
+    /// crate calls `Connection::set_transaction_behavior` to override that default, so this
+    /// method's `unchecked_transaction()` call always begins DEFERRED.
     pub fn member_and_cap_epoch(
         &self,
         device_fp: Fingerprint,
@@ -3353,9 +3390,15 @@ mod tests {
     /// straddling a revoke either mints a live capability for a member the owner just revoked
     /// (fail-open) or stamps a still-valid member with an epoch the host will reject on sight
     /// (fail-closed, but still wrong). Removing the `unchecked_transaction`/`commit` pair from
-    /// `member_and_cap_epoch` makes this test fail with the second, fail-closed pair — see the
-    /// read-order rationale in that method's doc comment for why it is that one and not the
-    /// first.
+    /// `member_and_cap_epoch` makes this test fail with the pair `(Revoked, epoch_before)`: B's
+    /// revoke lands after `cap_epoch` has already been read (so the epoch this call returns is
+    /// still the pre-bump value) but before the `devices` read that follows (so the member this
+    /// call returns already reads back `Revoked`). That is the fail-closed half of the straddle —
+    /// note that the *other* self-consistent-looking pair, `(Revoked, epoch_before + 1)`, is one
+    /// the assertion below accepts outright, so it could never be what makes this test fail; the
+    /// only pair the neuter can actually produce here is `(Revoked, epoch_before)`. See the
+    /// read-order rationale in that method's doc comment for why epoch-first is the order that
+    /// produces this pair rather than the member-first order's `(Active, epoch_after)`.
     #[test]
     fn member_and_cap_epoch_never_returns_a_torn_member_epoch_pair_under_a_concurrent_revoke() {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
