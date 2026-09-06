@@ -457,6 +457,13 @@ mod tests {
             fn cap_epoch(&self) -> Result<u64, LookupError> {
                 Err(LookupError::LockPoisoned)
             }
+
+            fn member_and_cap_epoch(
+                &self,
+                _device_fp: Fingerprint,
+            ) -> Result<(Option<Member>, Option<u64>), LookupError> {
+                Err(LookupError::LockPoisoned)
+            }
         }
 
         let handler = handler_for(AlwaysFails);

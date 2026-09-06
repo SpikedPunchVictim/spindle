@@ -55,6 +55,65 @@ pub trait DeviceLookup: Send + Sync {
     /// second thing that could theoretically read a stale epoch under some future refactor, for
     /// no benefit over reusing the lookup already in hand.
     fn cap_epoch(&self) -> Result<u64, LookupError>;
+
+    /// Resolves `device_fp`'s owning member **and** reads `cap_epoch`, both from one snapshot of
+    /// the store — the atomic counterpart to calling [`Self::member_for_device_fp`] and
+    /// [`Self::cap_epoch`] separately.
+    ///
+    /// The outer `Result` and the inner `Option<u64>` mean two very different things, and they
+    /// must not be collapsed into each other:
+    ///
+    /// - The outer `Result`'s `Err` means "membership is unprovable" — the same fail-closed
+    ///   signal [`Self::member_for_device_fp`] gives, and every caller treats it the same way:
+    ///   [`ConnectDecision::Deny`].
+    /// - The inner `Option<u64>` being `None` means "the connect is fine, there is just no fresh
+    ///   cap this time" — [`CapIssuer`]'s own doc comment states the invariant this preserves: a
+    ///   cap-issuance failure must never turn an otherwise-valid connect into a `Deny`. A single,
+    ///   shared `LookupError` cannot distinguish "I could not read membership" from "I read
+    ///   membership fine but the `cap_epoch` read failed", so folding the epoch read into the
+    ///   outer `Result` would silently deny every connect on the second failure too.
+    ///
+    /// That second failure is reachable, not hypothetical: `Store::cap_epoch` runs `SELECT
+    /// cap_epoch FROM meta WHERE id = 0`, and `spindle-hostd` deliberately opens multiple
+    /// independent connections to the same database file (see `crates/spindle-hostd/src/lib.rs`'s
+    /// module doc comment) — a transient `SQLITE_BUSY` on that read is possible while another
+    /// connection holds a write lock. If that busy error denied the connect, a host would refuse
+    /// every device until the busy window passed, which is precisely the lockout DESIGN.md:288-290's
+    /// renewal path exists to prevent. Losing the epoch on such a read must cost the connect
+    /// nothing worse than "no fresh cap this time" — [`Self::member_for_device_fp`] failing,
+    /// by contrast, means membership itself could not be proven, so `Deny` is correct there.
+    ///
+    /// This exists to close a TOCTOU race that a two-call sequence leaves open. `Store`'s two
+    /// revocation entry points — `revoke_member_and_bump_epoch` and
+    /// `revoke_device_and_bump_epoch` (`crates/spindle-vfs/src/store/mod.rs`) — each flip a
+    /// member's status (or a device's `revoked` flag) *and* bump `cap_epoch` inside one
+    /// transaction; nothing else in this codebase bumps `cap_epoch` at all (see this trait's
+    /// [`Self::cap_epoch`] doc comment). If a caller resolves the member via
+    /// [`Self::member_for_device_fp`], and only afterward reads [`Self::cap_epoch`] as a second,
+    /// independent lock acquisition, one of those revoke transactions can commit in the window
+    /// between the two reads. The caller then holds a `member` snapshot from *before* the revoke
+    /// paired with a `cap_epoch` from *after* it — and if it mints a capability from that pair,
+    /// the result is a capability for a subject the store has already revoked, stamped with the
+    /// post-bump epoch. That makes it indistinguishable from a legitimately fresh capability to
+    /// any consumer that only checks `cap.cap_epoch` against the host's current `cap_epoch` —
+    /// exactly the check `cap_epoch` exists to make revocation defeat. See
+    /// [`HostConnectAuthorizer::authorize`]'s own comment at its call site for the concrete
+    /// exploit shape this closes.
+    ///
+    /// An implementation must take **one** lock/snapshot covering both reads — a `member_for_device_fp`
+    /// call followed by a separate `cap_epoch` call inside this method's body would reproduce the
+    /// exact race this method exists to eliminate, not fix it. See
+    /// [`SqliteDeviceLookup::member_and_cap_epoch`] for the one acceptable shape.
+    ///
+    /// Any caller that is about to mint a capability from the result **must** use this method
+    /// rather than [`Self::member_for_device_fp`] plus [`Self::cap_epoch`]. Callers that only need
+    /// the membership decision and never touch `cap_epoch` — [`active_member_for_device`], and
+    /// through it [`crate::session::VfsSessionHandler`] — have no epoch to race against and keep
+    /// using [`Self::member_for_device_fp`] alone.
+    fn member_and_cap_epoch(
+        &self,
+        device_fp: Fingerprint,
+    ) -> Result<(Option<Member>, Option<u64>), LookupError>;
 }
 
 /// A [`DeviceLookup`] failure. Every caller of [`DeviceLookup::member_for_device_fp`] in this
@@ -106,6 +165,28 @@ impl DeviceLookup for SqliteDeviceLookup {
         let store = self.store.lock().map_err(|_| LookupError::LockPoisoned)?;
         Ok(store.cap_epoch()?)
     }
+
+    fn member_and_cap_epoch(
+        &self,
+        device_fp: Fingerprint,
+    ) -> Result<(Option<Member>, Option<u64>), LookupError> {
+        // One `lock()` call covering both reads — this is the entire fix `DeviceLookup::
+        // member_and_cap_epoch`'s doc comment describes. Two `store.lock()` calls in this body,
+        // even back to back, would let another connection's `revoke_*_and_bump_epoch`
+        // transaction commit between them and reproduce the exact race this method exists to
+        // close.
+        //
+        // The two reads are NOT symmetric in how their failures are handled, and that asymmetry
+        // is deliberate (see this method's doc comment): a failed `member_for_device_fp` means
+        // membership is unprovable, so it propagates via `?` and denies the connect. A failed
+        // `cap_epoch` — reachable via a transient `SQLITE_BUSY` on `meta`, since `spindle-hostd`
+        // holds multiple independent connections to the same database file — costs only the
+        // freshly-minted cap, via `.ok()`, never the connect itself.
+        let store = self.store.lock().map_err(|_| LookupError::LockPoisoned)?;
+        let member = store.member_for_device_fp(device_fp)?;
+        let cap_epoch = store.cap_epoch().ok();
+        Ok((member, cap_epoch))
+    }
 }
 
 /// Resolves `device_fp` to its owning member, but only if every one of DESIGN.md §A4's liveness
@@ -140,10 +221,24 @@ pub(crate) fn active_member_for_device<L: DeviceLookup + ?Sized>(
 ) -> Option<Member> {
     // 1 & 2.
     let member = match lookup.member_for_device_fp(device_fp) {
-        Ok(Some(member)) => member,
-        Ok(None) => return None,
+        Ok(member) => member,
         Err(_) => return None,
     };
+    liveness_checks(member, device_fp)
+}
+
+/// Checks 3–5 of [`active_member_for_device`]'s narrative — applied to an already-fetched
+/// `Option<Member>` rather than performing the fetch itself. Factored out so DESIGN.md §A4's
+/// liveness rule is defined in exactly one place while still having two entry points: the plain,
+/// membership-only fetch ([`active_member_for_device`], used by [`crate::session::VfsSessionHandler`]
+/// and by [`HostConnectAuthorizer::authorize`] when no cap will be minted) and the atomic
+/// snapshot fetch ([`DeviceLookup::member_and_cap_epoch`], used by
+/// [`HostConnectAuthorizer::authorize`] when a cap might be minted from the result). Checks 1 and
+/// 2 — the fetch itself, and its `None`/`Err` handling — are each entry point's own job, since
+/// they differ in how the member is obtained; this function starts from whatever `Option<Member>`
+/// the caller already has in hand.
+fn liveness_checks(member: Option<Member>, device_fp: Fingerprint) -> Option<Member> {
+    let member = member?;
 
     // 3.
     if member.status != MemberStatus::Active {
@@ -365,16 +460,58 @@ impl<L: DeviceLookup> HostConnectAuthorizer<L> {
 impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
     /// Every failure mode below returns `Deny`; only reaching the final line returns `Allow`. See
     /// the module doc comment and this crate's task brief for why each check exists; in
-    /// particular, checks 3 and 5 (folded into [`active_member_for_device`] below — see its own
-    /// doc comment for the full per-check narrative, including why checks 3 and 5 are
-    /// independently enforced: a still-`Active` member can have one revoked device among several,
-    /// the same split `server.rs`'s `denied:device_revoked` gate makes per request) are shared
-    /// with [`crate::session::VfsSessionHandler`]'s session-time gate rather than duplicated here.
+    /// particular, checks 3 and 5 (the shared `liveness_checks` helper reached via either
+    /// [`active_member_for_device`] or [`DeviceLookup::member_and_cap_epoch`] below — see
+    /// `active_member_for_device`'s doc comment for the full per-check narrative, including why
+    /// checks 3 and 5 are independently enforced: a still-`Active` member can have one revoked
+    /// device among several, the same split `server.rs`'s `denied:device_revoked` gate makes per
+    /// request) are shared with [`crate::session::VfsSessionHandler`]'s session-time gate rather
+    /// than duplicated here.
     async fn authorize(&self, from_fp: &Fingerprint) -> ConnectDecision {
-        // 1-5: is `from_fp` an active, non-revoked member's non-revoked device? See
-        // `active_member_for_device`'s doc comment for the full five-check narrative this folds
-        // together.
-        let Some(member) = active_member_for_device(&self.lookup, *from_fp) else {
+        // 1-5, plus — when a `CapIssuer` is installed — the `cap_epoch` a freshly minted cap must
+        // carry, both resolved from ONE atomic snapshot via `DeviceLookup::member_and_cap_epoch`.
+        //
+        // This used to be two independent reads: `active_member_for_device` (itself one
+        // `store.lock()`) for the member, then, after checks 6-8 below, a *separate*
+        // `self.lookup.cap_epoch()` call for the epoch. That shape has a TOCTOU race:
+        // `Store::revoke_member_and_bump_epoch` and `revoke_device_and_bump_epoch` each flip a
+        // member's status (or a device's `revoked` flag) *and* bump `cap_epoch` inside one
+        // transaction, and nothing stops such a transaction committing in the window between the
+        // two reads. When it does, the member snapshot already in hand is from *before* the
+        // revoke, but the `cap_epoch` read moments later is from *after* it — and minting from
+        // that pair produces a capability for a subject the store has already revoked, stamped
+        // with the post-bump epoch. Since the only thing most consumers check is `cap.cap_epoch`
+        // against the host's current `cap_epoch`, that capability is indistinguishable from a
+        // legitimately fresh one — which defeats `cap_epoch`'s entire purpose as the
+        // revocation-invalidation mechanism (DESIGN.md §A4). Do not "simplify" this back into two
+        // reads — see `DeviceLookup::member_and_cap_epoch`'s own doc comment for the same warning.
+        //
+        // When no issuer is installed, no capability will ever be minted from this call, so there
+        // is no epoch to race against: the plain, membership-only `active_member_for_device` is
+        // used instead, keeping this struct's own doc comment true ("a connect decision is
+        // membership, not capability freshness") — `cap_epoch` is never even read on this path.
+        //
+        // In the branch below, a `cap_epoch` read failure is likewise never a `Deny` — see
+        // `DeviceLookup::member_and_cap_epoch`'s doc comment: only a failure to read *membership*
+        // (an outer `Err`) denies; a missing epoch (`Ok((member, None))`) just means check 9
+        // mints no cap. The two failure modes share one `LookupError` type at the call site but
+        // must never share its fail-closed treatment.
+        let (member, cap_epoch_for_mint): (Option<Member>, Option<u64>) = match &self.issuer {
+            None => (active_member_for_device(&self.lookup, *from_fp), None),
+            Some(_) => match self.lookup.member_and_cap_epoch(*from_fp) {
+                // `cap_epoch` may legitimately be `None` here (see `DeviceLookup::
+                // member_and_cap_epoch`'s doc comment: a transient `cap_epoch` read failure,
+                // e.g. `SQLITE_BUSY` on `meta`, costs only the freshly-minted cap). That must
+                // NOT be conflated with the `Err` arm below: membership was read successfully,
+                // so an otherwise-live member still gets `Allow`, just with `member_cap: None`
+                // once check 9 finds no epoch to mint from.
+                Ok((member, cap_epoch)) => (liveness_checks(member, *from_fp), cap_epoch),
+                // Only a genuine `Err` — membership itself unprovable, or a poisoned lock — is a
+                // fail-closed `Deny`.
+                Err(_) => (None, None),
+            },
+        };
+        let Some(member) = member else {
             return ConnectDecision::Deny;
         };
         // Re-finding the device row is redundant with what `active_member_for_device` already
@@ -418,20 +555,22 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
         // issuance failure must be strictly no worse than the status quo (no fresh cap, not a
         // broken connect).
         //
+        // `cap_epoch_for_mint` can legitimately be `None` even when `self.issuer` is `Some` — see
+        // `DeviceLookup::member_and_cap_epoch`'s doc comment: a tolerated `cap_epoch` read
+        // failure (e.g. `SQLITE_BUSY` on `meta`) reaches here as `None`, not as a `Deny` a few
+        // lines up. The `match` spells out every combination explicitly rather than `unwrap`ping
+        // an epoch that might not be there — this module's house style never unwraps an
+        // invariant instead of failing closed, and here there simply is no invariant to unwrap:
+        // "issuer installed" and "epoch available" are independent facts.
+        //
         // `subject` is `member.root_fp`, not `from_fp`/`device_fp` — DESIGN.md:286: "`subject =
         // root_fp` so every root-certified device of the person may use it". This is the central
         // hazard of this slice: scoping the cap to the device fp instead would silently restrict
         // it to the one device that happened to connect, breaking every other device the same
         // person owns.
-        let member_cap = match &self.issuer {
-            None => None,
-            Some(issuer) => match self.lookup.cap_epoch() {
-                // A store read failure on the epoch is not a membership failure: every check
-                // above already proved `from_fp` is a live member device, so this connect stays
-                // an `Allow` — just one with no fresh cap, exactly like "no issuer installed".
-                Err(_) => None,
-                Ok(cap_epoch) => issuer.issue_member_cap(member.root_fp, cap_epoch),
-            },
+        let member_cap = match (&self.issuer, cap_epoch_for_mint) {
+            (Some(issuer), Some(cap_epoch)) => issuer.issue_member_cap(member.root_fp, cap_epoch),
+            _ => None,
         };
 
         ConnectDecision::Allow {
@@ -447,7 +586,7 @@ mod tests {
     use super::*;
     use spindle_core::artifacts::{issue_host_op_key_cert, verify_capability};
     use spindle_core::identity::{DeviceKey, RootKey};
-    use spindle_vfs::model::DevicePublicKeys;
+    use spindle_vfs::model::{Device, DevicePublicKeys, MemberId};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -645,6 +784,13 @@ mod tests {
             fn cap_epoch(&self) -> Result<u64, LookupError> {
                 Err(LookupError::LockPoisoned)
             }
+
+            fn member_and_cap_epoch(
+                &self,
+                _device_fp: Fingerprint,
+            ) -> Result<(Option<Member>, Option<u64>), LookupError> {
+                Err(LookupError::LockPoisoned)
+            }
         }
 
         let authorizer = HostConnectAuthorizer::new(AlwaysFails);
@@ -806,6 +952,119 @@ mod tests {
         }
     }
 
+    /// A [`DeviceLookup`] wrapping a real [`SqliteDeviceLookup`] but discarding the epoch half of
+    /// [`DeviceLookup::member_and_cap_epoch`]'s result — simulating the tolerated failure
+    /// `SqliteDeviceLookup::member_and_cap_epoch`'s own doc comment describes (a `cap_epoch` read
+    /// hitting `SQLITE_BUSY` on `meta` while membership itself was read fine). Delegates
+    /// `member_for_device_fp` and `cap_epoch` unchanged so any path that doesn't go through
+    /// `member_and_cap_epoch` behaves exactly like the plain `SqliteDeviceLookup`.
+    struct EpochUnavailableDeviceLookup {
+        inner: SqliteDeviceLookup,
+    }
+
+    impl DeviceLookup for EpochUnavailableDeviceLookup {
+        fn member_for_device_fp(
+            &self,
+            device_fp: Fingerprint,
+        ) -> Result<Option<Member>, LookupError> {
+            self.inner.member_for_device_fp(device_fp)
+        }
+
+        fn cap_epoch(&self) -> Result<u64, LookupError> {
+            self.inner.cap_epoch()
+        }
+
+        fn member_and_cap_epoch(
+            &self,
+            device_fp: Fingerprint,
+        ) -> Result<(Option<Member>, Option<u64>), LookupError> {
+            let (member, _epoch) = self.inner.member_and_cap_epoch(device_fp)?;
+            Ok((member, None))
+        }
+    }
+
+    /// The regression this whole slice exists to fix: a `DeviceLookup::member_and_cap_epoch` that
+    /// reads membership fine but cannot read `cap_epoch` (`Ok((Some(live_member), None))`) must
+    /// still `Allow` — with no minted cap, since there is no epoch to mint from — even though a
+    /// `CapIssuer` is installed. Conflating this with a genuine `Err` (see
+    /// `denies_when_the_lookup_returns_a_genuine_error_and_an_issuer_is_installed` below) would
+    /// deny every connect on a transient `SQLITE_BUSY` reading `meta`, exactly the lockout
+    /// DESIGN.md:288-290's renewal path exists to prevent.
+    #[tokio::test]
+    async fn ok_member_with_no_cap_epoch_still_allows_with_no_minted_cap_when_issuer_is_installed()
+    {
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x33; 32], [0x34; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+        let lookup = EpochUnavailableDeviceLookup {
+            inner: SqliteDeviceLookup::new(store),
+        };
+        let issuer = test_cap_issuer([0x35; 32], [0x36; 32], 1_000);
+        let authorizer = HostConnectAuthorizer::with_issuer(lookup, Box::new(issuer));
+
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Allow { member_cap, .. } => {
+                assert_eq!(
+                    member_cap, None,
+                    "Ok((Some(live_member), None)) from member_and_cap_epoch means membership is \
+                     fine but there is no fresh cap_epoch to mint from this time -- Allow with no \
+                     cap is correct, the same 'issuance failure is never worse than the status \
+                     quo' rule CapIssuer's doc comment states for a failing issuer"
+                );
+            }
+            ConnectDecision::Deny => panic!(
+                "regression: an active, non-revoked member's connect must not be denied just \
+                 because member_and_cap_epoch could not read cap_epoch -- that conflates 'no fresh \
+                 cap this time' with 'membership is unprovable', which would turn a transient \
+                 SQLITE_BUSY on Store::cap_epoch (reachable because spindle-hostd holds multiple \
+                 independent connections to the same database file) into a host that refuses every \
+                 connect"
+            ),
+        }
+    }
+
+    /// The other half of the same discrimination: a genuine [`LookupError`] from
+    /// `member_and_cap_epoch` — membership itself unprovable — must still `Deny`, with an issuer
+    /// installed and never reached. This is [`denies_when_a_lookup_returns_an_error`]'s twin on
+    /// the `with_issuer` path: that test's `AlwaysFails` lookup goes through
+    /// `active_member_for_device` because it uses `HostConnectAuthorizer::new` (no issuer), never
+    /// exercising `member_and_cap_epoch`'s own `Err` arm at all.
+    #[tokio::test]
+    async fn denies_when_the_lookup_returns_a_genuine_error_and_an_issuer_is_installed() {
+        struct AlwaysFails;
+        impl DeviceLookup for AlwaysFails {
+            fn member_for_device_fp(
+                &self,
+                _device_fp: Fingerprint,
+            ) -> Result<Option<Member>, LookupError> {
+                Err(LookupError::LockPoisoned)
+            }
+
+            fn cap_epoch(&self) -> Result<u64, LookupError> {
+                Err(LookupError::LockPoisoned)
+            }
+
+            fn member_and_cap_epoch(
+                &self,
+                _device_fp: Fingerprint,
+            ) -> Result<(Option<Member>, Option<u64>), LookupError> {
+                Err(LookupError::LockPoisoned)
+            }
+        }
+
+        let issuer = test_cap_issuer([0x37; 32], [0x38; 32], 1_000);
+        let authorizer = HostConnectAuthorizer::with_issuer(AlwaysFails, Box::new(issuer));
+        let some_fp = DeviceKey::from_seeds([0x39; 32], [0x3a; 32]).device_fp();
+
+        match authorizer.authorize(&some_fp).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => panic!(
+                "a genuine Err from member_and_cap_epoch means membership is unprovable -- must \
+                 fail closed even with an issuer installed"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn a_denied_device_never_reaches_the_issuer() {
         struct CountingIssuer {
@@ -837,5 +1096,265 @@ mod tests {
             0,
             "a denied device must never reach the cap issuer"
         );
+    }
+
+    // ---- TOCTOU: member_and_cap_epoch must read member + cap_epoch as one snapshot (td brief) --
+
+    /// Which half of DESIGN.md §A4's liveness rule [`RacingDeviceLookup`] revokes when its
+    /// simulated race lands — the two axes the task brief asks this suite to cover.
+    #[derive(Clone, Copy)]
+    enum RaceKind {
+        /// The member itself is revoked mid-window (its device stays enrolled and non-revoked).
+        Member,
+        /// Only the one device is revoked mid-window; its member stays `Active`.
+        Device,
+    }
+
+    struct RaceState {
+        member: Member,
+        device_fp: Fingerprint,
+        epoch: u64,
+        kind: RaceKind,
+        /// Set the first time any call lands the simulated race, so a second call doesn't
+        /// revoke/bump twice. The race lands as a side effect of [`RacingDeviceLookup::
+        /// member_for_device_fp`] specifically -- see that method and the struct doc comment.
+        landed: bool,
+    }
+
+    /// A [`DeviceLookup`] test double reproducing the exact TOCTOU window a two-read `authorize`
+    /// left open, to prove [`DeviceLookup::member_and_cap_epoch`] actually closes it.
+    ///
+    /// [`Self::member_for_device_fp`] returns a snapshot of the member *before* any revoke, then —
+    /// as a side effect of that call returning, simulating a concurrent
+    /// `Store::revoke_member_and_bump_epoch` / `revoke_device_and_bump_epoch` transaction
+    /// committing in the window right after this read released its lock — flips its internal
+    /// state: the member or its device becomes revoked, and `cap_epoch` is bumped, exactly as
+    /// `Store` does both atomically in one transaction. A later, *separate* [`Self::cap_epoch`]
+    /// call then observes that post-revoke epoch. This is precisely the shape the two-read version
+    /// of `authorize` used to have: a member read, then, after other checks ran, an independent
+    /// epoch read.
+    ///
+    /// [`Self::member_and_cap_epoch`] never goes through that side effect: it reads the member and
+    /// the epoch from the current state in one step, under one lock — the entire guarantee that
+    /// method exists to provide. Called exactly once, the way the fixed `authorize` calls it, it
+    /// therefore always returns a self-consistent pair reflecting one instant, never a
+    /// pre-revoke member paired with a post-revoke epoch.
+    ///
+    /// That alone only discriminates against the *old shape* of the bug (a `member_for_device_fp`
+    /// call followed by a separate `cap_epoch` call): `member_and_cap_epoch` here is idempotent
+    /// and never lands the race, so a regression to calling `member_and_cap_epoch` *twice* (taking
+    /// the member from the first call and the epoch from the second) would sail through unnoticed.
+    /// `calls` closes that gap: every [`DeviceLookup`] method on this double increments it, and
+    /// the tests assert it is exactly 1 after `authorize` returns -- proving `authorize` performs
+    /// exactly one lookup call of any kind, not merely "not the old two-call shape".
+    struct RacingDeviceLookup {
+        state: Mutex<RaceState>,
+        calls: AtomicUsize,
+    }
+
+    impl RacingDeviceLookup {
+        fn new(member: Member, device_fp: Fingerprint, epoch: u64, kind: RaceKind) -> Self {
+            RacingDeviceLookup {
+                state: Mutex::new(RaceState {
+                    member,
+                    device_fp,
+                    epoch,
+                    kind,
+                    landed: false,
+                }),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        /// Total number of [`DeviceLookup`] calls (of any of the three methods) made on this
+        /// double. `authorize` must leave this at exactly 1: any second call, even a second
+        /// `member_and_cap_epoch`, is a second read of what would be a racing store.
+        fn lookup_calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl DeviceLookup for RacingDeviceLookup {
+        fn member_for_device_fp(
+            &self,
+            _device_fp: Fingerprint,
+        ) -> Result<Option<Member>, LookupError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut state = self.state.lock().map_err(|_| LookupError::LockPoisoned)?;
+            let snapshot = state.member.clone();
+            if !state.landed {
+                state.landed = true;
+                match state.kind {
+                    RaceKind::Member => state.member.status = MemberStatus::Revoked,
+                    RaceKind::Device => {
+                        let device_fp = state.device_fp;
+                        if let Some(d) = state
+                            .member
+                            .devices
+                            .iter_mut()
+                            .find(|d| d.device_fp == device_fp)
+                        {
+                            d.revoked = true;
+                        }
+                    }
+                }
+                state.epoch += 1;
+            }
+            Ok(Some(snapshot))
+        }
+
+        fn cap_epoch(&self) -> Result<u64, LookupError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let state = self.state.lock().map_err(|_| LookupError::LockPoisoned)?;
+            Ok(state.epoch)
+        }
+
+        fn member_and_cap_epoch(
+            &self,
+            _device_fp: Fingerprint,
+        ) -> Result<(Option<Member>, Option<u64>), LookupError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // One lock, one read of both fields -- the race never gets a chance to land "between"
+            // them, because there is no between: this whole method is the atomic snapshot.
+            let state = self.state.lock().map_err(|_| LookupError::LockPoisoned)?;
+            Ok((Some(state.member.clone()), Some(state.epoch)))
+        }
+    }
+
+    /// Forwards through an `Arc` so the tests can hold onto the double (to read `lookup_calls`
+    /// after `authorize` consumes its lookup by value) while still handing `with_issuer` an owned
+    /// `L: DeviceLookup`.
+    impl DeviceLookup for std::sync::Arc<RacingDeviceLookup> {
+        fn member_for_device_fp(
+            &self,
+            device_fp: Fingerprint,
+        ) -> Result<Option<Member>, LookupError> {
+            (**self).member_for_device_fp(device_fp)
+        }
+
+        fn cap_epoch(&self) -> Result<u64, LookupError> {
+            (**self).cap_epoch()
+        }
+
+        fn member_and_cap_epoch(
+            &self,
+            device_fp: Fingerprint,
+        ) -> Result<(Option<Member>, Option<u64>), LookupError> {
+            (**self).member_and_cap_epoch(device_fp)
+        }
+    }
+
+    fn racing_member_and_device(device: &DeviceKey, device_fp: Fingerprint) -> Member {
+        Member {
+            member_id: MemberId(1),
+            root_fp: Fingerprint::of_parts(&[b"racing-member"]),
+            display_name: "racer".to_string(),
+            status: MemberStatus::Active,
+            devices: vec![Device {
+                device_fp,
+                label: "laptop".to_string(),
+                added: 0,
+                revoked: false,
+                sign_pk: Some(device.sign_public_key().as_bytes().to_vec()),
+                agree_pk: Some(device.agree_public_key().as_bytes().to_vec()),
+            }],
+            groups: vec![],
+            created: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_snapshot_survives_a_member_revoked_in_the_window_between_the_old_two_reads() {
+        let device = DeviceKey::from_seeds([0x2b; 32], [0x2c; 32]);
+        let device_fp = device.device_fp();
+        let member = racing_member_and_device(&device, device_fp);
+        let epoch_before_race = 41;
+        let lookup = Arc::new(RacingDeviceLookup::new(
+            member,
+            device_fp,
+            epoch_before_race,
+            RaceKind::Member,
+        ));
+        let issuer = test_cap_issuer([0x2d; 32], [0x2e; 32], 1_000);
+        let authorizer = HostConnectAuthorizer::with_issuer(Arc::clone(&lookup), Box::new(issuer));
+
+        let decision = authorizer.authorize(&device_fp).await;
+        assert_eq!(
+            lookup.lookup_calls(),
+            1,
+            "`authorize` must make exactly ONE DeviceLookup call on this path. A second call -- \
+             even another `member_and_cap_epoch` -- is a second read of a store a concurrent \
+             revoke can commit into between them, which is exactly the TOCTOU this method exists \
+             to close."
+        );
+        match decision {
+            ConnectDecision::Allow { member_cap, .. } => {
+                let cap = member_cap.expect(
+                    "the member was Active in the atomic snapshot this call took -- must mint",
+                );
+                assert_eq!(
+                    cap.cap_epoch, epoch_before_race,
+                    "the minted cap's cap_epoch must come from the SAME atomic snapshot that \
+                     showed the member Active, not a later, separately-read epoch bumped by a \
+                     member revoke landing in the window between two reads. A cap combining a \
+                     member snapshot from before such a revoke with the post-bump epoch would be \
+                     indistinguishable from a legitimately fresh cap to any consumer that only \
+                     checks cap.cap_epoch against the host's current cap_epoch -- defeating \
+                     cap_epoch's entire purpose as the revocation-invalidation mechanism."
+                );
+            }
+            ConnectDecision::Deny => panic!(
+                "expected Allow: the atomic snapshot must see the member Active -- the simulated \
+                 race only lands after a call returns, and `authorize` must make exactly one \
+                 DeviceLookup call on this path, never a second one for it to land before"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_snapshot_survives_a_device_revoked_in_the_window_between_the_old_two_reads() {
+        let device = DeviceKey::from_seeds([0x2f; 32], [0x30; 32]);
+        let device_fp = device.device_fp();
+        let member = racing_member_and_device(&device, device_fp);
+        let epoch_before_race = 7;
+        let lookup = Arc::new(RacingDeviceLookup::new(
+            member,
+            device_fp,
+            epoch_before_race,
+            RaceKind::Device,
+        ));
+        let issuer = test_cap_issuer([0x31; 32], [0x32; 32], 1_000);
+        let authorizer = HostConnectAuthorizer::with_issuer(Arc::clone(&lookup), Box::new(issuer));
+
+        let decision = authorizer.authorize(&device_fp).await;
+        assert_eq!(
+            lookup.lookup_calls(),
+            1,
+            "`authorize` must make exactly ONE DeviceLookup call on this path. A second call -- \
+             even another `member_and_cap_epoch` -- is a second read of a store a concurrent \
+             revoke can commit into between them, which is exactly the TOCTOU this method exists \
+             to close."
+        );
+        match decision {
+            ConnectDecision::Allow { member_cap, .. } => {
+                let cap = member_cap.expect(
+                    "the device was non-revoked in the atomic snapshot this call took -- must mint",
+                );
+                assert_eq!(
+                    cap.cap_epoch, epoch_before_race,
+                    "the minted cap's cap_epoch must come from the SAME atomic snapshot that \
+                     showed this device non-revoked, not a later, separately-read epoch bumped by \
+                     a device revoke landing in the window between two reads -- the member-revoked \
+                     axis's twin: a still-Active member can have one revoked device among several, \
+                     and that device's cap must not come out looking fresh either."
+                );
+            }
+            ConnectDecision::Deny => panic!(
+                "expected Allow: the atomic snapshot must see the device non-revoked -- the \
+                 simulated race only lands after a call returns, and `authorize` must make \
+                 exactly one DeviceLookup call on this path, never a second one for it to land \
+                 before"
+            ),
+        }
     }
 }
