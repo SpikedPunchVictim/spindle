@@ -62,12 +62,22 @@ pub fn list_dir(dir: &Dir, relative: &str) -> Result<Vec<RealDirEntry>, ConfineE
     .map_err(|e| ConfineError::io(relative, e))?;
 
     let mut out = Vec::new();
+    // Counted, not named — per this crate's tracing policy, a skipped entry is reported by
+    // reason and count, never by name (a name here is exactly the virtual-path-shaped detail
+    // that belongs only in the audit log, not in tracing output).
+    let mut readdir_errors = 0usize;
+    let mut non_utf8_names = 0usize;
+    let mut unreadable_metadata = 0usize;
     for entry in read_dir {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(_) => {
+                readdir_errors += 1;
+                continue;
+            }
         };
         let Ok(name) = entry.file_name().into_string() else {
+            non_utf8_names += 1;
             continue;
         };
         if is_staging_name(&name) {
@@ -79,6 +89,7 @@ pub fn list_dir(dir: &Dir, relative: &str) -> Result<Vec<RealDirEntry>, ConfineE
             format!("{relative}/{name}")
         };
         let Ok(meta) = stat_through_dir(dir, &child_relative) else {
+            unreadable_metadata += 1;
             continue;
         };
         let kind = if meta.is_dir() {
@@ -92,6 +103,20 @@ pub fn list_dir(dir: &Dir, relative: &str) -> Result<Vec<RealDirEntry>, ConfineE
             size: meta.len(),
             mtime: unix_seconds(&meta),
         });
+    }
+    let skipped = readdir_errors + non_utf8_names + unreadable_metadata;
+    if skipped > 0 {
+        // A listing this incomplete has no other signal reaching the caller — `Ok(Vec<..>)`
+        // looks identical to "the directory really only has these entries" — so this is the one
+        // place that skip becomes visible at all, at `warn!` per this crate's tracing policy.
+        tracing::warn!(
+            %skipped,
+            %readdir_errors,
+            %non_utf8_names,
+            %unreadable_metadata,
+            "list_dir skipped one or more directory entries it could not read or name; the \
+             listing returned is incomplete"
+        );
     }
     Ok(out)
 }

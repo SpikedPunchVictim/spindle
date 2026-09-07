@@ -302,7 +302,24 @@ impl<'a> Audit<'a> {
                 Ok(record)
             }
             Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
+                // The append itself already failed; if the ROLLBACK meant to undo its partial
+                // work *also* fails, this connection is left sitting inside an open transaction
+                // that neither committed nor rolled back. `Audit` and `Store` share this one
+                // connection (see the module doc comment), so every subsequent write on it then
+                // executes inside that stuck transaction instead of autocommitting as its caller
+                // expects: it can look like it succeeded while remaining undurable until some
+                // later operation happens to COMMIT, and a crash before that silently loses it —
+                // exactly the kind of inconsistency this hash-chained, tamper-evident log exists
+                // to make detectable, so a human needs to know immediately, not find it later via
+                // `verify_chain`.
+                if let Err(rollback_error) = self.conn.execute_batch("ROLLBACK") {
+                    tracing::error!(
+                        %rollback_error,
+                        append_error = %e,
+                        "audit ROLLBACK failed after a failed append; connection may be stuck \
+                         mid-transaction, so subsequent writes on it are not guaranteed durable"
+                    );
+                }
                 Err(e)
             }
         }

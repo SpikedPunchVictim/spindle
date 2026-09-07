@@ -61,6 +61,23 @@
 //! `spindle-host-core`, per the crate layering law — see that crate's `lib.rs` module doc comment.
 //! 76 tests (79 including the 4 Windows-only cases, and 3 new `MountPathCollision` tests in
 //! `store`).
+//!
+//! # `tracing` (td-6c9d95 step 2): library only, no subscriber
+//!
+//! This crate emits `tracing` events at a handful of targeted call sites — currently-silent
+//! failures, security decisions (confinement refusals, revocations, epoch bumps), and store-level
+//! degradations — following the house style `spindle-net` set first. It never carries a virtual
+//! path, file/group name, capability byte, key, or payload in a log line; where that detail
+//! genuinely belongs, it goes to the tamper-evident audit log ([`audit`]) instead, per DESIGN.md
+//! :413. Identifiers that do appear are truncated via `spindle_core::Fingerprint::redacted()`.
+//!
+//! **This crate must never call `tracing_subscriber` or install a global subscriber.** It is a
+//! library with no runtime of its own; without a subscriber installed by a binary, every event
+//! emitted here is silently dropped, which is correct — initializing one here would apply
+//! workspace-wide regardless of which binary eventually links this crate. Only binaries do that
+//! (see `crates/spindle-helper/src/bin/helper.rs:349-351`'s `tracing_subscriber::fmt()...init()`
+//! for the precedent). If output from this crate ever seems to vanish, the fix is to init a
+//! subscriber in the consuming binary, not to add one here.
 
 pub mod algebra;
 pub mod audit;

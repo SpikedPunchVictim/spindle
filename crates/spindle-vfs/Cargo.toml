@@ -12,7 +12,11 @@ edition.workspace = true
 # `spindle_core::{sign_bytes, verify_bytes}` rather than taking a direct `ed25519-dalek`/`sha2`
 # dependency of its own (see `crate::audit` module docs). td-47d24d (USER DECISION 2026-09-04)
 # adds `unicode-normalization` for `confine::fold::fold_key`'s NFD folding, replacing a hand-
-# rolled 27-entry Latin-1 table that stripped accents instead of normalizing them.
+# rolled 27-entry Latin-1 table that stripped accents instead of normalizing them. td-6c9d95 step 2
+# adds `tracing` — already a workspace dependency (root `Cargo.toml`) and already sanctioned by the
+# A9c manifest (DESIGN.md:814); `spindle-net` sets the house style this crate's call sites follow.
+# This crate stays a library: it must never call `tracing_subscriber` or install a global
+# subscriber — see `src/lib.rs`'s doc comment.
 [dependencies]
 spindle-core = { path = "../spindle-core" }
 cap-std = { workspace = true }
@@ -20,6 +24,7 @@ cap-fs-ext = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
 unicode-normalization = { workspace = true }
+tracing = { workspace = true }
 
 # `std::os::windows::fs::MetadataExt::{volume_serial_number,file_index,number_of_links}` are
 # gated behind the nightly-only `windows_by_handle` feature (rust-lang/rust#63010) — unusable on

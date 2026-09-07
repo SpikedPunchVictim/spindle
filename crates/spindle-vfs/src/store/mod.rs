@@ -557,20 +557,29 @@ impl Store {
         member_id: MemberId,
     ) -> Result<Option<u64>, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let current: Option<String> = tx
+        // `root_fp` is read alongside `status` in the same query so this method's only
+        // identifying detail for the `tracing` calls below comes for free — no extra round trip
+        // just to log.
+        let current: Option<(String, Vec<u8>)> = tx
             .query_row(
-                "SELECT status FROM members WHERE member_id = ?1",
+                "SELECT status, root_fp FROM members WHERE member_id = ?1",
                 params![member_id.0 as i64],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some(status_str_val) = current else {
+        let Some((status_str_val, root_fp_bytes)) = current else {
             return Err(StoreError::MemberNotFound(member_id));
         };
+        let root_fp = Fingerprint::from_slice(&root_fp_bytes)?;
         if parse_status(&status_str_val) == MemberStatus::Revoked {
             // Nothing to write, nothing to bump — commit (equivalent to rollback here, since
             // nothing was written) and report "no-op" to the caller.
             tx.commit()?;
+            tracing::debug!(
+                member_fp = %root_fp.redacted(),
+                "revoke_member_and_bump_epoch: member already revoked; cap_epoch not bumped \
+                 (idempotent no-op)"
+            );
             return Ok(None);
         }
         tx.execute(
@@ -579,6 +588,11 @@ impl Store {
         )?;
         let new_epoch = bump_cap_epoch_in_tx(&tx)?;
         tx.commit()?;
+        tracing::info!(
+            member_fp = %root_fp.redacted(),
+            %new_epoch,
+            "member revoked; cap_epoch bumped"
+        );
         Ok(Some(new_epoch))
     }
 
@@ -761,12 +775,22 @@ impl Store {
                     // Row exists and is already revoked — commit (equivalent to rollback here,
                     // since nothing was written) and report "no-op" to the caller.
                     tx.commit()?;
+                    tracing::debug!(
+                        device_fp = %device_fp.redacted(),
+                        "revoke_device_and_bump_epoch: device already revoked; cap_epoch not \
+                         bumped (idempotent no-op)"
+                    );
                     Ok(None)
                 }
             };
         }
         let new_epoch = bump_cap_epoch_in_tx(&tx)?;
         tx.commit()?;
+        tracing::info!(
+            device_fp = %device_fp.redacted(),
+            %new_epoch,
+            "device revoked; cap_epoch bumped"
+        );
         Ok(Some(new_epoch))
     }
 
@@ -1098,6 +1122,15 @@ impl Store {
         let new_mount_path = VirtualPath::parse(mount_path)?;
         for existing in self.list_shares()? {
             if overlap_check(real_root, &existing.real_root)? {
+                // Neither root is logged — a real filesystem path here is exactly the detail
+                // this crate's tracing policy forbids. `existing_share_id` is a host-local row
+                // id, not a path, and is enough for an operator to look the conflict up via
+                // `list_shares`.
+                let existing_share_id = existing.share_id.0;
+                tracing::warn!(
+                    %existing_share_id,
+                    "add_share refused: new share root overlaps an existing share's real root"
+                );
                 return Err(StoreError::OverlappingShareRoot {
                     new_root: real_root.to_path_buf(),
                     existing: existing.share_id,
@@ -1106,6 +1139,13 @@ impl Store {
             let existing_mount_path = VirtualPath::parse(&existing.mount_path)
                 .expect("mount_path persisted by this store is always a valid VirtualPath");
             if mount_paths_collide(&new_mount_path, &existing_mount_path) {
+                // `mount_path` is a virtual path — never logged, same reasoning as above.
+                let existing_share_id = existing.share_id.0;
+                tracing::warn!(
+                    %existing_share_id,
+                    "add_share refused: new mount_path collides with an existing share's \
+                     mount_path"
+                );
                 return Err(StoreError::MountPathCollision {
                     new_mount_path: mount_path.to_string(),
                     existing: existing.share_id,
