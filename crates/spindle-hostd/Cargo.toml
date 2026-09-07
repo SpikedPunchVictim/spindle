@@ -55,6 +55,12 @@ async-nats = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 
+# td-6c9d95 step 4 adds `tracing` — already a workspace dependency (root `Cargo.toml`) and already
+# sanctioned by the A9c manifest (DESIGN.md:814); `crates/spindle-vfs`'s instrumentation (step 2)
+# sets the house style this crate's call sites follow. This crate stays a library: it must never
+# call `tracing_subscriber` or install a global subscriber — see `src/lib.rs`'s module doc comment.
+tracing = { workspace = true }
+
 # `tests/live_hostd.rs`'s own remaining code (Stage 4 part 2, td-539ffa): the `#[ignore]`d live
 # test that drives `HostDaemon` — and therefore the production `HostConnectAuthorizer<
 # SqliteDeviceLookup>` — against `deploy/docker-compose.yml`'s real NATS Auth Callout, in place of

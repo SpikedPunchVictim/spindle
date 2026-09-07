@@ -200,7 +200,7 @@ impl DeviceLookup for SqliteDeviceLookup {
         let store = self.store.lock().map_err(|_| LookupError::LockPoisoned)?;
         match store.member_and_cap_epoch(device_fp) {
             Ok((member, cap_epoch)) => Ok((member, Some(cap_epoch))),
-            Err(_) => {
+            Err(e) => {
                 // `Store::member_and_cap_epoch` failed as a whole — most plausibly a transient
                 // `SQLITE_BUSY` opening the transaction while another of `spindle-hostd`'s
                 // connections holds a write lock. Preserve the deliberate asymmetry this trait's
@@ -210,6 +210,22 @@ impl DeviceLookup for SqliteDeviceLookup {
                 // if membership can be read on its own, the connect proceeds with no fresh cap
                 // (`None`); if it can't, `?` propagates and denies, exactly as it would have if
                 // the fused read had never been attempted.
+                //
+                // This single occurrence may well be exactly that transient blip — this call site
+                // cannot tell transient from persistent apart, so this reports what happened, not
+                // what caused it. What makes a *persistent* failure here worth a human's attention:
+                // every connect keeps succeeding (via the fallback below, or via the plain
+                // membership-only path when no issuer is installed), but this host quietly stops
+                // minting fresh member capabilities — a fleet-wide lock-out that only surfaces once
+                // existing caps expire (`MEMBER_CAP_DEFAULT_TTL_SECS`: six weeks), degrees removed
+                // in both time and symptom from this call site.
+                tracing::warn!(
+                    device_fp = %device_fp.redacted(),
+                    error = %e,
+                    "member_and_cap_epoch: fused member+cap_epoch read failed; falling back to a \
+                     membership-only read for this connect. A persistent recurrence silently \
+                     degrades this host to never minting fresh member capabilities"
+                );
                 let member = store.member_for_device_fp(device_fp)?;
                 Ok((member, None))
             }
@@ -250,7 +266,23 @@ pub(crate) fn active_member_for_device<L: DeviceLookup + ?Sized>(
     // 1 & 2.
     let member = match lookup.member_for_device_fp(device_fp) {
         Ok(member) => member,
-        Err(_) => return None,
+        Err(e) => {
+            // Reachable from two independent pipelines: `HostConnectAuthorizer::authorize` when
+            // no `CapIssuer` is installed, and every session's own liveness re-check
+            // (`crate::session::VfsSessionHandler::session_context`) — so this fires far more
+            // often than just at connect time. Fails closed either way (per this function's own
+            // doc comment), which is correct regardless of why the lookup failed; this line exists
+            // only so a human can tell "denied, store unreadable" apart from "denied, not a
+            // member" after the fact, the same distinction `HostConnectAuthorizer::authorize`
+            // makes explicit for its own `Err` arm below.
+            tracing::warn!(
+                device_fp = %device_fp.redacted(),
+                error = %e,
+                "active_member_for_device: membership lookup failed; failing closed (treated as \
+                 not live)"
+            );
+            return None;
+        }
     };
     liveness_checks(member, device_fp)
 }
@@ -541,8 +573,18 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
                 // once check 9 finds no epoch to mint from.
                 Ok((member, cap_epoch)) => (liveness_checks(member, *from_fp), cap_epoch),
                 // Only a genuine `Err` — membership itself unprovable, or a poisoned lock — is a
-                // fail-closed `Deny`.
-                Err(_) => (None, None),
+                // fail-closed `Deny`. Worth a line of its own: without it, this `Deny` is
+                // indistinguishable from "the device is not a member", when it is operationally a
+                // very different fact — the store could not be read at all.
+                Err(e) => {
+                    tracing::warn!(
+                        device_fp = %from_fp.redacted(),
+                        error = %e,
+                        "authorize: member_and_cap_epoch failed; denying connect due to a store \
+                         failure, not because the device is not a member"
+                    );
+                    (None, None)
+                }
             },
         };
         let Some(member) = member else {

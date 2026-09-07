@@ -134,10 +134,38 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         }
     }
 
+    /// Best-effort: called from [`Self::gc_expired_upload_sessions`] (TTL GC) and
+    /// [`Self::abort_and_gc`] (entitlement-change-mid-transfer abort) for a session whose staging
+    /// file `handle_upload_open` already created (Stage 6 slice 4: the staging file is created
+    /// eagerly at `upload_open`, not lazily on first chunk), so by the time this runs the file is
+    /// expected to exist. A `remove_file` failure here is therefore a genuine anomaly, not the
+    /// ordinary "nothing to clean up" case — and it leaks a file per failure: nothing else in this
+    /// crate or `spindle_vfs::reconcile` sweeps orphaned staging files (that module's
+    /// `reconcile_uploads_against_disk` walks the *committed* upload ledger, which staging files,
+    /// hidden via `confine::is_staging_name`, are never part of).
     fn discard_staging_bytes(&self, session: &UploadSession) {
         if let Ok(Some(share)) = self.store().get_share(session.share_id) {
             if let Ok(dir) = confine::open_share_root(&share.real_root) {
-                let _ = dir.remove_file(confine::staging_name(&session.id));
+                if let Err(remove_error) = dir.remove_file(confine::staging_name(&session.id)) {
+                    // Per this crate's tracing policy, never the staging file's name (it encodes
+                    // the session id, not a virtual path, but is still a real filesystem name) —
+                    // only a truncated identifier for the session itself, recovered from
+                    // `session.id`'s own construction (`Fingerprint::of_parts(..)` in
+                    // `UploadSessions::open_or_resume`) defensively rather than assumed.
+                    match redacted_session_id(&session.id) {
+                        Some(redacted) => tracing::warn!(
+                            session_fp = %redacted,
+                            %remove_error,
+                            "discard_staging_bytes: failed to remove an upload session's \
+                             staging file; it is leaked on disk"
+                        ),
+                        None => tracing::warn!(
+                            %remove_error,
+                            "discard_staging_bytes: failed to remove an upload session's \
+                             staging file; it is leaked on disk"
+                        ),
+                    }
+                }
             }
         }
     }
@@ -1655,6 +1683,19 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
 // ===========================================================================================
 // Free functions
 // ===========================================================================================
+
+/// A truncated, tracing-safe identifier for an upload session, for [`VfsRpcServer::
+/// discard_staging_bytes`]'s failure log. `session.id` is always exactly a [`Fingerprint`]'s
+/// bytes by construction (`UploadSessions::open_or_resume` builds it via `Fingerprint::of_parts`),
+/// but this defends against that invariant changing rather than assuming and unwrapping it —
+/// this module's house style never unwraps an invariant instead of failing closed. Returns `None`
+/// (rather than a placeholder identifier) if `session.id` is ever not 32 bytes, so the caller logs
+/// a plain marker instead.
+fn redacted_session_id(session_id: &[u8]) -> Option<spindle_core::RedactedFingerprint> {
+    Fingerprint::from_slice(session_id)
+        .ok()
+        .map(Fingerprint::redacted)
+}
 
 fn op_name(req: &VfsRequest) -> &'static str {
     match req {
@@ -3243,6 +3284,44 @@ mod tests {
             std::fs::read_dir(fx.real_root()).expect("read_dir").count(),
             0,
             "must GC the staging file once the session's TTL has passed"
+        );
+    }
+
+    /// Exercises `discard_staging_bytes`'s new `remove_file` failure branch (td-6c9d95 step 3):
+    /// removes the staging file out from under a live session — standing in for an operator or
+    /// another process touching the share root directly — before GC ever runs. `discard_staging_
+    /// bytes` must not panic on the resulting `NotFound`; this only proves that (and that the
+    /// session table entry is still cleared), not anything about the `tracing::warn!` this now
+    /// emits, which this suite deliberately never asserts on.
+    #[test]
+    fn gc_expired_upload_sessions_survives_a_staging_file_already_removed_out_of_band() {
+        let fx = UploadFixture::new(Perms::UPLOAD);
+        let server = fx.server();
+        let data = b"stale".to_vec();
+        let session_id = fx.open(&server, 1_000, "Drop/a.bin", &data);
+
+        let staging_path = fx
+            .real_root()
+            .join(spindle_vfs::confine::staging_name(&session_id));
+        std::fs::remove_file(&staging_path).expect("remove the staging file out of band");
+        assert_eq!(
+            std::fs::read_dir(fx.real_root()).expect("read_dir").count(),
+            0,
+            "the staging file is already gone before GC ever runs"
+        );
+
+        // Must not panic despite `remove_file` failing inside `discard_staging_bytes`.
+        server.gc_expired_upload_sessions(1_000 + UPLOAD_SESSION_TTL_SECS + 1);
+
+        // The session is still removed from the in-memory table even though its on-disk file was
+        // already gone — `upload_sessions.gc_expired` runs unconditionally, before
+        // `discard_staging_bytes`'s best-effort filesystem cleanup.
+        assert!(
+            server
+                .upload_sessions
+                .get_owned(&session_id, fx.member_id)
+                .is_none(),
+            "an expired session must be removed from the table regardless of staging-file cleanup"
         );
     }
 

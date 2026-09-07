@@ -20,7 +20,11 @@ edition.workspace = true
 # dependency beyond `spindle-net` itself, since the frame payloads are still this crate's own
 # canonical-CBOR bytes. `tokio` is new here too: `serve_control_stream` is `async fn`, generic over
 # any `tokio::io::{AsyncRead, AsyncWrite}` half (not tied to QUIC specifically — see that
-# function's doc comment).
+# function's doc comment). td-6c9d95 step 3 adds `tracing` — already a workspace dependency (root
+# `Cargo.toml`) and already sanctioned by the A9c manifest (DESIGN.md:814); `spindle-vfs`'s step 2
+# instrumentation sets the house style this crate's call sites follow. This crate stays a library:
+# it must never call `tracing_subscriber` or install a global subscriber — see `src/lib.rs`'s doc
+# comment.
 [dependencies]
 spindle-core = { path = "../spindle-core" }
 spindle-proto = { path = "../spindle-proto" }
@@ -29,6 +33,7 @@ spindle-net = { path = "../spindle-net" }
 cap-std = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 # `rustix`/`windows-sys` back `limits::OsFreeSpace` (DESIGN.md §A4b free-space floor; user decision
 # 2026-08-26 — A9c manifest amended). Both are already-transitive dependencies of this crate via

@@ -68,11 +68,13 @@
 //!
 //! # Store handles: one per seam, never shared
 //!
-//! [`HostDaemon::run`] opens **three** independent SQLite connections to the same store file
-//! rather than passing one `Store` handle around: one for the connect-time
+//! [`HostDaemon::run`] opens **two** independent SQLite connections eagerly, rather than passing
+//! one `Store` handle around: one for the connect-time
 //! [`spindle_host_core::SqliteDeviceLookup`] behind [`spindle_host_core::HostConnectAuthorizer`],
-//! one for the session-time `SqliteDeviceLookup` behind [`spindle_host_core::VfsSessionHandler`],
-//! and — via [`spindle_host_core::SqliteStoreFactory`] — a fresh one per accepted RPC session.
+//! and one for the session-time `SqliteDeviceLookup` behind
+//! [`spindle_host_core::VfsSessionHandler`]. It also constructs a
+//! [`spindle_host_core::SqliteStoreFactory`] — which is not itself a connection — and that
+//! factory opens one further connection per accepted RPC session, lazily.
 //! `SqliteDeviceLookup`'s own doc comment sets the precedent this follows: "a host should give
 //! this its own `Store` handle ... keeping the connect path off the RPC path's connection
 //! entirely". `VfsSessionHandler` needs a `DeviceLookup` of its own for exactly the same
@@ -84,8 +86,29 @@
 //! each other's in-flight reads), this crate opens a second, independent connection instead.
 //! SQLite supports multiple connections to one database file, which is the same fact
 //! `SqliteStoreFactory`'s own doc comment already leans on to justify opening a fresh connection
-//! per RPC session; three independent connections in one process is the same pattern applied one
-//! more time, not a new one.
+//! per RPC session; opening this second, independent connection here applies that same pattern
+//! once more, not a new one.
+//!
+//! # `tracing` (td-6c9d95 step 4): library only, no subscriber
+//!
+//! This crate emits `tracing` events at a handful of lifecycle call sites in [`HostDaemon::run`] —
+//! startup, the cap-issuer seam, and how the signaling run loop exits — following the house style
+//! `crates/spindle-vfs`'s instrumentation (step 2) set. No call site here carries a filesystem or
+//! virtual path (the store path is a path and is never logged), a file or group name, capability
+//! bytes, key material, or a payload; identifiers that do appear are truncated via
+//! `spindle_core::Fingerprint::redacted()`. This crate also does not duplicate the tamper-evident
+//! audit log `spindle-host-core` already writes (DESIGN.md:413) — tracing here is lifecycle
+//! visibility for an operator, not an audit trail.
+//!
+//! **This crate must never call `tracing_subscriber` or install a global subscriber**, even though
+//! it is daemon-shaped. It is a library with no runtime of its own — see this module's own "Why
+//! this crate ships no binary (yet)" section above — and installing a subscriber here would apply
+//! workspace-wide to whatever binary eventually links this crate, including `apps/host`'s Tauri
+//! shell, which must own that decision itself. Only a binary initializes one (see
+//! `crates/spindle-helper/src/bin/helper.rs:349-351`'s `tracing_subscriber::fmt()...init()` for the
+//! precedent this crate's future binary, or `apps/host`, should follow). If output from this crate
+//! ever seems to vanish, the fix is to init a subscriber in the consuming binary, not to add one
+//! here.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -131,7 +154,7 @@ pub fn wall_clock_now_secs() -> u64 {
 /// the signaling host.
 #[derive(Debug, thiserror::Error)]
 pub enum HostDaemonError {
-    /// One of the three independent SQLite connections `run` opens (see this crate's module doc
+    /// One of the two SQLite connections `run` opens eagerly (see this crate's module doc
     /// comment's "Store handles" section) failed to open.
     #[error("failed to open host store: {0}")]
     Store(#[from] StoreError),
@@ -256,10 +279,10 @@ impl HostDaemon {
     /// Assembles and drives the whole connect path, per this module's doc comment's "Store
     /// handles" section:
     ///
-    /// 1. Opens three independent SQLite connections to `store_path` — one for the connect-time
-    ///    `SqliteDeviceLookup`, one for the session-time `SqliteDeviceLookup`, and a
-    ///    [`SqliteStoreFactory`] that opens a fourth (and every subsequent) connection lazily, one
-    ///    per accepted RPC session.
+    /// 1. Opens two independent SQLite connections to `store_path` eagerly — one for the
+    ///    connect-time `SqliteDeviceLookup`, one for the session-time `SqliteDeviceLookup` — and
+    ///    constructs a [`SqliteStoreFactory`] (not itself a connection) that opens one further
+    ///    connection lazily per accepted RPC session: the third, the fourth, and so on.
     /// 2. Wraps the connect-time lookup in [`HostConnectAuthorizer`] and the session-time lookup
     ///    (plus the factory) in [`VfsSessionHandler`].
     /// 3. Builds a [`SignalingHost`] from the caller-owned NATS client, this host's two
@@ -277,33 +300,88 @@ impl HostDaemon {
             issuer,
         } = self;
 
+        // Bound to a plain local first (rather than interpolating `device.device_fp().redacted()`
+        // directly) so `crates/spindle-core/tests/redaction_guard.rs`'s text scan can see the
+        // `.redacted()` call immediately after the flagged `_fp` binding — its heuristic does not
+        // look past an intermediate method call's parentheses. Truncated per this crate's
+        // redaction policy (see this module's `tracing` doc section) — enough for an operator to
+        // tell which host this log came from, never enough to identify it on its own.
+        let device_fp = device.device_fp();
+        tracing::info!(
+            device_fp = %device_fp.redacted(),
+            host_fp = %host_fp.redacted(),
+            "host daemon starting"
+        );
+
         let factory = SqliteStoreFactory::new(&store_path);
 
         // Independent connection #1: the connect path's own lookup (never the RPC path's) — see
         // `SqliteDeviceLookup`'s doc comment and this module's doc comment.
-        let connect_store = factory.open()?;
+        let connect_store = match factory.open() {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::error!(%error, "host daemon failed to open connect-path store connection");
+                return Err(error.into());
+            }
+        };
         let connect_lookup = SqliteDeviceLookup::new(connect_store);
         let authorizer = match issuer {
             // `with_cap_issuer`'s doc comment explains why this crate never builds this seam
             // itself: a real `RootKeyCapIssuer` needs this host's operating signing key, and that
-            // key's custody (an OS keystore) is unresolved Stage 7 work.
-            Some(issuer) => HostConnectAuthorizer::with_issuer(connect_lookup, issuer),
-            None => HostConnectAuthorizer::new(connect_lookup),
+            // key's custody (an OS keystore) is unresolved Stage 7 work. Whether one is installed
+            // changes behavior materially (with none, connect answers never carry a member
+            // capability), so it is worth its own `info!` line rather than folding into the
+            // startup line above.
+            Some(issuer) => {
+                tracing::info!(
+                    "cap issuer installed; successful connects will carry a freshly-minted \
+                     member capability"
+                );
+                HostConnectAuthorizer::with_issuer(connect_lookup, issuer)
+            }
+            None => {
+                tracing::info!(
+                    "no cap issuer installed (HostDaemon::with_cap_issuer was not called); \
+                     connect answers will never carry a member capability"
+                );
+                HostConnectAuthorizer::new(connect_lookup)
+            }
         };
 
         // Independent connection #2: the session handler's own lookup. `HostConnectAuthorizer`
         // consumed the first `SqliteDeviceLookup` by value above, so `VfsSessionHandler` needs a
         // second one of its own rather than a reference to the first.
-        let session_lookup_store = factory.open()?;
+        let session_lookup_store = match factory.open() {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::error!(%error, "host daemon failed to open session-path store connection");
+                return Err(error.into());
+            }
+        };
         let session_lookup = SqliteDeviceLookup::new(session_lookup_store);
 
         // `factory` itself is moved in here; every RPC session gets its own connection (#3, #4,
         // ...) opened on demand by `VfsSessionHandler::handle_session` via `StoreFactory::open`.
         let handler = VfsSessionHandler::new(factory, session_lookup, now_fn);
 
+        tracing::info!(
+            connections_opened = 2u32,
+            "host daemon store connections opened at startup; entering signaling run loop"
+        );
+
         let host: AssembledSignalingHost<_> =
             SignalingHost::new(nats, device, host_fp, authorizer, handler);
-        Arc::new(host).run(opts).await?;
-        Ok(())
+        match Arc::new(host).run(opts).await {
+            Ok(()) => {
+                tracing::info!(
+                    "host daemon signaling run loop exited (nats connection closed or dropped)"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(%error, "host daemon signaling run loop failed");
+                Err(error.into())
+            }
+        }
     }
 }

@@ -98,7 +98,21 @@ impl FreeSpaceProbe for OsFreeSpace {
         // `u64::MAX` rather than wrap.
         match rustix::fs::statvfs(real_root) {
             Ok(stat) => stat.f_bavail.saturating_mul(stat.f_frsize),
-            Err(_) => 0,
+            Err(e) => {
+                // Fails closed to 0 (see this type's doc comment for why), but a *persistent*
+                // probe failure is silently indistinguishable from a genuinely full disk: uploads
+                // are refused with `storage_full` even though there may be plenty of room, and
+                // nothing else observes or reports the probe itself failing. `errno`-only, no
+                // path: `rustix`'s `Errno` display is a bare OS error code/message and never
+                // echoes the path it was called with.
+                tracing::warn!(
+                    error = %e,
+                    "OsFreeSpace::available_bytes (unix): statvfs probe failed; reporting 0 \
+                     bytes available (fail closed) — uploads will be refused as though the disk \
+                     were full even though free space is simply unknown"
+                );
+                0
+            }
         }
     }
 }
@@ -130,7 +144,18 @@ impl FreeSpaceProbe for OsFreeSpace {
         };
 
         if ok == 0 {
-            // BOOL == 0 means the call failed (e.g. path does not exist) — fail closed.
+            // BOOL == 0 means the call failed (e.g. path does not exist) — fail closed. Same
+            // silent-degradation shape as the Unix branch above: a persistent failure here is
+            // indistinguishable from a genuinely full disk to anything watching `storage_full`
+            // alone. `std::io::Error::last_os_error()`'s Win32 FormatMessage text is a per-error-
+            // code template (e.g. "The system cannot find the path specified. (os error 3)") —
+            // it never echoes the path this call was made with.
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "OsFreeSpace::available_bytes (windows): GetDiskFreeSpaceExW failed; reporting 0 \
+                 bytes available (fail closed) — uploads will be refused as though the disk were \
+                 full even though free space is simply unknown"
+            );
             0
         } else {
             // FreeBytesAvailableToCaller (not the raw total-free) is the caller-quota-aware value:

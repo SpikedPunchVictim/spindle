@@ -93,6 +93,29 @@
 //!
 //! **Out**: streaming a `read`/`upload_chunk` reply's bytes across multiple frames instead of one
 //! shot; the browser-peer WebRTC data-channel transport (needs signaling — Stage 5, unscheduled).
+//!
+//! # `tracing` (td-6c9d95 step 3): library only, no subscriber
+//!
+//! This crate emits `tracing` events at a handful of targeted call sites — currently-silent
+//! failures whose symptom would otherwise surface only much later, degrees away from the fault
+//! (a lock-out that only appears once a member capability's TTL expires; uploads refused as if
+//! the disk were full when a free-space probe simply failed; a leaked staging file), and
+//! security-adjacent decisions where "denied because the store could not be read" and "denied
+//! because the device is not a member" were previously indistinguishable — following the house
+//! style `spindle-vfs`'s own step 2 instrumentation set first. It never carries a virtual path,
+//! file/group name, capability byte, key, or payload in a log line; where that detail genuinely
+//! belongs, it goes to the tamper-evident audit log (`server.rs`'s `audit`/`deny`/`deny_with_code`,
+//! DESIGN.md:413) instead — most `Err(_)` arms in `server.rs` are already audited this way and are
+//! deliberately left untouched here, to avoid duplicating that record. Identifiers that do appear
+//! are truncated via `spindle_core::Fingerprint::redacted()`.
+//!
+//! **This crate must never call `tracing_subscriber` or install a global subscriber.** It is a
+//! library with no runtime of its own; without a subscriber installed by a binary, every event
+//! emitted here is silently dropped, which is correct — initializing one here would apply
+//! workspace-wide regardless of which binary eventually links this crate. Only binaries do that
+//! (see `crates/spindle-helper/src/bin/helper.rs`'s `tracing_subscriber::fmt()...init()` for the
+//! precedent). If output from this crate ever seems to vanish, the fix is to init a subscriber in
+//! the consuming binary (`spindle-hostd`), not to add one here.
 
 pub mod authorize;
 pub mod serve;

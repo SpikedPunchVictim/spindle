@@ -297,6 +297,23 @@ where
         let store = match self.store_factory.open() {
             Ok(store) => store,
             Err(_) => {
+                // Deliberately not logging the `StoreError` itself: `Store::open`'s failure modes
+                // include a fresh `rusqlite::Connection::open` (confirmed empirically: a failed
+                // SQLite open embeds the database file's real path in its error message, e.g.
+                // "unable to open database file: <path>") and `check_persisted_share_overlaps`'s
+                // `ConfineError`, which can likewise carry a share's real root — exactly the
+                // filesystem-path content this crate's tracing policy forbids. There is nothing
+                // else to observe this failure with: `CLOSE_SESSION_UNAVAILABLE`'s own doc comment
+                // already establishes this is meant to read as "transient host fault", but that
+                // close code alone gives an operator no host-side signal at all. `error!`, not
+                // `warn!`: unlike a per-connect capability-mint degradation, this refuses the
+                // *entire session* with no fallback, and if persistent it means this host cannot
+                // open its own store — every peer is refused, not just this one.
+                tracing::error!(
+                    "VfsSessionHandler::handle_session: store_factory.open() failed; session \
+                     refused (host store unavailable). A persistent recurrence means this host \
+                     cannot open its own store and is refusing every session."
+                );
                 control.close(CLOSE_SESSION_UNAVAILABLE, b"host store unavailable");
                 return control;
             }
@@ -325,6 +342,21 @@ where
         match result {
             Ok(()) => control,
             Err(_) => {
+                // Deliberately not logging the `ServeError` itself: it wraps `spindle_proto::
+                // ProtoError`, whose `UnknownField(String)` variant carries a raw CBOR map key
+                // straight from the peer's bytes — untrusted payload content this crate's tracing
+                // policy forbids, exactly as much as a virtual path would be. `peer_device_fp` is
+                // safe to name here (redacted): per `CLOSE_PROTOCOL_VIOLATION`'s own doc comment,
+                // by this point the peer is already inside a live, authorized session, so nothing
+                // is protected by withholding it. Nothing else records that this session ended in
+                // a protocol violation rather than a clean close — `warn!`: this ends one session,
+                // not the whole host, but a device that repeatedly triggers this is worth an
+                // operator's attention (a buggy client, version skew, or a tampering attempt).
+                tracing::warn!(
+                    peer_device_fp = %peer_device_fp.redacted(),
+                    "VfsSessionHandler::handle_session: serve_control_stream ended in a \
+                     protocol violation; closing the session"
+                );
                 control.close(CLOSE_PROTOCOL_VIOLATION, b"protocol violation");
                 control
             }
