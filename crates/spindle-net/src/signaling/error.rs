@@ -141,7 +141,10 @@ impl SignalingError {
 /// `quinn::ConnectionError` shape that never carries a peer byte at all, so the rest render
 /// exactly as they always did. The test throughout is "does this carry peer-controlled bytes or
 /// an untruncated identifier", not "is this a transport error": most of `quinn::ConnectionError`
-/// is exactly that and still safe.
+/// is exactly that and still safe. [`SignalingError::Ice`] is the one exception to "every other
+/// variant" above: its payload doesn't fit any of those closed categories, and the `Ice` bullet
+/// below states why it is left safe anyway — a traced, present-day fact rather than a type-level
+/// guarantee.
 ///
 /// - [`SignalingError::EnvelopeDecode`] and [`SignalingError::Payload`] can reach
 ///   [`ProtoError::UnknownField`], a CBOR map key taken verbatim from the peer's bytes — deferred
@@ -156,6 +159,33 @@ impl SignalingError {
 ///   log-injection surface (arbitrary bytes, including newlines, straight into a
 ///   `tracing::warn!`) the other bullets above exist to close. `error_code` is a number the
 ///   protocol/peer picks from a known space, not free text, so it is rendered, not withheld.
+/// - [`SignalingError::Ice`] wraps `rtc_shared::error::Error`, locked at rtc-shared 0.20.3
+///   (`Cargo.lock`) and declared `#[non_exhaustive]` (`error.rs:31-32`) with dozens of
+///   `String`-carrying variants across the whole WebRTC stack it aggregates — `Other(String)`
+///   (`error.rs:2331`), `OtherIceErr(String)` (`error.rs:2304`), `SdpInvalidSyntax(String)`
+///   (`error.rs:2226-2228`), `ParseExtMap(String)` (`error.rs:2237`), and more this wrapper has not
+///   audited one by one. What is actually reachable *today* is narrower. `ice.rs`'s
+///   `drive_ice_agent_trickle` is the only place a `SignalingError::Ice` can be produced, converted
+///   via `#[from]` from `agent.handle_read(..)` on bytes taken straight off `socket.recv_from`
+///   (`ice.rs:178-189`) — attacker-addressable UDP, ahead of any envelope verification. Traced
+///   through rtc-ice 0.20.3's `handle_inbound_candidate_msg` (`src/agent/mod.rs:1438-1460`, which
+///   STUN-decodes the datagram via rtc-stun's `Message::decode` at `mod.rs:1449` and returns any
+///   decode error unchanged) into rtc-stun 0.20.3's `Message::decode` (`src/message.rs:332-405`),
+///   the only `Error::Other` this path can produce today comes from four sites
+///   (`message.rs:345-347`, `350-354`, `371-375`, `390-395`) that format nothing but a peer-chosen
+///   4-byte magic-cookie value as hex, buffer-length integers, and an attribute-type code rendered
+///   through `AttrType`'s `Display` (`rtc-stun-0.20.3/src/attributes.rs:48-89`), which either prints
+///   a fixed name from a static table or falls back to `0x{:x}` — never free-form peer text. So
+///   today's reachable `Ice` content is numeric/hex only. But the enum's `#[non_exhaustive]` real
+///   `String` variants sit elsewhere in a surface this wrapper cannot enumerate or gate at the
+///   source the way `quic.rs`'s verifiers do for the `TransportError` hazard below — a future
+///   rtc-ice/rtc-stun release, or some other call path into the same `SignalingError::Ice` variant,
+///   could start carrying one of those `String`s here without this file changing at all. Leaving it
+///   rendering through the `safe` arm is a deliberate decision, not an oversight: the numeric
+///   ICE-failure detail reachable today is genuinely useful for diagnosing connectivity problems,
+///   and blanket-withholding it would cost real diagnosability for no present gain — but unlike
+///   every bullet above, this one is a standing hazard checked against what is reachable *right
+///   now*, not a closed proof.
 /// - Every other `quinn::ConnectionError` — including `TransportError` — is left alone, but not
 ///   because it is unconditionally safe. `quinn_proto::TransportError::reason` is never built from
 ///   bytes the *peer* put on the wire — checked against every construction site in quinn-proto
@@ -232,6 +262,16 @@ mod tests {
     /// The two decode variants can reach a peer-supplied CBOR map key; the two subject variants
     /// spell out untruncated fingerprints. All four must be withheld by `redacted()`, and every
     /// other variant must survive it unchanged.
+    ///
+    /// The `safe` loop covers every one of this enum's 19 variants except the four in `leaky`
+    /// above and the `Quic(ApplicationClosed)`/`Quic(ConnectionClosed)` shapes, which
+    /// `redacted_display_withholds_quic_close_reasons_but_keeps_the_code` exercises separately —
+    /// including [`SignalingError::Ice`] (see the `Ice` bullet on
+    /// [`RedactedSignalingError`]'s doc comment: numeric/hex content only, reachable today, but a
+    /// standing hazard because `rtc_shared::error::Error` is `#[non_exhaustive]`) and a
+    /// `Quic` shape that isn't either rewritten `ConnectionError`, to prove the fallback `safe`
+    /// arm covers `Quic` too, not just the two explicit `ConnectionError` shapes. Every variant
+    /// here has a real public constructor, so none had to be skipped.
     #[test]
     fn redacted_display_withholds_peer_bytes_and_subjects_and_nothing_else() {
         let subject = "host.ABCDEFGH.sess.IJKLMNOP.0011.c2h";
@@ -255,14 +295,30 @@ mod tests {
 
         for safe in [
             SignalingError::Envelope(EnvelopeError::BadSignature),
-            SignalingError::BadEphPk(17),
-            SignalingError::Denied,
-            SignalingError::Nats("connection reset".to_string()),
             SignalingError::Payload(ProtoSignalingError::TooLong {
                 field: "ufrag",
                 max: 8,
                 actual: 9,
             }),
+            SignalingError::Fingerprint(FingerprintError::WrongLength(17)),
+            SignalingError::MissingEphPk,
+            SignalingError::BadEphPk(17),
+            SignalingError::BadReplyPrefix,
+            SignalingError::ReplyInboxMismatch,
+            SignalingError::HostOffline,
+            SignalingError::Denied,
+            SignalingError::UnsupportedTransport(Transport::WebRtc),
+            SignalingError::IceFailed,
+            // Numeric-only today (see the `Ice` bullet above `RedactedSignalingError`) — but the
+            // point of this entry is that it renders unchanged like the rest, not that its content
+            // is unconditionally trustworthy.
+            SignalingError::Ice(rtc_shared::error::Error::ErrTimeout),
+            SignalingError::Timeout("ICE trickle"),
+            // A `Quic` shape that is neither `ApplicationClosed` nor `ConnectionClosed` — proves
+            // the fallback `safe` arm actually covers `Quic`, not just the two rewritten shapes.
+            SignalingError::Quic(crate::quic::QuicError::EndpointClosed),
+            SignalingError::Nats("connection reset".to_string()),
+            SignalingError::Io(std::io::Error::other("disk full")),
         ] {
             assert_eq!(safe.to_string(), safe.redacted().to_string());
         }
