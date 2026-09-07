@@ -173,10 +173,23 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
         if actual == self.expected {
             Ok(ServerCertVerified::assertion())
         } else {
+            // This message becomes `rustls::Error::General`'s `Display` text, which quinn-proto
+            // 0.11.17's `crypto/rustls.rs:112` copies verbatim into `TransportError::reason` — the
+            // exact spot `QuicError::Connection`'s doc comment above (~lines 92-94) says a
+            // fingerprint mismatch surfaces — and from there reaches `tracing::warn!` in
+            // `signaling/host.rs`'s `handle_connect`. `RedactedSignalingError`'s `safe` arm
+            // (`signaling/error.rs`) deliberately leaves `TransportError` alone, since its
+            // `reason` is an opaque string this wrapper cannot reliably parse — so nothing
+            // downstream will truncate this for us. The full 32-byte digest must therefore never
+            // be built here at all: only an 8-hex-character prefix is ever formatted, matching
+            // `spindle_core::fingerprint::RedactedFingerprint`'s "short prefix + `..`" convention
+            // (that type is base32; this is hex, since these are raw SHA-256 bytes rather than a
+            // `Fingerprint`, but the same spirit — enough to tell expected apart from got, not
+            // enough to reconstruct or reuse either).
             Err(rustls::Error::General(format!(
                 "server certificate fingerprint mismatch: expected sha256:{}, got sha256:{}",
-                hex(&self.expected),
-                hex(&actual),
+                hex_prefix(&self.expected),
+                hex_prefix(&actual),
             )))
         }
     }
@@ -253,10 +266,20 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
         if actual == self.expected {
             Ok(ClientCertVerified::assertion())
         } else {
+            // Same reasoning as `PinnedServerCertVerifier::verify_server_cert` above: this
+            // message becomes `rustls::Error::General`'s `Display` text, which quinn-proto
+            // 0.11.17's `crypto/rustls.rs:112` copies verbatim into `TransportError::reason` (the
+            // spot `QuicError::Connection`'s doc comment, ~lines 92-94, says a fingerprint
+            // mismatch surfaces) and from there into `tracing::warn!` via `signaling/host.rs`'s
+            // `handle_connect` — `RedactedSignalingError`'s `safe` arm leaves `TransportError`
+            // alone (its `reason` is an opaque string that wrapper cannot reliably parse), so the
+            // full 32-byte digest must never be built here in the first place; only an
+            // 8-hex-character prefix is formatted, matching
+            // `spindle_core::fingerprint::RedactedFingerprint`'s "short prefix + `..`" convention.
             Err(rustls::Error::General(format!(
                 "client certificate fingerprint mismatch: expected sha256:{}, got sha256:{}",
-                hex(&self.expected),
-                hex(&actual),
+                hex_prefix(&self.expected),
+                hex_prefix(&actual),
             )))
         }
     }
@@ -298,6 +321,17 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Renders the first 4 bytes (8 hex characters) of a 32-byte digest, followed by `..` — the two
+/// mismatch messages above are the only callers, and both need the two operands to stay
+/// distinguishable (an operator must still see that expected != got) without ever building the
+/// full 64-character digest in a string that can reach a log (see the comments at both call
+/// sites). Mirrors `spindle_core::fingerprint::RedactedFingerprint`'s "short prefix + `..`"
+/// convention in spirit — hex here, since these are raw SHA-256 bytes rather than a `Fingerprint`
+/// — rather than its literal base32 encoding.
+fn hex_prefix(bytes: &[u8; 32]) -> String {
+    format!("{}..", hex(&bytes[..4]))
 }
 
 // ── TLS config builders (one per side — see the module doc comment below) ──────────────────────────
@@ -614,6 +648,69 @@ mod tests {
                 panic!("expected a pinning rejection containing {needle:?}, but the call succeeded")
             }
         }
+    }
+
+    // Load-bearing: proves the mismatch messages built by `verify_server_cert`/
+    // `verify_client_cert` never carry the full 64-character hex digest of either operand — that
+    // text reaches a `tracing::warn!` through `TransportError::reason` with no further redaction
+    // (see the comments at both `Err(rustls::Error::General(...))` sites above), so the
+    // truncation has to hold at the source. Drives the verifiers directly (no handshake) so this
+    // stays a fast, synchronous unit test.
+    #[test]
+    fn mismatch_messages_omit_the_full_64_char_digest() {
+        let expected_cert = SessionCert::generate().expect("expected cert");
+        let actual_cert = SessionCert::generate().expect("actual (wrong) cert");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let full_expected = hex(&expected_cert.fingerprint());
+        let full_actual = hex(&actual_cert.fingerprint());
+
+        let server_verifier = PinnedServerCertVerifier {
+            expected: expected_cert.fingerprint(),
+            provider: provider.clone(),
+        };
+        let server_err = server_verifier
+            .verify_server_cert(
+                &actual_cert.cert_der(),
+                &[],
+                &ServerName::try_from("localhost").expect("valid server name"),
+                &[],
+                UnixTime::now(),
+            )
+            .expect_err("mismatched server cert must be rejected");
+        let rendered = server_err.to_string();
+        assert!(
+            rendered.contains("server certificate fingerprint mismatch"),
+            "missing mismatch needle: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&full_expected),
+            "full expected digest leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&full_actual),
+            "full actual digest leaked: {rendered}"
+        );
+
+        let client_verifier = PinnedClientCertVerifier {
+            expected: expected_cert.fingerprint(),
+            provider,
+        };
+        let client_err = client_verifier
+            .verify_client_cert(&actual_cert.cert_der(), &[], UnixTime::now())
+            .expect_err("mismatched client cert must be rejected");
+        let rendered = client_err.to_string();
+        assert!(
+            rendered.contains("client certificate fingerprint mismatch"),
+            "missing mismatch needle: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&full_expected),
+            "full expected digest leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&full_actual),
+            "full actual digest leaked: {rendered}"
+        );
     }
 
     #[tokio::test]

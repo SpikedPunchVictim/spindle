@@ -257,7 +257,11 @@ where
             let this = self.clone();
             tokio::spawn(async move {
                 if let Err(error) = this.handle_connect(msg, opts).await {
-                    tracing::warn!(%error, "connect attempt failed");
+                    // `error.redacted()`, not `%error`: `handle_connect` can fail with any
+                    // `SignalingError`, including the four variants that carry peer-supplied
+                    // CBOR keys or an untruncated-fingerprint NATS subject — see
+                    // `SignalingError::redacted`.
+                    tracing::warn!(error = %error.redacted(), "connect attempt failed");
                 }
             });
         }

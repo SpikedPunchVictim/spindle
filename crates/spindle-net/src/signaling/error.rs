@@ -5,6 +5,8 @@
 //! test, per this crate's `assert_pinning_rejected` convention in `quic.rs` — can always tell
 //! "this is a real §A7/§A5 rejection" apart from "this is a transport hiccup".
 
+use std::fmt;
+
 use spindle_core::envelope::EnvelopeError;
 use spindle_core::fingerprint::FingerprintError;
 use spindle_proto::artifacts::ProtoError;
@@ -115,4 +117,194 @@ pub enum SignalingError {
     /// address, converting it to a `std::net::UdpSocket` for quinn).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl SignalingError {
+    /// A log-safe `Display` view of this error — see [`RedactedSignalingError`].
+    ///
+    /// Use this, never the plain `Display`, anywhere a `SignalingError` reaches a `tracing::`
+    /// call. Five of this enum's variants can carry content the repo's redaction policy forbids
+    /// logging (see this crate's `lib.rs` and `crates/spindle-core/tests/redaction_guard.rs` —
+    /// that guard inspects binding names only and cannot see content reachable through an
+    /// error's `Display`).
+    pub fn redacted(&self) -> RedactedSignalingError<'_> {
+        RedactedSignalingError(self)
+    }
+}
+
+/// A `Display` wrapper that renders a [`SignalingError`] with every peer-controlled byte and
+/// every untruncated identifier replaced by its shape.
+///
+/// Five of this enum's variants can reach peer-controlled bytes or an untruncated identifier;
+/// every other variant's payload is a numeric bound, a `&'static str`, an [`EnvelopeError`]
+/// (whose whole surface is constant text and integers), or — per the `Quic` bullets below — a
+/// `quinn::ConnectionError` shape that never carries a peer byte at all, so the rest render
+/// exactly as they always did. The test throughout is "does this carry peer-controlled bytes or
+/// an untruncated identifier", not "is this a transport error": most of `quinn::ConnectionError`
+/// is exactly that and still safe.
+///
+/// - [`SignalingError::EnvelopeDecode`] and [`SignalingError::Payload`] can reach
+///   [`ProtoError::UnknownField`], a CBOR map key taken verbatim from the peer's bytes — deferred
+///   to [`ProtoError::redacted`].
+/// - [`SignalingError::SubjectMismatch`] and [`SignalingError::BadSubject`] carry a NATS session
+///   subject, which spells out `host.<host_fp>.sess.<client_fp>.<sid>.<dir>` — two *untruncated*
+///   fingerprints, exactly what `spindle_core::Fingerprint::redacted` exists to prevent.
+/// - [`SignalingError::Quic`] wrapping `quinn::ConnectionError::ApplicationClosed` or
+///   `::ConnectionClosed`: quinn-proto 0.11.17's `frame::ApplicationClose`/`ConnectionClose`
+///   `Display` impls (`frame.rs:262-271`, `frame.rs:312-324`) write `String::from_utf8_lossy`
+///   over a `reason: Bytes` the *peer* chose when it sent the CLOSE frame — the same
+///   log-injection surface (arbitrary bytes, including newlines, straight into a
+///   `tracing::warn!`) the other bullets above exist to close. `error_code` is a number the
+///   protocol/peer picks from a known space, not free text, so it is rendered, not withheld.
+/// - Every other `quinn::ConnectionError` — including `TransportError` — is left alone, but not
+///   because it is unconditionally safe. `quinn_proto::TransportError::reason` is never built from
+///   bytes the *peer* put on the wire — checked against every construction site in quinn-proto
+///   0.11.17's `connection/`, `transport_parameters.rs`, and `frame.rs`; a peer's CONNECTION_CLOSE
+///   frame, transport-type or application-type, decodes straight into
+///   `ConnectionClosed`/`ApplicationClosed` (`connection/mod.rs:3875-3876`), never into
+///   `TransportError`. But `crypto/rustls.rs:112` builds `reason` from this crate's *own*
+///   `rustls::Error::General` text — which is exactly how `quic.rs`'s
+///   `PinnedServerCertVerifier`/`PinnedClientCertVerifier` report a pinning mismatch, and that
+///   text used to carry two untruncated 32-byte fingerprint digests, an "untruncated identifier"
+///   by this wrapper's own stated criterion, not peer-controlled bytes. That hazard is fixed at
+///   the source in `quic.rs`'s verifiers (both mismatch messages now format an 8-hex-character
+///   prefix, never the full digest) rather than here, because a `TransportError::reason` is an
+///   opaque `String` by the time it reaches this wrapper — there is no reliable way to pattern-match
+///   a hex digest back out of an arbitrary reason string built from other `rustls::Error` variants
+///   or future quinn-proto call sites. So `TransportError` is deliberately left rendering through
+///   the `safe` arm below: the peer-controlled-bytes hazard never applied to it, and the
+///   untruncated-identifier hazard is closed upstream, at the one place that can fix it for every
+///   consumer at once (including `QuicError::Tls(#[from] rustls::Error)`, `quic.rs:79`, the
+///   shorter path to the same `rustls::Error::General` text).
+#[derive(Debug, Clone, Copy)]
+pub struct RedactedSignalingError<'a>(&'a SignalingError);
+
+impl fmt::Display for RedactedSignalingError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            SignalingError::EnvelopeDecode(e) => {
+                write!(f, "envelope decode failed: {}", e.redacted())
+            }
+            SignalingError::Payload(ProtoSignalingError::Proto(e)) => {
+                write!(f, "signaling payload decode failed: {}", e.redacted())
+            }
+            SignalingError::SubjectMismatch { subject } => write!(
+                f,
+                "subject (withheld: {} bytes naming host_fp/client_fp/sid) does not match the \
+                 expected session (host/client/sid/direction)",
+                subject.len()
+            ),
+            SignalingError::BadSubject(subject) => write!(
+                f,
+                "malformed session subject (withheld: {} bytes)",
+                subject.len()
+            ),
+            // The peer picks these `reason` bytes when it sends the CLOSE frame
+            // (quinn-proto 0.11.17 `frame.rs:262-271`/`312-324`'s `Display` impls write them via
+            // `String::from_utf8_lossy`, untruncated) — the same log-injection surface as the
+            // arms above. `error_code` is a number from a known space, not free text, so it is
+            // rendered, not withheld.
+            SignalingError::Quic(crate::quic::QuicError::Connection(
+                quinn::ConnectionError::ApplicationClosed(close),
+            )) => write!(
+                f,
+                "closed by peer: code {} (reason withheld: {} bytes of peer-supplied text)",
+                close.error_code,
+                close.reason.len()
+            ),
+            SignalingError::Quic(crate::quic::QuicError::Connection(
+                quinn::ConnectionError::ConnectionClosed(close),
+            )) => write!(
+                f,
+                "aborted by peer: code {} (reason withheld: {} bytes of peer-supplied text)",
+                close.error_code,
+                close.reason.len()
+            ),
+            safe => write!(f, "{safe}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two decode variants can reach a peer-supplied CBOR map key; the two subject variants
+    /// spell out untruncated fingerprints. All four must be withheld by `redacted()`, and every
+    /// other variant must survive it unchanged.
+    #[test]
+    fn redacted_display_withholds_peer_bytes_and_subjects_and_nothing_else() {
+        let subject = "host.ABCDEFGH.sess.IJKLMNOP.0011.c2h";
+        let leaky = [
+            SignalingError::EnvelopeDecode(ProtoError::UnknownField("secret-key".into())),
+            SignalingError::Payload(ProtoSignalingError::Proto(ProtoError::UnknownField(
+                "secret-key".into(),
+            ))),
+            SignalingError::BadSubject(subject.to_string()),
+            SignalingError::SubjectMismatch {
+                subject: subject.to_string(),
+            },
+        ];
+        for e in &leaky {
+            let plain = e.to_string();
+            let redacted = e.redacted().to_string();
+            assert_ne!(plain, redacted, "{plain}");
+            assert!(!redacted.contains("secret-key"), "{redacted}");
+            assert!(!redacted.contains(subject), "{redacted}");
+        }
+
+        for safe in [
+            SignalingError::Envelope(EnvelopeError::BadSignature),
+            SignalingError::BadEphPk(17),
+            SignalingError::Denied,
+            SignalingError::Nats("connection reset".to_string()),
+            SignalingError::Payload(ProtoSignalingError::TooLong {
+                field: "ufrag",
+                max: 8,
+                actual: 9,
+            }),
+        ] {
+            assert_eq!(safe.to_string(), safe.redacted().to_string());
+        }
+    }
+
+    /// A peer picks the CLOSE frame's `reason` bytes (quinn-proto 0.11.17 `frame.rs:262-271`/
+    /// `312-324`), so `redacted()` must withhold them from both `ConnectionError` shapes while
+    /// still surfacing the numeric `error_code` for diagnosability.
+    #[test]
+    fn redacted_display_withholds_quic_close_reasons_but_keeps_the_code() {
+        let reason = "attacker-controlled close reason\nwith a forged log line";
+
+        let application_closed = SignalingError::Quic(crate::quic::QuicError::Connection(
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(42),
+                reason: bytes::Bytes::from_static(reason.as_bytes()),
+            }),
+        ));
+        let connection_closed = SignalingError::Quic(crate::quic::QuicError::Connection(
+            quinn::ConnectionError::ConnectionClosed(quinn::ConnectionClose {
+                error_code: quinn::TransportErrorCode::PROTOCOL_VIOLATION,
+                frame_type: None,
+                reason: bytes::Bytes::from_static(reason.as_bytes()),
+            }),
+        ));
+
+        for e in [&application_closed, &connection_closed] {
+            let plain = e.to_string();
+            let redacted = e.redacted().to_string();
+            assert_ne!(plain, redacted, "{plain}");
+            assert!(!redacted.contains(reason), "{redacted}");
+            assert!(!redacted.contains('\n'), "{redacted}");
+        }
+
+        assert!(application_closed.redacted().to_string().contains("42"));
+        // `TransportErrorCode::PROTOCOL_VIOLATION`'s `Display` (quinn-proto's `errors!` macro in
+        // `transport_error.rs`) writes this fixed description, never the peer-chosen value's raw
+        // bits, so asserting on it also proves the code renders through a bounded lookup table
+        // rather than free text.
+        assert!(connection_closed
+            .redacted()
+            .to_string()
+            .contains("protocol compliance"));
+    }
 }

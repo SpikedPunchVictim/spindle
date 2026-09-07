@@ -195,11 +195,24 @@ pub async fn drive_ice_agent_trickle(
                             let _ = agent.add_remote_candidate(c);
                             stats.candidates_applied += 1;
                         }
-                        Err(error) => {
+                        Err(_error) => {
                             stats.bad_candidates_seen += 1;
+                            // Neither the candidate line nor the parser's own message can be
+                            // logged. The line is a peer-supplied SDP candidate — it spells out
+                            // that peer's host/reflexive IP addresses and ports — and
+                            // `rtc_ice`'s `unmarshal_candidate` funnels every rejection through
+                            // `Error::Other(String)`, whose text interpolates the peer's own
+                            // candidate-type token verbatim (verified in rtc-ice 0.20.3,
+                            // `src/candidate/mod.rs`'s `ErrUnknownCandidateType` arm). What is
+                            // left is still enough to act on: the running reject count, the
+                            // line's length, and its whitespace-field count — a count below 8 is
+                            // exactly `rtc_ice`'s own "attribute too short" rejection, which
+                            // separates a truncated line from a well-formed one this agent
+                            // simply does not understand.
                             tracing::warn!(
-                                candidate = %line,
-                                %error,
+                                bad_candidates_seen = stats.bad_candidates_seen,
+                                candidate_len = line.len(),
+                                candidate_fields = line.split_whitespace().count(),
                                 "failed to unmarshal trickled ICE candidate; ignoring"
                             );
                         }

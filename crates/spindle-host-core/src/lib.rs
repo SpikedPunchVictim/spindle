@@ -109,6 +109,18 @@
 //! deliberately left untouched here, to avoid duplicating that record. Identifiers that do appear
 //! are truncated via `spindle_core::Fingerprint::redacted()`.
 //!
+//! **Operator configuration is not user data** (a clarification to td-6c9d95's policy, decided by
+//! the repo owner). This host's own store path, socket paths, and NATS URLs are configuration
+//! chosen by the operator running the daemon, not member content, and may appear in a log line —
+//! including when reached indirectly through an interpolated error's `Display`, which is how a
+//! `rusqlite` open failure carries the store path. The rule protects *members'* paths, names, and
+//! content; it is not a licence to make a daemon's own startup failure undiagnosable. Credentials,
+//! tokens, and anything from a `.creds` file are never loggable, exempt or not.
+//!
+//! An interpolated error's `Display` is part of what a log line carries, and is invisible to
+//! `crates/spindle-core/tests/redaction_guard.rs`'s binding-name scan — read what an error type
+//! can actually emit, transitively, before interpolating it.
+//!
 //! **This crate must never call `tracing_subscriber` or install a global subscriber.** It is a
 //! library with no runtime of its own; without a subscriber installed by a binary, every event
 //! emitted here is silently dropped, which is correct — initializing one here would apply

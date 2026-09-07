@@ -59,6 +59,40 @@ impl fmt::Display for ProtoError {
 
 impl std::error::Error for ProtoError {}
 
+impl ProtoError {
+    /// A log-safe `Display` view of this error — see [`RedactedProtoError`].
+    ///
+    /// Use this, never the plain `Display`, anywhere a `ProtoError` reaches a `tracing::` call:
+    /// [`ProtoError::UnknownField`] carries a CBOR map key taken verbatim from the peer's bytes,
+    /// which the repo's redaction policy forbids logging (see `crates/spindle-core/tests/
+    /// redaction_guard.rs`; that guard inspects binding names only and cannot see content
+    /// reachable through an error's `Display`).
+    pub fn redacted(&self) -> RedactedProtoError<'_> {
+        RedactedProtoError(self)
+    }
+}
+
+/// A `Display` wrapper that renders a [`ProtoError`] with every peer-controlled byte replaced by
+/// its shape. Every variant but [`ProtoError::UnknownField`] is already content-free — its
+/// payload is a `&'static str` field name from this crate's own schema, a numeric enum
+/// discriminant, or a [`crate::canonical::CborError`] byte offset — so only that one variant is
+/// rewritten; the rest render exactly as they always did, keeping the diagnostic value intact.
+#[derive(Debug, Clone, Copy)]
+pub struct RedactedProtoError<'a>(pub &'a ProtoError);
+
+impl fmt::Display for RedactedProtoError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            ProtoError::UnknownField(name) => write!(
+                f,
+                "unknown field (name withheld: {} bytes of peer-supplied text)",
+                name.len()
+            ),
+            safe => write!(f, "{safe}"),
+        }
+    }
+}
+
 impl From<crate::canonical::CborError> for ProtoError {
     fn from(e: crate::canonical::CborError) -> Self {
         ProtoError::Cbor(e)
@@ -1278,5 +1312,21 @@ mod tests {
         for (input, tag) in inputs.iter().zip(tags.iter()) {
             assert!(input.starts_with(tag));
         }
+    }
+
+    /// `ProtoError::UnknownField` carries a CBOR map key taken verbatim from a peer's bytes, so
+    /// it must never reach a log line. `redacted()` is the log-safe view; every other variant is
+    /// already content-free and must render unchanged, or the redaction would cost diagnosability
+    /// it does not need to.
+    #[test]
+    fn redacted_display_withholds_an_unknown_field_name_and_nothing_else() {
+        let leaky = ProtoError::UnknownField("secret-peer-key-name".to_string());
+        assert!(leaky.to_string().contains("secret-peer-key-name"));
+        let redacted = leaky.redacted().to_string();
+        assert!(!redacted.contains("secret-peer-key-name"), "{redacted}");
+        assert!(redacted.contains("20 bytes"), "{redacted}");
+
+        let safe = ProtoError::InvalidEnumValue("kind", 9);
+        assert_eq!(safe.to_string(), safe.redacted().to_string());
     }
 }

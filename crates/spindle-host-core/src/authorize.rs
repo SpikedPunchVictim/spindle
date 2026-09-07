@@ -219,6 +219,15 @@ impl DeviceLookup for SqliteDeviceLookup {
                 // minting fresh member capabilities — a fleet-wide lock-out that only surfaces once
                 // existing caps expire (`MEMBER_CAP_DEFAULT_TTL_SECS`: six weeks), degrees removed
                 // in both time and symptom from this call site.
+                // Audited 2026-09-07: `%e` is a `LookupError`, whose only reachable content
+                // here is a `rusqlite` message from this host's own store (its path is operator
+                // configuration, exempt — see this crate's `lib.rs` `tracing` section) or a
+                // fingerprint *length* complaint. `LookupError::Store` is typed over all of
+                // `StoreError` though, and that enum's `Confine`/`Model`/`MountPathCollision`/
+                // `DeviceNotFound` variants do carry real paths, virtual paths, and untruncated
+                // fingerprints — so anything that widens what these lookups call must re-check
+                // this line rather than trusting the redaction guard, which only reads binding
+                // names.
                 tracing::warn!(
                     device_fp = %device_fp.redacted(),
                     error = %e,
@@ -275,6 +284,15 @@ pub(crate) fn active_member_for_device<L: DeviceLookup + ?Sized>(
             // only so a human can tell "denied, store unreadable" apart from "denied, not a
             // member" after the fact, the same distinction `HostConnectAuthorizer::authorize`
             // makes explicit for its own `Err` arm below.
+            // Audited 2026-09-07: `%e` is a `LookupError`, whose only reachable content
+            // here is a `rusqlite` message from this host's own store (its path is operator
+            // configuration, exempt — see this crate's `lib.rs` `tracing` section) or a
+            // fingerprint *length* complaint. `LookupError::Store` is typed over all of
+            // `StoreError` though, and that enum's `Confine`/`Model`/`MountPathCollision`/
+            // `DeviceNotFound` variants do carry real paths, virtual paths, and untruncated
+            // fingerprints — so anything that widens what these lookups call must re-check
+            // this line rather than trusting the redaction guard, which only reads binding
+            // names.
             tracing::warn!(
                 device_fp = %device_fp.redacted(),
                 error = %e,
@@ -577,6 +595,15 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
                 // indistinguishable from "the device is not a member", when it is operationally a
                 // very different fact — the store could not be read at all.
                 Err(e) => {
+                    // Audited 2026-09-07: `%e` is a `LookupError`, whose only reachable content
+                    // here is a `rusqlite` message from this host's own store (its path is operator
+                    // configuration, exempt — see this crate's `lib.rs` `tracing` section) or a
+                    // fingerprint *length* complaint. `LookupError::Store` is typed over all of
+                    // `StoreError` though, and that enum's `Confine`/`Model`/`MountPathCollision`/
+                    // `DeviceNotFound` variants do carry real paths, virtual paths, and untruncated
+                    // fingerprints — so anything that widens what these lookups call must re-check
+                    // this line rather than trusting the redaction guard, which only reads binding
+                    // names.
                     tracing::warn!(
                         device_fp = %from_fp.redacted(),
                         error = %e,

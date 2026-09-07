@@ -91,14 +91,27 @@
 //!
 //! # `tracing` (td-6c9d95 step 4): library only, no subscriber
 //!
-//! This crate emits `tracing` events at a handful of lifecycle call sites in [`HostDaemon::run`] —
-//! startup, the cap-issuer seam, and how the signaling run loop exits — following the house style
-//! `crates/spindle-vfs`'s instrumentation (step 2) set. No call site here carries a filesystem or
-//! virtual path (the store path is a path and is never logged), a file or group name, capability
-//! bytes, key material, or a payload; identifiers that do appear are truncated via
-//! `spindle_core::Fingerprint::redacted()`. This crate also does not duplicate the tamper-evident
-//! audit log `spindle-host-core` already writes (DESIGN.md:413) — tracing here is lifecycle
-//! visibility for an operator, not an audit trail.
+//! This crate emits `tracing` events at a handful of lifecycle call sites in
+//! [`HostDaemon::run`] — startup, the cap-issuer seam, and how the signaling run loop exits —
+//! following the house style `crates/spindle-vfs`'s instrumentation (step 2) set. No call site here
+//! carries a member's virtual path, a file or group name, capability bytes, key material, or a
+//! payload; identifiers that do appear are truncated via `spindle_core::Fingerprint::redacted()`.
+//! The two store-open failure lines do carry this host's own store path, reached through
+//! `StoreError`'s `Display` — that is deliberate and permitted, per the exemption below. This
+//! crate also does not duplicate the tamper-evident audit log `spindle-host-core` already writes
+//! (DESIGN.md:413) — tracing here is lifecycle visibility for an operator, not an audit trail.
+//!
+//! **Operator configuration is not user data** (a clarification to td-6c9d95's policy, decided by
+//! the repo owner). This host's own store path, socket paths, and NATS URLs are configuration
+//! chosen by the operator running the daemon, not member content, and may appear in a log line —
+//! including when reached indirectly through an interpolated error's `Display`, which is how a
+//! `rusqlite` open failure carries the store path. The rule protects *members'* paths, names, and
+//! content; it is not a licence to make a daemon's own startup failure undiagnosable. Credentials,
+//! tokens, and anything from a `.creds` file are never loggable, exempt or not.
+//!
+//! An interpolated error's `Display` is part of what a log line carries, and is invisible to
+//! `crates/spindle-core/tests/redaction_guard.rs`'s binding-name scan — read what an error type
+//! can actually emit, transitively, before interpolating it.
 //!
 //! **This crate must never call `tracing_subscriber` or install a global subscriber**, even though
 //! it is daemon-shaped. It is a library with no runtime of its own — see this module's own "Why
@@ -379,7 +392,16 @@ impl HostDaemon {
                 Ok(())
             }
             Err(error) => {
-                tracing::error!(%error, "host daemon signaling run loop failed");
+                // `error.redacted()`, not `%error`: `SignalingHost::run` is typed over the whole
+                // `SignalingError` enum, four of whose variants carry peer-supplied CBOR keys or
+                // an untruncated-fingerprint NATS subject (see `SignalingError::redacted`). The
+                // *reachable* set here is narrower today — only the connect subscription's
+                // `SignalingError::Nats` — but that is a property of `run`'s body, not of its
+                // signature, so this does not rely on it.
+                tracing::error!(
+                    error = %error.redacted(),
+                    "host daemon signaling run loop failed"
+                );
                 Err(error.into())
             }
         }

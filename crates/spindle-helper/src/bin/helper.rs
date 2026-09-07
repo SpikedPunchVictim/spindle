@@ -151,7 +151,9 @@ enum ConfigError {
     BadAdmissionMode { given: String },
     #[error("--{0} requires a value")]
     FlagMissingValue(String),
-    #[error("unrecognized argument: {0}")]
+    /// Only the part of the argument before the first `=` is ever kept — see
+    /// [`ConfigError::unknown_arg`], which is the only way this variant is constructed.
+    #[error("unrecognized argument: {0} (any `=<value>` suffix is withheld — it may be a secret)")]
     UnknownArg(String),
     #[error("invalid value {given:?} for --{flag} / {env_var} (expected a non-negative integer)")]
     BadInteger {
@@ -159,6 +161,22 @@ enum ConfigError {
         env_var: &'static str,
         given: String,
     },
+}
+
+impl ConfigError {
+    /// Builds [`ConfigError::UnknownArg`] from a raw argv token, keeping only the part before the
+    /// first `=`.
+    ///
+    /// This parser is space-separated (`--callout-seed <seed>`), so the common `--flag=value`
+    /// spelling of a *recognized* flag falls through to the unknown-argument arm with the value
+    /// still attached — and `run`'s fatal-error line logs this error's `Display`. Six of this
+    /// binary's flags take an nkey seed or a `DATABASE_URL`; echoing one into a log is a
+    /// credential leak, which the redaction policy exempts nothing from. Truncating at the `=`
+    /// keeps the diagnosis ("you spelled a flag in a form this parser does not accept, and here
+    /// is which one") without the secret.
+    fn unknown_arg(arg: &str) -> ConfigError {
+        ConfigError::UnknownArg(arg.split('=').next().unwrap_or("").to_string())
+    }
 }
 
 const HELP: &str = r#"spindle-helper — the NATS Auth Callout responder (DESIGN.md §A4/§A5)
@@ -279,7 +297,7 @@ impl Config {
                         ConfigError::FlagMissingValue("turn-monthly-quota".to_string())
                     })?)
                 }
-                other => return Err(ConfigError::UnknownArg(other.to_string())),
+                other => return Err(ConfigError::unknown_arg(other)),
             }
         }
 
@@ -866,9 +884,15 @@ async fn run(config: Config) -> anyhow::Result<()> {
                                 }
                             }
                             Err(e) => {
+                                // `e.redacted()`, not `?e`: this is a `spindle_proto::artifacts::
+                                // ProtoError` over a payload another host published, and its
+                                // `UnknownField(String)` variant carries a CBOR map key lifted
+                                // verbatim out of those bytes — peer-supplied content the
+                                // redaction policy forbids logging. Every other variant renders
+                                // unchanged, so the decode reason is still readable.
                                 tracing::error!(
                                     host_fp = %host_fp.redacted(),
-                                    error = ?e,
+                                    error = %e.redacted(),
                                     "accepted revocation's payload failed to re-decode for the \
                                      kick relay — no kicks issued for this record"
                                 );
@@ -1908,5 +1932,31 @@ mod tests {
             user_from_sys_event(REAL_DISCONNECT_EVENT_STALE.as_bytes()),
             Some("UB5AUMGSNEAINIEWVEYRRSDD4PX6LUWDNO7OLOFCAJCT7IZLLARZWP6N".to_string())
         );
+    }
+
+    /// This parser is space-separated, so `--callout-seed=SUA...` — a spelling every other CLI
+    /// accepts — falls through to the unknown-argument arm with the seed still attached, and
+    /// `run` logs that error's `Display` at `error!`. Credentials are never loggable, exemptions
+    /// included, so the value must not survive into the error at all.
+    #[test]
+    fn unknown_arg_withholds_anything_after_an_equals_sign() {
+        let args = ["--callout-seed=SUAVERYSECRETSEEDVALUE".to_string()].into_iter();
+        let Err(err) = Config::from_env_and_args(args) else {
+            panic!("should be an unknown argument");
+        };
+        let rendered = err.to_string();
+        assert!(!rendered.contains("SUAVERYSECRETSEEDVALUE"), "{rendered}");
+        assert!(rendered.contains("--callout-seed"), "{rendered}");
+    }
+
+    /// An unknown argument with no `=` is still reported in full — the truncation must not cost
+    /// the ordinary typo its diagnosis.
+    #[test]
+    fn unknown_arg_without_a_value_is_reported_verbatim() {
+        let args = ["--nats-urls".to_string()].into_iter();
+        let Err(err) = Config::from_env_and_args(args) else {
+            panic!("should be an unknown argument");
+        };
+        assert!(err.to_string().contains("--nats-urls"), "{err}");
     }
 }

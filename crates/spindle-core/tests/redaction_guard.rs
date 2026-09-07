@@ -24,6 +24,22 @@
 //! confidentiality proof — that is exactly the same honesty [`spindle_core::fingerprint::
 //! RedactedFingerprint`]'s own doc comment applies to what redaction protects against.
 //!
+//! **Interpolated errors are the concrete, load-bearing case of that blindness.** This guard
+//! inspects *binding names only*. `error`, `e`, and `remove_error` are not suspicious names, so
+//! every `%error` in the workspace passes — no matter what that error's type actually emits. A
+//! manual audit (2026-09-07) found real leaks that way: `rusqlite::Error`'s `Display` embeds the
+//! database file's path (`unable to open database file: <path>`), which `spindle_vfs::store::
+//! StoreError::Sqlite` passes straight through; `spindle_proto::artifacts::ProtoError::
+//! UnknownField` carries a CBOR map key taken verbatim from a peer's bytes; and
+//! `spindle_net::signaling::SignalingError`'s subject variants spell out two *untruncated*
+//! fingerprints. **Passing this test is not evidence that a `tracing::` line is safe.** Before
+//! interpolating an error, read what its type can emit, transitively through every `#[from]` and
+//! `{0}` in its `thiserror` attributes, and reach for that type's own redacted `Display` view
+//! (`ProtoError::redacted`, `SignalingError::redacted`) where one exists. Which content is
+//! permitted — and the operator-configuration exemption that lets a daemon log its own store
+//! path — is stated in `spindle-vfs`, `spindle-host-core`, and `spindle-hostd`'s crate-root
+//! `tracing` sections.
+//!
 //! # Escape hatch
 //!
 //! A binding name matching a suspicious pattern is not always actually unsafe to log (e.g. its

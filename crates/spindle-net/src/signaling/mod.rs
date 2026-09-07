@@ -101,7 +101,14 @@ pub(crate) async fn bridge_incoming_ice(
         let env = match Envelope::from_canonical_bytes(&msg.payload) {
             Ok(env) => env,
             Err(error) => {
-                tracing::warn!(%error, "malformed trickled ICE envelope; dropping");
+                // `error.redacted()`, not `%error`: a `ProtoError::UnknownField` carries a CBOR
+                // map key lifted verbatim out of the peer's bytes (see
+                // `spindle_proto::artifacts::RedactedProtoError`). Every other variant renders
+                // unchanged, so the rejection reason is still readable.
+                tracing::warn!(
+                    error = %error.redacted(),
+                    "malformed trickled ICE envelope; dropping"
+                );
                 continue;
             }
         };
@@ -120,8 +127,11 @@ pub(crate) async fn bridge_incoming_ice(
         ) {
             Ok(opened) => opened,
             Err(error) => {
+                // `error.redacted()`, not `%error` — see `SignalingError::redacted`: the payload/
+                // envelope-decode variants can reach peer-supplied CBOR keys, and the subject
+                // variants spell out two untruncated fingerprints.
                 tracing::warn!(
-                    %error,
+                    error = %error.redacted(),
                     "rejected trickled ICE envelope; dropping (uniform silent drop, DESIGN.md §A5)"
                 );
                 continue;
