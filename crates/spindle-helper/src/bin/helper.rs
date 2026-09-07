@@ -808,7 +808,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 match revoke::ingest_revocation(msg.subject.as_str(), &msg.payload, &mut store) {
                     revoke::RevokeOutcome::Accepted { host_fp, epoch, revoked_count } => {
                         tracing::info!(
-                            %host_fp,
+                            host_fp = %host_fp.redacted(),
                             epoch,
                             revoked_count,
                             "registry.revoke.<hfp> record accepted"
@@ -844,7 +844,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                                     // security-relevant fail-open must survive a production `warn`
                                     // filter, not get buried at `info`.
                                     tracing::warn!(
-                                        %host_fp,
+                                        host_fp = %host_fp.redacted(),
                                         unresolved = plan.unresolved.len(),
                                         "revocation matched live session records with no known \
                                          connection to kick yet — scheduling a delayed re-plan"
@@ -867,7 +867,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                             }
                             Err(e) => {
                                 tracing::error!(
-                                    %host_fp,
+                                    host_fp = %host_fp.redacted(),
                                     error = ?e,
                                     "accepted revocation's payload failed to re-decode for the \
                                      kick relay — no kicks issued for this record"
@@ -1039,7 +1039,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     match kick_map.target_for(&u) {
                         Some(target) => {
                             tracing::info!(
-                                nats_fp = %target.nats_fp,
+                                nats_fp = %target.nats_fp.redacted(),
                                 matched_subject = %target.matched_subject,
                                 "delayed kick re-plan resolved a session the original plan missed"
                             );
@@ -1143,7 +1143,7 @@ async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) 
                 error = %e,
                 subject = %subject,
                 cid = target.cid,
-                nats_fp = %target.nats_fp,
+                nats_fp = %target.nats_fp.redacted(),
                 "KICK request failed (transport)"
             );
             return;
@@ -1152,7 +1152,7 @@ async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) 
             tracing::error!(
                 subject = %subject,
                 cid = target.cid,
-                nats_fp = %target.nats_fp,
+                nats_fp = %target.nats_fp.redacted(),
                 "KICK request timed out"
             );
             return;
@@ -1166,7 +1166,7 @@ async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) 
                 error = %e,
                 subject = %subject,
                 cid = target.cid,
-                nats_fp = %target.nats_fp,
+                nats_fp = %target.nats_fp.redacted(),
                 reply = %String::from_utf8_lossy(&reply.payload),
                 "KICK reply was not valid JSON — treating as failed, not successful"
             );
@@ -1180,7 +1180,7 @@ async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) 
         tracing::error!(
             subject = %subject,
             cid = target.cid,
-            nats_fp = %target.nats_fp,
+            nats_fp = %target.nats_fp.redacted(),
             matched_subject = %target.matched_subject,
             server_error = %error,
             "KICK request was answered but failed"
@@ -1191,7 +1191,7 @@ async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) 
     tracing::info!(
         subject = %subject,
         cid = target.cid,
-        nats_fp = %target.nats_fp,
+        nats_fp = %target.nats_fp.redacted(),
         matched_subject = %target.matched_subject,
         "kicked a revoked connection"
     );
@@ -1207,7 +1207,7 @@ async fn publish_presence_delta(
 ) {
     let Some(client) = app_client else {
         tracing::warn!(
-            host_fp = %delta.host_fp,
+            host_fp = %delta.host_fp.redacted(),
             "APP_CONN_SEED not set — dropping a host.<hfp>.presence delta"
         );
         return;
@@ -1515,7 +1515,7 @@ async fn connz_kick_fallback(
             matched_subject: u.matched_subject,
         };
         tracing::info!(
-            nats_fp = %target.nats_fp,
+            nats_fp = %target.nats_fp.redacted(),
             matched_subject = %target.matched_subject,
             "CONNZ kick fallback resolved a session the delayed re-plan still missed"
         );
@@ -1523,10 +1523,15 @@ async fn connz_kick_fallback(
     }
 
     if !still_unresolved.is_empty() {
-        let fingerprints: Vec<String> = still_unresolved.keys().map(|fp| fp.to_string()).collect();
+        // Already truncated via `Fingerprint::redacted()` below, not the full `nats_fp` values —
+        // the binding is still named `fingerprints` for readability at the call site.
+        let fingerprints: Vec<String> = still_unresolved
+            .keys()
+            .map(|fp| fp.redacted().to_string())
+            .collect();
         tracing::warn!(
             unresolved = still_unresolved.len(),
-            nats_fps = ?fingerprints,
+            nats_fps = ?fingerprints, // redaction-ok: values are pre-truncated via Fingerprint::redacted() above, not full fingerprints
             "CONNZ kick fallback still could not resolve these sessions — the server's own \
              connection table doesn't know about them either, nothing left to kick"
         );

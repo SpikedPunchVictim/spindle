@@ -6,7 +6,10 @@
 //!
 //! # Modules
 //! - [`fingerprint`] — [`Fingerprint`], the shared 32-byte SHA-256 identifier type (`root_fp`,
-//!   `device_fp`, `host_fp`), with a base32 (RFC 4648, no padding, lowercase) `Display`.
+//!   `device_fp`, `host_fp`), with a base32 (RFC 4648, no padding, lowercase) `Display`; and
+//!   [`RedactedFingerprint`] (via [`Fingerprint::redacted`]), a truncating `Display`/`Debug`
+//!   wrapper for `tracing`/log call sites — see that type's doc comment for the "no payload
+//!   logging" policy (DESIGN.md:850) it implements and what it does not protect against.
 //! - [`identity`] — [`RootKey`] (person/host identity root, pre-committed rotation) and
 //!   [`DeviceKey`] (Ed25519 sign + X25519 agree keypair).
 //! - [`artifacts`] — issue/verify functions for the seven non-`Envelope` A7b signed-artifact
@@ -45,7 +48,7 @@ pub use envelope::{
     derive_bootstrap_key, derive_session_key, direction_byte, open, seal, EnvelopeError,
     OpenParams, SealParams, SessionKey,
 };
-pub use fingerprint::{Fingerprint, FingerprintError, FINGERPRINT_LEN};
+pub use fingerprint::{Fingerprint, FingerprintError, RedactedFingerprint, FINGERPRINT_LEN};
 pub use identity::{
     device_fp_of, generate_next_root, root_fp_of, sign_bytes, sign_root_rotation, verify_bytes,
     verify_root_rotation, DeviceKey, IdentityError, NextRoot, RootKey, ALG_ID_V1,
