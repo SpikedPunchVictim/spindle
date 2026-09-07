@@ -386,8 +386,9 @@ than one.
   (device bootstrap bundle) is still unbuilt.
 - Gate at `92e59b1`: 699 passed / 0 failed / 15 ignored, independently reconfirmed by the final
   review. TypeScript unchanged: 368 `@spindle/proto` + 129 `@spindle/crypto`. DESIGN version
-  unchanged at v0.9.22. Head is `92e59b1`; `origin/main` is at `3822a05`, so there are 6 unpushed
-  local commits (`3c92522`, `e69d6a7`, `0306dea`, `21723f7`, `0dc559b`, `92e59b1`). Stage 5's own
+  unchanged at v0.9.22. Head was `92e59b1` at the time of this entry, with `origin/main` at
+  `3822a05` and 6 unpushed local commits (`3c92522`, `e69d6a7`, `0306dea`, `21723f7`, `0dc559b`,
+  `92e59b1`) — see Stage 6's 2026-09-07 note for the current head. Stage 5's own
   Status stays **In Progress**.
 
 ## Stage 6: spindle-vfs + host-core
@@ -698,6 +699,86 @@ took four CI rounds, and each surfaced a real platform bug rather than a flake: 
 flake plus a Windows `FileIdentity` compile error (`5c42716`), cap-std's `Dir::open` failing on
 Windows and silently dropping every directory from listings (`9a27bdc`), and the Windows host
 pinning delete-denying handles via a `FileIdentity` retained in `IdentityCache` (`85459aa`).
+
+**Note** (2026-09-07) — tracing/redaction hardening, td-6c9d95, four commits. Not part of this
+stage's original scope, but landed here because the stateful crates it targets are this stage's
+own: `9928cf7` added `Fingerprint::redacted()` to `spindle-core` (Display truncates to 8 base32
+characters plus an elision marker; no `FromStr`, no `PartialEq` against `Fingerprint` — for human
+eyes, not an identifier) and `crates/spindle-core/tests/redaction_guard.rs`, a source-scanning
+guard that fails on an interpolated tracing binding named like an identifier or path unless
+wrapped in `.redacted()` (masks comments/string bodies first; takes an explicit
+`// redaction-ok: <reason>` escape hatch). Running it for real caught 12 pre-existing leaks in
+`spindle-helper`'s binary, all now fixed. `5f0fa3a` instrumented 8 call sites in `spindle-vfs` —
+the crate's genuinely silent failures and its security decisions, including an unguarded
+`ROLLBACK` in the audit log's own append path that could strand the shared connection
+mid-transaction, and `list_dir`'s silent entry-drop (the same shape as the Windows listing bug
+above). `1d1e472` instrumented 7 sites in `spindle-host-core` (including td-db6541's
+fallback-swallows-a-persistent-failure hazard, now logged at `warn!`) and 8 in `spindle-hostd`
+(daemon lifecycle visibility, including the only production signal for a documented
+cap-issuer-drop neuter); it also corrected a wrong connection-count claim in `spindle-hostd`'s own
+docs (three claimed, two actual) that the instrumentation work exposed.
+
+`e8480af` closed a different gap: the guard sees binding names only, so it cannot catch a leak
+reaching a log line through an interpolated error's `Display` — `%error` is not a suspicious
+binding name no matter what the error type emits. Found by hand instead: a live nkey seed reaching
+`spindle-helper`'s fatal-config `error!` log via a `--flag=value` typo falling into the
+unknown-argument arm (a real credential leak, fixed by truncating at the first `=`); untruncated
+CBOR map keys, subject fingerprints, and peer-chosen close reasons rendered by `spindle-proto`'s
+`ProtoError` and `spindle-net`'s `SignalingError`, now behind new `.redacted()` methods on each;
+and an untruncated fingerprint pair in `spindle-net/src/quic.rs`'s pinning-mismatch message,
+truncated to an 8-hex prefix at the source, before `rustls`/`quinn-proto` ever copy it into
+`TransportError::reason`.
+
+**What remains unproven, stated plainly**: none of this instrumentation has been observed running
+against the live composed stack — every gate run so far is `cargo test --workspace`, offline, not
+a run against `deploy/docker-compose.yml` with the resulting logs inspected. The redaction guard
+(`crates/spindle-core/tests/redaction_guard.rs`) inspects interpolated-binding *names* only, and by
+construction cannot see content reachable only through an interpolated error's `Display` — exactly
+the class `e8480af` had to find by hand. That gap is not closed by this work; it is tracked
+separately as **td-a196b6**. DESIGN.md:707's observability metrics are **not** part of this work —
+they are a separate ticket, **td-323db0**, and remain unimplemented.
+
+Gate after `e8480af`: 712 passed / 0 failed / 15 ignored (was 706 before this work started); TS
+unchanged at `@spindle/proto` 368 / `@spindle/crypto` 129.
+
+`a337c18` is an independent adversarial review of `e8480af`, and both of the following are known
+because that review found them, not because `e8480af`'s own author caught them.
+
+**A correction to the record**: `e8480af`'s commit message named the wrong sink for the credential
+leak. It said the nkey seed reached `helper.rs:382`'s `tracing::error!`; the actual sink is
+`eprintln!` at `helper.rs:376` — `:382` handles `run()`'s `anyhow::Error` and is unreachable when
+config parsing failed, so the citation was wrong before and after, and that region was untouched by
+`e8480af`. The fix itself is unaffected: `unknown_arg()` truncates the `ConfigError` value at its
+source, so it is safe regardless of which sink prints it. This is the **second** time in this arc
+that a commit message stated a mechanism wrongly in a file meant to be permanent — the first was
+`92e59b1`, correcting four wrong mechanisms in the cap-snapshot doc comments (Stage 5, above). Both
+times the conclusion held while the stated mechanism did not.
+
+**The methodology gap that correction exposed** matters more than the citation error itself: the
+audit's method was "grep every `tracing::` macro", and this leak's sink — `eprintln!` — was
+structurally invisible to that grep. The leak was found by reading the error type, not by the grep.
+The class was swept immediately: across all of `crates/*/src` there are 8 `eprintln!`/`println!`
+hits total, and exactly one is a production sink carrying an error — `helper.rs:376`, already fixed.
+The rest are vector-generator bins, test bodies, and doc prose. That receipt is recorded here so
+nobody has to re-derive it.
+
+The same review also found that `SignalingError::Ice` had never been audited at all — absent from
+`RedactedSignalingError`'s safety enumeration, with no match arm, falling through the `safe`
+passthrough unexamined. Traced at the locked dependency versions, what is reachable today through
+that path is numeric/hex only, so it deliberately keeps rendering rather than being withheld — but
+that is a snapshot of today's reachable path, not a closed proof, since `rtc_shared::error::Error`
+is `#[non_exhaustive]` with dozens of `String`-carrying variants this wrapper hasn't audited one by
+one. Tracked as **td-aa0482**.
+
+Three further review findings were ticketed rather than fixed: **td-0a2111** (reverting any
+`.redacted()` call site compiles and passes every test — the call sites are guarded by review
+attention alone, not by any structural check), **td-e09180** (`authorize.rs`'s three `%e` sites rely
+on a comment-only invariant spanning a crate boundary; confirmed not reachable today), and
+**td-aa0482** above.
+
+Gate is unchanged at 712 / 0 / 15: `a337c18` extends the existing "renders unchanged" test from 5
+sampled variants to 16 rather than adding a new test, so there is no new coverage to report beyond
+that extension.
 
 ## Stage 7: client-core + Tauri apps init + engine-api/engine-tauri/ui
 **Goal**: Implement `spindle-client-core`; initialize `apps/host` and `apps/client` as real Tauri
