@@ -21,6 +21,7 @@ import type {
   HostDeviceCert,
 } from "../src/artifacts.js";
 import { CapKind } from "../src/artifacts.js";
+import type { BundleEntry, DeviceBootstrapBundle } from "../src/bootstrap.js";
 
 // ---- vector file loading ----
 
@@ -177,6 +178,67 @@ export function parseHostDeviceCert(d: any): HostDeviceCert {
     ts: BigInt(d.ts),
     exp: BigInt(d.exp),
     sig_host_op: hexToBytes(d.sig_host_op),
+  };
+}
+
+// ---- bootstrap.json: generic CBOR-tree -> DeviceBootstrapBundle ----
+//
+// Unlike capability.json etc., `vectors/bootstrap.json`'s `decoded` field is the generic
+// `{type, value}` CBOR-tree shape (`parseCborTree`'s input format, shared with
+// `signaling.json`/`canonical-cbor.json`/`AdminCommand.args`) rather than a flat field/hex-string
+// object — DeviceBootstrapBundle is not an A7b artifact, and its vector generator emits the
+// generic tree form. `parseBootstrapBundle` walks that tree directly (hex strings -> bytes via
+// `hexToBytes`, uint nodes -> `number`/`bigint` as the field demands) and, for the nested
+// `member_cap`, rebuilds the flat capability.json-shaped object and hands it to the EXISTING
+// `parseCapability` unchanged, rather than re-deriving its field conversions a second time.
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function rawMapField(node: any, key: string): any {
+  const entry = (node.value as Array<{ key: any; value: any }>).find(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (e: any) => e.key.type === "text" && e.key.value === key,
+  );
+  if (entry === undefined) throw new Error(`rawMapField: missing field \`${key}\``);
+  return entry.value;
+}
+
+/** Rebuilds the flat, capability.json-shaped JSON object (hex strings, plain numbers) that
+ * `parseCapability` expects, from the generic `{type, value}` CBOR-tree node bootstrap.json uses
+ * for a nested `member_cap` map. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function capabilityJsonFromTree(node: any): any {
+  return {
+    v: rawMapField(node, "v").value,
+    host_fp: rawMapField(node, "host_fp").value,
+    host_root_pk: rawMapField(node, "host_root_pk").value,
+    op_cert: rawMapField(node, "op_cert").value,
+    kind: rawMapField(node, "kind").value,
+    subject: rawMapField(node, "subject").value,
+    cap_epoch: rawMapField(node, "cap_epoch").value,
+    exp: rawMapField(node, "exp").value,
+    nonce: rawMapField(node, "nonce").value,
+    sig: rawMapField(node, "sig").value,
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function bundleEntryFromTree(node: any): BundleEntry {
+  return {
+    sign_pk: hexToBytes(rawMapField(node, "sign_pk").value),
+    agree_pk: hexToBytes(rawMapField(node, "agree_pk").value),
+    member_cap: parseCapability(capabilityJsonFromTree(rawMapField(node, "member_cap"))),
+  };
+}
+
+/** Parses a `vectors/bootstrap.json` case's `decoded` field (generic `{type, value}` CBOR tree)
+ * into a `DeviceBootstrapBundle`. See the section comment above for why this differs from
+ * `parseCapability` etc.'s flat-JSON convention. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function parseBootstrapBundle(d: any): DeviceBootstrapBundle {
+  return {
+    v: Number(rawMapField(d, "v").value),
+    registry: rawMapField(d, "registry").value,
+    entries: (rawMapField(d, "entries").value as unknown[]).map(bundleEntryFromTree),
   };
 }
 

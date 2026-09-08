@@ -13,7 +13,9 @@
 //! - [`identity`] — [`RootKey`] (person/host identity root, pre-committed rotation) and
 //!   [`DeviceKey`] (Ed25519 sign + X25519 agree keypair).
 //! - [`artifacts`] — issue/verify functions for the seven non-`Envelope` A7b signed-artifact
-//!   types.
+//!   types, plus build/verify for the device bootstrap state bundle (`artifacts::bootstrap`),
+//!   which is deliberately not one of those seven signed artifacts — see that submodule's doc
+//!   comment.
 //! - [`envelope`] — the A7 end-to-end signaling envelope: session-key derivation, `seal`/`open`.
 //!
 //! # Design notes and ambiguities (reported, not silently resolved)

@@ -18,9 +18,20 @@
 //! This crate never reads a system clock: every time check takes a caller-supplied `now: u64`
 //! (Unix seconds), consistent with DESIGN.md §A7 ("clients compute an offset" from helper server
 //! time — spindle-core has no opinion on how `now` was obtained).
+//!
+//! [`bootstrap`] is the one exception to the table above: the device bootstrap state bundle
+//! (DESIGN.md §A4 "Adding a device (device bootstrap)", :317-330) is deliberately **not** a signed
+//! artifact — it has no signer, because its only consumer is the new device over the same local QR
+//! channel that already conveys the root identity itself, so a signature here would have no
+//! verifier that channel doesn't already establish (see `crates/spindle-proto/src/bootstrap.rs`'s
+//! module doc for the full argument). This module still builds and verifies it, alongside
+//! everything above, because building it correctly (the QR fit check) and verifying it correctly
+//! (deriving `host_fp`/`device_fp`, running [`verify_capability`] per entry) both need the same
+//! crypto this module already has and `spindle-proto` deliberately does not.
 
 mod admin_command;
 mod admission_token;
+mod bootstrap;
 mod capability;
 mod device_cert;
 mod host_device_cert;
@@ -29,6 +40,10 @@ mod revocation;
 
 pub use admin_command::{issue_admin_command, verify_admin_command};
 pub use admission_token::{issue_admission_token, verify_admission_token};
+pub use bootstrap::{
+    build_bootstrap_bundle, verify_bootstrap_bundle, BundleError, QrEcLevel, VerifiedBundle,
+    VerifiedBundleEntry,
+};
 pub use capability::{issue_capability, verify_capability};
 pub use device_cert::{issue_device_certificate, verify_device_certificate};
 pub use host_device_cert::{issue_host_device_cert, verify_host_device_cert};

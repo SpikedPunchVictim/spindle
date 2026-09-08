@@ -7,6 +7,10 @@
 //! # Modules
 //! - [`canonical`] — the canonical CBOR codec (encoder + strict decoder). See its module docs
 //!   for why it is hand-rolled rather than built on `minicbor`.
+//! - [`bootstrap`] — the device bootstrap state bundle wire types (DESIGN.md §A4 :317-330, the
+//!   QR-based "adding a device" flow). Not one of the eight A7b signed artifacts, and
+//!   deliberately so — see that module's doc comment for why, and for the hard constraint that
+//!   confines this exemption to the local QR channel.
 //! - [`tags`] — the eight A7b domain-separation tags and the `tag || bytes` signing-input
 //!   helper.
 //! - [`artifacts`] — the eight A7b wire structures ([`Envelope`], [`Capability`],
@@ -42,6 +46,7 @@
 //! | `DeviceCertificate.label` | **Omitted** — see the discrepancy note on [`artifacts::DeviceCertificate`]: A4's inline `sig_root(...)` notation names `label` as signed material, but A4's later enrollment paragraph states labels are host-local, renameable, and "never baked into certificates." This crate follows the later, more specific rule. |
 //! | `v` field presence | Only `Envelope`, `Capability`, and `AdminCommand` carry an explicit wire-level `v` byte, matching DESIGN.md's own inline struct notations for each. `AdmissionToken`, `DeviceCertificate`, `RevocationRecord`, and `HostOpKeyCert` have no such field in their DESIGN.md notations even though A7b's prose says "every signed artifact shares... a version byte `v`" — for those four, the domain-separation tag itself is the version discriminant (a `spindle-*-v1`-signed artifact is a v1 artifact by construction; a hypothetical v2 would mint a new tag, e.g. `spindle-dev-cert-v2`). Flagged here as a second DESIGN.md tension, resolved the same way as the label discrepancy: by following the literal struct notation rather than the generalizing prose. |
 //! | `Capability` host-identity chain (decision A10.30, 2026-08-24) | `Capability` carries `host_fp, host_root_pk, op_cert, ..., sig` — not the pre-A10.30 `host_fp, host_pk, ..., sig_host`. `host_fp = SHA-256(host_root_pk)` (root-derived, not operating-key-derived — S1 flagged the old op-key-derived `host_fp` as scoping-inconsistent with §A4/§A5's root-derived `host_fp`). `op_cert` is the existing [`artifacts::HostOpKeyCert`] artifact embedded whole as its own complete canonical CBOR encoding (an opaque byte string here — no second op-cert wire shape was invented); `sig` remains an Ed25519 signature by the operating key `op_cert` certifies, over the capability's own `spindle-cap-v1` signing input. `spindle-core::verify_capability` is what actually walks the chain (decode `op_cert`, re-run `verify_host_op_key_cert` against `host_root_pk`, then check `sig` under the op cert's `host_op_pk`) — this crate only carries the bytes. |
+//! | `bootstrap::DeviceBootstrapBundle.v` (exception to the `v` field presence row above) | Carries an explicit wire `v` even though it is not `Envelope`/`Capability`/`AdminCommand` and has no domain-separation tag to serve as an implicit version discriminant either — it isn't a signed artifact at all (see `bootstrap`'s module doc comment for why). A closed schema plus this crate's own explicit `v` is what lets a v2 bundle decoded by a v1 device fail with `UnknownField`, not a silently-wrong parse; the two ends can genuinely ship apart (an old primary enrolling a brand-new device). `spindle-proto` decodes and carries `v` uninterpreted; `spindle-core::check_min_v` owns the floor. |
 //!
 //! # Canonical CBOR encoder
 //!
@@ -55,6 +60,7 @@
 //! has zero non-dev dependencies.
 
 pub mod artifacts;
+pub mod bootstrap;
 pub mod canonical;
 pub mod signaling;
 pub mod tags;
@@ -64,6 +70,11 @@ pub use artifacts::{
     AdminCommand, AdmissionToken, CapKind, Capability, DeviceCertificate, Envelope, HostOpKeyCert,
     ProtoError, RevocationRecord, ADMIN_COMMAND_CURRENT_V, ADMIN_COMMAND_MIN_V,
     CAPABILITY_CURRENT_V, CAPABILITY_MIN_V,
+};
+pub use bootstrap::{
+    BundleEntry, BundleWireError, DeviceBootstrapBundle, RedactedBundleWireError, BUNDLE_CURRENT_V,
+    BUNDLE_MIN_V, MAX_BUNDLE_ENTRIES, MAX_REGISTRY_LEN, MEASURED_ENTRY_BYTES,
+    QR_V40_L_CAPACITY_BYTES, QR_V40_M_CAPACITY_BYTES,
 };
 pub use canonical::{canonical_decode, canonical_encode, CborError, CborValue, MAX_NESTING_DEPTH};
 pub use signaling::{

@@ -20,6 +20,7 @@ vector file — the single source of truth for what "correct wire format" means 
 | `canonical-cbor.json` | Primitive canonical-CBOR encoding cases (RFC 8949 §4.2.1) independent of any Spindle artifact type: integer shortest-form boundaries (23/24/255/256/65535/65536/4294967295/4294967296), negative integers, byte strings, text strings, arrays (including empty), map key ordering (by length, and by content at equal length), nested maps, and the three allowed simple values (`true`/`false`/`null`). For validating a canonical CBOR encoder at the byte level, independent of the artifact-level vectors. |
 | `vfs-rpc.json` | VFS RPC wire types (DESIGN.md §A8, Stage 6 slice 3) — **not** one of the seven A7b signed artifacts (no domain tag, no signing input), so this file's shape differs slightly from the artifact files (see below). `requests`: one case per op (`list` with and without a cursor/limit, `stat`, `read`, `mkdir`, `delete`, `whoami`). `replies`: one case per op plus every one of the eight typed [`spindle_proto::vfs_rpc::VfsErrorCode`] values (DESIGN.md's seven named codes plus this crate's own `UnsupportedVersion` addition — see that module's doc comment for why). **The TS twin (`@spindle/proto`) does not implement this schema yet** — flagged as a required follow-up before the CI vector cross-check job can cover it; see `IMPLEMENTATION_PLAN.md`'s Stage 6 slice 3 note. |
 | `signaling.json` | Signaling payload wire types (DESIGN.md §A6/§A7, §A10.31/32), promoted from `spikes/s2-signaling`'s crate-local types — **not** one of the seven A7b signed artifacts (no domain tag, no signing input): these payloads are always the plaintext sealed inside an already-signed `Envelope`, so this file's shape matches `vfs-rpc.json`'s (see below), not the artifact files'. `offers`: `OfferPayload` cases for both `transport` values plus a boundary-length case (`inbox`/`ufrag`/`pwd` each at their length cap). `answers`: `AnswerPayload` cases for both `transport` values. `ice`: `IcePayload` cases — a host candidate, a `srflx` candidate with `raddr`/`rport`, the end-of-candidates marker (`candidate` key omitted, not CBOR null), and a boundary-length candidate. Both the Rust encoder and the TS twin (`@spindle/proto`'s `signaling.ts`) are covered by this file from the start — see `packages/proto/test/signaling.test.ts`. |
+| `bootstrap.json` | Device bootstrap state bundle wire types (DESIGN.md §A4 "Adding a device (device bootstrap)", :317-330) — **not** one of the seven A7b signed artifacts (no domain tag, no signing input): the bundle travels only over the QR channel that already establishes the new device's trust, so this file's shape matches `vfs-rpc.json`'s (see below), not the artifact files'. `cases`: a one-entry bundle (the minimal realistic bootstrap), a four-entry bundle (DESIGN.md :328-329's stated EC-level-M ceiling for a version-40 QR), a zero-entry bundle (empty host list, a legal encoding), and a boundary case with `registry` at exactly `MAX_REGISTRY_LEN` bytes. Also pins the canonical key order: bundle keys emit as `v`, `entries`, `registry`; entry keys as `sign_pk`, `agree_pk`, `member_cap`. |
 
 Each artifact-level case has the shape `{name, description, decoded, canonical_cbor_hex,
 signing_input_hex}`: `decoded` mirrors the Rust struct's fields as JSON (byte strings as
@@ -49,6 +50,14 @@ sets).
 canonical_cbor_hex}`, no `signing_input_hex`, same rationale (signaling payloads are the plaintext
 of an already-signed `Envelope`, never signed independently). Top-level keys are `offers`,
 `answers`, `ice` rather than `requests`/`replies`.
+
+**`bootstrap.json`'s shape**: same per-case shape as `vfs-rpc.json` — `{name, description, decoded,
+canonical_cbor_hex}`, no `signing_input_hex`. The bundle is unsigned not because another layer's
+signature already covers it (unlike `vfs-rpc.json`/`signaling.json`'s reasoning) but because a
+signature here would have no verifier the QR delivery channel doesn't already establish — see
+`spindle_proto::bootstrap`'s module doc comment. Top-level key is a single flat `cases` array
+(the four cases don't fall into natural request/reply-style groups the way the other two files'
+cases do).
 
 ## How they're generated
 

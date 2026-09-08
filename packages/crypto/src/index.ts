@@ -45,3 +45,11 @@ export {
   verifyHostOpKeyCert,
   verifyRevocationRecord,
 } from "./artifacts.js";
+
+export type { BundleErrorKind, VerifiedBundle, VerifiedBundleEntry } from "./bootstrap.js";
+export {
+  BundleError,
+  QrEcLevel,
+  buildBootstrapBundle,
+  verifyBootstrapBundle,
+} from "./bootstrap.js";

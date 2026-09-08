@@ -70,3 +70,19 @@ export {
   IcePayload,
 } from "./signaling.js";
 export type { SignalingErrorKind } from "./signaling.js";
+
+export {
+  BUNDLE_MIN_V,
+  BUNDLE_CURRENT_V,
+  MAX_REGISTRY_LEN,
+  MAX_BUNDLE_ENTRIES,
+  QR_V40_L_CAPACITY_BYTES,
+  QR_V40_M_CAPACITY_BYTES,
+  MEASURED_ENTRY_BYTES,
+  BUNDLE_ENTRY_FIELDS,
+  BUNDLE_FIELDS,
+  BundleWireError,
+  BundleEntry,
+  DeviceBootstrapBundle,
+} from "./bootstrap.js";
+export type { BundleWireErrorKind } from "./bootstrap.js";

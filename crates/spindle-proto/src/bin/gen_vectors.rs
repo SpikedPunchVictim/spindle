@@ -15,6 +15,9 @@ use spindle_proto::artifacts::{
     AdminCommand, AdmissionToken, CapKind, Capability, DeviceCertificate, Envelope, HostDeviceCert,
     HostOpKeyCert, RevocationRecord,
 };
+use spindle_proto::bootstrap::{
+    BundleEntry, DeviceBootstrapBundle, BUNDLE_CURRENT_V, MAX_REGISTRY_LEN,
+};
 use spindle_proto::canonical::{canonical_encode, CborValue};
 use spindle_proto::signaling::{AnswerPayload, IcePayload, OfferPayload, Transport};
 use spindle_proto::tags;
@@ -262,6 +265,7 @@ fn main() {
     );
     write_vector_file(&vectors_dir, "vfs-rpc.json", vfs_rpc_vectors());
     write_vector_file(&vectors_dir, "signaling.json", signaling_vectors());
+    write_vector_file(&vectors_dir, "bootstrap.json", bootstrap_vectors());
 }
 
 fn vectors_dir() -> PathBuf {
@@ -1426,5 +1430,118 @@ fn signaling_vectors() -> Json {
         ("offers", Json::Arr(offers)),
         ("answers", Json::Arr(answers)),
         ("ice", Json::Arr(ice)),
+    ])
+}
+
+// ---- Device bootstrap state bundle (DESIGN.md §A4 :317-330) ----
+//
+// Not an A7b signed artifact (see `spindle_proto::bootstrap`'s module doc comment's "Not one of
+// A7b's eight signed artifacts" section) — no domain tag, no signing input, so each case here is
+// `{name, description, decoded, canonical_cbor_hex}`, exactly mirroring `signaling.json`'s shape.
+//
+// These vectors also pin the canonical key order: a `DeviceBootstrapBundle` map's keys emit as
+// `v`, `entries`, `registry`, and a `BundleEntry` map's keys emit as `sign_pk`, `agree_pk`,
+// `member_cap` — canonical CBOR sorts map keys length-first then bytewise, never in
+// struct-field-declaration order, so a cross-language decoder must reproduce this exact order.
+
+/// One bootstrap entry with every dummy byte pattern derived from `byte`, so distinct entries in
+/// the same bundle are trivially distinguishable by eye and an accidental entry-reordering bug is
+/// visible in the vector's `canonical_cbor_hex`. Mirrors `answer_member_cap`'s own
+/// consecutive-byte-offset convention above.
+fn bootstrap_entry(byte: u8) -> BundleEntry {
+    BundleEntry {
+        sign_pk: rep(byte, 32),
+        agree_pk: rep(byte.wrapping_add(0x01), 32),
+        member_cap: Capability {
+            v: 1,
+            host_fp: rep(byte.wrapping_add(0x02), 32),
+            host_root_pk: rep(byte.wrapping_add(0x03), 32),
+            op_cert: rep(byte.wrapping_add(0x04), 16),
+            kind: CapKind::Member,
+            subject: rep(byte.wrapping_add(0x05), 32),
+            cap_epoch: byte as u64,
+            exp: 1_759_017_600,
+            nonce: rep(byte.wrapping_add(0x06), 16),
+            sig: rep(byte.wrapping_add(0x07), 64),
+        },
+    }
+}
+
+fn bootstrap_vectors() -> Json {
+    let cases = vec![
+        signaling_case(
+            "one_entry_bundle",
+            "The minimal realistic bootstrap: a primary handing a new device state for exactly \
+             one host it already belongs to (DESIGN.md :317-318's `{registry, [{sign_pk, \
+             agree_pk, member_cap}...]}`, one entry).",
+            DeviceBootstrapBundle {
+                v: BUNDLE_CURRENT_V,
+                registry: "nats://registry.example:4222".to_string(),
+                entries: vec![bootstrap_entry(0x10)],
+            }
+            .to_cbor(),
+        ),
+        signaling_case(
+            "four_entry_bundle_qr_v40_ec_level_m_ceiling",
+            "Four hosts — DESIGN.md :328-329's stated EC-level-M ceiling (\"a version-40 QR \
+             carries 4 hosts at EC level M and 5 at level L\"). Pins the encoding at exactly the \
+             host count spindle-core's QR fit check is measured against for that EC level. NOTE: \
+             this vector's byte size is NOT a capacity measurement — spindle-proto has no crypto \
+             dependency, so its embedded caps are short dummy byte patterns, not a real embedded \
+             op_cert (185 B on its own). The real measured figure, with genuine caps, is 2228 B \
+             for four entries against EC-M's 2331 B budget (see MEASURED_ENTRY_BYTES).",
+            DeviceBootstrapBundle {
+                v: BUNDLE_CURRENT_V,
+                registry: "nats://registry.example:4222".to_string(),
+                entries: vec![
+                    bootstrap_entry(0x20),
+                    bootstrap_entry(0x30),
+                    bootstrap_entry(0x40),
+                    bootstrap_entry(0x50),
+                ],
+            }
+            .to_cbor(),
+        ),
+        signaling_case(
+            "zero_entry_bundle",
+            "An empty host list — a legal encoding, not an error: a primary that belongs to no \
+             host yet still hands over a bundle carrying just its registry endpoint. Pins the \
+             empty-array canonical encoding for `entries` across both languages.",
+            DeviceBootstrapBundle {
+                v: BUNDLE_CURRENT_V,
+                registry: "nats://registry.example:4222".to_string(),
+                entries: vec![],
+            }
+            .to_cbor(),
+        ),
+        signaling_case(
+            "registry_boundary_length",
+            "Edge case: `registry` at exactly its decoder-enforced byte-length cap \
+             (MAX_REGISTRY_LEN = 256) — the strict decoder must accept exactly this length and \
+             reject anything one byte longer.",
+            DeviceBootstrapBundle {
+                v: BUNDLE_CURRENT_V,
+                registry: "r".repeat(MAX_REGISTRY_LEN),
+                entries: vec![bootstrap_entry(0x60)],
+            }
+            .to_cbor(),
+        ),
+    ];
+
+    Json::Obj(vec![
+        (
+            "description",
+            Json::Str(
+                "Device bootstrap state bundle wire types (DESIGN.md §A4 \"Adding a device \
+                 (device bootstrap)\", :317-330): the state a primary hands a new device over \
+                 the QR channel — a registry endpoint plus one entry per host the primary \
+                 already belongs to. Unsigned, unlike A7b's eight signed artifacts — no domain \
+                 tag, no signing input; see `spindle_proto::bootstrap`'s module doc comment for \
+                 why a signature here would have no verifier the QR channel doesn't already \
+                 establish."
+                    .to_string(),
+            ),
+        ),
+        ("cases", Json::Arr(cases)),
     ])
 }
