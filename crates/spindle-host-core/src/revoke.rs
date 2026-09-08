@@ -114,6 +114,24 @@
 //! get appended — but the record of this one action is gone from the chain rather than merely
 //! unreadable. That gap is a known, accepted trade against the alternative of lying about whether
 //! the revocation itself succeeded, not an oversight.
+//!
+//! This fail-open principle covers the audit append itself, and — in [`revoke_device_and_mint`] —
+//! the owning-member lookup that fills the append's `member` column; it does **not** cover
+//! [`revoke_member_and_mint`]'s `store.get_member(member_id)?` fetch of `root_fp` a few lines
+//! above the append, even though that fetch also runs after the same already-committed mutation.
+//! The distinguishing fact is payload versus observability: `root_fp` is not something *about* the
+//! revocation, it is fed straight into `issue_revocation_record(op_key, host_fp, epoch,
+//! vec![root_fp], ts)` as the thing being signed and published, so without it there is no
+//! `RevocationPublication` this function could return as `Ok` — `Err` is the only truthful
+//! outcome, and a caller that retries lands on the idempotent `"ok:already_revoked"` branch above.
+//! The audit entry, and the device path's `member` column, are each a record *about* an action
+//! that is already complete either way; losing them degrades observability without changing what
+//! the function accomplished, which is exactly the asymmetry the rest of this section argues from.
+//! As it happens `get_member` returning `None` here is unreachable today — `grep -rn
+//! "fn remove_member\|DELETE FROM members" crates/spindle-vfs/src/store/mod.rs` finds nothing, so
+//! there is no way for a member id that `revoke_member_and_bump_epoch` just accepted to vanish
+//! before this read — which makes the point above a doc-consistency concern rather than a live
+//! one, for now. It stops being hypothetical the day a member-delete primitive is added.
 
 use spindle_core::artifacts::issue_revocation_record;
 use spindle_core::{Fingerprint, SigningKey};
@@ -195,6 +213,10 @@ pub fn revoke_member_and_mint(
     // Best-effort audit append — see the module doc comment's "The audit append is best-effort"
     // section for why an append failure must not turn this already-committed revocation into an
     // `Err`.
+    // `%e` here is a `spindle_vfs::audit::AuditError`, which is redaction-safe by construction —
+    // every variant interpolates only `seq`/`field`/`len`, and `CorruptFingerprint { seq, source }`
+    // delegates to `FingerprintError`, which echoes no bytes either — so this `%e`, unlike the
+    // `StoreError` ones elsewhere in this module, needs no reachability caveat.
     if let Err(e) = store.audit().append(AuditEntry {
         ts,
         member: Some(root_fp),
@@ -244,10 +266,20 @@ pub fn revoke_device_and_mint(
 
     // The owning member's root_fp is an audit-column nicety, not a condition of the revocation
     // succeeding: the device row is already durably revoked by the match above regardless of
-    // whether this lookup works. So a lookup failure (store error) or a lookup miss (no member
-    // owns this device_fp — e.g. it was already removed) is logged and recorded as `member:
-    // None` rather than failing this call; see the module doc comment's "The audit append is
-    // best-effort" section for the same argument applied to the append itself.
+    // whether this lookup works. So a lookup failure (store error) or a lookup miss is logged and
+    // recorded as `member: None` rather than failing this call; see the module doc comment's "The
+    // audit append is best-effort" section for the same argument applied to the append itself.
+    //
+    // The lookup-miss arm is defensive, not reachable today: there is no device-delete primitive
+    // (`grep -rn "fn remove_device\|DELETE FROM devices" crates/spindle-vfs/src/store/mod.rs`
+    // finds nothing; `revoke_device`/`revoke_device_and_bump_epoch` only ever `UPDATE devices SET
+    // revoked = 1 ...`, never delete a row), `member_for_device_fp` queries by `device_fp` without
+    // filtering on `revoked`, and `revoke_device_and_bump_epoch(device_fp)?` having already
+    // succeeded above proves the device row exists — so this device's `devices.member_id` foreign
+    // key guarantees its member exists too. The branch stays anyway, because the alternative is an
+    // `expect`/`unwrap` on that invariant, which is exactly what this crate's house style refuses;
+    // it is here so a future schema change that does allow device or member removal degrades this
+    // call to a missing audit column instead of a panic.
     let member_root_fp = match store.member_for_device_fp(device_fp) {
         Ok(Some(member)) => Some(member.root_fp),
         Ok(None) => {
@@ -259,6 +291,23 @@ pub fn revoke_device_and_mint(
             None
         }
         Err(e) => {
+            // `%e` is a `StoreError`, and that enum is not uniformly redaction-safe: e.g.
+            // `DeviceNotFound(Fingerprint)`'s `Display` is the full, untruncated base32
+            // fingerprint; `Confine(#[from] confine::ConfineError)`'s variants interpolate raw
+            // filesystem paths; `DeviceKeyBindingMismatch { device_fp }` echoes the fingerprint
+            // again. It is safe here only because of what `store.member_for_device_fp` can
+            // actually reach: a `query_row` plus `get_member`, and `get_member`/
+            // `devices_for_member`/`groups_for_member` issue plain `SELECT`s plus
+            // `Fingerprint::from_slice`, so the only reachable variants are `StoreError::Sqlite`
+            // and `StoreError::CorruptFingerprint` — and `CorruptFingerprint` wraps
+            // `FingerprintError`, whose variants (`WrongLength(usize)`, `InvalidEncoding`) echo no
+            // bytes. This is the same reasoning `crates/spindle-host-core/src/authorize.rs` already
+            // applies to its own `%e` at the identical `member_for_device_fp` lookup, and that
+            // comment's warning applies here too: anything that widens what this lookup calls must
+            // re-check this line rather than trusting the redaction guard. td-0bc380 tracks
+            // replacing this reachability argument with a `RedactedStoreError` wrapper, on the
+            // pattern `spindle_net::signaling::RedactedSignalingError`/
+            // `spindle_core::RedactedFingerprint` already establish.
             tracing::warn!(
                 device_fp = %device_fp.redacted(),
                 error = %e,
