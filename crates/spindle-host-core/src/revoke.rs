@@ -83,10 +83,42 @@
 //! `FromStr for Fingerprint`'s doc comment names itself "the exact inverse of Display"), and it
 //! matches that module's own test fixture `subject_for` (`format!("registry.revoke.{host_fp}")`
 //! at `crates/spindle-helper/src/revoke.rs:198-200`) byte for byte.
+//!
+//! # The audit append is best-effort, after the store mutation has already committed [deliberate]
+//!
+//! DESIGN.md:421 requires an audit entry `{ts, member, device, action, virtual_path, bytes,
+//! outcome}` "for every VFS op and every admin change", and DESIGN.md:230 says the admin audit
+//! log records "every command, signer, result" — and a revocation is the highest-consequence
+//! admin action this system has, so both [`revoke_member_and_mint`] and [`revoke_device_and_mint`]
+//! append one. But by the time that append runs, the store mutation and the `cap_epoch` bump have
+//! **already committed** — that transaction lives entirely inside `Store`
+//! (`Store::revoke_member_and_bump_epoch`/`Store::revoke_device_and_bump_epoch`; see "`cap_epoch`
+//! is bumped atomically..." above), and the audit append cannot join it after the fact. So if the
+//! append failed and this function propagated that as an `Err`, it would report a revocation as
+//! failed that is in fact durably applied and already being enforced by `crate::server`'s
+//! per-request gates and `crate::authorize`'s connect-time twin (both read straight from the
+//! store, not from the audit log). Misreporting a completed security action as failed is worse
+//! than leaving it unaudited: an operator told "revocation failed" may reasonably conclude the
+//! subject is still admitted, and act on that false belief — e.g. skip the follow-up they'd
+//! otherwise take, or assume a retry is still needed when the subject is in fact already refused.
+//! So the append here is best-effort: `if let Err(e) = store.audit().append(entry)` logs the
+//! failure with `tracing::error!` (loud, because a missed admin-audit row is significant) rather
+//! than turning it into this function's `Err`. This matches `crate::server`'s own `fn audit`
+//! (`server.rs:1655`), which makes the identical fail-open choice for VFS ops for the identical
+//! reason and documents it there — but that call site currently drops the failure with a bare
+//! `let _ =`, where this one logs it.
+//!
+//! The trade-off is real, not free: an audit-append failure here leaves a gap in a log that is
+//! otherwise meant to be a tamper-evident hash chain (`spindle_vfs::audit`'s module doc comment).
+//! A missing row is not a forged one — `Audit::verify_chain` still verifies everything that *did*
+//! get appended — but the record of this one action is gone from the chain rather than merely
+//! unreadable. That gap is a known, accepted trade against the alternative of lying about whether
+//! the revocation itself succeeded, not an oversight.
 
 use spindle_core::artifacts::issue_revocation_record;
 use spindle_core::{Fingerprint, SigningKey};
 use spindle_proto::artifacts::RevocationRecord;
+use spindle_vfs::audit::AuditEntry;
 use spindle_vfs::model::MemberId;
 use spindle_vfs::store::{Store, StoreError};
 use thiserror::Error;
@@ -142,19 +174,43 @@ pub fn revoke_member_and_mint(
     member_id: MemberId,
     ts: u64,
 ) -> Result<RevocationPublication, RevokeError> {
-    let epoch = match store.revoke_member_and_bump_epoch(member_id)? {
-        Some(new_epoch) => new_epoch,
+    // The outcome string must distinguish "this call performed the revocation" from "this call
+    // observed an already-revoked subject and is a no-op retry" — carried out of this match
+    // alongside the epoch so the audit entry below can report the true outcome rather than a
+    // blanket "ok" that would hide a retry.
+    let (epoch, outcome) = match store.revoke_member_and_bump_epoch(member_id)? {
+        Some(new_epoch) => (new_epoch, "ok"),
         // Already revoked (a retry after a completed revocation): mint at the store's *current*
         // cap_epoch rather than bumping again. The subject is already revoked as of that epoch,
         // cap_epoch only ever moves forward, and re-bumping purely to mint a duplicate record
         // would invalidate every outstanding capability on this host for nothing.
-        None => store.cap_epoch()?,
+        None => (store.cap_epoch()?, "ok:already_revoked"),
     };
 
     let root_fp = store
         .get_member(member_id)?
         .ok_or(StoreError::MemberNotFound(member_id))?
         .root_fp;
+
+    // Best-effort audit append — see the module doc comment's "The audit append is best-effort"
+    // section for why an append failure must not turn this already-committed revocation into an
+    // `Err`.
+    if let Err(e) = store.audit().append(AuditEntry {
+        ts,
+        member: Some(root_fp),
+        device: None,
+        action: "revoke_member".to_string(),
+        virtual_path: None,
+        bytes: None,
+        outcome: outcome.to_string(),
+    }) {
+        tracing::error!(
+            root_fp = %root_fp.redacted(),
+            error = %e,
+            "revoke_member_and_mint: audit append failed; the revocation itself already \
+             committed and is already being enforced, proceeding without an audit record"
+        );
+    }
 
     let record = issue_revocation_record(op_key, host_fp, epoch, vec![root_fp], ts);
     Ok(RevocationPublication {
@@ -176,13 +232,62 @@ pub fn revoke_device_and_mint(
     device_fp: Fingerprint,
     ts: u64,
 ) -> Result<RevocationPublication, RevokeError> {
-    let epoch = match store.revoke_device_and_bump_epoch(device_fp)? {
-        Some(new_epoch) => new_epoch,
+    // See revoke_member_and_mint's identical match for why the outcome string is carried out of
+    // this branch alongside the epoch.
+    let (epoch, outcome) = match store.revoke_device_and_bump_epoch(device_fp)? {
+        Some(new_epoch) => (new_epoch, "ok"),
         // Already revoked (a retry after a completed revocation): mint at the store's *current*
         // cap_epoch rather than bumping again — see revoke_member_and_mint's comment on the same
         // branch for why re-bumping here would be wrong.
-        None => store.cap_epoch()?,
+        None => (store.cap_epoch()?, "ok:already_revoked"),
     };
+
+    // The owning member's root_fp is an audit-column nicety, not a condition of the revocation
+    // succeeding: the device row is already durably revoked by the match above regardless of
+    // whether this lookup works. So a lookup failure (store error) or a lookup miss (no member
+    // owns this device_fp — e.g. it was already removed) is logged and recorded as `member:
+    // None` rather than failing this call; see the module doc comment's "The audit append is
+    // best-effort" section for the same argument applied to the append itself.
+    let member_root_fp = match store.member_for_device_fp(device_fp) {
+        Ok(Some(member)) => Some(member.root_fp),
+        Ok(None) => {
+            tracing::warn!(
+                device_fp = %device_fp.redacted(),
+                "revoke_device_and_mint: no member owns this device_fp; auditing the \
+                 revocation without a member column"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                device_fp = %device_fp.redacted(),
+                error = %e,
+                "revoke_device_and_mint: owning-member lookup failed; auditing the revocation \
+                 without a member column"
+            );
+            None
+        }
+    };
+
+    // Best-effort audit append — see the module doc comment's "The audit append is best-effort"
+    // section for why an append failure must not turn this already-committed revocation into an
+    // `Err`.
+    if let Err(e) = store.audit().append(AuditEntry {
+        ts,
+        member: member_root_fp,
+        device: Some(device_fp),
+        action: "revoke_device".to_string(),
+        virtual_path: None,
+        bytes: None,
+        outcome: outcome.to_string(),
+    }) {
+        tracing::error!(
+            device_fp = %device_fp.redacted(),
+            error = %e,
+            "revoke_device_and_mint: audit append failed; the revocation itself already \
+             committed and is already being enforced, proceeding without an audit record"
+        );
+    }
 
     let record = issue_revocation_record(op_key, host_fp, epoch, vec![device_fp], ts);
     Ok(RevocationPublication {
@@ -427,6 +532,111 @@ mod tests {
         assert!(
             second.record.epoch >= first.record.epoch,
             "the second call's minted epoch must be >= the first's"
+        );
+    }
+
+    // ---- audit trail (td-684764) --------------------------------------------------------------
+
+    #[test]
+    fn revoke_member_and_mint_appends_exactly_one_audit_entry_naming_the_root_fp() {
+        let (store, member_id, root_fp) = store_with_member("alex");
+
+        revoke_member_and_mint(&store, &op_key(), host_fp(), member_id, 4_242)
+            .expect("revoke_member_and_mint");
+
+        let page = store.audit().list(None, 10).expect("list");
+        assert_eq!(page.records.len(), 1, "exactly one audit entry");
+        let entry = &page.records[0].entry;
+        assert_eq!(entry.action, "revoke_member");
+        assert_eq!(entry.outcome, "ok");
+        assert_eq!(entry.member, Some(root_fp));
+        assert_eq!(entry.device, None);
+        assert_eq!(entry.ts, 4_242);
+    }
+
+    #[test]
+    fn revoke_device_and_mint_appends_an_audit_entry_naming_the_device_and_its_owning_member() {
+        let (store, member_id, root_fp) = store_with_member("alex");
+        let device_a = enroll_device(&store, member_id, 0x11);
+
+        revoke_device_and_mint(&store, &op_key(), host_fp(), device_a, 5_151)
+            .expect("revoke_device_and_mint");
+
+        let page = store.audit().list(None, 10).expect("list");
+        assert_eq!(page.records.len(), 1, "exactly one audit entry");
+        let entry = &page.records[0].entry;
+        assert_eq!(entry.action, "revoke_device");
+        assert_eq!(entry.outcome, "ok");
+        assert_eq!(entry.device, Some(device_a));
+        assert_eq!(
+            entry.member,
+            Some(root_fp),
+            "the member column must carry the device's owning member, not None"
+        );
+        assert_eq!(entry.ts, 5_151);
+    }
+
+    #[test]
+    fn a_retried_member_revocation_audits_a_second_entry_with_the_already_revoked_outcome() {
+        let (store, member_id, root_fp) = store_with_member("alex");
+
+        revoke_member_and_mint(&store, &op_key(), host_fp(), member_id, 1_000)
+            .expect("first revoke_member_and_mint");
+        revoke_member_and_mint(&store, &op_key(), host_fp(), member_id, 2_000)
+            .expect("second (retry) revoke_member_and_mint");
+
+        let page = store.audit().list(None, 10).expect("list");
+        assert_eq!(
+            page.records.len(),
+            2,
+            "both the original call and the retry must be audited"
+        );
+        assert_eq!(page.records[0].entry.outcome, "ok");
+        assert_eq!(page.records[0].entry.member, Some(root_fp));
+        assert_eq!(
+            page.records[1].entry.outcome, "ok:already_revoked",
+            "the retry must be distinguishable from the original call's outcome"
+        );
+        assert_eq!(page.records[1].entry.member, Some(root_fp));
+    }
+
+    #[test]
+    fn a_retried_device_revocation_audits_a_second_entry_with_the_already_revoked_outcome() {
+        let (store, member_id, _root_fp) = store_with_member("alex");
+        let device_a = enroll_device(&store, member_id, 0x13);
+
+        revoke_device_and_mint(&store, &op_key(), host_fp(), device_a, 1_000)
+            .expect("first revoke_device_and_mint");
+        revoke_device_and_mint(&store, &op_key(), host_fp(), device_a, 2_000)
+            .expect("second (retry) revoke_device_and_mint");
+
+        let page = store.audit().list(None, 10).expect("list");
+        assert_eq!(
+            page.records.len(),
+            2,
+            "both the original call and the retry must be audited"
+        );
+        assert_eq!(page.records[0].entry.outcome, "ok");
+        assert_eq!(
+            page.records[1].entry.outcome, "ok:already_revoked",
+            "the retry must be distinguishable from the original call's outcome"
+        );
+    }
+
+    #[test]
+    fn revocation_audit_entries_extend_a_verifiable_hash_chain() {
+        let (store, member_id, _root_fp) = store_with_member("alex");
+        let device_a = enroll_device(&store, member_id, 0x15);
+
+        revoke_device_and_mint(&store, &op_key(), host_fp(), device_a, 1_000)
+            .expect("revoke_device_and_mint");
+        revoke_member_and_mint(&store, &op_key(), host_fp(), member_id, 2_000)
+            .expect("revoke_member_and_mint");
+
+        let head = store.audit().verify_chain().expect("verify_chain");
+        assert_eq!(
+            head.seq, 2,
+            "one audit entry per revocation call, in call order"
         );
     }
 }
