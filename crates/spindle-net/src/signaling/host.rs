@@ -82,6 +82,33 @@ pub struct HostOptions {
     /// How long to wait for `connection.closed()` after a session ends, before giving up and
     /// letting the `ControlStream` drop anyway (see this module's doc comment).
     pub session_close_timeout: Duration,
+    /// The maximum number of connect offers being handled concurrently. `SignalingHost::run`'s
+    /// subscription is `host.<hfp>.connect` (DESIGN.md §A5's subject table), a subject any
+    /// authenticated NATS client can publish to — the Auth Callout grants `pub` on it to anyone
+    /// holding a valid device identity, and nothing about §A5/§A6 checks a Spindle-level signature
+    /// before that message reaches this host. Before this field existed, `run` spawned one
+    /// unbounded `tokio::spawn` task per inbound message on that subject, so an attacker with
+    /// nothing more than a NATS connection could set this host's task count and, through it, its
+    /// memory. DESIGN.md:481-483 requires a "max-concurrent-sessions" cap on every connect, and
+    /// DESIGN.md:930 threat #14 pairs "token bucket, concurrency cap" as the mitigation for
+    /// exactly this — this field is the concurrency-cap half.
+    ///
+    /// `64` is a retunable placeholder, not a derived constant: DESIGN.md:481 mandates the cap but
+    /// specifies no number for it, and this crate has no basis yet (no live load data) to pick one
+    /// more precisely. Treat this default as something to revisit once a real deployment's
+    /// concurrent-session profile is known, not as a value load-bearing in its own right.
+    ///
+    /// When the cap is reached, `run` drops the offer with no reply at all — it does not queue or
+    /// block. That is DESIGN.md §A5's uniform silent drop, the same observable outcome a peer sees
+    /// from a `ConnectDecision::Deny` or a malformed envelope: no signal distinguishes "the host is
+    /// at capacity" from "the offer was rejected" from "the offer was malformed". Queuing instead
+    /// (e.g. waiting for a permit before spawning) was considered and rejected: a blocked
+    /// subscription loop cannot pull the next message off the NATS subscription until a permit
+    /// frees up, so the unbounded growth this field exists to bound would simply move from the
+    /// task count into the NATS subscription's own internal buffer — strictly worse, since the
+    /// memory is still consumed and *every* legitimate offer behind the flood is delayed instead of
+    /// only the hostile one(s) being dropped.
+    pub max_concurrent_connects: usize,
 }
 
 impl Default for HostOptions {
@@ -90,6 +117,7 @@ impl Default for HostOptions {
             bind_ip: IpAddr::from([0, 0, 0, 0]),
             ice_timeout: Duration::from_secs(10),
             session_close_timeout: Duration::from_secs(5),
+            max_concurrent_connects: 64,
         }
     }
 }
@@ -243,9 +271,12 @@ where
     /// Subscribes on `host.<self>.connect` and handles connect offers for as long as the
     /// subscription stays open (i.e. until the NATS connection is dropped/closed by the caller —
     /// this method has no separate shutdown signal of its own). Each accepted offer is handled in
-    /// its own spawned task so one slow or hostile connect attempt cannot block the next.
+    /// its own spawned task so one slow or hostile connect attempt cannot block the next, bounded
+    /// by `opts.max_concurrent_connects` in-flight tasks at a time — see that field's doc comment
+    /// for why the cap exists and why exceeding it drops the offer rather than queuing it.
     pub async fn run(self: Arc<Self>, opts: HostOptions) -> Result<(), SignalingError> {
         use futures_util::StreamExt;
+        use tokio::sync::Semaphore;
 
         let mut sub = self
             .nats
@@ -253,9 +284,30 @@ where
             .await
             .map_err(|e| SignalingError::Nats(e.to_string()))?;
 
+        let connect_slots = Arc::new(Semaphore::new(opts.max_concurrent_connects));
+
         while let Some(msg) = sub.next().await {
+            // `try_acquire_owned`, never the blocking `acquire`: this loop must never wait for a
+            // permit. Waiting here would stall the NATS subscription itself — see
+            // `HostOptions::max_concurrent_connects`'s doc comment for why that is strictly worse
+            // than the uniform silent drop below.
+            let Ok(permit) = Arc::clone(&connect_slots).try_acquire_owned() else {
+                // Uniform silent drop (DESIGN.md §A5): the offer gets no reply at all, the same
+                // observable outcome as a `ConnectDecision::Deny` or a malformed envelope. Log only
+                // the cap value, never anything derived from `msg` — its payload, reply subject,
+                // and headers are all attacker-supplied and unverified at this point (no signature
+                // has been checked yet).
+                tracing::warn!(
+                    max_concurrent_connects = opts.max_concurrent_connects,
+                    "connect offer dropped: at max-concurrent-connects cap"
+                );
+                continue;
+            };
             let this = self.clone();
             tokio::spawn(async move {
+                // Held for the whole handler; the slot is released when this task ends, whether
+                // `handle_connect` succeeds, errors, or panics.
+                let _permit = permit;
                 if let Err(error) = this.handle_connect(msg, opts).await {
                     // `error.redacted()`, not `%error`: `handle_connect` can fail with any
                     // `SignalingError`, including the four variants that carry peer-supplied
@@ -966,5 +1018,68 @@ mod tests {
         } else {
             panic!("expected a map");
         }
+    }
+
+    // ---- td-4bcf24: max_concurrent_connects is a load-bearing cap, not a decorative default ----
+
+    /// Pins the documented default so `HostOptions::default()`'s `64` cannot silently drift out of
+    /// sync with `max_concurrent_connects`'s doc comment (which cites this exact number).
+    #[test]
+    fn host_options_default_max_concurrent_connects_is_64() {
+        assert_eq!(HostOptions::default().max_concurrent_connects, 64);
+    }
+
+    /// A pure-semaphore proof that the cap actually bounds concurrency, without standing up NATS:
+    /// a `Semaphore` sized from `HostOptions::default().max_concurrent_connects` yields exactly
+    /// that many non-blocking permits and then refuses the next `try_acquire_owned` -- mirroring
+    /// `SignalingHost::run`'s own use of `try_acquire_owned` (never the blocking `acquire`) against
+    /// the exact same `Semaphore` API this test exercises directly.
+    #[test]
+    fn semaphore_sized_from_the_default_cap_admits_exactly_that_many_permits_then_refuses() {
+        let cap = HostOptions::default().max_concurrent_connects;
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(cap));
+
+        let permits: Vec<_> = (0..cap)
+            .map(|_| {
+                std::sync::Arc::clone(&slots)
+                    .try_acquire_owned()
+                    .expect("permit within the cap must be granted")
+            })
+            .collect();
+        assert_eq!(permits.len(), cap);
+
+        assert!(
+            std::sync::Arc::clone(&slots).try_acquire_owned().is_err(),
+            "a permit beyond the cap must be refused, not granted or blocked on"
+        );
+    }
+
+    /// The release half of the same proof: dropping one held permit frees exactly one slot -- the
+    /// next `try_acquire_owned` succeeds, and the one after that (with no further drop) fails
+    /// again. This is the behavior `SignalingHost::run` relies on to admit the next legitimate
+    /// offer once an in-flight `handle_connect` task ends and drops its `_permit`.
+    #[test]
+    fn dropping_one_permit_admits_exactly_one_more() {
+        let cap = HostOptions::default().max_concurrent_connects;
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(cap));
+
+        let mut permits: Vec<_> = (0..cap)
+            .map(|_| {
+                std::sync::Arc::clone(&slots)
+                    .try_acquire_owned()
+                    .expect("permit within the cap must be granted")
+            })
+            .collect();
+        assert!(std::sync::Arc::clone(&slots).try_acquire_owned().is_err());
+
+        drop(permits.pop().expect("cap is non-zero"));
+
+        let _reacquired = std::sync::Arc::clone(&slots)
+            .try_acquire_owned()
+            .expect("dropping one permit must admit exactly one more");
+        assert!(
+            std::sync::Arc::clone(&slots).try_acquire_owned().is_err(),
+            "only one additional permit should be admitted after exactly one drop"
+        );
     }
 }

@@ -235,7 +235,11 @@ impl HostDaemon {
     }
 
     /// As [`Self::new`], but with an explicit `now_fn` — the injectable-clock seam this module's
-    /// doc comment on [`wall_clock_now_secs`] describes.
+    /// doc comment on [`wall_clock_now_secs`] describes. [`Self::run`] shares this one clock across
+    /// both time-reading components it assembles: the per-session `VfsSessionHandler`'s VFS RPC
+    /// serve loop, and `HostConnectAuthorizer`'s connect-time rate limiter. A caller injecting a
+    /// deterministic clock here gets both components honoring it — never one on the injected clock
+    /// while the other silently falls back to the real wall clock.
     pub fn with_now_fn(
         nats: async_nats::Client,
         device: DeviceKey,
@@ -326,6 +330,13 @@ impl HostDaemon {
             "host daemon starting"
         );
 
+        // `HostDaemon` exposes exactly one clock seam (`with_now_fn`), so every time-reading
+        // component `run` assembles below must read that same clock — a component that quietly
+        // fell back to `SystemTime::now()` instead would make an injected deterministic clock a
+        // half-truth, honored by one seam and silently ignored by the other. `Arc::from(Box<dyn
+        // T>)` is a std `impl`; each consumer below gets its own cloned handle onto this one clock.
+        let now_fn: Arc<dyn Fn() -> u64 + Send + Sync + 'static> = Arc::from(now_fn);
+
         let factory = SqliteStoreFactory::new(&store_path);
 
         // Independent connection #1: the connect path's own lookup (never the RPC path's) — see
@@ -350,14 +361,20 @@ impl HostDaemon {
                     "cap issuer installed; successful connects will carry a freshly-minted \
                      member capability"
                 );
-                HostConnectAuthorizer::with_issuer(connect_lookup, issuer)
+                HostConnectAuthorizer::with_issuer(connect_lookup, issuer).with_now_fn({
+                    let now = Arc::clone(&now_fn);
+                    move || (*now)()
+                })
             }
             None => {
                 tracing::info!(
                     "no cap issuer installed (HostDaemon::with_cap_issuer was not called); \
                      connect answers will never carry a member capability"
                 );
-                HostConnectAuthorizer::new(connect_lookup)
+                HostConnectAuthorizer::new(connect_lookup).with_now_fn({
+                    let now = Arc::clone(&now_fn);
+                    move || (*now)()
+                })
             }
         };
 
@@ -375,7 +392,13 @@ impl HostDaemon {
 
         // `factory` itself is moved in here; every RPC session gets its own connection (#3, #4,
         // ...) opened on demand by `VfsSessionHandler::handle_session` via `StoreFactory::open`.
-        let handler = VfsSessionHandler::new(factory, session_lookup, now_fn);
+        // `VfsSessionHandler` still wants a `BoxedNowFn`, not the shared `Arc` itself — rebuilt
+        // from another clone of the one shared clock, per this block's comment above.
+        let handler_now: BoxedNowFn = {
+            let now = Arc::clone(&now_fn);
+            Box::new(move || (*now)())
+        };
+        let handler = VfsSessionHandler::new(factory, session_lookup, handler_now);
 
         tracing::info!(
             connections_opened = 2u32,

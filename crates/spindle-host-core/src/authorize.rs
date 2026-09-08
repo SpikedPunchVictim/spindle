@@ -24,6 +24,7 @@
 //! backed by a connection pool or an already-`Sync` store can implement `DeviceLookup` directly
 //! and skip the lock entirely.
 
+use crate::ratelimit::{ConnectRateLimitConfig, ConnectRateLimiter};
 use spindle_core::artifacts::issue_capability;
 use spindle_core::identity::device_fp_of;
 use spindle_core::{Fingerprint, SigningKey, VerifyingKey, X25519PublicKey, ALG_ID_V1};
@@ -31,7 +32,7 @@ use spindle_net::signaling::authorize::{ConnectAuthorizer, ConnectDecision};
 use spindle_proto::artifacts::{CapKind, Capability, HostOpKeyCert};
 use spindle_vfs::model::{Member, MemberStatus};
 use spindle_vfs::store::{Store, StoreError};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex, Once};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -503,6 +504,24 @@ impl CapIssuer for RootKeyCapIssuer {
 /// non-revoked member device permitted to connect to this host?" decision, resolved against a
 /// real member registry via [`DeviceLookup`].
 ///
+/// Closes both of `spindle-net`'s `signaling::host` module doc comment's MUSTs for a
+/// `ConnectAuthorizer` implementation (`crates/spindle-net/src/signaling/host.rs`'s
+/// `process_offer` doc comment, ~line 194-197 as of this writing): "must rate-limit these lookups"
+/// is [`Self::limiter`], a [`ConnectRateLimiter`] consulted before any store access (see
+/// `authorize`'s check 0); "must make `Allow` and `Deny` indistinguishable to the caller in timing
+/// and observable behavior" is [`equalize_denial_work`], run on every pre-crypto `Deny` so an
+/// unenrolled `from_fp` costs roughly the same crypto work as an enrolled one. Neither is complete:
+///
+/// - the rate limiter's own state (which bucket a given `from_fp` lands in, whether the global
+///   bucket is exhausted) is itself observable via timing/behavior differences between callers —
+///   see [`ConnectRateLimiter`]'s own doc comment for the accepted "shared fate" cost this implies;
+/// - the timing equalization closes the crypto-work asymmetry (check 9's own comment explains why
+///   it stops exactly there) but leaves the store-side cost difference between a registry hit and
+///   a miss, plus SQLite page-cache and allocator jitter, unequalized — see
+///   [`equalize_denial_work`]'s doc comment for the honest accounting of what remains open. That
+///   residual gap is bounded by the rate limiter and by §A5's uniform silent drop
+///   (`SignalingError::Denied` produces no reply at all), not eliminated.
+///
 /// Deliberately does **not**:
 /// - verify the envelope signature — the caller does that next, using the `sign_pk`/`agree_pk`
 ///   this returns (see `ConnectAuthorizer::authorize`'s own doc comment: "an authorizer must not
@@ -518,27 +537,255 @@ pub struct HostConnectAuthorizer<L: DeviceLookup> {
     /// breaking API change this slice has no reason to force; a `Box<dyn CapIssuer>` keeps the
     /// struct's public shape exactly as every existing caller already names it.
     issuer: Option<Box<dyn CapIssuer>>,
+    /// `spindle-net`'s `signaling::host` module doc comment's first MUST (see this struct's own
+    /// doc comment above): the pre-authentication token bucket over the connect endpoint DESIGN.md
+    /// §A5/v0.9.24 mandates. Installed by both [`Self::new`] and [`Self::with_issuer`] with
+    /// [`ConnectRateLimitConfig::default`] — **never opt-in**. This is a security control, not a
+    /// convenience knob: a host built via either constructor and never touching
+    /// [`Self::with_connect_rate_limit`] must still be rate-limited, not silently unlimited. See
+    /// this module's `tests::the_rate_limiter_is_on_by_default_and_is_not_opt_in` for the test
+    /// that pins this.
+    limiter: ConnectRateLimiter,
+    /// The clock the rate limiter reads (separate from [`CapIssuer`]'s own `now_fn`, which stamps
+    /// a minted capability's `exp` — the two clocks answer different questions and a test may need
+    /// to control them independently). Defaults to [`wall_clock_now_secs`]; [`Self::with_now_fn`]
+    /// injects a deterministic one for tests, mirroring [`RootKeyCapIssuer::with_now_fn`]'s own
+    /// chainable-setter shape (see that method's doc comment for why chainable consuming-self
+    /// setters are used here rather than alternative constructors).
+    now_fn: BoxedNowFn,
 }
 
 impl<L: DeviceLookup> HostConnectAuthorizer<L> {
     /// Installs no cap-issuing seam: `authorize` always answers `member_cap: None`. Correct for a
     /// host with no cap-signing key online yet — see [`CapIssuer`]'s doc comment — not merely a
     /// placeholder for "unimplemented".
+    ///
+    /// Also installs the connect-rate limiter ([`ConnectRateLimiter`], via
+    /// [`ConnectRateLimitConfig::default`]) and the real wall clock for it. Unlike the cap issuer,
+    /// the limiter is **not** an opt-in seam: DESIGN.md §A5/v0.9.24 mandates it unconditionally,
+    /// so there is no "no limiter installed" state to construct, the way `issuer: None` is a valid
+    /// choice. Use [`Self::with_connect_rate_limit`] to retune it, not to turn it on.
     pub fn new(lookup: L) -> Self {
         HostConnectAuthorizer {
             lookup,
             issuer: None,
+            limiter: ConnectRateLimiter::new(ConnectRateLimitConfig::default()),
+            now_fn: Box::new(wall_clock_now_secs),
         }
     }
 
     /// As [`Self::new`], but with a real [`CapIssuer`] installed so `authorize` mints a fresh
-    /// member capability for every `Allow`.
+    /// member capability for every `Allow`. Installs the same default-on connect-rate limiter
+    /// [`Self::new`] does — see that constructor's doc comment; the cap issuer and the rate
+    /// limiter are independent seams, and neither constructor may skip the limiter.
     pub fn with_issuer(lookup: L, issuer: Box<dyn CapIssuer>) -> Self {
         HostConnectAuthorizer {
             lookup,
             issuer: Some(issuer),
+            limiter: ConnectRateLimiter::new(ConnectRateLimitConfig::default()),
+            now_fn: Box::new(wall_clock_now_secs),
         }
     }
+
+    /// As either constructor built it, but with an explicit clock for the connect-rate limiter —
+    /// a deterministic clock for tests. Follows [`RootKeyCapIssuer::with_now_fn`]'s established
+    /// chainable-consuming-self-setter shape (see that method's doc comment for why this is a
+    /// setter rather than a third alternative constructor: it must compose with
+    /// [`Self::with_connect_rate_limit`], and a per-knob alternative constructor would make the
+    /// two mutually exclusive).
+    pub fn with_now_fn(self, now_fn: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        HostConnectAuthorizer {
+            now_fn: Box::new(now_fn),
+            ..self
+        }
+    }
+
+    /// As either constructor built it, but with the connect-rate limiter rebuilt from an explicit
+    /// `config` instead of [`ConnectRateLimitConfig::default`]. Rebuilding (rather than mutating
+    /// the existing limiter in place) is correct here: [`ConnectRateLimiter`] has no in-place
+    /// reconfiguration method, and a fresh limiter with empty bucket state is exactly what
+    /// switching configs should produce — there is no meaningful "carry the old buckets forward
+    /// under new parameters" behavior to preserve.
+    pub fn with_connect_rate_limit(self, config: ConnectRateLimitConfig) -> Self {
+        HostConnectAuthorizer {
+            limiter: ConnectRateLimiter::new(config),
+            ..self
+        }
+    }
+}
+
+/// A fixed, valid Ed25519 verifying key / X25519 public key pair, computed once, that
+/// [`equalize_denial_work`] recomputes a `device_fp` against on every pre-crypto `Deny`.
+///
+/// Only the sign half needs to be a genuinely valid curve point: `VerifyingKey::from_bytes` is a
+/// point decompression that can fail for a byte string that does not encode a valid Ed25519 point,
+/// and it is exactly that decompression — not a scalar multiplication, which the real `Allow` path
+/// never performs either — that [`equalize_denial_work`] must redo per call to match the real
+/// path's cost. Deriving `sign_bytes` here, once, via `SigningKey::from_bytes(&[0xA5; 32])
+/// .verifying_key().to_bytes()` guarantees a point `VerifyingKey::from_bytes` can always
+/// successfully decompress, without paying that derivation cost on every denied connect.
+///
+/// `agree_bytes` has no such constraint: X25519 public keys are unvalidated (any 32 bytes decode),
+/// so `[0x5A; 32]` — an arbitrary fixed constant, chosen only to be visibly not all-zero — is fine
+/// as-is; there is no equivalent "valid point" cost for `X25519PublicKey::from` to redo, since the
+/// real `Allow` path's own `X25519PublicKey::from` call (check 7, above) does not validate either.
+static EQUALIZATION_DUMMY_KEYS: LazyLock<([u8; 32], [u8; 32])> = LazyLock::new(|| {
+    let sign_bytes = SigningKey::from_bytes(&[0xA5; 32])
+        .verifying_key()
+        .to_bytes();
+    let agree_bytes = [0x5A; 32];
+    (sign_bytes, agree_bytes)
+});
+
+/// Guards the `tracing::error!` in [`equalize_denial_work`]'s failure branch so it fires at most
+/// once per process. That branch runs on the pre-authentication connect path, reachable by any
+/// unauthenticated peer naming any `from_fp` it likes — every denied connect that isn't a plain
+/// rate-limit or already-signature-verified `Deny` re-enters `equalize_denial_work`, and a bad
+/// `EQUALIZATION_DUMMY_KEYS` constant would make ALL of them take this branch. Without a guard,
+/// that is an attacker-driven, unbounded log flood: one `tracing::error!` per denied connect,
+/// forever, for as long as the attacker keeps connecting. `Once` still gets the operator the
+/// signal — this is a real programmer error worth surfacing loudly — just exactly once per
+/// process lifetime rather than once per attacker request.
+static EQUALIZATION_DUMMY_KEY_INVALID_LOGGED: Once = Once::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of [`equalize_denial_work`] invocations on the current thread. Thread-local,
+    /// **not** a global `AtomicUsize`: this module's tests run concurrently in one process and
+    /// several of them call `authorize`, so a shared global counter would be raced by unrelated
+    /// tests incrementing it out from under each other. `#[tokio::test]` uses a current-thread
+    /// runtime, so each test's `authorize` calls all happen on that one test's own thread — a
+    /// thread-local is race-free here with no lock needed, at the cost of the test harness
+    /// potentially reusing that OS thread for a later test, which is exactly why every test using
+    /// this resets it first via [`reset_equalization_calls`] rather than trusting it to start at
+    /// `0`.
+    ///
+    /// What this proves, and what it does not: an increment proves the denial path *called*
+    /// [`equalize_denial_work`], which is what makes the routing of all eight
+    /// `deny_with_equalized_work()` call sites in `HostConnectAuthorizer::authorize` load-bearing —
+    /// see `tests::a_denial_for_an_unenrolled_from_fp_runs_the_timing_equalization`, which fails if
+    /// a future edit quietly reverts one of those call sites back to a plain
+    /// `ConnectDecision::Deny`. It says nothing about whether the resulting timings are actually
+    /// indistinguishable: this crate deliberately does not assert wall-clock timing anywhere (see
+    /// the comment at the end of this module's `tests` module for why such an assertion would be
+    /// flaky and prove nothing), and `equalize_denial_work`'s own doc comment's "What this does NOT
+    /// close" section already scopes that honestly — the store-side cost difference and ordinary
+    /// allocator/cache jitter stay unequalized no matter how many times this counter increments.
+    static EQUALIZATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only reader for [`EQUALIZATION_CALLS`] on the current thread. Exists so tests read the
+/// count through a named function rather than reaching into the `Cell` directly at each call site.
+#[cfg(test)]
+fn equalization_calls() -> usize {
+    EQUALIZATION_CALLS.with(|calls| calls.get())
+}
+
+/// Test-only reset of [`EQUALIZATION_CALLS`] on the current thread to `0`. Every test that reads
+/// this counter must call this first — see [`EQUALIZATION_CALLS`]'s own doc comment: the test
+/// harness may reuse the same OS thread for an earlier, unrelated test, so a fresh `#[tokio::test]`
+/// cannot assume the counter already reads `0`.
+#[cfg(test)]
+fn reset_equalization_calls() {
+    EQUALIZATION_CALLS.with(|calls| calls.set(0));
+}
+
+/// Performs the same Ed25519/X25519 key parse and `device_fp_of` recompute an `Allow` path
+/// performs (checks 7 and 9 of [`HostConnectAuthorizer::authorize`]), against the fixed dummy key
+/// pair in [`EQUALIZATION_DUMMY_KEYS`], and discards the result — the crypto half of closing
+/// `spindle-net`'s `signaling::host` module doc comment's second MUST for a `ConnectAuthorizer`:
+/// making `Allow` and `Deny` "indistinguishable to the caller in timing and observable behavior".
+///
+/// Without this, an unenrolled `from_fp` returns after one indexed store lookup (`liveness_checks`
+/// finding no member/device), while an enrolled, live one continues through `get_member`'s row
+/// assembly, two key parses, and a `device_fp_of` rehash — a real, measurable amount of extra
+/// crypto work an `Allow` pays that a fast pre-crypto `Deny` does not. Doing that same parse-and-
+/// rehash work on the `Deny` path too, against a value nobody's response depends on, closes that
+/// gap: every pre-crypto `Deny` (see [`deny_with_equalized_work`]) now pays roughly the same
+/// crypto cost an `Allow` does, so an attacker timing responses cannot use the crypto-work
+/// difference to distinguish "not a member" from "is a member, but denied for some other reason
+/// upstream of crypto" — or, combined with the rate limiter, to efficiently enumerate valid
+/// `from_fp` values by timing alone.
+///
+/// **What this does NOT close** — read before assuming the timing channel is shut: the store-side
+/// cost difference between a registry hit (`get_member` assembling a `Member` plus its device
+/// rows) and a miss (one indexed lookup returning nothing) remains unequalized here, along with
+/// ordinary SQLite page-cache and allocator jitter between runs. This function only redoes the
+/// *crypto* work an `Allow` performs; it does not — and, running entirely in-process with no store
+/// handle in scope, cannot — redo the store-side asymmetry too. That residual gap is bounded by
+/// [`ConnectRateLimiter`] (an attacker gets only so many timed samples per unit time) and by
+/// DESIGN.md §A5's uniform silent drop (`SignalingError::Denied` produces no reply at all, so
+/// there is no reply latency to time from the wire in the first place), not eliminated by it.
+/// DESIGN.md:481-483's v0.9.24 amendment records this same caveat; do not describe this function,
+/// in a future doc update, as closing the channel entirely — it does not.
+///
+/// A second, larger gap in the same direction: once a [`CapIssuer`] is installed (see check 10 in
+/// [`HostConnectAuthorizer::authorize`]), an `Allow` that successfully mints a member cap performs
+/// an Ed25519 SIGNATURE — `issue_member_cap`'s whole reason for existing — that this function's
+/// crypto recompute never matches; it only redoes the parse/rehash work of checks 7 and 9, never a
+/// signature. Measured on one release-build machine: `equalize_denial_work` ≈ 3.3 µs/call,
+/// `issue_member_cap` ≈ 16.7 µs/call — an asymmetry roughly 5x LARGER than the parse/rehash gap
+/// this function closes, pointing the same direction (`Allow` slower than `Deny`). Nothing
+/// installs a `CapIssuer` today — only `spindle-hostd`'s `HostDaemon::with_cap_issuer`'s
+/// definition exists, nothing calls it yet — so this is latent, not live, but it goes live
+/// silently the moment Stage 7 wires the operating key in, with no change to this function
+/// required to trigger it. Equalizing it is NOT the fix: performing an Ed25519 signature on every
+/// denial, to match, would hand an attacker exactly the CPU-cost amplification
+/// [`ConnectRateLimiter`] exists to deny them — trading a timing side-channel for a cheap
+/// denial-of-service amplifier is a strictly worse trade. The right fix, whenever this goes live,
+/// is scoped to Stage 7, not to this function.
+///
+/// Wrapped in [`std::hint::black_box`] so the compiler cannot prove the result is unused and
+/// optimize the recompute away — an elided recompute would silently stop equalizing anything while
+/// looking, to a reader of this source, exactly like it still was.
+fn equalize_denial_work() {
+    // Test-only instrumentation, load-bearing for the coverage gap td-4bcf24 closes: see
+    // EQUALIZATION_CALLS's doc comment for what an increment here does and does not prove.
+    #[cfg(test)]
+    EQUALIZATION_CALLS.with(|calls| calls.set(calls.get() + 1));
+
+    let (sign_bytes, agree_bytes) = *EQUALIZATION_DUMMY_KEYS;
+    // If this ever failed, `equalize_denial_work` would silently do LESS work than the real
+    // `Allow` path (which always has a key that parsed, by construction) — quietly reopening the
+    // exact timing gap this function exists to close, with no compile-time or test signal short of
+    // `the_equalization_dummy_key_parses_as_a_valid_ed25519_point` (below) catching a bad constant.
+    // Returning early here costs only that equalization, never the security decision itself: this
+    // function's only caller, `deny_with_equalized_work`, returns `ConnectDecision::Deny` either
+    // way, with or without the equalization work actually running. This module's house style never
+    // `unwrap`s an invariant in a security path (see e.g. check 4 and check 8's own comments for
+    // the same rule), and here that rule is sharper than usual — `equalize_denial_work` runs on
+    // the pre-authentication connect path, reachable by any unauthenticated peer naming any
+    // `from_fp` it likes, so panicking on a malformed *constant* would convert a programmer error
+    // into the one crash-shaped seam in an otherwise all-`Deny` path. Logging loudly and returning
+    // is strictly better: the connect is still denied, just without this call's timing
+    // equalization.
+    let Ok(sign_pk) = VerifyingKey::from_bytes(&sign_bytes) else {
+        // See EQUALIZATION_DUMMY_KEY_INVALID_LOGGED's doc comment: any peer can reach this branch
+        // at will simply by causing a pre-crypto denial, so this must log at most once per
+        // process, not once per request.
+        EQUALIZATION_DUMMY_KEY_INVALID_LOGGED.call_once(|| {
+            tracing::error!(
+                "equalize_denial_work: the fixed dummy Ed25519 key failed to decompress, so \
+                 connect denials are no longer timing-equalized against the Allow path's crypto \
+                 work. This is a programmer error in EQUALIZATION_DUMMY_KEYS, not \
+                 attacker-controlled input"
+            );
+        });
+        return;
+    };
+    let agree_pk = X25519PublicKey::from(agree_bytes);
+    let recomputed = device_fp_of(ALG_ID_V1, &sign_pk, &agree_pk);
+    std::hint::black_box(recomputed);
+}
+
+/// A pre-crypto `Deny` (checks 1-8 of [`HostConnectAuthorizer::authorize`] — every check that
+/// denies before performing the real `device_fp_of` rehash) routed through
+/// [`equalize_denial_work`] first. See that function's doc comment for exactly what this does, and
+/// does not, close. Check 9's own `Deny` (the `device_fp_of` mismatch) deliberately does NOT use
+/// this helper — see the comment at that call site for why.
+fn deny_with_equalized_work() -> ConnectDecision {
+    equalize_denial_work();
+    ConnectDecision::Deny
 }
 
 impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
@@ -552,6 +799,25 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
     /// request) are shared with [`crate::session::VfsSessionHandler`]'s session-time gate rather
     /// than duplicated here.
     async fn authorize(&self, from_fp: &Fingerprint) -> ConnectDecision {
+        // 0. Rate limit, before any store access at all (`spindle-net`'s `signaling::host` module
+        // doc comment: an implementation "must rate-limit these lookups", since the authorizer is
+        // reached with an unverified, attacker-chosen `from_fp` before any signature is checked).
+        //
+        // This returns a PLAIN `Deny`, not `deny_with_equalized_work()`'s equalized one, and that
+        // is deliberate, not an oversight:
+        // - a rate-limited rejection reveals only rate-limiter state (this bucket, or the shared
+        //   global one, is out of tokens right now), never membership — it leaks nothing about
+        //   whether `from_fp` is enrolled, so there is no membership-oracle signal here to hide
+        //   behind equalized crypto work;
+        // - spending crypto work on a request the limiter has already refused would hand a
+        //   flooder exactly the amplification the limiter exists to deny: the whole point of
+        //   checking the limiter first is to make a throttled request cheap, not merely
+        //   indistinguishable-looking. Being measurably faster on this path is the correct
+        //   trade-off, not a timing leak that needs closing.
+        if !self.limiter.try_acquire(*from_fp, (self.now_fn)()) {
+            return ConnectDecision::Deny;
+        }
+
         // 1-5, plus — when a `CapIssuer` is installed — the `cap_epoch` a freshly minted cap must
         // carry, both resolved from ONE atomic snapshot via `DeviceLookup::member_and_cap_epoch`.
         //
@@ -615,32 +881,44 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
             },
         };
         let Some(member) = member else {
-            return ConnectDecision::Deny;
+            return deny_with_equalized_work();
         };
         // Re-finding the device row is redundant with what `active_member_for_device` already
         // confirmed, but this module's house style never unwraps an invariant instead of failing
         // closed (see check 4's own comment for the same call) — an `expect` here would be the
         // one panic-shaped seam in an otherwise all-`Deny` function.
         let Some(device) = member.devices.iter().find(|d| d.device_fp == *from_fp) else {
-            return ConnectDecision::Deny;
+            return deny_with_equalized_work();
         };
 
         // 6. Either key is missing on file. Fail closed; a missing key is never "skip the check".
         let (Some(sign_pk_bytes), Some(agree_pk_bytes)) = (&device.sign_pk, &device.agree_pk)
         else {
-            return ConnectDecision::Deny;
+            return deny_with_equalized_work();
         };
 
         // 7. Either key fails to parse (wrong length, or — for the Ed25519 sign key — not a valid
         // curve point).
         let Ok(sign_pk_arr): Result<[u8; 32], _> = sign_pk_bytes.as_slice().try_into() else {
-            return ConnectDecision::Deny;
+            return deny_with_equalized_work();
         };
+        // td-4bcf24 review note: this `Deny` routing through `deny_with_equalized_work()` was
+        // flagged as "over-equalized" (a failed decompression is already cheaper than a real
+        // `Allow`, so equalizing it further supposedly widens rather than closes the gap). That
+        // finding is wrong; recorded here so a future reviewer does not re-raise it. Let D = the
+        // cost of `VerifyingKey::from_bytes`'s point decompression, H = the cost of the
+        // `device_fp_of` rehash (checks 7/9 combined with an `Allow`'s later work), and Df = the
+        // (smaller) cost of a decompression that fails fast. A real `Allow` pays D+H. Without
+        // equalization, this failed-decompression `Deny` pays only Df — off from `Allow` by the
+        // full D+H, a large gap. WITH equalization (`deny_with_equalized_work` redoes a successful
+        // decompression + rehash against the fixed dummy key), this `Deny` pays Df+D+H — off from
+        // `Allow` by only Df, a tiny gap. Df+D+H is strictly closer to D+H than Df alone is:
+        // equalizing here is strictly closer to indistinguishable, not further from it.
         let Ok(sign_pk) = VerifyingKey::from_bytes(&sign_pk_arr) else {
-            return ConnectDecision::Deny;
+            return deny_with_equalized_work();
         };
         let Ok(agree_pk_arr): Result<[u8; 32], _> = agree_pk_bytes.as_slice().try_into() else {
-            return ConnectDecision::Deny;
+            return deny_with_equalized_work();
         };
         let agree_pk = X25519PublicKey::from(agree_pk_arr);
 
@@ -668,10 +946,10 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
         // would break the `!=` comparison at compile time (or, at worst, compare against the wrong
         // but still-explicit value), never silently widen this into a no-op check.
         let Some(alg_id) = device.alg_id else {
-            return ConnectDecision::Deny;
+            return deny_with_equalized_work();
         };
         if alg_id != ALG_ID_V1 {
-            return ConnectDecision::Deny;
+            return deny_with_equalized_work();
         }
 
         // 9. The binding does not hold (DESIGN.md §A7b clarification-6 — the same check
@@ -685,6 +963,16 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
         // constant, is what makes this the actual device_fp recompute td-6c01e3 requires: a
         // future second algorithm added as another `Some(alg_id) if alg_id != ALG_ID_V1` arm
         // above would still rehash correctly here without this line needing to change at all.
+        //
+        // This `Deny` stays PLAIN — never routed through `deny_with_equalized_work()` — and that
+        // is deliberate, not a missed spot: every check above this one denies *before* performing
+        // the real `VerifyingKey::from_bytes`/`X25519PublicKey::from`/`device_fp_of` work an
+        // `Allow` also does, so equalizing them against a dummy recompute closes a real
+        // faster-than-`Allow` gap. This check has already paid that exact cost for real (the parse
+        // at checks 6-7, the rehash right above) before reaching here — there is no gap left to
+        // close. Adding a second, redundant `equalize_denial_work()` call here would not equalize
+        // anything; it would make this specific `Deny` measurably *slower* than an `Allow` reaches
+        // the same point, manufacturing a new timing asymmetry pointing the other way.
         if device_fp_of(alg_id, &sign_pk, &agree_pk) != *from_fp {
             return ConnectDecision::Deny;
         }
@@ -723,10 +1011,11 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ratelimit::RateLimitConfig;
     use spindle_core::artifacts::{issue_host_op_key_cert, verify_capability};
     use spindle_core::identity::{DeviceKey, RootKey};
     use spindle_vfs::model::{Device, DevicePublicKeys, MemberId};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn store_with_active_member(display_name: &str) -> (Store, spindle_vfs::model::MemberId) {
@@ -1624,4 +1913,305 @@ mod tests {
             ),
         }
     }
+
+    // ---- connect-rate limiting (td-4bcf24): DESIGN.md §A5/v0.9.24's per-`from_fp` + global token
+    // bucket over the connect endpoint, and its timing/observable-behavior equalization -------
+
+    /// The load-bearing test for `HostConnectAuthorizer`'s rate limiter being a security control,
+    /// not an opt-in convenience: a plain `HostConnectAuthorizer::new(..)` -- never touching
+    /// `with_connect_rate_limit` -- must still throttle. If this regresses to `Allow` on the 11th
+    /// call, `new`/`with_issuer` have silently stopped installing a real `ConnectRateLimiter`.
+    #[tokio::test]
+    async fn the_rate_limiter_is_on_by_default_and_is_not_opt_in() {
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x40; 32], [0x41; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+        // A frozen clock, so refill never masks the burst boundary -- `with_now_fn` is the only
+        // knob touched here; `with_connect_rate_limit` deliberately is not, since this test exists
+        // to prove the *default* config (installed by `new` with no further configuration) is
+        // what's actually enforced.
+        let authorizer =
+            HostConnectAuthorizer::new(SqliteDeviceLookup::new(store)).with_now_fn(|| 0);
+
+        for i in 0..10 {
+            match authorizer.authorize(&device_fp).await {
+                ConnectDecision::Allow { .. } => {}
+                ConnectDecision::Deny => panic!(
+                    "call {i} of the documented default per-fp burst (10) must Allow -- a live, \
+                     active member device must not be throttled before its own burst is spent"
+                ),
+            }
+        }
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => panic!(
+                "the rate limiter is on by default and is NOT opt-in: HostConnectAuthorizer::new \
+                 must install ConnectRateLimiter::new(ConnectRateLimitConfig::default()) even \
+                 though this test never called with_connect_rate_limit. An Allow on the 11th call \
+                 (one past the documented default per-fp burst of 10) would mean a host built via \
+                 HostConnectAuthorizer::new silently ran with no rate limiting at all -- exactly \
+                 the security regression this test exists to catch."
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn denies_a_live_member_device_once_its_per_fp_burst_is_exhausted() {
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x42; 32], [0x43; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+        let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store))
+            .with_now_fn(|| 0)
+            .with_connect_rate_limit(ConnectRateLimitConfig {
+                per_fp: RateLimitConfig {
+                    burst: 2.0,
+                    refill_per_sec: 0.0,
+                },
+                global: ConnectRateLimitConfig::default().global,
+                max_tracked_fps: ConnectRateLimitConfig::default().max_tracked_fps,
+            });
+
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Allow { .. } => {}
+            ConnectDecision::Deny => panic!("first call must Allow: per-fp burst is 2"),
+        }
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Allow { .. } => {}
+            ConnectDecision::Deny => panic!("second call must Allow: per-fp burst is 2"),
+        }
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => panic!(
+                "third call must Deny: the per-fp burst of 2 is exhausted, refill_per_sec is 0, \
+                 and the clock is frozen at the same instant -- even a genuinely live, active \
+                 member device is throttled once its own bucket is empty"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_throttled_device_is_allowed_again_once_its_bucket_refills() {
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x44; 32], [0x45; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+        let clock = Arc::new(AtomicU64::new(0));
+        let clock_for_fn = Arc::clone(&clock);
+        let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store))
+            .with_now_fn(move || clock_for_fn.load(Ordering::SeqCst))
+            .with_connect_rate_limit(ConnectRateLimitConfig {
+                per_fp: RateLimitConfig {
+                    burst: 1.0,
+                    refill_per_sec: 1.0,
+                },
+                global: ConnectRateLimitConfig::default().global,
+                max_tracked_fps: ConnectRateLimitConfig::default().max_tracked_fps,
+            });
+
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Allow { .. } => {}
+            ConnectDecision::Deny => {
+                panic!("first call must Allow: burst is 1 and the bucket starts full")
+            }
+        }
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => panic!(
+                "second call at the same instant must Deny: burst of 1 is exhausted and the \
+                 clock has not advanced"
+            ),
+        }
+        clock.store(1, Ordering::SeqCst);
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Allow { .. } => {}
+            ConnectDecision::Deny => panic!(
+                "one second later, at refill_per_sec = 1.0, exactly one token has refilled -- \
+                 this call must Allow"
+            ),
+        }
+    }
+
+    /// Proves DESIGN.md v0.9.24's accepted "shared fate" cost is real and intentional, not a bug:
+    /// a flood that rotates its claimed `from_fp` on every attempt cannot be stopped by the per-fp
+    /// bucket alone (each fabricated fp starts with a fresh, full bucket), so the global bucket is
+    /// the only thing that can bound it -- and spending it costs *every* caller, including a
+    /// genuinely live member device, not just the flooder. The alternative (no global bound) lets
+    /// identity rotation defeat throttling entirely, which DESIGN.md judges strictly worse than
+    /// this shared cost.
+    #[tokio::test]
+    async fn a_flood_that_rotates_from_fp_is_stopped_by_the_global_bucket() {
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x46; 32], [0x47; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+        let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store))
+            .with_now_fn(|| 0)
+            .with_connect_rate_limit(ConnectRateLimitConfig {
+                per_fp: RateLimitConfig {
+                    burst: 1000.0,
+                    refill_per_sec: 1000.0,
+                },
+                global: RateLimitConfig {
+                    burst: 3.0,
+                    refill_per_sec: 0.0,
+                },
+                max_tracked_fps: ConnectRateLimitConfig::default().max_tracked_fps,
+            });
+
+        // Three fabricated, never-enrolled fingerprints. Each is denied on membership (checks
+        // 1-2), but check 0 -- the rate limiter -- runs before any membership lookup, so each
+        // still spends one of the global bucket's three tokens regardless of the Deny reason.
+        for seed in [0x50u8, 0x51, 0x52] {
+            let stranger =
+                DeviceKey::from_seeds([seed; 32], [seed.wrapping_add(1); 32]).device_fp();
+            match authorizer.authorize(&stranger).await {
+                ConnectDecision::Deny => {}
+                ConnectDecision::Allow { .. } => {
+                    panic!("an unenrolled, fabricated fingerprint must be denied on membership")
+                }
+            }
+        }
+
+        // The global bucket (burst 3, refill 0) is now empty. This is the accepted trade-off,
+        // not a bug: a rotating flood of fabricated fingerprints, none of which is ever a real
+        // member, still exhausts the SAME shared budget a legitimate device's connect draws from.
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => panic!(
+                "expected Deny: the global bucket was exhausted by the preceding rotating flood, \
+                 so even this genuinely live member device must be denied at check 0 -- before \
+                 its membership is ever consulted. This is DESIGN.md v0.9.24's accepted \
+                 shared-fate cost, not a bug: the alternative (no global bucket) would let \
+                 identity rotation defeat throttling entirely."
+            ),
+        }
+    }
+
+    /// Without this, a bad `EQUALIZATION_DUMMY_KEYS` constant would make `equalize_denial_work`
+    /// silently do LESS work than the real `Allow` path (a failed `VerifyingKey::from_bytes` short-
+    /// circuits before the `device_fp_of` rehash it exists to redo), quietly reopening the timing
+    /// gap it exists to close -- and nothing else in this suite would catch that, since every other
+    /// test here observes only `ConnectDecision`, never the equalization's internal cost.
+    #[test]
+    fn the_equalization_dummy_key_parses_as_a_valid_ed25519_point() {
+        let (sign_bytes, _agree_bytes) = *EQUALIZATION_DUMMY_KEYS;
+        assert!(
+            VerifyingKey::from_bytes(&sign_bytes).is_ok(),
+            "EQUALIZATION_DUMMY_KEYS's sign half must decompress as a valid Ed25519 point"
+        );
+    }
+
+    /// The load-bearing test for the coverage gap td-4bcf24 exists to close: a neuter that replaced
+    /// every one of `HostConnectAuthorizer::authorize`'s eight `deny_with_equalized_work()` return
+    /// sites with a plain `Deny` left this whole suite green -- nothing asserted
+    /// that a pre-crypto denial actually ran the timing equalization, only that it returned `Deny`.
+    /// This test closes that: it asserts both the verdict AND that `equalize_denial_work` ran
+    /// exactly once, so reverting any of those eight call sites back to a plain `Deny` fails it.
+    #[tokio::test]
+    async fn a_denial_for_an_unenrolled_from_fp_runs_the_timing_equalization() {
+        reset_equalization_calls();
+        let (store, _member_id) = store_with_active_member("alex");
+        let authorizer =
+            HostConnectAuthorizer::new(SqliteDeviceLookup::new(store)).with_now_fn(|| 0);
+
+        let stranger = DeviceKey::from_seeds([0x60; 32], [0x61; 32]).device_fp();
+        match authorizer.authorize(&stranger).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => panic!("expected Deny for an unenrolled device_fp"),
+        }
+        assert_eq!(
+            equalization_calls(),
+            1,
+            "an unenrolled from_fp is denied by checks 1-2, before any crypto -- that denial must \
+             go through deny_with_equalized_work(), which calls equalize_denial_work() exactly \
+             once. A count of 0 here means the call site that denied this request has been \
+             reverted to a plain ConnectDecision::Deny, silently reopening the timing gap between \
+             an unenrolled from_fp and a live member's device -- exactly the regression a neuter \
+             of all 8 deny_with_equalized_work() call sites proved this suite could not otherwise \
+             catch."
+        );
+    }
+
+    /// The `Allow` side of the same coverage: the real path already pays the parse-and-rehash cost
+    /// `equalize_denial_work` exists to imitate, so it must never run the dummy work too -- doing
+    /// so would waste cycles and would make `Allow` slower than the denials it is supposed to be
+    /// indistinguishable from, the opposite of what the equalization is for.
+    #[tokio::test]
+    async fn an_allow_does_not_run_the_timing_equalization() {
+        reset_equalization_calls();
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x62; 32], [0x63; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+        let authorizer =
+            HostConnectAuthorizer::new(SqliteDeviceLookup::new(store)).with_now_fn(|| 0);
+
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Allow { .. } => {}
+            ConnectDecision::Deny => panic!("expected Allow for an active member's own device"),
+        }
+        assert_eq!(
+            equalization_calls(),
+            0,
+            "an Allow must never call equalize_denial_work() -- the Allow path already performs \
+             the real VerifyingKey::from_bytes/X25519PublicKey::from/device_fp_of work that \
+             function exists to imitate for a Deny, so running the dummy work on top of the real \
+             work would be pure waste and would make Allow measurably slower than the denials it \
+             is supposed to be indistinguishable from."
+        );
+    }
+
+    /// Pins the deliberate exception documented at check 0 in `authorize`: a rate-limited
+    /// rejection stays a PLAIN `ConnectDecision::Deny`, never routed through
+    /// `deny_with_equalized_work()`. Without a test observing the equalization call count
+    /// directly, a future reader could "fix" what looks like a missed spot by wiring check 0
+    /// through the equalizer too -- which check 0's own comment explains would hand a flooder
+    /// exactly the crypto-work amplification the rate limiter exists to deny, since a rejection
+    /// here reveals only limiter state, never membership.
+    #[tokio::test]
+    async fn a_rate_limited_denial_does_not_run_the_timing_equalization() {
+        reset_equalization_calls();
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x64; 32], [0x65; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+        let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store))
+            .with_now_fn(|| 0)
+            .with_connect_rate_limit(ConnectRateLimitConfig {
+                per_fp: RateLimitConfig {
+                    burst: 1.0,
+                    refill_per_sec: 0.0,
+                },
+                global: ConnectRateLimitConfig::default().global,
+                max_tracked_fps: ConnectRateLimitConfig::default().max_tracked_fps,
+            });
+
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Allow { .. } => {}
+            ConnectDecision::Deny => panic!("first call must Allow: per-fp burst is 1"),
+        }
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => panic!(
+                "second call must Deny: the per-fp burst of 1 is exhausted, refill_per_sec is 0, \
+                 and the clock is frozen at the same instant -- even this genuinely live, enrolled \
+                 device is throttled once its own bucket is empty"
+            ),
+        }
+        assert_eq!(
+            equalization_calls(),
+            0,
+            "a rate-limited denial (check 0) must never call equalize_denial_work() -- if this \
+             counter is nonzero, check 0 has been rewired to route through \
+             deny_with_equalized_work(), reversing the deliberate exception documented at that \
+             check: a rate-limited rejection reveals only limiter state, not membership, so \
+             spending crypto work equalizing it would hand a flooder exactly the amplification \
+             the rate limiter exists to deny."
+        );
+    }
+
+    // Deliberately no wall-clock timing assertion anywhere in this section (e.g. asserting a
+    // Deny and an Allow complete within some close elapsed-time tolerance of each other): such an
+    // assertion would be flaky under ordinary scheduling/allocator/CPU-frequency jitter, and
+    // passing it would not actually prove the equalization works -- only that this run, on this
+    // machine, happened to produce two close-enough numbers. `the_equalization_dummy_key_parses_
+    // as_a_valid_ed25519_point` above is the meaningful thing to test instead: that the dummy
+    // constant is valid, so `equalize_denial_work` always performs the same SHAPE of work an
+    // `Allow` does, which is what this module can actually guarantee deterministically.
 }

@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.23) + Execution Plan
+# Spindle — System Design Document (draft v0.9.24) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -59,6 +59,13 @@
 > `MAX_REGISTRY_LEN` ceiling it is **3**/**4**; the same 449 B cap figure corrects the CONNECT `auth_token`
 > presentation in §A4 — a full 32-cap token measures **19,751 B**, 40% under the 32 KiB ceiling, not the previously
 > stated 19,106 B/42% (user decision, 2026-09-07).
+> v0.9.24: §A5's connect limiter amended — the per-`from_fp` token bucket is kept but capacity-bounded and paired
+> with a global bucket over the connect endpoint, because `from_fp` is unverified at authorize time (rotation
+> defeats a per-fp-only bucket, and each fabricated fp allocates state); timing equalization stated as best-effort
+> with the residual store-side asymmetry documented rather than claimed away; the two denial modes the shape creates
+> (targeted lockout of a named `from_fp`, and outright refusal of untracked devices once the bounded map is full and
+> throttled) recorded alongside it, the first gated on an unproven expectation that §A5's permission set refuses a
+> publish carrying another device's inbox as its reply (user decision, 2026-09-08).
 
 ---
 
@@ -478,9 +485,33 @@ Photos because they're in Family") derived directly from the union model.
   two connections to three. Finalized in S1, amended in S5; recorded in ADR-002's
   topology table.
 - **Host MUST validate** on every `connect`: reply subject starts with `_INBOX_<from_fp>.`; sender is an active member
-  device (cheap check **before** crypto) or holds a valid unused invite; per-`from_fp` token bucket and
-  max-concurrent-sessions; `sid` not bound to a different `from_fp`. All rejections are **uniform silent drops**
-  (no distinguishable not-member / rate-limited / bad-envelope responses, timing included).
+  device (cheap check **before** crypto) or holds a valid unused invite; per-`from_fp` token bucket **and** a global
+  token bucket over the connect endpoint [v0.9.24], and max-concurrent-sessions; `sid` not bound to a different
+  `from_fp`. All rejections are **uniform silent drops** (no distinguishable not-member / rate-limited / bad-envelope
+  responses, timing included).
+- **Why the per-`from_fp` bucket cannot stand alone** [v0.9.24]: the connect authorizer is structurally forced to run
+  *before* any signature is checked — it is what resolves the `sign_pk` the signature would be checked against — so
+  `from_fp` is unverified and attacker-chosen at that moment. A limiter keyed only on it is defeated by rotating
+  `from_fp` (every offer arrives at a fresh, full bucket), and each fabricated `from_fp` allocates bucket state,
+  making the limiter its own memory-exhaustion surface. The per-`from_fp` bucket is kept — it is what bounds a
+  single *identified* device — but lives in a **capacity-bounded** map, and is paired with a global bucket that
+  bounds total connect-lookup work no matter how many identities an attacker names. Accepted cost: **shared fate** —
+  a flooder draining the global bucket slows legitimate connects too. Timing equalization is best-effort by
+  construction: the authorizer performs the same key parse and `device_fp` recompute on a rejected lookup as on an
+  accepted one, but the store-side cost difference between a registry hit and a miss remains, bounded by these
+  limiters and by the uniform silent drop rather than eliminated.
+- **Two denial modes this shape creates**, recorded here rather than discovered in production [v0.9.24]: (1) because
+  the bucket's key is attacker-chosen, an attacker that reaches the authorizer naming a *victim's* `from_fp` drains
+  that victim's bucket and locks that one device out for as long as the flood runs — a targeted denial the global
+  bucket cannot even see, since a per-`from_fp` refusal short-circuits before the global bucket is consulted.
+  Reaching the authorizer under a spoofed `from_fp` additionally requires publishing with a reply subject of
+  `_INBOX_<victim_fp>.`, because the host validates the reply prefix *before* consulting the authorizer, and §A5's
+  own permission set (`sub _INBOX_<own>.>`) is expected to refuse exactly that publish. **That expectation is not
+  yet proven**, and it is the single check that decides whether this mode is live at all. (2) When the bounded map
+  is full and every tracked bucket is still throttled, a device the map is not already tracking is refused
+  outright — a harder denial than shared fate, and one that bites even while the global bucket is completely full.
+  Failing closed is still correct there (the alternative is the unbounded allocation the bound exists to prevent),
+  but it is a stronger cost than "slows legitimate connects", and is named separately so the two are not confused.
 - Consequences: an A1 attacker cannot reach/enumerate/flood hosts it has no cap for, cannot see/inject into other
   clients' sessions, cannot read other inboxes, cannot proxy through a host; an A5 attacker with fresh keys gets no
   connection at all.

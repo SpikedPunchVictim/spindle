@@ -13,6 +13,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
+
+use spindle_core::Fingerprint;
 
 /// Token-bucket parameters. Defaults are generous-but-bounded placeholders (DESIGN.md does not
 /// specify numbers for this layer's limiter, only that one must exist) — documented here, like
@@ -37,9 +40,108 @@ impl Default for RateLimitConfig {
     }
 }
 
+impl RateLimitConfig {
+    /// Returns this config with any non-finite (`NaN`/`inf`) or negative `burst`/`refill_per_sec`
+    /// replaced by `0.0`. Both fields are `pub` on a `pub` type reachable from
+    /// `HostConnectAuthorizer::with_connect_rate_limit`, so nothing upstream of construction can
+    /// be trusted to have validated them — sanitizing once, here, is the only place that is
+    /// guaranteed to run no matter how the config arrived.
+    ///
+    /// `0.0` is the correct replacement for BOTH fields, not merely a convenient one: a bucket
+    /// with `burst: 0.0` starts, and stays, empty (`refill_and_spend`'s `tokens >= 1.0` check
+    /// never passes), and `refill_per_sec: 0.0` never adds anything back — so a sanitized field
+    /// denies every request through it, fails CLOSED. That direction is deliberate: a
+    /// misconfigured limiter that refuses connects is loud, breaks the first test or smoke run,
+    /// and gets fixed immediately; one that silently permits everything is invisible and defeats
+    /// the control it exists to be, with no test short of one built to specifically probe for it
+    /// (see `a_nan_refill_rate_cannot_disable_the_limiter` et al., below) ever noticing.
+    ///
+    /// The `NaN` case is not hypothetical carelessness — it defeats this type's own arithmetic
+    /// specifically: `f64::min` returns the *non*-`NaN` operand, so in `refill`,
+    /// `(bucket.tokens + NaN).min(config.burst)` evaluates to `config.burst` on every single call,
+    /// refilling the bucket to full regardless of elapsed time. A `refill_per_sec` of `NaN` alone
+    /// — no attacker control needed, just a bad config value — silently turns this limiter into a
+    /// no-op while every doc comment in this module insists it cannot be. `burst: f64::INFINITY`
+    /// fails open the same way without even needing `NaN`: `.min(inf)` never caps anything, so the
+    /// bucket is effectively bottomless.
+    ///
+    /// Deliberately does NOT touch [`ConnectRateLimitConfig::max_tracked_fps`] — see that field's
+    /// own doc comment for why `0` there already fails closed and needs no sanitizing.
+    fn sanitized(self) -> Self {
+        fn sanitize_one(parameter: &'static str, value: f64) -> f64 {
+            if value.is_finite() && value >= 0.0 {
+                return value;
+            }
+            // Only logged when sanitization actually changes something — the normal, correctly-
+            // configured path never emits this.
+            tracing::error!(
+                parameter,
+                value,
+                "RateLimitConfig::sanitized: non-finite or negative parameter rejected and \
+                 replaced with 0.0. 0.0 denies every request through this bucket (fails the \
+                 limiter closed) rather than the alternative of silently permitting every \
+                 request (failing it open) — check the caller that built this config"
+            );
+            0.0
+        }
+        RateLimitConfig {
+            burst: sanitize_one("burst", self.burst),
+            refill_per_sec: sanitize_one("refill_per_sec", self.refill_per_sec),
+        }
+    }
+}
+
 struct Bucket {
     tokens: f64,
     last_refill_ts: u64,
+}
+
+/// Advances `bucket` to `ts`: adds tokens for elapsed time at `config.refill_per_sec`, capped at
+/// `config.burst`, and moves `last_refill_ts` forward. Split out from
+/// [`refill_and_spend`]/`RateLimiter::try_acquire` so [`ConnectRateLimiter::try_acquire`] can
+/// refill a bucket without necessarily spending from it (its capacity-eviction sweep needs exactly
+/// that: bring every tracked bucket up to date, then look at whether it is full, without charging
+/// anyone a token for being swept).
+///
+/// The `last_refill_ts` write below is not bookkeeping incidental to the token math — it IS the
+/// reason repeated calls at the same or a later `ts` don't keep re-granting tokens for time that
+/// was already paid out. Drop it (or make it conditional on `elapsed > 0.0`, which amounts to the
+/// same mistake) and every bucket keeps measuring `elapsed` from the moment it was *created*,
+/// forever: a bucket touched twice a second real-time looks, ts-wise, like it has been idle since
+/// creation on every call after the first, so it refills to `burst` almost immediately and never
+/// throttles again. `cargo test` alone does not catch this — see
+/// `refilling_advances_the_high_water_mark_so_a_repeat_call_at_the_same_ts_is_denied` below and
+/// its `ConnectRateLimiter` twin, which are the only tests that call `try_acquire` twice at the
+/// *same* `ts` after a refill has already happened, the one shape that tells correct and broken
+/// apart.
+///
+/// The write only ever moves `last_refill_ts` forward, though. `ts.saturating_sub` above already
+/// clamps `elapsed` to `0.0` when `ts` is behind `last_refill_ts` (a backward clock step), but
+/// that alone does not stop the reference point itself from moving backwards too — and if it did,
+/// a later call at the original, larger `ts` would measure `elapsed` from that earlier point and
+/// hand a possibly-just-drained bucket a full burst's worth of tokens for time that never passed.
+/// `last_refill_ts` is a monotonic high-water mark, not "the ts of the last call": a clock that
+/// steps backwards must never be allowed to manufacture tokens. See
+/// `a_backward_clock_step_does_not_grant_a_free_refill` below.
+fn refill(bucket: &mut Bucket, config: &RateLimitConfig, ts: u64) {
+    let elapsed = ts.saturating_sub(bucket.last_refill_ts) as f64;
+    bucket.tokens = (bucket.tokens + elapsed * config.refill_per_sec).min(config.burst);
+    if ts > bucket.last_refill_ts {
+        bucket.last_refill_ts = ts;
+    }
+}
+
+/// Refills `bucket` to `ts`, then attempts to spend one token. Returns `true` (token spent) or
+/// `false` (bucket empty, caller throttled) — the shared arithmetic behind both
+/// `RateLimiter::try_acquire` and [`ConnectRateLimiter::try_acquire`].
+fn refill_and_spend(bucket: &mut Bucket, config: &RateLimitConfig, ts: u64) -> bool {
+    refill(bucket, config, ts);
+    if bucket.tokens >= 1.0 {
+        bucket.tokens -= 1.0;
+        true
+    } else {
+        false
+    }
 }
 
 /// The rate limiter's per-server state — one bucket per caller key, lazily created on first use.
@@ -51,7 +153,10 @@ pub(crate) struct RateLimiter {
 impl RateLimiter {
     pub(crate) fn new(config: RateLimitConfig) -> Self {
         RateLimiter {
-            config,
+            // Sanitize once, at construction — see `RateLimitConfig::sanitized`'s doc comment for
+            // why an unsanitized `NaN`/`inf`/negative field would otherwise silently turn this
+            // limiter into a no-op.
+            config: config.sanitized(),
             buckets: RefCell::new(HashMap::new()),
         }
     }
@@ -68,17 +173,235 @@ impl RateLimiter {
             last_refill_ts: ts,
         });
 
-        let elapsed = ts.saturating_sub(bucket.last_refill_ts) as f64;
-        bucket.tokens =
-            (bucket.tokens + elapsed * self.config.refill_per_sec).min(self.config.burst);
-        bucket.last_refill_ts = ts;
+        refill_and_spend(bucket, &self.config, ts)
+    }
+}
 
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
+/// Token-bucket parameters for [`ConnectRateLimiter`], the pre-authentication limiter in front of
+/// `HostConnectAuthorizer` (DESIGN.md §A5: "per-`from_fp` token bucket"). These are, like
+/// [`RateLimitConfig`]'s own defaults, retunable placeholders — DESIGN.md mandates that a token
+/// bucket exist at this layer but specifies no numbers for it.
+///
+/// The defaults below are deliberately far tighter than [`RateLimitConfig::default`]'s
+/// 200 burst / 50 per-sec: that limiter guards the post-auth VFS-RPC path, where the caller has
+/// already proven a signature. This one guards a *pre-authentication* path — the connect
+/// authorizer runs before any signature has been checked, so it is the first thing an attacker
+/// with no valid credential at all can reach and hammer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConnectRateLimitConfig {
+    /// Per-`from_fp` bucket: bounds how fast one *identified* device (a specific claimed
+    /// `from_fp`) may retry connects. Default: burst 10, refill 1/sec.
+    pub per_fp: RateLimitConfig,
+    /// Bucket shared across every `from_fp`: bounds total connect-lookup work regardless of how
+    /// many distinct (and, pre-auth, unverified) fingerprints an attacker rotates through.
+    /// Default: burst 200, refill 50/sec.
+    pub global: RateLimitConfig,
+    /// Upper bound on the number of per-fp buckets tracked at once, so an attacker who fabricates
+    /// unboundedly many `from_fp` values cannot turn the limiter itself into an unbounded
+    /// allocation. Default: 4096.
+    ///
+    /// Deliberately left out of the `sanitized()` treatment [`RateLimitConfig::burst`] and
+    /// [`RateLimitConfig::refill_per_sec`] get in [`ConnectRateLimiter::new`]: `0` here already
+    /// fails CLOSED on its own — `try_acquire`'s capacity check (`buckets.len() >=
+    /// max_tracked_fps`) is `true` before any bucket exists, so with `0` no `from_fp`, ever, can
+    /// be admitted into the map, and every connect from a not-yet-tracked fp is refused. That is
+    /// the opposite failure direction from `burst`/`refill_per_sec`'s `NaN`/`inf` hazard, so do
+    /// not "fix" a `0` here by giving it some nonzero fallback default under the assumption it
+    /// must be a misconfiguration — that would turn an already-safe fail-closed value into a
+    /// fail-open one.
+    pub max_tracked_fps: usize,
+}
+
+impl Default for ConnectRateLimitConfig {
+    fn default() -> Self {
+        ConnectRateLimitConfig {
+            per_fp: RateLimitConfig {
+                burst: 10.0,
+                refill_per_sec: 1.0,
+            },
+            global: RateLimitConfig {
+                burst: 200.0,
+                refill_per_sec: 50.0,
+            },
+            max_tracked_fps: 4096,
         }
+    }
+}
+
+struct ConnectLimiterState {
+    buckets: HashMap<Fingerprint, Bucket>,
+    global: Bucket,
+}
+
+/// Pre-authentication rate limiter for `HostConnectAuthorizer`.
+///
+/// DESIGN.md §A5 calls for a "per-`from_fp` token bucket", but at the connect authorizer
+/// `from_fp` is unverified and attacker-chosen: it is exactly the value the authorizer uses to
+/// look up the `sign_pk` a signature would later be checked against, so nothing has vouched for
+/// it yet. A limiter keyed only on `from_fp` is therefore defeated by an attacker who simply
+/// rotates the claimed fingerprint on every connect attempt — and worse, each fabricated fp
+/// allocates a new bucket, so the limiter's own state becomes an unbounded-allocation target.
+///
+/// This type resolves that tension by keeping both layers:
+/// - a per-fp bucket (`ConnectLimiterState::buckets`), which still bounds a single *identified*
+///   device the way §A5 describes, but capped at `max_tracked_fps` entries: when full, every
+///   bucket that has refilled back to full is swept out to make room (see `try_acquire` step 2) —
+///   there is no recency ordering, so a bucket is evicted purely because it is fully refilled
+///   (indistinguishable from a never-created one), not because it is the "oldest" one;
+/// - a global bucket (`ConnectLimiterState::global`), which bounds total connect-lookup work
+///   regardless of identity rotation, since a per-fp bucket alone cannot.
+///
+/// Accepted cost: shared fate. A flood that exhausts the global bucket slows legitimate connects
+/// too, not just the flooder — the alternative (no global bound) lets identity rotation defeat
+/// throttling entirely, which is worse. This shape is recorded as a DESIGN.md amendment
+/// (v0.9.24, §A5).
+///
+/// An independent adversarial review (td-4bcf24) found two further denial modes this comment
+/// did not previously name. Both are CONFIRMED against this code by measurement, not
+/// speculation:
+///
+/// **Mode 1 — targeted lockout of a named `from_fp`.** The bucket key is attacker-chosen — the
+/// same premise the paragraph above already relies on — so an attacker who reaches
+/// `HostConnectAuthorizer::authorize` naming a *victim's* `from_fp` drains that victim's own
+/// per-fp bucket and locks that one device out for as long as the flood runs. At the defaults
+/// above (`per_fp` burst 10, refill 1/sec), roughly two offers per second suffice to keep the
+/// bucket permanently empty. Measured by the review: a victim succeeded 0/60 times during a
+/// sustained flood while a bystander fp was allowed 10/10 at the same instant.
+///
+/// The global bucket cannot see this happening: `try_acquire` returns `false` on a per-fp
+/// refusal *before* the global bucket is ever consulted — the same ordering the comment on the
+/// final `refill_and_spend(&mut state.global, ...)` call below defends as load-bearing. It is
+/// load-bearing, and this is its cost: a flood aimed at a single victim fp spends zero global
+/// tokens and trips no shared-fate signal at all. Read that comment and this one together — they
+/// are two halves of one trade-off.
+///
+/// Whether this mode is reachable at all is open, not settled either way. `HostConnectAuthorizer`
+/// is reached from `spindle_net::signaling::host::process_offer`, which calls `reply_prefix_ok`
+/// to validate the reply subject BEFORE it consults the authorizer, requiring the NATS reply to
+/// start with `_INBOX_<from_fp>.` — so spoofing a victim's `from_fp` here also requires
+/// publishing with the victim's own inbox as the reply-to, which §A5's permission set (`sub
+/// _INBOX_<own_device_fp>.>`, see `spindle_helper::permissions`) is expected to refuse. **That
+/// expectation is not proven anywhere in this repo**: `spikes/s1-callout` has a check that a
+/// device cannot SUBSCRIBE to another device's inbox, but no check that it cannot PUBLISH with
+/// one as a reply-to. Tracked as **td-fc5a30**, which decides whether this mode is live.
+///
+/// **Mode 2 — outright refusal of untracked devices at capacity.** When the map is full
+/// (`max_tracked_fps`, default 4096) and every tracked bucket is still throttled, the sweep in
+/// `try_acquire` step 2 frees nothing, and `try_acquire` returns `false` for any fp the map does
+/// not already track. This is a *harder* denial than the shared-fate cost above — an outright
+/// refusal, not a slowdown — and it is decoupled from the global bucket: it bites even while the
+/// global bucket is completely full and untouched. The review measured 0/20 legitimate new
+/// devices admitted while the map sat at capacity with the global bucket full, recovering only
+/// roughly 10 seconds after the flood stopped.
+///
+/// Failing closed here is still the right call — the alternative is exactly the unbounded
+/// allocation `max_tracked_fps` exists to prevent — but this cost must not be mistaken for the
+/// shared-fate cost described above it: shared fate slows legitimate connects, this refuses them
+/// outright. It is also cheap to trigger: a request the global bucket will ultimately deny has
+/// *already* allocated its per-fp bucket and spent a per-fp token by that point, because both the
+/// map insert (`state.buckets.entry(fp).or_insert_with(...)`) and the per-fp `refill_and_spend`
+/// happen before the global bucket is checked at all. Filling the map to capacity is therefore
+/// decoupled from the global budget entirely.
+///
+/// Uses `std::sync::Mutex`, not `RefCell` (unlike [`RateLimiter`]): this limiter lives inside
+/// `HostConnectAuthorizer`, which must be `Send + Sync + 'static`.
+pub(crate) struct ConnectRateLimiter {
+    config: ConnectRateLimitConfig,
+    state: Mutex<ConnectLimiterState>,
+}
+
+impl ConnectRateLimiter {
+    pub(crate) fn new(config: ConnectRateLimitConfig) -> Self {
+        // Sanitize both buckets' configs once, at construction — see `RateLimitConfig::sanitized`'s
+        // doc comment. `max_tracked_fps` is passed through untouched; its own doc comment explains
+        // why `0` already fails closed and must not be sanitized.
+        let config = ConnectRateLimitConfig {
+            per_fp: config.per_fp.sanitized(),
+            global: config.global.sanitized(),
+            max_tracked_fps: config.max_tracked_fps,
+        };
+        let global = Bucket {
+            tokens: config.global.burst,
+            last_refill_ts: 0,
+        };
+        ConnectRateLimiter {
+            config,
+            state: Mutex::new(ConnectLimiterState {
+                buckets: HashMap::new(),
+                global,
+            }),
+        }
+    }
+
+    /// Attempts to spend one token for `fp` at time `ts`; returns `true` if the connect attempt
+    /// may proceed, `false` if it must be refused.
+    ///
+    /// A poisoned lock (some other thread panicked while holding it) fails closed: this returns
+    /// `false` rather than falling back to some "unlimited" behavior, since a limiter that stops
+    /// limiting under stress is worse than one that stops connects.
+    pub(crate) fn try_acquire(&self, fp: Fingerprint, ts: u64) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+
+        // Capacity-bounded per-fp map: only relevant when `fp` isn't already tracked and the map
+        // is already at capacity.
+        if !state.buckets.contains_key(&fp) && state.buckets.len() >= self.config.max_tracked_fps {
+            // Sweep buckets that have refilled back to full. A full bucket is indistinguishable
+            // from one that was never created — dropping it loses no throttling state, since the
+            // next request from that fp will just recreate an identical fresh bucket.
+            let per_fp = &self.config.per_fp;
+            state.buckets.retain(|_, bucket| {
+                refill(bucket, per_fp, ts);
+                bucket.tokens < per_fp.burst
+            });
+
+            // Still full after sweeping: every tracked bucket is actively throttled. Refuse the
+            // new fp rather than inserting anyway — the alternative turns this limiter into an
+            // unbounded allocation, which is the exact failure mode it exists to prevent.
+            if state.buckets.len() >= self.config.max_tracked_fps {
+                return false;
+            }
+        }
+
+        let per_fp_config = self.config.per_fp;
+        let bucket = state.buckets.entry(fp).or_insert_with(|| Bucket {
+            // A first-seen fp starts with a full bucket, never empty, so it isn't immediately
+            // throttled — same rule as `RateLimiter::try_acquire`.
+            tokens: per_fp_config.burst,
+            last_refill_ts: ts,
+        });
+        if !refill_and_spend(bucket, &per_fp_config, ts) {
+            return false;
+        }
+
+        // Only consult the global bucket once the per-fp bucket has allowed the request. Checking
+        // order here is load-bearing: if the global token were spent first, an already-throttled
+        // flooder would still drain the shared global budget on every attempt (the per-fp check
+        // would reject it afterward, but the global token is already gone). Checking per-fp first
+        // means a flooder stuck on its own bucket can never touch the global budget at all.
+        //
+        // This does accept one asymmetry: when the per-fp bucket allows but the global bucket
+        // then denies, the per-fp token has already been spent. That's deliberate and harmless —
+        // the request did not proceed either way, and the per-fp bucket refills on its own on the
+        // next attempt.
+        refill_and_spend(&mut state.global, &self.config.global, ts)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_fps(&self) -> usize {
+        match self.state.lock() {
+            Ok(state) => state.buckets.len(),
+            Err(_) => 0,
+        }
+    }
+
+    /// Test-only: poisons `state`'s lock by panicking while holding it, so tests can exercise the
+    /// fail-closed path in `try_acquire`.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let _state = self.state.lock().unwrap();
+        panic!("deliberate poison for test");
     }
 }
 
@@ -122,5 +445,397 @@ mod tests {
         assert!(!limiter.try_acquire(b"caller-a", 0));
         // A different caller has its own untouched bucket.
         assert!(limiter.try_acquire(b"caller-b", 0));
+    }
+
+    fn fp(seed: &[u8]) -> Fingerprint {
+        Fingerprint::of_parts(&[seed])
+    }
+
+    #[test]
+    fn connect_limiter_allows_up_to_the_per_fp_burst_then_throttles_that_fp() {
+        let limiter = ConnectRateLimiter::new(ConnectRateLimitConfig {
+            per_fp: RateLimitConfig {
+                burst: 2.0,
+                refill_per_sec: 0.0,
+            },
+            global: RateLimitConfig {
+                burst: 200.0,
+                refill_per_sec: 50.0,
+            },
+            max_tracked_fps: 4096,
+        });
+        let a = fp(b"connect-fp-a");
+        assert!(limiter.try_acquire(a, 0));
+        assert!(limiter.try_acquire(a, 0));
+        assert!(
+            !limiter.try_acquire(a, 0),
+            "third call at the same instant must be throttled by the per-fp bucket"
+        );
+    }
+
+    #[test]
+    fn connect_limiter_does_not_let_a_throttled_fp_drain_the_global_budget() {
+        // Global burst is 3, not 2: exactly enough for A's one legitimate success plus one each
+        // for B and C (3 total spends). If A's nine denials spent global tokens too — the bug
+        // this limiter's ordering (per-fp checked before global) prevents — the global bucket
+        // would run dry before both B and C could succeed.
+        let limiter = ConnectRateLimiter::new(ConnectRateLimitConfig {
+            per_fp: RateLimitConfig {
+                burst: 1.0,
+                refill_per_sec: 0.0,
+            },
+            global: RateLimitConfig {
+                burst: 3.0,
+                refill_per_sec: 0.0,
+            },
+            max_tracked_fps: 4096,
+        });
+        let a = fp(b"connect-fp-flooder");
+        // First call spends A's own token and one global token; the next nine must be denied by
+        // A's own (empty) bucket without ever touching the global bucket.
+        assert!(limiter.try_acquire(a, 0));
+        for _ in 0..9 {
+            assert!(
+                !limiter.try_acquire(a, 0),
+                "a throttled fp must stay throttled by its own bucket"
+            );
+        }
+        // Two global tokens remain (3 - 1, spent only by A's single success). Both B and C must
+        // be allowed, proving A's nine denials spent no additional global tokens.
+        let b = fp(b"connect-fp-b");
+        let c = fp(b"connect-fp-c");
+        assert!(
+            limiter.try_acquire(b, 0),
+            "global bucket must still have budget for a legitimate fp"
+        );
+        assert!(
+            limiter.try_acquire(c, 0),
+            "global bucket must still have budget for a second legitimate fp, proving A's nine \
+             denials spent no global tokens"
+        );
+    }
+
+    #[test]
+    fn connect_limiter_global_bucket_throttles_a_flood_that_rotates_from_fp() {
+        let limiter = ConnectRateLimiter::new(ConnectRateLimitConfig {
+            per_fp: RateLimitConfig {
+                burst: 10.0,
+                refill_per_sec: 0.0,
+            },
+            global: RateLimitConfig {
+                burst: 3.0,
+                refill_per_sec: 0.0,
+            },
+            max_tracked_fps: 4096,
+        });
+        assert!(limiter.try_acquire(fp(b"rotating-fp-1"), 0));
+        assert!(limiter.try_acquire(fp(b"rotating-fp-2"), 0));
+        assert!(limiter.try_acquire(fp(b"rotating-fp-3"), 0));
+        assert!(
+            !limiter.try_acquire(fp(b"rotating-fp-4"), 0),
+            "a fourth distinct fp must be denied once the global bucket is spent, even though \
+             each fp's own bucket is fresh"
+        );
+    }
+
+    #[test]
+    fn connect_limiter_refuses_a_new_fp_rather_than_growing_past_capacity() {
+        let limiter = ConnectRateLimiter::new(ConnectRateLimitConfig {
+            per_fp: RateLimitConfig {
+                burst: 1.0,
+                refill_per_sec: 0.0,
+            },
+            global: RateLimitConfig {
+                burst: 1000.0,
+                refill_per_sec: 1000.0,
+            },
+            max_tracked_fps: 2,
+        });
+        assert!(limiter.try_acquire(fp(b"capacity-fp-1"), 0));
+        assert!(limiter.try_acquire(fp(b"capacity-fp-2"), 0));
+        assert!(
+            !limiter.try_acquire(fp(b"capacity-fp-3"), 0),
+            "a third distinct fp must be refused once the map is at capacity and no bucket has \
+             refilled to full"
+        );
+        assert_eq!(limiter.tracked_fps(), 2);
+    }
+
+    #[test]
+    fn connect_limiter_evicts_refilled_buckets_to_admit_a_new_fp() {
+        let limiter = ConnectRateLimiter::new(ConnectRateLimitConfig {
+            per_fp: RateLimitConfig {
+                burst: 1.0,
+                refill_per_sec: 1.0,
+            },
+            global: RateLimitConfig {
+                burst: 1000.0,
+                refill_per_sec: 1000.0,
+            },
+            max_tracked_fps: 2,
+        });
+        assert!(limiter.try_acquire(fp(b"evict-fp-1"), 0));
+        assert!(limiter.try_acquire(fp(b"evict-fp-2"), 0));
+        // Five seconds later both buckets have refilled to full (burst 1.0, refill 1.0/sec), so
+        // the capacity sweep should evict them and admit a third fp.
+        assert!(
+            limiter.try_acquire(fp(b"evict-fp-3"), 5),
+            "fully-refilled buckets must be evicted to admit a new fp at capacity"
+        );
+        assert!(limiter.tracked_fps() <= 2);
+    }
+
+    #[test]
+    fn connect_limiter_denies_when_its_lock_is_poisoned() {
+        let limiter =
+            std::sync::Arc::new(ConnectRateLimiter::new(ConnectRateLimitConfig::default()));
+        let poisoner = std::sync::Arc::clone(&limiter);
+        let result = std::thread::spawn(move || poisoner.poison_for_test()).join();
+        assert!(
+            result.is_err(),
+            "poison_for_test must panic while holding the lock"
+        );
+        assert!(
+            !limiter.try_acquire(fp(b"poison-fp"), 0),
+            "a poisoned limiter must fail closed, never become unlimited"
+        );
+    }
+
+    // --- td-4bcf24: regression coverage for defects an independent adversarial review found in
+    // this module's `refill` and config handling. See that task's notes for the full analysis;
+    // each test below is named for the specific defect it pins.
+
+    #[test]
+    fn refilling_advances_the_high_water_mark_so_a_repeat_call_at_the_same_ts_is_denied() {
+        // Deleting `refill`'s `last_refill_ts` advance leaves this exact suite green everywhere
+        // except here: the two pre-existing `refills_over_time` tests each advance the clock
+        // exactly once from bucket creation, which is the one case where the correct and the
+        // neutered `refill` agree. The fourth call below — a SECOND `try_acquire` at the same
+        // ts=1 that just granted a token — is the whole point: under the neuter, `last_refill_ts`
+        // never left `0` (bucket creation), so this call re-measures elapsed time as `1 - 0 = 1`
+        // all over again and wrongly hands out a second token.
+        let limiter = RateLimiter::new(RateLimitConfig {
+            burst: 1.0,
+            refill_per_sec: 1.0,
+        });
+        assert!(
+            limiter.try_acquire(b"caller-a", 0),
+            "ts=0: bucket starts full"
+        );
+        assert!(
+            !limiter.try_acquire(b"caller-a", 0),
+            "ts=0 again: no time has passed, bucket is empty"
+        );
+        assert!(
+            limiter.try_acquire(b"caller-a", 1),
+            "ts=1: exactly one second/token has elapsed"
+        );
+        assert!(
+            !limiter.try_acquire(b"caller-a", 1),
+            "ts=1 AGAIN must be denied — no time passed since the previous call, so no token \
+             should have refilled. An `Allow` here means `last_refill_ts` was not advanced and \
+             elapsed time is still being measured from bucket creation"
+        );
+    }
+
+    #[test]
+    fn connect_limiter_refilling_advances_the_high_water_mark_so_a_repeat_call_at_the_same_ts_is_denied(
+    ) {
+        // `ConnectRateLimiter::try_acquire` spends through the same `refill` this module's
+        // `RateLimiter` uses (for its per-fp bucket) — see the sibling test above for the full
+        // reasoning. A generous global bucket keeps this test isolated to the per-fp path.
+        let limiter = ConnectRateLimiter::new(ConnectRateLimitConfig {
+            per_fp: RateLimitConfig {
+                burst: 1.0,
+                refill_per_sec: 1.0,
+            },
+            global: RateLimitConfig {
+                burst: 1000.0,
+                refill_per_sec: 1000.0,
+            },
+            max_tracked_fps: 4096,
+        });
+        let a = fp(b"connect-fp-repeat-ts");
+        assert!(limiter.try_acquire(a, 0), "ts=0: bucket starts full");
+        assert!(!limiter.try_acquire(a, 0), "ts=0 again: bucket is empty");
+        assert!(limiter.try_acquire(a, 1), "ts=1: one token refilled");
+        assert!(
+            !limiter.try_acquire(a, 1),
+            "ts=1 AGAIN must be denied — a second token here means `last_refill_ts` was never \
+             advanced past bucket creation"
+        );
+    }
+
+    #[test]
+    fn connect_limiter_global_bucket_refills_over_time() {
+        // Pins the global bucket's own refill specifically: replacing the config
+        // `ConnectRateLimiter::try_acquire`'s final `refill_and_spend(&mut state.global, ...)`
+        // call is given with one whose `refill_per_sec` is `0.0` leaves every other test in this
+        // module green, because none of them advance the clock far enough, on a global bucket
+        // that has not already been exhausted, to observe a refill. This test drains the global
+        // bucket, advances the clock, and requires the refill to actually have happened.
+        let limiter = ConnectRateLimiter::new(ConnectRateLimitConfig {
+            // Generous enough that the per-fp bucket never interferes with the global assertions.
+            per_fp: RateLimitConfig {
+                burst: 1000.0,
+                refill_per_sec: 1000.0,
+            },
+            global: RateLimitConfig {
+                burst: 2.0,
+                refill_per_sec: 1.0,
+            },
+            max_tracked_fps: 4096,
+        });
+        let a = fp(b"connect-fp-global-refill-a");
+        let b = fp(b"connect-fp-global-refill-b");
+        let c = fp(b"connect-fp-global-refill-c");
+        assert!(
+            limiter.try_acquire(a, 0),
+            "global burst is 2: first spend allowed"
+        );
+        assert!(
+            limiter.try_acquire(b, 0),
+            "global burst is 2: second spend allowed"
+        );
+        assert!(
+            !limiter.try_acquire(c, 0),
+            "global bucket is drained at ts=0: a third distinct fp must be denied"
+        );
+        assert!(
+            limiter.try_acquire(c, 1),
+            "one second later, at 1 token/sec, exactly one global token has refilled — this \
+             specifically fails if the global bucket's refill_per_sec is not actually wired to \
+             refill_and_spend"
+        );
+    }
+
+    #[test]
+    fn a_backward_clock_step_does_not_grant_a_free_refill() {
+        // `saturating_sub` clamps `elapsed` to `0` when `ts` is behind `last_refill_ts`, but that
+        // alone does not stop `last_refill_ts` itself from being written backwards. If it were,
+        // a later call at the ORIGINAL, larger ts would measure elapsed time from the backward-
+        // stepped point and hand out a full burst — not just the one token that time actually
+        // earned.
+        let limiter = RateLimiter::new(RateLimitConfig {
+            burst: 5.0,
+            refill_per_sec: 1.0,
+        });
+        // Drain the bucket at a large ts.
+        for _ in 0..5 {
+            assert!(limiter.try_acquire(b"caller-a", 1000));
+        }
+        assert!(
+            !limiter.try_acquire(b"caller-a", 1000),
+            "bucket must be fully drained"
+        );
+        // Clock steps backwards. Must still be empty — and must not move last_refill_ts backwards.
+        assert!(
+            !limiter.try_acquire(b"caller-a", 10),
+            "a backward clock step must not itself grant a token"
+        );
+        // Clock resumes forward from the ORIGINAL high point, one second later: exactly one token
+        // should have refilled (1 elapsed second at 1/sec since ts=1000), not a full burst of 5
+        // (which is what measuring elapsed from the backward-stepped ts=10 would produce: 991
+        // apparent elapsed seconds, capped at burst).
+        assert!(
+            limiter.try_acquire(b"caller-a", 1001),
+            "exactly one second has passed since the bucket was last legitimately touched at \
+             ts=1000, so exactly one token should be available"
+        );
+        assert!(
+            !limiter.try_acquire(b"caller-a", 1001),
+            "a second token here means the backward step at ts=10 was allowed to move \
+             last_refill_ts backwards, manufacturing a free near-full-burst refill"
+        );
+    }
+
+    #[test]
+    fn a_nan_refill_rate_cannot_disable_the_limiter() {
+        // `f64::min` returns the non-NaN operand, so an unsanitized `(tokens + NaN).min(burst)`
+        // evaluates to `burst` on every call — a silent, permanent full refill regardless of
+        // elapsed time. `RateLimitConfig::sanitized` must replace this with `0.0` instead, which
+        // denies everything rather than allowing everything.
+        let limiter = RateLimiter::new(RateLimitConfig {
+            burst: 2.0,
+            refill_per_sec: f64::NAN,
+        });
+        assert!(limiter.try_acquire(b"caller-a", 0));
+        assert!(limiter.try_acquire(b"caller-a", 0));
+        assert!(
+            !limiter.try_acquire(b"caller-a", 0),
+            "burst of 2 exhausted; a NaN refill_per_sec must not silently refill to full"
+        );
+        assert!(
+            !limiter.try_acquire(b"caller-a", 1_000_000),
+            "sanitized refill_per_sec is 0.0: no amount of elapsed time should refill this bucket"
+        );
+    }
+
+    #[test]
+    fn an_infinite_burst_cannot_disable_the_limiter() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            burst: f64::INFINITY,
+            refill_per_sec: 1.0,
+        });
+        assert!(
+            !limiter.try_acquire(b"caller-a", 0),
+            "an infinite burst must be sanitized to 0.0 (denying immediately), not left as a \
+             bottomless bucket"
+        );
+    }
+
+    #[test]
+    fn a_negative_config_value_cannot_disable_the_limiter() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            burst: -5.0,
+            refill_per_sec: -1.0,
+        });
+        assert!(
+            !limiter.try_acquire(b"caller-a", 0),
+            "negative burst/refill_per_sec must be sanitized to 0.0, not treated as unlimited or \
+             inverted"
+        );
+    }
+
+    #[test]
+    fn connect_limiter_sanitizes_a_nan_per_fp_refill_rate() {
+        let limiter = ConnectRateLimiter::new(ConnectRateLimitConfig {
+            per_fp: RateLimitConfig {
+                burst: 2.0,
+                refill_per_sec: f64::NAN,
+            },
+            global: RateLimitConfig {
+                burst: 1000.0,
+                refill_per_sec: 1000.0,
+            },
+            max_tracked_fps: 4096,
+        });
+        let a = fp(b"connect-fp-nan-per-fp");
+        assert!(limiter.try_acquire(a, 0));
+        assert!(limiter.try_acquire(a, 0));
+        assert!(
+            !limiter.try_acquire(a, 0),
+            "a NaN per_fp refill_per_sec must be sanitized to 0.0, not defeat the per-fp bucket"
+        );
+    }
+
+    #[test]
+    fn connect_limiter_sanitizes_an_infinite_global_burst() {
+        let limiter = ConnectRateLimiter::new(ConnectRateLimitConfig {
+            per_fp: RateLimitConfig {
+                burst: 1000.0,
+                refill_per_sec: 1000.0,
+            },
+            global: RateLimitConfig {
+                burst: f64::INFINITY,
+                refill_per_sec: 1.0,
+            },
+            max_tracked_fps: 4096,
+        });
+        assert!(
+            !limiter.try_acquire(fp(b"connect-fp-global-inf"), 0),
+            "an infinite global burst must be sanitized to 0.0, denying immediately, rather than \
+             granting a bottomless global bucket"
+        );
     }
 }

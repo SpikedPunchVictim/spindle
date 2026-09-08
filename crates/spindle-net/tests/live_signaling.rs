@@ -303,6 +303,7 @@ fn host_opts() -> HostOptions {
         bind_ip: ICE_BIND_IP,
         ice_timeout: Duration::from_secs(10),
         session_close_timeout: Duration::from_secs(5),
+        max_concurrent_connects: HostOptions::default().max_concurrent_connects,
     }
 }
 
