@@ -158,6 +158,22 @@ pub enum StoreError {
     )]
     DeviceKeyBindingMismatch { device_fp: Fingerprint },
 
+    /// [`Store::repair_device_keys`]'s alg_id guard: the supplied [`crate::model::DevicePublicKeys`]
+    /// names an algorithm other than `ALG_ID_V1`, which this method cannot verify — it parses
+    /// `sign_pk`/`agree_pk` as Ed25519/X25519 unconditionally, so a different `alg_id` is
+    /// unverifiable by this code path, not merely unsupported in the sense of "not yet
+    /// implemented". Carries ONLY `alg_id`, deliberately no `Fingerprint`: `StoreError`'s
+    /// `Display` is logged via `error = %e` at `tracing` call sites in `spindle-host-core`, and
+    /// this enum already has variants that leak more than they should (`DeviceNotFound`'s
+    /// untruncated base32 fingerprint, `Confine`'s raw filesystem paths — td-0bc380 tracks fixing
+    /// that). This variant must not widen that leak surface in the meantime, so it says nothing
+    /// about which device it is.
+    #[error(
+        "unsupported device key algorithm id {alg_id}; only ALG_ID_V1 can be verified by this \
+         code path (sign_pk/agree_pk are parsed as Ed25519/X25519 unconditionally)"
+    )]
+    UnsupportedAlgId { alg_id: u8 },
+
     /// DESIGN.md §A4b member status: "invited|active|revoked"; revoked is terminal.
     #[error(
         "invalid member status transition {from:?} -> {to:?} (DESIGN.md §A4b: revoked is \
@@ -437,7 +453,7 @@ impl Store {
 
     fn devices_for_member(&self, member_id: MemberId) -> Result<Vec<Device>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT device_fp, label, added, revoked, sign_pk, agree_pk FROM devices \
+            "SELECT device_fp, label, added, revoked, sign_pk, agree_pk, alg_id FROM devices \
              WHERE member_id = ?1",
         )?;
         let rows = stmt.query_map(params![member_id.0 as i64], |r| {
@@ -448,11 +464,12 @@ impl Store {
                 r.get::<_, i64>(3)?,
                 r.get::<_, Option<Vec<u8>>>(4)?,
                 r.get::<_, Option<Vec<u8>>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (fp_bytes, label, added, revoked, sign_pk, agree_pk) = row?;
+            let (fp_bytes, label, added, revoked, sign_pk, agree_pk, alg_id) = row?;
             out.push(Device {
                 device_fp: Fingerprint::from_slice(&fp_bytes)?,
                 label,
@@ -460,6 +477,7 @@ impl Store {
                 revoked: revoked != 0,
                 sign_pk,
                 agree_pk,
+                alg_id: alg_id.map(|a| a as u8),
             });
         }
         Ok(out)
@@ -621,9 +639,14 @@ impl Store {
         if self.get_member(member_id)?.is_none() {
             return Err(StoreError::MemberNotFound(member_id));
         }
+        // All three columns are populated from the same `Option<&DevicePublicKeys>`, which is
+        // what makes the NULL-iff-no-keys invariant on `alg_id` structural rather than an
+        // incidental agreement between two separate writes: there is no code path here that could
+        // write `alg_id` without also writing the keys it describes, or vice versa.
         self.conn.execute(
-            "INSERT INTO devices (device_fp, member_id, label, added, revoked, sign_pk, agree_pk) \
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+            "INSERT INTO devices \
+             (device_fp, member_id, label, added, revoked, sign_pk, agree_pk, alg_id) \
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
             params![
                 device_fp.to_vec(),
                 member_id.0 as i64,
@@ -631,6 +654,7 @@ impl Store {
                 added as i64,
                 keys.map(|k| k.sign_pk.clone()),
                 keys.map(|k| k.agree_pk.clone()),
+                keys.map(|k| k.alg_id),
             ],
         )?;
         Ok(())
@@ -665,10 +689,16 @@ impl Store {
     /// with the wrong keys learns that immediately, as a named error, rather than discovering it
     /// later at connect time as a deny indistinguishable from any other deny.
     ///
-    /// `alg_id` is hardcoded to `ALG_ID_V1` because the `devices` table does not persist `alg_id`
-    /// — exactly the assumption `authorize.rs` already makes when it authorizes a connection.
-    /// td-6c01e3 tracks adding a persisted `alg_id` column; if it lands, this method should read
-    /// `alg_id` from the row instead of assuming it.
+    /// `alg_id` is read from `keys.alg_id` (td-6c01e3's persisted `devices.alg_id` column — see
+    /// `crate::store::schema::SCHEMA_V9`'s doc comment) and rejected outright, before any key is
+    /// parsed or the binding is checked, if it is not `ALG_ID_V1`: `sign_pk`/`agree_pk` are about
+    /// to be parsed as Ed25519/X25519 unconditionally, the only parse this method knows how to do,
+    /// so a `keys.alg_id` naming a different algorithm is not merely unknown to this method — it
+    /// is unverifiable by it. Hashing that `alg_id` into `device_fp_of` anyway would manufacture a
+    /// hash that matches for a row nobody can actually verify, which is strictly worse than
+    /// refusing. This repairs a row whose keys (and therefore `alg_id`) may currently be `NULL`,
+    /// so this rejection is the only thing standing between an unverifiable `alg_id` and a written
+    /// row — `authorize.rs`'s own connect-time check is the same reasoning applied at read time.
     ///
     /// Deliberately out of scope: `add_device` is not changed to perform this same binding check.
     /// A caller can still enroll a device whose stored keys do not rehash to its `device_fp`
@@ -680,6 +710,12 @@ impl Store {
         device_fp: Fingerprint,
         keys: &DevicePublicKeys,
     ) -> Result<(), StoreError> {
+        if keys.alg_id != spindle_core::ALG_ID_V1 {
+            return Err(StoreError::UnsupportedAlgId {
+                alg_id: keys.alg_id,
+            });
+        }
+
         let sign_pk_arr: [u8; 32] = keys
             .sign_pk
             .as_slice()
@@ -694,15 +730,13 @@ impl Store {
             .map_err(|_| StoreError::DeviceKeyBindingMismatch { device_fp })?;
         let agree_pk = spindle_core::X25519PublicKey::from(agree_pk_arr);
 
-        if spindle_core::identity::device_fp_of(spindle_core::ALG_ID_V1, &sign_pk, &agree_pk)
-            != device_fp
-        {
+        if spindle_core::identity::device_fp_of(keys.alg_id, &sign_pk, &agree_pk) != device_fp {
             return Err(StoreError::DeviceKeyBindingMismatch { device_fp });
         }
 
         let changed = self.conn.execute(
-            "UPDATE devices SET sign_pk = ?1, agree_pk = ?2 WHERE device_fp = ?3",
-            params![keys.sign_pk, keys.agree_pk, device_fp.to_vec()],
+            "UPDATE devices SET sign_pk = ?1, agree_pk = ?2, alg_id = ?3 WHERE device_fp = ?4",
+            params![keys.sign_pk, keys.agree_pk, keys.alg_id, device_fp.to_vec()],
         )?;
         if changed == 0 {
             return Err(StoreError::DeviceNotFound(device_fp));
@@ -1901,6 +1935,51 @@ impl Store {
     }
 }
 
+/// Test-only surface, gated behind the `test-support` feature (`Cargo.toml`'s `[features]` block
+/// explains the feature itself). This impl block exists ONLY so a downstream crate's own tests can
+/// construct a `devices` row that no real write path can produce: `Store::add_device` always
+/// writes `alg_id` from the very same `Option<&DevicePublicKeys>` that supplies `sign_pk`/
+/// `agree_pk` (see that method's doc comment), so it is structurally incapable of leaving `alg_id`
+/// `NULL` next to present keys, or of writing a value other than `ALG_ID_V1`. The consumer this was
+/// built for is `spindle-host-core`'s `authorize.rs`, whose check-8 tests
+/// (`denies_a_device_whose_stored_alg_id_is_null_despite_both_keys_being_present` and
+/// `denies_a_device_whose_stored_alg_id_names_an_unsupported_algorithm`) need exactly such an
+/// otherwise-unreachable row to prove that check fails closed — if those tests are ever removed,
+/// this method likely has no remaining reason to exist either.
+///
+/// It lives in this module, not a separate file, because it needs `self.conn`, which is private to
+/// `Store` and only reachable from code inside `store/mod.rs`.
+#[cfg(feature = "test-support")]
+impl Store {
+    /// Overwrites a device's stored `alg_id` directly, bypassing every invariant `add_device`
+    /// otherwise enforces. This deliberately performs **no** validation of `alg_id` — accepting
+    /// `None` (to produce the NULL-beside-present-keys row no real caller can write) or any `u8`
+    /// (to name an unsupported algorithm) is the entire point: this method's only job is to write
+    /// invalid rows so a downstream fail-closed check can be proven against them. It is unreachable
+    /// from any production build: `test-support` is only ever enabled through a dev-dependency edge
+    /// (see `Cargo.toml`), and `resolver = "2"` keeps that from unifying into a normal build.
+    ///
+    /// Returns [`StoreError::DeviceNotFound`] if `device_fp` does not name an existing device — a
+    /// silent no-op here would let a caller's test pass for the wrong reason (never having written
+    /// the row it thinks it wrote), which is precisely the failure mode this whole mechanism exists
+    /// to avoid.
+    #[doc(hidden)]
+    pub fn set_device_alg_id_for_test(
+        &self,
+        device_fp: Fingerprint,
+        alg_id: Option<u8>,
+    ) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE devices SET alg_id = ?1 WHERE device_fp = ?2",
+            params![alg_id.map(|a| a as i64), device_fp.to_vec()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::DeviceNotFound(device_fp));
+        }
+        Ok(())
+    }
+}
+
 /// The same `UPDATE ... RETURNING` shape as [`Store::bump_cap_epoch`], run against an in-progress
 /// [`Transaction`] rather than the bare connection — the shared building block
 /// [`Store::revoke_member_and_bump_epoch`] and [`Store::revoke_device_and_bump_epoch`] both use so
@@ -2936,6 +3015,7 @@ mod tests {
                 "Phone",
                 0,
                 Some(&DevicePublicKeys {
+                    alg_id: spindle_core::ALG_ID_V1,
                     sign_pk: vec![0xAB; 32],
                     agree_pk: vec![0xCD; 32],
                 }),
@@ -2966,6 +3046,7 @@ mod tests {
             .expect("add_member");
         let device_fp = Fingerprint::of_parts(&[b"alex-laptop"]);
         let keys = DevicePublicKeys {
+            alg_id: spindle_core::ALG_ID_V1,
             sign_pk: vec![0x11; 32],
             agree_pk: vec![0x22; 32],
         };
@@ -3016,6 +3097,7 @@ mod tests {
         let dev = spindle_core::identity::DeviceKey::from_seeds([0x30; 32], [0x31; 32]);
         let device_fp = dev.device_fp();
         let keys = DevicePublicKeys {
+            alg_id: spindle_core::ALG_ID_V1,
             sign_pk: dev.sign_public_key().as_bytes().to_vec(),
             agree_pk: dev.agree_public_key().as_bytes().to_vec(),
         };
@@ -3051,6 +3133,75 @@ mod tests {
         );
     }
 
+    // ---- Devices: alg_id (td-6c01e3) ----
+
+    #[test]
+    fn add_device_with_keys_persists_alg_id_and_it_round_trips_through_get_member() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let device_fp = Fingerprint::of_parts(&[b"alex-laptop"]);
+        let keys = DevicePublicKeys {
+            alg_id: spindle_core::ALG_ID_V1,
+            sign_pk: vec![0x11; 32],
+            agree_pk: vec![0x22; 32],
+        };
+        store
+            .add_device(member_id, device_fp, "Laptop", 0, Some(&keys))
+            .expect("add_device");
+
+        // Via `get_member` (which calls the crate-private `devices_for_member`).
+        let member = store
+            .get_member(member_id)
+            .expect("get_member")
+            .expect("member exists");
+        let device = member
+            .devices
+            .iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("member's devices include the added device");
+        assert_eq!(device.alg_id, Some(spindle_core::ALG_ID_V1));
+
+        // And via `member_for_device_fp`, the other read path over the same `devices_for_member`.
+        let via_lookup = store
+            .member_for_device_fp(device_fp)
+            .expect("lookup")
+            .expect("device is known")
+            .devices
+            .into_iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("owning member's devices include the looked-up device");
+        assert_eq!(via_lookup.alg_id, Some(spindle_core::ALG_ID_V1));
+    }
+
+    #[test]
+    fn add_device_with_no_keys_leaves_alg_id_null() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let device_fp = Fingerprint::of_parts(&[b"keyless-device"]);
+        store
+            .add_device(member_id, device_fp, "Keyless", 0, None)
+            .expect("add_device with no keys");
+
+        let member = store
+            .get_member(member_id)
+            .expect("get_member")
+            .expect("member exists");
+        let device = member
+            .devices
+            .iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("member's devices include the added device");
+        assert_eq!(
+            device.alg_id, None,
+            "a device with no keys has no algorithm to name — alg_id must stay NULL, matching \
+             the NULL-iff-no-keys invariant (see SCHEMA_V9's doc comment)"
+        );
+    }
+
     // ---- Devices: repair_device_keys (td-b2c16b) ----
 
     #[test]
@@ -3066,6 +3217,7 @@ mod tests {
             .expect("add_device with no keys, simulating a pre-SCHEMA_V4 row");
 
         let keys = DevicePublicKeys {
+            alg_id: spindle_core::ALG_ID_V1,
             sign_pk: dev.sign_public_key().as_bytes().to_vec(),
             agree_pk: dev.agree_public_key().as_bytes().to_vec(),
         };
@@ -3084,6 +3236,59 @@ mod tests {
             .expect("owning member's devices include the repaired device");
         assert_eq!(device.sign_pk.as_deref(), Some(keys.sign_pk.as_slice()));
         assert_eq!(device.agree_pk.as_deref(), Some(keys.agree_pk.as_slice()));
+        assert_eq!(device.alg_id, Some(spindle_core::ALG_ID_V1));
+    }
+
+    #[test]
+    fn repair_device_keys_rejects_an_unsupported_alg_id_and_writes_nothing() {
+        // Normal write paths cannot produce a `DevicePublicKeys` with an unsupported `alg_id` —
+        // `ALG_ID_V1` is the only value `spindle_core::ALG_ID_V1` names — so this constructs one
+        // directly to exercise the fail-closed guard itself. That is the honest way to test a
+        // rejection with no legitimate caller: there is no other way to reach it.
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let dev = spindle_core::identity::DeviceKey::from_seeds([0x45; 32], [0x46; 32]);
+        let device_fp = dev.device_fp();
+        store
+            .add_device(member_id, device_fp, "Laptop", 0, None)
+            .expect("add_device with no keys");
+
+        let unsupported_keys = DevicePublicKeys {
+            alg_id: 2,
+            sign_pk: dev.sign_public_key().as_bytes().to_vec(),
+            agree_pk: dev.agree_public_key().as_bytes().to_vec(),
+        };
+        let err = store
+            .repair_device_keys(device_fp, &unsupported_keys)
+            .expect_err("an alg_id other than ALG_ID_V1 must be rejected");
+        assert!(
+            matches!(err, StoreError::UnsupportedAlgId { alg_id: 2 }),
+            "expected UnsupportedAlgId {{ alg_id: 2 }}, got {err:?}"
+        );
+
+        let member = store
+            .member_for_device_fp(device_fp)
+            .expect("lookup")
+            .expect("device is known");
+        let device = member
+            .devices
+            .iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("owning member's devices include the device");
+        assert_eq!(
+            device.sign_pk, None,
+            "a rejected repair must not write the sign_pk half"
+        );
+        assert_eq!(
+            device.agree_pk, None,
+            "a rejected repair must not write the agree_pk half"
+        );
+        assert_eq!(
+            device.alg_id, None,
+            "a rejected repair must not write alg_id either"
+        );
     }
 
     #[test]
@@ -3102,6 +3307,7 @@ mod tests {
         // dev2's sign_pk paired with dev1's agree_pk does not rehash to dev1's device_fp — both
         // halves parse fine, so this exercises the binding check itself, not a parse failure.
         let mismatched_keys = DevicePublicKeys {
+            alg_id: spindle_core::ALG_ID_V1,
             sign_pk: dev2.sign_public_key().as_bytes().to_vec(),
             agree_pk: dev1.agree_public_key().as_bytes().to_vec(),
         };
@@ -3147,6 +3353,7 @@ mod tests {
                 "Laptop",
                 0,
                 Some(&DevicePublicKeys {
+                    alg_id: spindle_core::ALG_ID_V1,
                     sign_pk: vec![0xAB; 32],
                     agree_pk: vec![0xCD; 32],
                 }),
@@ -3154,6 +3361,7 @@ mod tests {
             .expect("add_device with wrong key bytes on file");
 
         let correct_keys = DevicePublicKeys {
+            alg_id: spindle_core::ALG_ID_V1,
             sign_pk: dev.sign_public_key().as_bytes().to_vec(),
             agree_pk: dev.agree_public_key().as_bytes().to_vec(),
         };
@@ -3186,6 +3394,7 @@ mod tests {
         let dev = spindle_core::identity::DeviceKey::from_seeds([0x70; 32], [0x71; 32]);
         let device_fp = dev.device_fp();
         let keys = DevicePublicKeys {
+            alg_id: spindle_core::ALG_ID_V1,
             sign_pk: dev.sign_public_key().as_bytes().to_vec(),
             agree_pk: dev.agree_public_key().as_bytes().to_vec(),
         };
@@ -3205,6 +3414,7 @@ mod tests {
         let dev = spindle_core::identity::DeviceKey::from_seeds([0x80; 32], [0x81; 32]);
         let device_fp = dev.device_fp();
         let keys = DevicePublicKeys {
+            alg_id: spindle_core::ALG_ID_V1,
             sign_pk: dev.sign_public_key().as_bytes().to_vec(),
             agree_pk: dev.agree_public_key().as_bytes().to_vec(),
         };

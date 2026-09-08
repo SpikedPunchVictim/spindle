@@ -56,5 +56,17 @@ windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem"] }
 # `spindle-vfs`'s own `Cargo.toml`: negative/integration tests need disposable real temp
 # directories to run confinement/RPC pipeline tests against; this never becomes a runtime
 # dependency of spindle-host-core.
+#
+# This re-declares the already-normal `spindle-vfs` dependency above purely to switch on its
+# `test-support` feature (see that crate's `Cargo.toml` for what the feature is and why it exists)
+# for this crate's own test builds. Under `resolver = "2"` (workspace root `Cargo.toml:2`), a
+# feature enabled only via a `[dev-dependencies]` edge does not unify into normal (non-test) builds
+# of the crate that enables it, so this does not leak `test-support` into a plain `cargo build` of
+# `spindle-host-core`. `authorize.rs`'s check-8 tests use the resulting
+# `Store::set_device_alg_id_for_test` to write an `alg_id` value the normal `Store`/
+# `DevicePublicKeys` write paths cannot produce, exercising `authorize.rs`'s fail-closed handling of
+# an anomalous stored row without this crate opening a second, raw SQLite connection of its own — `spindle-
+# vfs` keeps sole ownership of all real SQLite access per the A9c crate-layering law.
 [dev-dependencies]
 tempfile = "3"
+spindle-vfs = { path = "../spindle-vfs", features = ["test-support"] }

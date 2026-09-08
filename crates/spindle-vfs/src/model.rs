@@ -253,6 +253,20 @@ pub struct Group {
 /// verified — `sign_pk` verifies the envelope signature, `agree_pk` is the key `k0`/`k1` are
 /// derived from (DESIGN.md §A7). `None` means "cannot authorize this device" — fail closed, the
 /// same as a missing `sign_pk`, never "skip the check".
+///
+/// **td-6c01e3 addition**: `alg_id` — the algorithm identifier that is the second element of
+/// `device_fp`'s preimage, `H(DEVICE_FP_DOMAIN, alg_id, sign_pk, agree_pk)` (DESIGN.md:225-227,
+/// `spindle_core::identity::device_fp_of`). Before this, every verifier recomputed that hash with
+/// `alg_id` hardcoded to `ALG_ID_V1` rather than reading it from the row it names — this field is
+/// what the row was missing to verify itself. The invariant is **`alg_id` is `None` if and only if
+/// `sign_pk`/`agree_pk` are `None`** — a row with no keys has no algorithm to name. A verifier that
+/// finds `None` here MUST treat it as "cannot verify this device", never as "skip the alg_id
+/// check" — the identical fail-closed treatment this doc comment already prescribes for a missing
+/// `sign_pk`/`agree_pk`. The same applies to `Some(a)` where `a != ALG_ID_V1`: `sign_pk`/`agree_pk`
+/// are parsed as Ed25519/X25519 unconditionally (that is the only parse this codebase knows how to
+/// do), so a row naming a different algorithm cannot actually be verified by that parse — hashing
+/// its `alg_id` into `device_fp_of` anyway would manufacture a hash that matches for a row nobody
+/// can verify, which is strictly worse than the old hardcoded assumption. Reject, do not hash.
 #[derive(Clone, Debug)]
 pub struct Device {
     pub device_fp: Fingerprint,
@@ -261,6 +275,7 @@ pub struct Device {
     pub revoked: bool,
     pub sign_pk: Option<Vec<u8>>,
     pub agree_pk: Option<Vec<u8>>,
+    pub alg_id: Option<u8>,
 }
 
 /// The write-path pairing of a device's two public key halves, for [`crate::store::Store::add_device`].
@@ -272,8 +287,18 @@ pub struct Device {
 /// discovered only at connect time. It also encodes "both halves or neither" — the only
 /// combination a `device_fp` binding check can use — as a single `Option` rather than letting two
 /// independent `Option`s disagree.
+///
+/// **td-6c01e3 addition**: `alg_id` lives here, not as a separate parameter threaded alongside
+/// this struct into [`crate::store::Store::add_device`] (28 call sites at the time of writing).
+/// `alg_id` describes this key pair — it is the algorithm the pair was generated under, and the
+/// second element of the `device_fp` preimage that binds them together (DESIGN.md:225-227) — so it
+/// belongs with the pieces it describes, in the struct that exists precisely to keep them together
+/// and untransposable, per this doc comment's own opening sentence. A bolted-on extra argument next
+/// to two same-typed byte vectors would reintroduce exactly the transposition hazard this struct
+/// was created to prevent, just with a third value instead of two.
 #[derive(Clone, Debug)]
 pub struct DevicePublicKeys {
+    pub alg_id: u8,
     pub sign_pk: Vec<u8>,
     pub agree_pk: Vec<u8>,
 }

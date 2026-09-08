@@ -392,6 +392,7 @@ mod tests {
     ) -> Fingerprint {
         let device_fp = device.device_fp();
         let keys = DevicePublicKeys {
+            alg_id: spindle_core::ALG_ID_V1,
             sign_pk: device.sign_public_key().as_bytes().to_vec(),
             agree_pk: device.agree_public_key().as_bytes().to_vec(),
         };

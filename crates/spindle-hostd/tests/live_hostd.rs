@@ -190,6 +190,7 @@ fn seed_active_member_with_devices(
                 &format!("test-device-{i}"),
                 fixtures::now(),
                 Some(&DevicePublicKeys {
+                    alg_id: spindle_core::ALG_ID_V1,
                     sign_pk: keys.sign_public_key().as_bytes().to_vec(),
                     agree_pk: keys.agree_public_key().as_bytes().to_vec(),
                 }),

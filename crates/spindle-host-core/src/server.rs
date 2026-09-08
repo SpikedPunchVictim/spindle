@@ -2040,6 +2040,7 @@ mod tests {
                     label,
                     0,
                     Some(&DevicePublicKeys {
+                        alg_id: spindle_core::ALG_ID_V1,
                         sign_pk: dev.sign_public_key().as_bytes().to_vec(),
                         agree_pk: dev.agree_public_key().as_bytes().to_vec(),
                     }),

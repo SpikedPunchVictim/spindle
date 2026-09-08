@@ -388,6 +388,40 @@ CREATE TABLE entitlements (
 );
 "#;
 
+/// Version 9 (td-6c01e3) — persists `devices.alg_id`, closing the gap where `device_fp = H(
+/// DEVICE_FP_DOMAIN, alg_id, sign_pk, agree_pk)` (DESIGN.md:225-227) was recomputed by every
+/// verifier with `alg_id` hardcoded to `ALG_ID_V1` rather than read from the row it names — the
+/// stored row did not carry enough information to verify itself. Nullable for the same reason
+/// `sign_pk`/`agree_pk` are (`SCHEMA_V3`/`SCHEMA_V4`): `ALTER TABLE ... ADD COLUMN` requires a
+/// default for `NOT NULL`, and there is no sensible default for an algorithm identifier. The
+/// invariant this column must hold is **`alg_id` is NULL if and only if `sign_pk`/`agree_pk` are
+/// NULL** — a row with no keys has no algorithm to name, and writing `1` there would assert a v1
+/// device whose keys this row does not actually have. See `crate::model::Device::alg_id`'s doc
+/// comment for how a verifier must treat `NULL`: the same "cannot verify", never "skip the check",
+/// treatment `Device::agree_pk` already documents for a missing key half.
+///
+/// **This migration does not make a second algorithm usable, and nothing built on top of it
+/// should claim otherwise.** `spindle_core::identity::device_fp_of` takes an
+/// `ed25519_dalek::VerifyingKey` and an `X25519PublicKey` — the algorithm is pinned by the *type*
+/// the bytes are parsed as, not by this integer. Feeding a stored `alg_id != ALG_ID_V1` into the
+/// hash while still parsing the bytes as Ed25519/X25519 (the only parse this codebase knows how to
+/// do) would produce a *matching* hash for a row nobody can actually verify — strictly worse than
+/// today's hardcoded assumption. What this column buys is narrower and still real: the hardcoded
+/// assumption becomes an enforced, checkable precondition. Every reader of this column
+/// (`crate::store::Store::repair_device_keys`, `spindle-host-core`'s connect-time authorizer) must
+/// reject any `alg_id` other than `ALG_ID_V1` outright rather than hash it.
+///
+/// The backfill (`UPDATE devices SET alg_id = 1 WHERE sign_pk IS NOT NULL AND agree_pk IS NOT
+/// NULL`) is provably correct, not a fudge: `ALG_ID_V1` is the only algorithm that has ever
+/// existed in this codebase, so every pre-migration row that has both key halves necessarily had
+/// its `device_fp` computed with `alg_id = 1` — there was never another value it could have been.
+/// A row with no keys is left at `alg_id = NULL` by the conditional `WHERE`, matching the
+/// invariant above rather than asserting an algorithm for a keyless row.
+const SCHEMA_V9: &str = r#"
+ALTER TABLE devices ADD COLUMN alg_id INTEGER;
+UPDATE devices SET alg_id = 1 WHERE sign_pk IS NOT NULL AND agree_pk IS NOT NULL;
+"#;
+
 /// Every schema version in order, oldest first. Appending a new `(N, SQL)` pair is the only way
 /// to evolve the schema — existing entries are never edited once shipped.
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -399,6 +433,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, SCHEMA_V6),
     (7, SCHEMA_V7),
     (8, SCHEMA_V8),
+    (9, SCHEMA_V9),
 ];
 
 /// Applies every migration strictly newer than the connection's current `user_version`, each in
@@ -740,13 +775,104 @@ mod tests {
         );
     }
 
+    /// This ticket's upgrade-path check (persisted `alg_id`, SCHEMA_V9): build a database at the
+    /// OLD (pre-V9) schema by hand — directly from `SCHEMA_V1..V8`, for the same reason
+    /// `migrate_v7_rebuilds_uploaded_files_and_zeroes_both_counters`'s doc comment gives — seed
+    /// one device row with both key halves and one with neither, under the OLD (no `alg_id`)
+    /// shape, then run [`migrate`] and confirm SCHEMA_V9's documented backfill proves both halves
+    /// of the invariant: the keyed row is backfilled to `alg_id = 1`, and the keyless row is left
+    /// at `alg_id = NULL` rather than having an algorithm asserted for keys it does not have.
+    #[test]
+    fn migrate_v9_backfills_alg_id_iff_both_key_halves_are_present() {
+        let mut conn = Connection::open_in_memory().expect("open");
+
+        // Hand-roll a database at schema version 8 (pre-V9) by applying V1..V8 directly.
+        conn.execute_batch(SCHEMA_V1).expect("apply V1");
+        conn.execute_batch(SCHEMA_V2).expect("apply V2");
+        conn.execute_batch(SCHEMA_V3).expect("apply V3");
+        conn.execute_batch(SCHEMA_V4).expect("apply V4");
+        conn.execute_batch(SCHEMA_V5).expect("apply V5");
+        conn.execute_batch(SCHEMA_V6).expect("apply V6");
+        conn.execute_batch(SCHEMA_V7).expect("apply V7");
+        conn.execute_batch(SCHEMA_V8).expect("apply V8");
+        conn.execute_batch("PRAGMA user_version = 8")
+            .expect("set user_version to 8");
+
+        conn.execute(
+            "INSERT INTO members (root_fp, display_name, status, created) \
+             VALUES (?1, 'Alex', 'active', 0)",
+            [vec![0x11u8; 32]],
+        )
+        .expect("insert member alex");
+        let member_id = conn.last_insert_rowid();
+
+        // A row under the OLD (no `alg_id`) shape, with both key halves present.
+        conn.execute(
+            "INSERT INTO devices (device_fp, member_id, label, added, revoked, sign_pk, agree_pk) \
+             VALUES (?1, ?2, 'Laptop', 0, 0, ?3, ?4)",
+            rusqlite::params![
+                vec![0xAAu8; 32],
+                member_id,
+                vec![0x01u8; 32],
+                vec![0x02u8; 32],
+            ],
+        )
+        .expect("insert pre-V9 device row with keys");
+
+        // A row with neither key half — the pre-SCHEMA_V4 shape `Store::repair_device_keys`
+        // exists to fix.
+        conn.execute(
+            "INSERT INTO devices (device_fp, member_id, label, added, revoked) \
+             VALUES (?1, ?2, 'Keyless', 0, 0)",
+            rusqlite::params![vec![0xBBu8; 32], member_id],
+        )
+        .expect("insert pre-V9 device row without keys");
+
+        migrate(&mut conn).expect("migrate old schema up to latest");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
+
+        let keyed_alg_id: Option<i64> = conn
+            .query_row(
+                "SELECT alg_id FROM devices WHERE device_fp = ?1",
+                [vec![0xAAu8; 32]],
+                |r| r.get(0),
+            )
+            .expect("read keyed device's alg_id");
+        assert_eq!(
+            keyed_alg_id,
+            Some(1),
+            "a row with both key halves must be backfilled to alg_id = 1 — ALG_ID_V1 is the only \
+             algorithm that has ever existed, so this is the only value its device_fp could have \
+             been computed with"
+        );
+
+        let keyless_alg_id: Option<i64> = conn
+            .query_row(
+                "SELECT alg_id FROM devices WHERE device_fp = ?1",
+                [vec![0xBBu8; 32]],
+                |r| r.get(0),
+            )
+            .expect("read keyless device's alg_id");
+        assert_eq!(
+            keyless_alg_id, None,
+            "a row with no keys has no algorithm to name and must stay NULL, not be asserted as v1"
+        );
+    }
+
     #[test]
     fn migrate_refuses_a_database_from_a_newer_build() {
         let mut conn = Connection::open_in_memory().expect("open");
         migrate(&mut conn).expect("migrate to latest");
         let supported = MIGRATIONS.last().unwrap().0;
 
-        conn.execute_batch("PRAGMA user_version = 9")
+        // One past the newest migration this build knows about (SCHEMA_V9, added by this ticket)
+        // — must be bumped again whenever a new migration is appended, or this stops testing a
+        // genuinely-too-new version and starts testing a merely-current one.
+        conn.execute_batch("PRAGMA user_version = 10")
             .expect("simulate a newer-build database");
 
         let err = migrate(&mut conn).expect_err("must refuse a newer schema version");
@@ -755,14 +881,14 @@ mod tests {
                 found,
                 supported: s,
             } => {
-                assert_eq!(found, 9);
+                assert_eq!(found, 10);
                 assert_eq!(s, supported);
             }
             other => panic!("expected StoreError::SchemaTooNew, got {other:?}"),
         }
         let message = err_to_string(&err);
         assert!(
-            message.contains('9'),
+            message.contains("10"),
             "message must mention found version: {message}"
         );
         assert!(

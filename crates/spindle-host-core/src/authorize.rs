@@ -644,7 +644,20 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
         };
         let agree_pk = X25519PublicKey::from(agree_pk_arr);
 
-        // 8. The binding does not hold (DESIGN.md §A7b clarification-6 — the same check
+        // 8. The stored `alg_id` is missing, or names anything other than `ALG_ID_V1` (td-6c01e3:
+        // `devices.alg_id`, DESIGN.md:225-227's `device_fp = H(DEVICE_FP_DOMAIN, alg_id, sign_pk,
+        // agree_pk)`). `sign_pk`/`agree_pk` were just parsed above as Ed25519/X25519
+        // unconditionally — that parsing is what pins the algorithm, not this integer — so a row
+        // whose `alg_id` is `None` (a row with keys but no algorithm — impossible after the
+        // SCHEMA_V9 backfill, but this module's house style never unwraps an invariant instead of
+        // failing closed) or names something other than v1 cannot be verified by this code path
+        // at all. Hashing that `alg_id` into `device_fp_of` anyway would manufacture a hash that
+        // matches for a row nobody can actually verify; denying is the only sound answer.
+        let Some(ALG_ID_V1) = device.alg_id else {
+            return ConnectDecision::Deny;
+        };
+
+        // 9. The binding does not hold (DESIGN.md §A7b clarification-6 — the same check
         // `verify_device_certificate` performs). This is what makes the stored key pair
         // *self-verifying*: `device_fp` is the hash of exactly `(DEVICE_FP_DOMAIN, alg_id,
         // sign_pk, agree_pk)`, so a row whose keys were corrupted, transposed, or swapped for
@@ -653,7 +666,7 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
             return ConnectDecision::Deny;
         }
 
-        // 9. Mint the opportunistic member capability (DESIGN.md:286), if we can. This never
+        // 10. Mint the opportunistic member capability (DESIGN.md:286), if we can. This never
         // downgrades an `Allow` into a `Deny` — see `CapIssuer`'s doc comment for why an
         // issuance failure must be strictly no worse than the status quo (no fresh cap, not a
         // broken connect).
@@ -714,6 +727,7 @@ mod tests {
     ) -> Fingerprint {
         let device_fp = device.device_fp();
         let keys = DevicePublicKeys {
+            alg_id: ALG_ID_V1,
             sign_pk: device.sign_public_key().as_bytes().to_vec(),
             agree_pk: device.agree_public_key().as_bytes().to_vec(),
         };
@@ -851,6 +865,7 @@ mod tests {
         let device_a = DeviceKey::from_seeds([0x0b; 32], [0x0c; 32]);
         let device_b = DeviceKey::from_seeds([0x0d; 32], [0x0e; 32]);
         let mismatched_keys = DevicePublicKeys {
+            alg_id: ALG_ID_V1,
             sign_pk: device_b.sign_public_key().as_bytes().to_vec(),
             agree_pk: device_b.agree_public_key().as_bytes().to_vec(),
         };
@@ -870,6 +885,57 @@ mod tests {
             ConnectDecision::Allow { .. } => {
                 panic!("expected Deny: stored keys do not rehash to this device's own device_fp")
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn denies_a_device_whose_stored_alg_id_is_null_despite_both_keys_being_present() {
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x0f; 32], [0x10; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+
+        // `add_device` always writes `alg_id` from the very `Option` that supplies the keys (see
+        // `Store::add_device`'s doc comment), so no legitimate caller can leave `alg_id` `NULL`
+        // next to present keys. `set_device_alg_id_for_test` (a `spindle-vfs` `test-support`-
+        // feature-gated method, enabled only via this crate's dev-dependency edge on `spindle-vfs`
+        // — see that crate's `Cargo.toml`) is the honest way to test a fail-closed guard against a
+        // row nothing else can create, not a workaround for a missing API.
+        store
+            .set_device_alg_id_for_test(device_fp, None)
+            .expect("set_device_alg_id_for_test");
+
+        let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store));
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => panic!(
+                "expected Deny: alg_id is NULL even though both keys are present — impossible \
+                 after the SCHEMA_V9 backfill via any real write path, but this module's house \
+                 style never unwraps an invariant instead of failing closed"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn denies_a_device_whose_stored_alg_id_names_an_unsupported_algorithm() {
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x11; 32], [0x12; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+
+        // See the sibling test above for why writing this directly (rather than through any real
+        // `Store`/`DevicePublicKeys` API) is the only way to construct this row: `add_device`
+        // rejects nothing here — it just cannot produce a non-`ALG_ID_V1` value on its own.
+        store
+            .set_device_alg_id_for_test(device_fp, Some(2))
+            .expect("set_device_alg_id_for_test");
+
+        let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store));
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => panic!(
+                "expected Deny: alg_id = 2 names an algorithm this code path parses sign_pk/\
+                 agree_pk as neither of — sign_pk/agree_pk are parsed as Ed25519/X25519 \
+                 unconditionally, so a row claiming another algorithm cannot be verified here"
+            ),
         }
     }
 
@@ -1360,6 +1426,7 @@ mod tests {
                 revoked: false,
                 sign_pk: Some(device.sign_public_key().as_bytes().to_vec()),
                 agree_pk: Some(device.agree_public_key().as_bytes().to_vec()),
+                alg_id: Some(ALG_ID_V1),
             }],
             groups: vec![],
             created: 0,

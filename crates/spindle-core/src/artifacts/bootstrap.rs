@@ -301,9 +301,21 @@ pub struct VerifiedBundle {
 ///    Any per-entry failure surfaces as [`BundleError::Entry`], carrying that entry's index.
 ///
 /// **`ALG_ID_V1` is assumed, not read from the wire**: [`device_fp_of`] takes an `alg_id`
-/// parameter, but [`BundleEntry`] carries no `alg_id` field for the host's envelope keys. This is
-/// the same assumption `crates/spindle-host-core/src/authorize.rs:652` already makes for the
-/// devices table's own `device_fp_of` call — tracked for both call sites by open ticket td-6c01e3.
+/// parameter, but [`BundleEntry`] carries no `alg_id` field for the host's envelope keys, so this
+/// call site still hashes the constant rather than a carried value. The devices table's own
+/// `device_fp_of` call used to share this same assumption, but no longer does: td-6c01e3 landed
+/// `devices.alg_id` as a persisted column (`SCHEMA_V9`), `Device` now carries `alg_id: Option<u8>`,
+/// and `authorize.rs`'s check 8 denies a device outright, before the binding recompute ever runs,
+/// whenever its stored `alg_id` is `None` or anything other than `ALG_ID_V1`. This bundle's
+/// remaining assumption is tracked separately, by open ticket td-4f520f.
+///
+/// Carrying `alg_id` on [`BundleEntry`] would not, by itself, let a second algorithm verify:
+/// [`device_fp_of`] takes an [`ed25519_dalek::VerifyingKey`] and an [`x25519_dalek::PublicKey`], so
+/// the algorithm is pinned by the *type* of the parsed keys, not by an integer alongside them.
+/// Hashing a carried `alg_id = 2` while this function still parses `sign_pk`/`agree_pk` as Ed25519
+/// would only manufacture a hash that matches for an entry nobody here can actually verify —
+/// strictly worse than the current assumption. What carrying it *would* buy is the ability to
+/// reject a non-v1 entry explicitly, instead of silently mis-verifying it as v1.
 pub fn verify_bootstrap_bundle(
     bundle: &DeviceBootstrapBundle,
     now: u64,

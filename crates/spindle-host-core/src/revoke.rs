@@ -379,6 +379,7 @@ mod tests {
         let device = DeviceKey::from_seeds([seed; 32], [seed.wrapping_add(1); 32]);
         let device_fp = device.device_fp();
         let keys = DevicePublicKeys {
+            alg_id: spindle_core::ALG_ID_V1,
             sign_pk: device.sign_public_key().as_bytes().to_vec(),
             agree_pk: device.agree_public_key().as_bytes().to_vec(),
         };

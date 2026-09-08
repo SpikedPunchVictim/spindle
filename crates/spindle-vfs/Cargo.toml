@@ -37,6 +37,24 @@ tracing = { workspace = true }
 same-file = "1"
 winapi-util = "0.1"
 
+# The first `[features]` section in this workspace (no other crate has one yet, so this sets the
+# precedent). `test-support` exists for exactly one purpose: letting a downstream crate's own test
+# code construct a `devices` row that this crate's real write paths structurally cannot produce
+# (see `Store::set_device_alg_id_for_test`'s doc comment in `src/store/mod.rs` for the row shape
+# and why). The feature is additive-only — it adds a method, it changes nothing else — and off by
+# default, so a plain `cargo build`/`cargo check` of this crate or anything depending on it never
+# sees it. It must never be turned on by a normal (non-dev) dependency edge: the workspace uses
+# `resolver = "2"` (root `Cargo.toml:2`), which keeps a feature enabled only via a `[dev-dependencies]`
+# edge from unifying into that dependent crate's own non-test builds, so as long as every consumer
+# enables `test-support` from its `[dev-dependencies]` section (as `spindle-host-core`'s does), the
+# feature can never reach a production binary. Anything gated behind this feature is test
+# scaffolding: it deliberately performs no validation and exists to write rows a real caller
+# cannot, so production code must never be able to reach it — that is what keeps this an addition
+# to the A9c SQLite-ownership boundary (spindle-vfs owns all SQLite access) rather than a hole in
+# it.
+[features]
+test-support = []
+
 # tempfile is crate-local only (not a workspace dependency), matching the precedent set by the
 # S11 spike (spikes/s11-vfs-confinement/Cargo.toml) it graduates from: confinement tests need a
 # disposable sandbox directory tree; this never becomes a runtime dependency of spindle-vfs.
