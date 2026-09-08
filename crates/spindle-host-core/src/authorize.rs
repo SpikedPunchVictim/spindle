@@ -653,16 +653,39 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
         // failing closed) or names something other than v1 cannot be verified by this code path
         // at all. Hashing that `alg_id` into `device_fp_of` anyway would manufacture a hash that
         // matches for a row nobody can actually verify; denying is the only sound answer.
-        let Some(ALG_ID_V1) = device.alg_id else {
+        //
+        // Written as an explicit bind-then-compare rather than `let Some(ALG_ID_V1) = device.alg_id
+        // else { ... }`. That form type-checks today only because `ALG_ID_V1` happens to resolve to
+        // an in-scope `const` in SCREAMING_SNAKE_CASE, which is a lexical convention Rust's pattern
+        // matching leans on but does not enforce — nothing about the type system requires it. A
+        // future rename away from that convention, or a local shadowing binding named `ALG_ID_V1`,
+        // would silently turn `Some(ALG_ID_V1)` from a refutable constant pattern into an
+        // irrefutable *binding* pattern that accepts every `Some(_)` — and it would still compile,
+        // because the name is used again on the next lines (as the now-shadowed binding, not the
+        // constant). That failure mode is silent and would not show up as a type or lint error, only
+        // as this check quietly accepting every alg_id. Binding the value under its own name and
+        // comparing with `!=` cannot be reinterpreted that way: renaming or shadowing `ALG_ID_V1`
+        // would break the `!=` comparison at compile time (or, at worst, compare against the wrong
+        // but still-explicit value), never silently widen this into a no-op check.
+        let Some(alg_id) = device.alg_id else {
             return ConnectDecision::Deny;
         };
+        if alg_id != ALG_ID_V1 {
+            return ConnectDecision::Deny;
+        }
 
         // 9. The binding does not hold (DESIGN.md §A7b clarification-6 — the same check
         // `verify_device_certificate` performs). This is what makes the stored key pair
         // *self-verifying*: `device_fp` is the hash of exactly `(DEVICE_FP_DOMAIN, alg_id,
         // sign_pk, agree_pk)`, so a row whose keys were corrupted, transposed, or swapped for
         // another device's cannot silently authorize — it simply fails to rehash to `from_fp`.
-        if device_fp_of(ALG_ID_V1, &sign_pk, &agree_pk) != *from_fp {
+        // Uses `alg_id` (the value just read from and validated against this row), not a
+        // hardcoded `ALG_ID_V1` constant — check 8 above already proved they're equal for this
+        // row, but recomputing the hash from the row's own field, rather than a compile-time
+        // constant, is what makes this the actual device_fp recompute td-6c01e3 requires: a
+        // future second algorithm added as another `Some(alg_id) if alg_id != ALG_ID_V1` arm
+        // above would still rehash correctly here without this line needing to change at all.
+        if device_fp_of(alg_id, &sign_pk, &agree_pk) != *from_fp {
             return ConnectDecision::Deny;
         }
 
@@ -919,22 +942,96 @@ mod tests {
     async fn denies_a_device_whose_stored_alg_id_names_an_unsupported_algorithm() {
         let (store, member_id) = store_with_active_member("alex");
         let device = DeviceKey::from_seeds([0x11; 32], [0x12; 32]);
+
+        // This row must be *self-consistent* under alg_id = 2, not merely have its alg_id column
+        // flipped after enrolling under alg 1 (that was this test's original, broken shape — see
+        // below). A device_fp genuinely committed to alg 2 is
+        // `device_fp_of(2, sign_pk, agree_pk)`, so that is what gets stored as `device_fp` here —
+        // deliberately NOT `device.device_fp()`, which is `device_fp_of(ALG_ID_V1, ..)` and would
+        // leave the row internally inconsistent (a fingerprint computed under alg 1, sitting next
+        // to an alg_id column claiming 2).
+        //
+        // Why the self-consistent row matters: check 9, a few lines below check 8 in
+        // `authorize()`, recomputes `device_fp_of(alg_id, sign_pk, agree_pk)` from the row's OWN
+        // `alg_id` field and compares it against `from_fp`. If the row is inconsistent (fp under
+        // alg 1, column says 2), check 9's recompute uses alg_id = 2 and produces a hash that does
+        // NOT match the stored (alg-1) `device_fp` — so check 9 denies on its own, and check 8
+        // never gets exercised at all. That was this test's original defect: it asserted `Deny`
+        // for the right verdict but the wrong reason, and proved nothing about check 8. Emptying
+        // check 8 (deleting its `if alg_id != ALG_ID_V1 { return Deny }`) left the whole
+        // `spindle-host-core` suite green, because check 9 covered the inconsistent-row case check
+        // 8 was never actually exercised on.
+        //
+        // With the row self-consistent (fp genuinely derived under alg 2, column says 2), check
+        // 9's recompute matches `from_fp` and check 9 ALLOWS. Check 8 is then the only thing
+        // standing between this row and an `Allow` — exactly the case check 8 exists to guard:
+        // `sign_pk`/`agree_pk` are parsed as Ed25519/X25519 unconditionally regardless of what
+        // `alg_id` claims, so this code path cannot actually verify an alg-2 device even though
+        // its fingerprint checks out.
+        //
+        // A future reader tempted to "simplify" this back to `enroll_device` +
+        // `set_device_alg_id_for_test` should not — that simpler-looking shape is precisely the
+        // broken version this comment describes.
+        let alg2_fp = device_fp_of(2, &device.sign_public_key(), &device.agree_public_key());
+        let keys = DevicePublicKeys {
+            // `Store::add_device` rejects any `keys.alg_id != ALG_ID_V1` (see its doc comment and
+            // implementation), so the row must be written as alg 1 first and flipped to 2
+            // afterward via `set_device_alg_id_for_test` — `add_device` does not otherwise
+            // validate the `device_fp`/keys binding (see its own doc comment; `store/mod.rs`'s
+            // tests rely on the same non-validation to store deliberately mismatched keys), so
+            // storing `alg2_fp` next to `ALG_ID_V1` keys here is legal.
+            alg_id: ALG_ID_V1,
+            sign_pk: device.sign_public_key().as_bytes().to_vec(),
+            agree_pk: device.agree_public_key().as_bytes().to_vec(),
+        };
+        // `enroll_device` hardcodes `device.device_fp()` (alg-1) as the stored fingerprint, so it
+        // cannot produce this row — call `Store::add_device` directly with `alg2_fp` instead.
+        store
+            .add_device(member_id, alg2_fp, "laptop", 0, Some(&keys))
+            .expect("add_device");
+        store
+            .set_device_alg_id_for_test(alg2_fp, Some(2))
+            .expect("set_device_alg_id_for_test");
+
+        let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store));
+        match authorizer.authorize(&alg2_fp).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => panic!(
+                "expected Deny: alg_id = 2 names an algorithm this code path parses sign_pk/\
+                 agree_pk as neither of — sign_pk/agree_pk are parsed as Ed25519/X25519 \
+                 unconditionally, so a row claiming another algorithm cannot be verified here, \
+                 even though this row's device_fp genuinely commits to alg 2 and so passes check \
+                 9's recompute"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn denies_a_device_whose_stored_alg_id_is_out_of_range_rather_than_truncating_to_v1() {
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x13; 32], [0x14; 32]);
         let device_fp = enroll_device(&store, member_id, "laptop", &device);
 
-        // See the sibling test above for why writing this directly (rather than through any real
-        // `Store`/`DevicePublicKeys` API) is the only way to construct this row: `add_device`
-        // rejects nothing here — it just cannot produce a non-`ALG_ID_V1` value on its own.
+        // `devices.alg_id` is a SQLite `INTEGER` column (i64-domain), so a corrupted or tampered
+        // row can hold a raw value no real `u8`-typed writer would ever produce — 257, in
+        // particular. Before the `Store::devices_for_member` fix this test proves, that value was
+        // read with `alg_id.map(|a| a as u8)`, and `257 as u8` truncates (modulo 256) to `1`,
+        // which is `ALG_ID_V1` — so this exact row would have been silently treated as "verified
+        // v1" and ALLOWED, defeating check 8 entirely. `u8::try_from` makes the conversion total
+        // instead: an out-of-range value becomes `None`, which is denied fail-closed exactly like
+        // any other unverifiable row. `set_device_alg_id_for_test` takes `Option<i64>` (not
+        // `Option<u8>`) precisely so a test can reach this otherwise-unwritable value.
         store
-            .set_device_alg_id_for_test(device_fp, Some(2))
+            .set_device_alg_id_for_test(device_fp, Some(257))
             .expect("set_device_alg_id_for_test");
 
         let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store));
         match authorizer.authorize(&device_fp).await {
             ConnectDecision::Deny => {}
             ConnectDecision::Allow { .. } => panic!(
-                "expected Deny: alg_id = 2 names an algorithm this code path parses sign_pk/\
-                 agree_pk as neither of — sign_pk/agree_pk are parsed as Ed25519/X25519 \
-                 unconditionally, so a row claiming another algorithm cannot be verified here"
+                "expected Deny: alg_id = 257 is out of u8 range and must not truncate to a \
+                 valid-looking ALG_ID_V1 (1) — before the fix, `257 as u8 == 1` and this row \
+                 would have been ALLOWED"
             ),
         }
     }

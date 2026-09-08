@@ -477,7 +477,24 @@ impl Store {
                 revoked: revoked != 0,
                 sign_pk,
                 agree_pk,
-                alg_id: alg_id.map(|a| a as u8),
+                // `alg_id` is `INTEGER` — SQLite's i64 domain — but `Device::alg_id` is `Option<u8>`
+                // (DESIGN.md's `ALG_ID_V1` and every algorithm id this codebase knows about fit in
+                // a byte). `as u8` would silently truncate modulo 256: a corrupted or tampered raw
+                // value of 257 would truncate to 1, aliasing to `ALG_ID_V1` and sailing through
+                // `authorize.rs`'s check 8 as "verified v1" when it is neither v1 nor anything this
+                // code path can verify. `u8::try_from` is a total, non-lossy conversion instead: an
+                // out-of-range value becomes `None` rather than a wrapped-around lookalike. `None`
+                // already means "cannot verify" here and is already denied fail-closed by check 8
+                // and by every other consumer of this field, so this only ever converts silent
+                // aliasing into the correct refusal — it never turns a valid value into a denial.
+                //
+                // This does conflate two distinct rows into the same `None`: an out-of-range
+                // (corrupt/tampered) `alg_id` and a genuinely absent one (no keys enrolled). A
+                // future reader must not assume `None` here only ever means "absent" — it also
+                // means "the stored value could not possibly be right". That conflation is
+                // acceptable, not incidental: both cases must fail closed identically, and neither
+                // is a legitimate value a verifier could act on.
+                alg_id: alg_id.and_then(|a| u8::try_from(a).ok()),
             });
         }
         Ok(out)
@@ -628,6 +645,22 @@ impl Store {
     /// should always supply both — a device with no keys on file cannot have any upload it signs
     /// verified later (`crate::model::Device::sign_pk`), nor can it ever be authorized to connect
     /// (`crate::model::Device::agree_pk`).
+    /// Rejects `keys.alg_id != ALG_ID_V1` with [`StoreError::UnsupportedAlgId`] whenever `keys` is
+    /// `Some` — the same guard [`Store::repair_device_keys`] applies to the same column, added so
+    /// the two write paths to `devices.alg_id` agree instead of one enforcing it and the other
+    /// writing whatever a caller supplies verbatim. Every current caller in this repo passes
+    /// `ALG_ID_V1` already (`sign_pk`/`agree_pk` are only ever parsed as Ed25519/X25519, so nothing
+    /// else could be verified anyway), so this is not a behavior change for them; it exists for a
+    /// future enrollment path that constructs `DevicePublicKeys` from wire-supplied data, so an
+    /// unsupported `alg_id` is refused at the point it would otherwise be persisted, not silently
+    /// accepted and left to `authorize.rs`'s connect-time check to catch later.
+    ///
+    /// Deliberately narrower than what [`Store::repair_device_keys`] additionally checks: this
+    /// guard is only about the algorithm identifier, not the `device_fp` binding (whether
+    /// `sign_pk`/`agree_pk` actually rehash to `device_fp`). That omission is unchanged from before
+    /// and already documented on `repair_device_keys`'s doc comment ("Deliberately out of scope:
+    /// `add_device` is not changed to perform this same binding check") — this fix does not touch
+    /// that decision.
     pub fn add_device(
         &self,
         member_id: MemberId,
@@ -638,6 +671,11 @@ impl Store {
     ) -> Result<(), StoreError> {
         if self.get_member(member_id)?.is_none() {
             return Err(StoreError::MemberNotFound(member_id));
+        }
+        if let Some(k) = keys {
+            if k.alg_id != spindle_core::ALG_ID_V1 {
+                return Err(StoreError::UnsupportedAlgId { alg_id: k.alg_id });
+            }
         }
         // All three columns are populated from the same `Option<&DevicePublicKeys>`, which is
         // what makes the NULL-iff-no-keys invariant on `alg_id` structural rather than an
@@ -1953,11 +1991,21 @@ impl Store {
 impl Store {
     /// Overwrites a device's stored `alg_id` directly, bypassing every invariant `add_device`
     /// otherwise enforces. This deliberately performs **no** validation of `alg_id` — accepting
-    /// `None` (to produce the NULL-beside-present-keys row no real caller can write) or any `u8`
-    /// (to name an unsupported algorithm) is the entire point: this method's only job is to write
-    /// invalid rows so a downstream fail-closed check can be proven against them. It is unreachable
-    /// from any production build: `test-support` is only ever enabled through a dev-dependency edge
-    /// (see `Cargo.toml`), and `resolver = "2"` keeps that from unifying into a normal build.
+    /// `None` (to produce the NULL-beside-present-keys row no real caller can write) or any value
+    /// (to name an unsupported algorithm, or one outside `u8`'s range entirely) is the entire
+    /// point: this method's only job is to write invalid rows so a downstream fail-closed check
+    /// can be proven against them. It is unreachable from any production build: `test-support` is
+    /// only ever enabled through a dev-dependency edge (see `Cargo.toml`), and `resolver = "2"`
+    /// keeps that from unifying into a normal build.
+    ///
+    /// Takes `Option<i64>`, not `Option<u8>`, deliberately: `devices.alg_id` is a SQLite
+    /// `INTEGER` column, i.e. i64-domain, and this helper's entire reason to exist is writing rows
+    /// the real API cannot produce. A `u8` parameter would cap this helper's reach at exactly the
+    /// same range `Device::alg_id: Option<u8>` already covers, making it structurally unable to
+    /// write the one row class the read path's `u8::try_from` conversion (see
+    /// `Store::devices_for_member`) exists to defend against: a stored value like `257` that is
+    /// out of `u8` range altogether, not merely a valid-but-unsupported `u8` like `2`. Widening
+    /// this parameter is what makes that corruption class testable at all.
     ///
     /// Returns [`StoreError::DeviceNotFound`] if `device_fp` does not name an existing device — a
     /// silent no-op here would let a caller's test pass for the wrong reason (never having written
@@ -1967,11 +2015,11 @@ impl Store {
     pub fn set_device_alg_id_for_test(
         &self,
         device_fp: Fingerprint,
-        alg_id: Option<u8>,
+        alg_id: Option<i64>,
     ) -> Result<(), StoreError> {
         let changed = self.conn.execute(
             "UPDATE devices SET alg_id = ?1 WHERE device_fp = ?2",
-            params![alg_id.map(|a| a as i64), device_fp.to_vec()],
+            params![alg_id, device_fp.to_vec()],
         )?;
         if changed == 0 {
             return Err(StoreError::DeviceNotFound(device_fp));
