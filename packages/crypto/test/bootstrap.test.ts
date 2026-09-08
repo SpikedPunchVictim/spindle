@@ -10,7 +10,7 @@
 
 import { CapKind, Capability, HostOpKeyCert } from "@spindle/proto";
 import type { BundleEntry } from "@spindle/proto";
-import { MAX_BUNDLE_ENTRIES, QR_V40_M_CAPACITY_BYTES } from "@spindle/proto";
+import { MAX_BUNDLE_ENTRIES, MAX_REGISTRY_LEN, QR_V40_M_CAPACITY_BYTES } from "@spindle/proto";
 import { describe, expect, it } from "vitest";
 
 import { ArtifactError } from "../src/artifacts.js";
@@ -280,5 +280,161 @@ describe("buildBootstrapBundle / verifyBootstrapBundle", () => {
     expect(err.kind).toBe("TooManyEntries");
     expect(err.found).toBe(MAX_BUNDLE_ENTRIES + 1);
     expect(err.max).toBe(MAX_BUNDLE_ENTRIES);
+  });
+
+  // ---- registry length cap on build (defect: builder used to never check this) ----
+
+  // Rust: build_rejects_registry_one_byte_over_max_registry_len
+  it("rejects a registry one byte over MAX_REGISTRY_LEN, from the BUILDER itself", async () => {
+    // BUILDER-side rejection, not merely the decoder's: before this fix, `buildBootstrapBundle`
+    // had no length check on `registry` at all, so this call would have produced a bundle
+    // `DeviceBootstrapBundle.fromCbor` (the decode path) would then reject — the build/decode
+    // asymmetry this fix closes.
+    const registry = "r".repeat(MAX_REGISTRY_LEN + 1);
+    const { entry } = await realEntry(0x64, 0x65, 10_000n);
+    const err = await expectBundleError(() =>
+      buildBootstrapBundle(registry, [entry], QrEcLevel.M),
+    );
+    expect(err.kind).toBe("RegistryTooLong");
+    expect(err.max).toBe(MAX_REGISTRY_LEN);
+    expect(err.actual).toBe(MAX_REGISTRY_LEN + 1);
+  });
+
+  // Rust: build_rejects_multibyte_registry_over_byte_cap_but_under_utf16_cap
+  it("rejects a multi-byte registry over the byte cap but under the UTF-16 cap", async () => {
+    // TWIN-DIVERGENCE GUARD: 100 repetitions of a 3-byte-in-UTF-8 CJK character is 300 UTF-8
+    // bytes (over MAX_REGISTRY_LEN) but only 100 UTF-16 code units (`registry.length`, well under
+    // it). This is exactly the string the Rust twin's own test uses. If this function measured
+    // `registry.length` instead of `textEncoder.encode(registry).length`, it would wrongly accept
+    // this registry — a string the Rust builder (and both languages' decoders) reject.
+    const registry = "文".repeat(100);
+    expect(registry.length).toBe(100); // UTF-16 code units: under the cap
+    const { entry } = await realEntry(0x66, 0x67, 10_000n);
+    const err = await expectBundleError(() =>
+      buildBootstrapBundle(registry, [entry], QrEcLevel.M),
+    );
+    expect(err.kind).toBe("RegistryTooLong");
+    expect(err.max).toBe(MAX_REGISTRY_LEN);
+    expect(err.actual).toBe(300); // UTF-8 bytes: over the cap
+  });
+
+  // Rust: retrying_with_fits_prefix_succeeds
+  it("retrying with entries.slice(0, fits) succeeds, per the doc-comment contract", async () => {
+    // This is the contract `BundleError.tooLargeForQr`'s doc comment promises ("re-calling with
+    // `entries[..fits]` succeeds") and the test whose absence let the original defect through:
+    // pre-fix, `fits` could be `0` without ever having been verified to actually fit, making this
+    // exact retry fail. Here `fits` is reached via a genuine per-entry overflow (a valid, short
+    // registry; six real entries exceed the EC-M budget) — the case the loop has always computed
+    // correctly by finding a genuine break. Combined with the oversized-registry repro test below
+    // (which exercises the actual historical failure mode), the two together prove the promise
+    // holds in general, not just for the specific shape that happened to already work.
+    const entries: BundleEntry[] = [];
+    for (let i = 0; i < 6; i++) {
+      const { entry } = await realEntry(0x68 + i, 0x78 + i, 10_000n);
+      entries.push(entry);
+    }
+
+    const err = await expectBundleError(() =>
+      buildBootstrapBundle("nats://x:4222", entries, QrEcLevel.M),
+    );
+    expect(err.kind).toBe("TooLargeForQr");
+    const fits = err.fits as number;
+    expect(fits).toBeLessThan(entries.length);
+
+    const retried = await buildBootstrapBundle(
+      "nats://x:4222",
+      entries.slice(0, fits),
+      QrEcLevel.M,
+    );
+    expect(retried.entries).toHaveLength(fits);
+  });
+
+  it("never lies about fits with an oversized registry (historical defect repro)", async () => {
+    // HISTORICAL DEFECT REPRODUCTION: this is the exact shape the adversarial review used to
+    // confirm the bug by execution — an over-limit `registry` (here, far larger than even the QR
+    // budget itself) plus a few real entries. Pre-fix, with no registry-length check at the top of
+    // `buildBootstrapBundle`, this call would proceed to the fit-search loop; even the n === 0
+    // (empty-entries) candidate's encoding is dominated by the oversized registry alone and still
+    // exceeds `budgetBytes`, so the loop would never break and `fits` would keep its
+    // uninitialized-in-truth value of `0` — indistinguishable from a genuinely verified "zero
+    // entries fit". Retrying with `entries.slice(0, 0)` (still carrying the same oversized
+    // registry) would then fail too, exactly as the reviewer observed in both languages.
+    //
+    // Post-fix, this can no longer happen: the registry-length check runs before any encoding work
+    // at all, so this call is rejected immediately with `RegistryTooLong` — a bundle this oversized
+    // is never even attempted, and `TooLargeForQr` is never reached (let alone with a lying
+    // `fits`). If this fix is reverted, this call instead throws `TooLargeForQr` (with `fits ===
+    // 0`), so this assertion fails.
+    const oversizedRegistry = "r".repeat(5_000);
+    const entries: BundleEntry[] = [];
+    for (let i = 0; i < 3; i++) {
+      const { entry } = await realEntry(0x90 + i, 0xa0 + i, 10_000n);
+      entries.push(entry);
+    }
+
+    const err = await expectBundleError(() =>
+      buildBootstrapBundle(oversizedRegistry, entries, QrEcLevel.M),
+    );
+    expect(err.kind).toBe("RegistryTooLong");
+    expect(err.max).toBe(MAX_REGISTRY_LEN);
+    expect(err.actual).toBe(5_000);
+  });
+
+  // ---- verified entries must not alias the input bundle ----
+
+  it("returns a VerifiedBundle independent of the original bundle's byte arrays", async () => {
+    // DEFECT REPRODUCTION: `verifyBundleEntry` used to return `entry.sign_pk`/`entry.agree_pk`/
+    // `entry.member_cap` (and `entry.member_cap.host_fp`) directly — live aliases into the
+    // caller's own bundle. Mutating the bundle AFTER a successful verify would then silently
+    // mutate the "verified" value too, with no re-verification and no signal. The Rust twin
+    // cannot do this (ownership forces a copy at every one of these points), so this test only has
+    // meaning on the TypeScript side; it must fail if the `.slice()`/`cloneCapability` copies in
+    // `verifyBundleEntry` are reverted to returning the input's own arrays/object.
+    const { entry } = await realEntry(0x50, 0x51, 10_000n);
+    const bundle = await buildBootstrapBundle("nats://x:4222", [entry], QrEcLevel.M);
+
+    const verified = await verifyBootstrapBundle(bundle, 1_500n);
+    const verifiedEntry = verified.entries[0];
+
+    // Snapshot every returned byte array before mutating the original.
+    const before = {
+      hostFp: verifiedEntry.hostFp.slice(),
+      hostDeviceFp: verifiedEntry.hostDeviceFp.slice(),
+      signPk: verifiedEntry.signPk.slice(),
+      agreePk: verifiedEntry.agreePk.slice(),
+      memberCap: {
+        host_fp: verifiedEntry.memberCap.host_fp.slice(),
+        host_root_pk: verifiedEntry.memberCap.host_root_pk.slice(),
+        op_cert: verifiedEntry.memberCap.op_cert.slice(),
+        subject: verifiedEntry.memberCap.subject.slice(),
+        nonce: verifiedEntry.memberCap.nonce.slice(),
+        sig: verifiedEntry.memberCap.sig.slice(),
+      },
+    };
+
+    // Mutate EVERY byte-array field of the ORIGINAL bundle, in place.
+    const originalEntry = bundle.entries[0];
+    originalEntry.sign_pk[0] ^= 0xff;
+    originalEntry.agree_pk[0] ^= 0xff;
+    originalEntry.member_cap.host_fp[0] ^= 0xff;
+    originalEntry.member_cap.host_root_pk[0] ^= 0xff;
+    originalEntry.member_cap.op_cert[0] ^= 0xff;
+    originalEntry.member_cap.subject[0] ^= 0xff;
+    originalEntry.member_cap.nonce[0] ^= 0xff;
+    originalEntry.member_cap.sig[0] ^= 0xff;
+
+    // The already-returned `VerifiedBundle` must be completely unaffected.
+    expect(bytesEqual(verifiedEntry.hostFp, before.hostFp)).toBe(true);
+    expect(bytesEqual(verifiedEntry.hostDeviceFp, before.hostDeviceFp)).toBe(true);
+    expect(bytesEqual(verifiedEntry.signPk, before.signPk)).toBe(true);
+    expect(bytesEqual(verifiedEntry.agreePk, before.agreePk)).toBe(true);
+    expect(bytesEqual(verifiedEntry.memberCap.host_fp, before.memberCap.host_fp)).toBe(true);
+    expect(bytesEqual(verifiedEntry.memberCap.host_root_pk, before.memberCap.host_root_pk)).toBe(
+      true,
+    );
+    expect(bytesEqual(verifiedEntry.memberCap.op_cert, before.memberCap.op_cert)).toBe(true);
+    expect(bytesEqual(verifiedEntry.memberCap.subject, before.memberCap.subject)).toBe(true);
+    expect(bytesEqual(verifiedEntry.memberCap.nonce, before.memberCap.nonce)).toBe(true);
+    expect(bytesEqual(verifiedEntry.memberCap.sig, before.memberCap.sig)).toBe(true);
   });
 });

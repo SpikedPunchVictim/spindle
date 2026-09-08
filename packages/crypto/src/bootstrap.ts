@@ -24,6 +24,7 @@ import {
   Capability,
   DeviceBootstrapBundle,
   MAX_BUNDLE_ENTRIES,
+  MAX_REGISTRY_LEN,
   QR_V40_L_CAPACITY_BYTES,
   QR_V40_M_CAPACITY_BYTES,
 } from "@spindle/proto";
@@ -84,7 +85,12 @@ export const QrEcLevel = {
 /** Errors from building or verifying a `DeviceBootstrapBundle`. Unlike `ArtifactError` (the A7b
  * signed-artifact catalog's error type), this one also covers the QR fit check, which has no
  * equivalent among the signed artifacts. Mirrors Rust's `BundleError` enum. */
-export type BundleErrorKind = "VersionTooLow" | "TooManyEntries" | "Entry" | "TooLargeForQr";
+export type BundleErrorKind =
+  | "VersionTooLow"
+  | "TooManyEntries"
+  | "RegistryTooLong"
+  | "Entry"
+  | "TooLargeForQr";
 
 export class BundleError extends Error {
   readonly kind: BundleErrorKind;
@@ -92,8 +98,10 @@ export class BundleError extends Error {
   readonly found?: number;
   /** Set for `VersionTooLow`. */
   readonly minimum?: number;
-  /** Set for `TooManyEntries`. */
+  /** Set for `TooManyEntries`, `RegistryTooLong`. */
   readonly max?: number;
+  /** Set for `RegistryTooLong` — `registry`'s actual length, in UTF-8 bytes. */
+  readonly actual?: number;
   /** Set for `Entry`. */
   readonly index?: number;
   /** Set for `Entry`. */
@@ -118,6 +126,7 @@ export class BundleError extends Error {
       found?: number;
       minimum?: number;
       max?: number;
+      actual?: number;
       index?: number;
       source?: ArtifactError;
       ecLevel?: QrEcLevel;
@@ -133,6 +142,7 @@ export class BundleError extends Error {
     this.found = extra?.found;
     this.minimum = extra?.minimum;
     this.max = extra?.max;
+    this.actual = extra?.actual;
     this.index = extra?.index;
     this.source = extra?.source;
     this.ecLevel = extra?.ecLevel;
@@ -163,6 +173,20 @@ export class BundleError extends Error {
       "TooManyEntries",
       `bundle has ${found} entries, exceeding the ${max}-entry cap`,
       { found, max },
+    );
+  }
+
+  /** `buildBootstrapBundle`: `registry`'s length in UTF-8 bytes exceeds `MAX_REGISTRY_LEN`.
+   * Checked before any encoding work, so this function can never produce a bundle that
+   * `DeviceBootstrapBundle.fromCbor`'s own `MAX_REGISTRY_LEN` check would then reject on decode —
+   * a build/decode asymmetry this mirrors the Rust twin's `BundleError::RegistryTooLong` in
+   * closing. Mirrors that variant's redaction discipline too: `message` reports only `actual`/
+   * `max` — a length and a cap — never the `registry` string itself. */
+  static registryTooLong(max: number, actual: number): BundleError {
+    return new BundleError(
+      "RegistryTooLong",
+      `bundle registry is ${actual} bytes long, exceeding the ${max}-byte cap`,
+      { max, actual },
     );
   }
 
@@ -215,6 +239,13 @@ export class BundleError extends Error {
 /** Builds a `DeviceBootstrapBundle` at `BUNDLE_CURRENT_V` and checks it against the printed QR's
  * real byte budget.
  *
+ * **`registry` is validated against `MAX_REGISTRY_LEN` before any encoding work**, so this
+ * function can never emit a bundle that `DeviceBootstrapBundle.fromCbor`'s own `MAX_REGISTRY_LEN`
+ * check would then reject on decode — a build/decode asymmetry this function used to allow. This
+ * also guarantees the overflow branch below never has to consider a `registry` alone large enough
+ * to bust the QR budget; see that branch's comment for why that guarantee is what makes the
+ * empty-prefix case provably unreachable.
+ *
  * **The fit check measures the REAL canonical encoding, never
  * `@spindle/proto`'s `MEASURED_ENTRY_BYTES`.** That constant is documentation for DESIGN.md
  * :328-329's "4 hosts at EC level M, 5 at level L" figures only — it is not a lower bound this
@@ -238,11 +269,23 @@ export class BundleError extends Error {
  * an expired-but-otherwise-valid capability here would make bundle construction less useful than
  * doing nothing at all. Verification is entirely a decode-side duty — see
  * `verifyBootstrapBundle`. Do not add a `verifyCapability` call here. */
+const textEncoder = new TextEncoder();
+
 export async function buildBootstrapBundle(
   registry: string,
   entries: BundleEntry[],
   ecLevel: QrEcLevel,
 ): Promise<DeviceBootstrapBundle> {
+  // Measured in UTF-8 BYTES via TextEncoder, matching the Rust twin's `str::len()` (already byte
+  // length) and `@spindle/proto`'s own (unexported) `checkRegistryLen` — NEVER `registry.length`,
+  // which counts UTF-16 code units and would silently under-count any non-ASCII registry (e.g. a
+  // 100-character CJK string is 100 UTF-16 code units but 300 UTF-8 bytes), letting this function
+  // accept a registry the Rust builder — and both languages' decoders — would reject.
+  const registryBytes = textEncoder.encode(registry).length;
+  if (registryBytes > MAX_REGISTRY_LEN) {
+    throw BundleError.registryTooLong(MAX_REGISTRY_LEN, registryBytes);
+  }
+
   if (entries.length > MAX_BUNDLE_ENTRIES) {
     throw BundleError.tooManyEntries(entries.length, MAX_BUNDLE_ENTRIES);
   }
@@ -255,7 +298,7 @@ export async function buildBootstrapBundle(
 
   // Overflow: find the largest fitting prefix by trying n descending from len - 1 to 0. The
   // full-length bundle (n === entries.length) already failed above, so it is not retried.
-  let fits = 0;
+  let fits: number | undefined;
   for (let n = entries.length - 1; n >= 0; n--) {
     const candidateEntries = entries.slice(0, n);
     const candidate: DeviceBootstrapBundle = { v: bundle.v, registry, entries: candidateEntries };
@@ -263,6 +306,25 @@ export async function buildBootstrapBundle(
       fits = n;
       break;
     }
+  }
+  // PROVABLY UNREACHABLE, not a silent fallback — mirrors the Rust twin's identical comment in
+  // `build_bootstrap_bundle` for the full argument: `registry` was already capped at
+  // MAX_REGISTRY_LEN (256 UTF-8 bytes) above, so the n === 0 (empty-entries) candidate this loop
+  // always tries last is guaranteed to encode well under budgetBytes — the smaller QR budget,
+  // QR_V40_M_CAPACITY_BYTES, is 2331 B, over 2000 B of headroom above the ~300 B an empty-entries
+  // bundle with a max-length registry ever costs. So `fits` is always assigned by the loop.
+  // Throwing a plain `Error` here (not a `BundleError`) mirrors Rust's `unreachable!()`: this is a
+  // violated internal invariant, not a normal rejection a caller should branch on. Before this
+  // fix, `fits` defaulted to a bare `0` and that value was left in place if the loop never broke —
+  // indistinguishable from a genuinely verified "zero entries fit"; that could only happen when
+  // `registry` itself was unbounded, which is no longer possible.
+  if (fits === undefined) {
+    throw new Error(
+      `internal invariant violated: empty-entries bundle (registry <= ${MAX_REGISTRY_LEN} B) ` +
+        `exceeded the ${budgetBytes}-byte QR budget at EC level ${ecLevel} — MAX_REGISTRY_LEN or ` +
+        `a QR budget constant must have changed since this invariant was last proven; re-derive ` +
+        `it before removing this check`,
+    );
   }
 
   // hostFp is derived from each dropped entry's own host_root_pk (SHA-256 of the raw key bytes),
@@ -352,6 +414,32 @@ export async function verifyBootstrapBundle(
   return { registry: bundle.registry, entries };
 }
 
+/** Deep-copies a `Capability`, including every byte-array field. The Rust twin gets this for free
+ * from ownership: `Fingerprint::from_slice` copies into an owned `[u8; 32]`, `parse_verifying_key`
+ * returns an owned `VerifyingKey`, and `member_cap` is explicitly `.clone()`d in
+ * `verify_bundle_entry` — so a `VerifiedBundleEntry` on the Rust side can never alias the input
+ * `bundle` it was verified from. JavaScript has no ownership system to get that for free:
+ * `Capability` is a plain object of `Uint8Array`s, and `{ ...cap }` (or returning `cap` itself)
+ * would only shallow-copy the object, leaving every `Uint8Array` field a live alias into the
+ * caller's own bundle. Without this, mutating the original bundle after a successful verify would
+ * silently mutate the "verified" value too, with no re-verification and no signal — this function
+ * exists so the two languages agree on what a `VerifiedBundle` means: independent of its input,
+ * always. */
+function cloneCapability(cap: Capability): Capability {
+  return {
+    v: cap.v,
+    host_fp: cap.host_fp.slice(),
+    host_root_pk: cap.host_root_pk.slice(),
+    op_cert: cap.op_cert.slice(),
+    kind: cap.kind,
+    subject: cap.subject.slice(),
+    cap_epoch: cap.cap_epoch,
+    exp: cap.exp,
+    nonce: cap.nonce.slice(),
+    sig: cap.sig.slice(),
+  };
+}
+
 /** One entry's worth of step 2 in `verifyBootstrapBundle`'s doc comment — pulled out so the loop
  * above can attach the entry's index to whichever `ArtifactError` this produces. */
 async function verifyBundleEntry(entry: BundleEntry, now: bigint): Promise<VerifiedBundleEntry> {
@@ -367,14 +455,16 @@ async function verifyBundleEntry(entry: BundleEntry, now: bigint): Promise<Verif
   await verifyCapability(entry.member_cap, now);
 
   // d. hostFp — safe only now that (c) has proven member_cap.host_fp is exactly 32 bytes and
-  // self-consistent with host_root_pk.
-  const hostFp = entry.member_cap.host_fp;
+  // self-consistent with host_root_pk. Copied (not aliased) below, along with every other
+  // returned field — see `cloneCapability`'s doc comment for why this package must do explicitly
+  // what Rust gets for free from ownership.
+  const hostFp = entry.member_cap.host_fp.slice();
 
   return {
     hostFp,
     hostDeviceFp,
-    signPk: entry.sign_pk,
-    agreePk: entry.agree_pk,
-    memberCap: entry.member_cap,
+    signPk: entry.sign_pk.slice(),
+    agreePk: entry.agree_pk.slice(),
+    memberCap: cloneCapability(entry.member_cap),
   };
 }

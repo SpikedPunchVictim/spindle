@@ -18,7 +18,7 @@ use ed25519_dalek::VerifyingKey;
 use spindle_proto::artifacts::Capability;
 use spindle_proto::bootstrap::{
     BundleEntry, DeviceBootstrapBundle, BUNDLE_CURRENT_V, BUNDLE_MIN_V, MAX_BUNDLE_ENTRIES,
-    QR_V40_L_CAPACITY_BYTES, QR_V40_M_CAPACITY_BYTES,
+    MAX_REGISTRY_LEN, QR_V40_L_CAPACITY_BYTES, QR_V40_M_CAPACITY_BYTES,
 };
 use thiserror::Error;
 use x25519_dalek::PublicKey as X25519PublicKey;
@@ -76,6 +76,17 @@ pub enum BundleError {
     #[error("bundle has {found} entries, exceeding the {max}-entry cap")]
     TooManyEntries { found: usize, max: usize },
 
+    /// [`build_bootstrap_bundle`]: `registry`'s length in UTF-8 bytes exceeds
+    /// [`MAX_REGISTRY_LEN`]. Checked before any encoding work, so a bundle that would fail
+    /// [`DeviceBootstrapBundle::from_cbor`]'s own `MAX_REGISTRY_LEN` check on decode is never
+    /// produced in the first place — see this module's doc comment for why the builder must not
+    /// be allowed to emit a bundle its own decoder would reject.
+    ///
+    /// REDACTION DISCIPLINE: same as [`TooLargeForQr`](Self::TooLargeForQr) below — `#[error(...)]`
+    /// reports only `actual`/`max`, a length and a cap, never the `registry` string itself.
+    #[error("bundle registry is {actual} bytes long, exceeding the {max}-byte cap")]
+    RegistryTooLong { max: usize, actual: usize },
+
     /// [`verify_bootstrap_bundle`]: entry `index` failed verification. `source` is whichever
     /// [`ArtifactError`] the per-entry checks produced — bad key encoding, a failed
     /// `verify_capability`, or a `host_fp` derivation failure.
@@ -116,6 +127,13 @@ pub enum BundleError {
 /// Builds a [`DeviceBootstrapBundle`] at [`BUNDLE_CURRENT_V`] and checks it against the printed
 /// QR's real byte budget.
 ///
+/// **`registry` is validated against [`MAX_REGISTRY_LEN`] before any encoding work**, so this
+/// function can never emit a bundle that [`DeviceBootstrapBundle::from_cbor`]'s own
+/// `MAX_REGISTRY_LEN` check would then reject on decode — a build/decode asymmetry this function
+/// used to allow. This also guarantees the overflow branch below never has to consider a
+/// `registry` alone large enough to bust the QR budget; see that branch's comment for why that
+/// guarantee is what makes the empty-prefix case provably unreachable.
+///
 /// **The fit check measures the REAL canonical encoding, never
 /// [`spindle_proto::bootstrap::MEASURED_ENTRY_BYTES`].** That constant is documentation for
 /// DESIGN.md :328-329's "4 hosts at EC level M, 5 at level L" figures only — it is not a lower
@@ -145,6 +163,18 @@ pub fn build_bootstrap_bundle(
     entries: Vec<BundleEntry>,
     ec_level: QrEcLevel,
 ) -> Result<DeviceBootstrapBundle, BundleError> {
+    // `str::len()` is already UTF-8 BYTES, not chars or UTF-16 code units — this matches
+    // `DeviceBootstrapBundle::from_cbor`'s own `registry.len()` check exactly, and matches the
+    // TypeScript twin's `textEncoder.encode(registry).length` (never `registry.length`, which is
+    // UTF-16 code units and would disagree with this byte count for any non-ASCII registry).
+    let registry_len = registry.len();
+    if registry_len > MAX_REGISTRY_LEN {
+        return Err(BundleError::RegistryTooLong {
+            max: MAX_REGISTRY_LEN,
+            actual: registry_len,
+        });
+    }
+
     if entries.len() > MAX_BUNDLE_ENTRIES {
         return Err(BundleError::TooManyEntries {
             found: entries.len(),
@@ -171,7 +201,7 @@ pub fn build_bootstrap_bundle(
         registry,
         entries,
     } = bundle;
-    let mut fits = 0usize;
+    let mut fits: Option<usize> = None;
     for n in (0..entries.len()).rev() {
         let candidate = DeviceBootstrapBundle {
             v,
@@ -179,10 +209,32 @@ pub fn build_bootstrap_bundle(
             entries: entries[..n].to_vec(),
         };
         if candidate.to_canonical_bytes().len() <= budget_bytes {
-            fits = n;
+            fits = Some(n);
             break;
         }
     }
+    // PROVABLY UNREACHABLE, not a silent fallback: this loop always tries n == 0 last (the
+    // empty-entries candidate), and that candidate is guaranteed to fit. `registry` was already
+    // capped at MAX_REGISTRY_LEN (256 B) above, so the n == 0 candidate's canonical encoding is
+    // at most a `v` byte, an up-to-256-byte `registry` string, an empty `entries` array, and the
+    // map/key overhead around them — comfortably under 300 B. `budget_bytes` is one of
+    // QR_V40_M_CAPACITY_BYTES (2331 B) or QR_V40_L_CAPACITY_BYTES (2953 B), either of which leaves
+    // over 2000 B of headroom over that worst case. So the loop above always breaks before
+    // exhausting its range, and `fits` is always `Some`. This differs from the pre-fix code, which
+    // initialized `fits` to a bare `0usize` and left that value in place — indistinguishable from a
+    // genuinely-verified "zero entries fit" — if the loop never broke; that could only happen when
+    // `registry` itself was unbounded, which is no longer possible. `unreachable!()` here, rather
+    // than a defaulted value, means a future change that reopens this gap (e.g. shrinking a QR
+    // budget constant, or raising MAX_REGISTRY_LEN) panics loudly instead of silently reintroducing
+    // the bug this comment describes.
+    let fits = fits.unwrap_or_else(|| {
+        unreachable!(
+            "empty-entries bundle (registry <= {MAX_REGISTRY_LEN} B) exceeded the \
+             {budget_bytes}-byte QR budget at {ec_level:?} — MAX_REGISTRY_LEN or a QR budget \
+             constant must have changed since this invariant was last proven; re-derive it before \
+             removing this panic"
+        )
+    });
 
     // host_fp is derived from each dropped entry's own host_root_pk (SHA-256 of the raw key
     // bytes), never trusted from the nested capability's carried `host_fp` field — the same
@@ -724,6 +776,124 @@ mod tests {
                 found: MAX_BUNDLE_ENTRIES + 1,
                 max: MAX_BUNDLE_ENTRIES,
             }
+        );
+    }
+
+    // ---- registry length cap on build (defect: builder used to never check this) ----
+
+    #[test]
+    fn build_rejects_registry_one_byte_over_max_registry_len() {
+        // BUILDER-side rejection, not merely the decoder's: before this fix, `build_bootstrap_
+        // bundle` had no length check on `registry` at all, so this call would have produced a
+        // bundle `DeviceBootstrapBundle::from_cbor` (the decode path) would then reject — the
+        // build/decode asymmetry this fix closes.
+        let registry = "r".repeat(MAX_REGISTRY_LEN + 1);
+        let (_host, entry) = real_entry(0x64, 0x65, 10_000);
+        let err = build_bootstrap_bundle(&registry, vec![entry], QrEcLevel::M).unwrap_err();
+        assert_eq!(
+            err,
+            BundleError::RegistryTooLong {
+                max: MAX_REGISTRY_LEN,
+                actual: MAX_REGISTRY_LEN + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn build_rejects_multibyte_registry_over_byte_cap_but_under_utf16_cap() {
+        // TWIN-DIVERGENCE GUARD: 100 repetitions of a 3-byte-in-UTF-8 CJK character is 300 UTF-8
+        // bytes (over MAX_REGISTRY_LEN) but only 100 UTF-16 code units (well under it). Rust's
+        // `str::len()` already measures UTF-8 bytes, so this mainly guards against a future
+        // accidental switch to a char-counting length here; the point of this test existing in
+        // both languages is that the SAME registry string is rejected for the SAME reason (byte
+        // length) in both, rather than the TypeScript twin silently accepting what Rust rejects
+        // because it measured `registry.length` (UTF-16 code units) instead of encoded bytes.
+        let registry: String = "文".repeat(100);
+        assert_eq!(
+            registry.len(),
+            300,
+            "sanity: 100 * 3-byte-UTF-8 CJK chars is 300 bytes"
+        );
+        assert_eq!(
+            registry.encode_utf16().count(),
+            100,
+            "sanity: 100 UTF-16 code units, under MAX_REGISTRY_LEN"
+        );
+        let (_host, entry) = real_entry(0x66, 0x67, 10_000);
+        let err = build_bootstrap_bundle(&registry, vec![entry], QrEcLevel::M).unwrap_err();
+        assert_eq!(
+            err,
+            BundleError::RegistryTooLong {
+                max: MAX_REGISTRY_LEN,
+                actual: 300,
+            }
+        );
+    }
+
+    #[test]
+    fn retrying_with_fits_prefix_succeeds() {
+        // This is the contract `BundleError::TooLargeForQr`'s doc comment promises ("re-calling
+        // with `entries[..fits]` succeeds") and the test whose absence let the original defect
+        // through: pre-fix, `fits` could be `0` without ever having been verified to actually fit,
+        // making this exact retry fail. Here `fits` is reached via a genuine per-entry overflow
+        // (a valid, short registry; six real entries exceed the EC-M budget) — the case the loop
+        // has always computed correctly by finding a genuine break. Combined with
+        // `build_never_lies_about_fits_even_with_an_oversized_registry` below (which exercises the
+        // actual historical failure mode: an oversized registry that made even the empty-entries
+        // candidate fail to fit), the two together prove the promise holds in general, not just
+        // for the specific shape that happened to already work.
+        let entries: Vec<BundleEntry> = (0u8..6)
+            .map(|i| real_entry(0x68 + i, 0x78 + i, 10_000).1)
+            .collect();
+        let err = build_bootstrap_bundle("nats://x:4222", entries.clone(), QrEcLevel::M)
+            .expect_err("6 real entries must overflow the EC-M budget");
+        let BundleError::TooLargeForQr { fits, .. } = err else {
+            panic!("expected TooLargeForQr, got {err:?}");
+        };
+        assert!(
+            fits < entries.len(),
+            "at least one entry must have been dropped"
+        );
+
+        let retried =
+            build_bootstrap_bundle("nats://x:4222", entries[..fits].to_vec(), QrEcLevel::M);
+        assert!(
+            retried.is_ok(),
+            "re-calling with entries[..fits] ({fits} entries) must succeed per the doc-comment \
+             contract, got {retried:?}"
+        );
+    }
+
+    #[test]
+    fn build_never_lies_about_fits_even_with_an_oversized_registry() {
+        // HISTORICAL DEFECT REPRODUCTION: this is the exact shape the adversarial review used to
+        // confirm the bug by execution — an over-limit `registry` (here, far larger than even the
+        // QR budget itself) plus a few real entries. Pre-fix, with no registry-length check at the
+        // top of `build_bootstrap_bundle`, this call would proceed to the fit-search loop; even the
+        // n == 0 (empty-entries) candidate's encoding is dominated by the oversized registry alone
+        // and still exceeds `budget_bytes`, so the loop would never break and `fits` would keep its
+        // uninitialized-in-truth value of `0` — indistinguishable from a genuinely verified "zero
+        // entries fit". Retrying with `entries[..0]` (still carrying the same oversized registry)
+        // would then fail too, exactly as the reviewer observed in both languages.
+        //
+        // Post-fix, this can no longer happen: the registry-length check runs before any encoding
+        // work at all, so this call is rejected immediately with `RegistryTooLong` — a bundle this
+        // oversized is never even attempted, and `TooLargeForQr` is never reached (let alone with a
+        // lying `fits`). If this fix is reverted, this call instead returns `TooLargeForQr` (with
+        // `fits == 0`), so this assertion fails.
+        let oversized_registry = "r".repeat(5_000);
+        let entries: Vec<BundleEntry> = (0u8..3)
+            .map(|i| real_entry(0x90 + i, 0xA0 + i, 10_000).1)
+            .collect();
+        let err = build_bootstrap_bundle(&oversized_registry, entries, QrEcLevel::M).unwrap_err();
+        assert_eq!(
+            err,
+            BundleError::RegistryTooLong {
+                max: MAX_REGISTRY_LEN,
+                actual: 5_000,
+            },
+            "an oversized registry must be rejected outright, never surfacing as a (lying) \
+             TooLargeForQr"
         );
     }
 }
