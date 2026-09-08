@@ -590,7 +590,8 @@ move-into-place, but `spindle_vfs::model::Device`/the v2 schema never persisted 
 signing public key anywhere — there was no key to verify against. Fixed via a new `store` migration,
 `SCHEMA_V3` (`ALTER TABLE devices ADD COLUMN sign_pk BLOB`, plus two new counter tables — see
 below), `Device::sign_pk: Option<Vec<u8>>`, `Store::add_device` gaining a `sign_pk` parameter, and
-`Store::device_sign_pk`. Verification itself needed no new dependency: `spindle-host-core` already
+`Store::device_sign_pk` (later removed by td-ad318f once the request path moved to the shared
+binding check). Verification itself needed no new dependency: `spindle-host-core` already
 depends on `spindle-core`, whose `verify_bytes`/`VerifyingKey` (already re-exported for exactly
 this generic-signature-checking use case, per slice 2) are used directly against the manifest's
 signing input, `spindle-host-core::upload::manifest_signing_bytes` (a length-prefixed

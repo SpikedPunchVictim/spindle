@@ -866,22 +866,6 @@ impl Store {
         Ok(Some(new_epoch))
     }
 
-    /// The device's pinned signing public key, if any (Stage 6 slice 4 — see
-    /// `crate::model::Device::sign_pk`'s doc comment). `Ok(None)` means either the device has no
-    /// key on file or the device does not exist — this method deliberately does not distinguish
-    /// the two (an upload-manifest-verification caller treats both identically: "cannot verify").
-    pub fn device_sign_pk(&self, device_fp: Fingerprint) -> Result<Option<Vec<u8>>, StoreError> {
-        let key: Option<Option<Vec<u8>>> = self
-            .conn
-            .query_row(
-                "SELECT sign_pk FROM devices WHERE device_fp = ?1",
-                params![device_fp.to_vec()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(key.flatten())
-    }
-
     /// Resolves the [`Member`] owning `device_fp` — the connect-time lookup direction. `device_fp`
     /// is what a connect offer's envelope names (DESIGN.md §A5's injected `ConnectAuthorizer`,
     /// `crates/spindle-net/src/signaling/authorize.rs`); `member_id` is host-internal and never
@@ -3040,48 +3024,6 @@ mod tests {
             }
             other => panic!("expected StoreError::Sqlite(SqliteFailure), got {other:?}"),
         }
-    }
-
-    // ---- Devices: sign_pk (Stage 6 slice 4) ----
-
-    #[test]
-    fn device_sign_pk_round_trips_and_defaults_to_none() {
-        let store = Store::open_in_memory().expect("open");
-        let member_id = store
-            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
-            .expect("add_member");
-        let fp_no_key = Fingerprint::of_parts(&[b"device-no-key"]);
-        let fp_with_key = Fingerprint::of_parts(&[b"device-with-key"]);
-
-        store
-            .add_device(member_id, fp_no_key, "Laptop", 0, None)
-            .expect("add_device without key");
-        store
-            .add_device(
-                member_id,
-                fp_with_key,
-                "Phone",
-                0,
-                Some(&DevicePublicKeys {
-                    alg_id: spindle_core::ALG_ID_V1,
-                    sign_pk: vec![0xAB; 32],
-                    agree_pk: vec![0xCD; 32],
-                }),
-            )
-            .expect("add_device with key");
-
-        assert_eq!(store.device_sign_pk(fp_no_key).expect("lookup"), None);
-        assert_eq!(
-            store.device_sign_pk(fp_with_key).expect("lookup"),
-            Some(vec![0xAB; 32])
-        );
-        assert_eq!(
-            store
-                .device_sign_pk(Fingerprint::of_parts(&[b"unknown-device"]))
-                .expect("lookup nonexistent"),
-            None,
-            "an unknown device_fp is treated the same as a known device with no key on file"
-        );
     }
 
     // ---- Devices: agree_pk + member_for_device_fp (Stage 6 slice 5) ----

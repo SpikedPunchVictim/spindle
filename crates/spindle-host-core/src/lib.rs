@@ -135,6 +135,7 @@ pub mod server;
 pub mod session;
 
 mod cache;
+mod device_keys;
 mod identity_cache;
 pub mod limits;
 mod mount;

@@ -10,13 +10,14 @@
 //! `spindle-net`'s job, out of scope here (task brief SCOPE/OUT).
 
 use crate::cache::GrantsCache;
+use crate::device_keys::{checked_device_keys, DeviceKeyError};
 use crate::identity_cache::IdentityCache;
 use crate::limits::{FreeSpaceProbe, UnlimitedFreeSpace, UploadLimits};
 use crate::mount::{MountLookup, MountNode, MountTable};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::upload::{manifest_signing_bytes, UploadSession, UploadSessions};
 use cap_std::fs::OpenOptions;
-use spindle_core::{verify_bytes, Fingerprint, VerifyingKey};
+use spindle_core::{verify_bytes, Fingerprint};
 use spindle_proto::{
     DirEntry, EntryKind, ProtoError, VfsErrorCode, VfsPerms, VfsReply, VfsRequest,
     VfsRequestEnvelope, MAX_LIST_PAGE, MAX_READ_CHUNK, MAX_UPLOAD_CHUNK, MIN_PROTOCOL_VERSION,
@@ -1058,7 +1059,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
             );
         }
 
-        if !self.verify_manifest_signature(Some(ctx.device_fp), path, size, hash, manifest_sig) {
+        if !self.verify_manifest_signature(member, ctx.device_fp, path, size, hash, manifest_sig) {
             return self.deny_with_code(
                 ts,
                 member,
@@ -1126,34 +1127,101 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
     }
 
     /// DESIGN.md §A8: the upload manifest (`path`+`size`+`hash`) is "signed ... by the sending
-    /// device's key" — checked against that device's `sign_pk` (Stage 6 slice 4's addition to
-    /// `spindle_vfs::model::Device`; see this slice's report for the schema-gap finding). A
-    /// session with no signer device (e.g. a test `SessionContext` carrying no `device_fp`) can
-    /// never pass this check, by construction — DESIGN.md gives no alternative identity to verify
-    /// an upload manifest against, so "no device" is treated as "cannot be authorized" rather than
-    /// silently skipping the check.
+    /// device's key" — checked against that device's `sign_pk`, but only once that key has been
+    /// proven to be the one actually bound to `device_fp` (td-ad318f). It is not enough to look up
+    /// *some* `sign_pk` stored under `device_fp` and verify against it: `device_fp = H(alg_id,
+    /// sign_pk, agree_pk)` (DESIGN.md:225-227) makes a stored device key pair self-verifying, and a
+    /// row whose keys were corrupted, transposed, or swapped for another device's must fail this
+    /// check rather than silently pass because a signature happens to verify under whatever bytes
+    /// are on file. `crate::device_keys::checked_device_keys` is the one place that rehash lives —
+    /// see its module doc comment — and this is the second of its two callers, alongside the
+    /// connect path in `crate::authorize`.
+    ///
+    /// Takes `member: &Member` rather than reading the store itself: `VfsRpcServer::handle`
+    /// already does a fresh `store.get_member(ctx.member_id)` (~line 244 of this file), and that
+    /// same read's device query already selects `device_fp, label, added, revoked, sign_pk,
+    /// agree_pk, alg_id` (`spindle-vfs/src/store/mod.rs`'s `devices_for_member`) — everything this
+    /// method needs. Taking the device row from that same `Member` the per-request device-
+    /// revocation gate (~line 312) already fetched removes a store round-trip rather than adding
+    /// one, and removes any read-skew window between "this device is unrevoked" and "these are the
+    /// keys that sign for it".
+    ///
+    /// Fails closed in every case: a `device_fp` absent from `member.devices` (this method never
+    /// `expect`s the device to be there), or a device whose stored keys are missing, unparseable,
+    /// or do not rehash to its own `device_fp`, is treated identically to a bad signature — `false`.
     fn verify_manifest_signature(
         &self,
-        device_fp: Option<Fingerprint>,
+        member: &Member,
+        device_fp: Fingerprint,
         path: &str,
         size: u64,
         hash: &[u8],
         sig: &[u8],
     ) -> bool {
-        let Some(fp) = device_fp else {
+        let Some(device) = member.devices.iter().find(|d| d.device_fp == device_fp) else {
             return false;
         };
-        let Ok(Some(sign_pk)) = self.store().device_sign_pk(fp) else {
-            return false;
-        };
-        let Ok(arr): Result<[u8; 32], _> = sign_pk.as_slice().try_into() else {
-            return false;
-        };
-        let Ok(vk) = VerifyingKey::from_bytes(&arr) else {
-            return false;
+        // `device` (the row found above by `device_fp`) and `&device_fp` (the caller's own
+        // fingerprint, i.e. `device_fp` the parameter) are passed as two separate arguments on
+        // purpose — do not "simplify" this to `checked_device_keys(device, &device.device_fp)`.
+        // That reads as equivalent, compiles, and would pass every existing test, but it changes
+        // what is being checked: `checked_device_keys` rehashes the row's *own* `sign_pk`/
+        // `agree_pk` and compares the result against whichever fingerprint it was handed. Handing
+        // it the row's own `device.device_fp` makes that compare a tautology — a well-formed
+        // row's keys always rehash to its own stored fingerprint, so `BindingMismatch` could
+        // never fire again, no matter how the row got there. Handing it the caller-supplied
+        // `device_fp` instead means the compare only succeeds when the row actually found *for
+        // that fingerprint* is the row whose keys rehash to it — the real safety net for a
+        // lookup that returned the wrong device (transposed write, corrupted index, or a
+        // lookup-by-position bug). `upload_open_verifies_the_session_devices_own_key_not_whichever_device_is_first`
+        // (below, in this module's tests) is what pins a wrong-device lookup as still-caught
+        // behavior; silently turning this into a tautology would not fail that test's compile or
+        // its type-check, only its assertions.
+        let keys = match checked_device_keys(device, &device_fp) {
+            Ok(keys) => keys,
+            Err(DeviceKeyError::BindingMismatch) => {
+                // The row's own keys do not rehash to its own `device_fp` — this host's stored
+                // state is internally inconsistent (corruption, a transposed write, or keys
+                // copied from another device), which is operator-actionable and a genuinely
+                // different fact from "the signature did not verify". `Unverifiable` gets no log:
+                // a device simply having no keys on file is an ordinary, expected state.
+                //
+                // Deliberately NOT throttled by a `Once` the way the peer-drivable `error!` in
+                // `crate::authorize::equalize_denial_work` is (see `EQUALIZATION_DUMMY_KEY_INVALID_LOGGED`,
+                // authorize.rs:649) — that guard and this line solve different problems.
+                // `authorize.rs`'s `Once` protects a *process-invariant* fact: whether the one
+                // fixed, compile-time `EQUALIZATION_DUMMY_KEYS` constant decompresses is decided
+                // once, at compile time, forever, so one log line is the complete story and
+                // logging it again on every subsequent denial would add no information. This line
+                // reports a *per-device* fact — which stored row is internally inconsistent — so
+                // a `Once` here would log the first corrupt device it ever saw and then silently
+                // swallow every different corrupt device afterward, which is the opposite of what
+                // an operator needs to actually find and repair the affected rows.
+                //
+                // Reachability is also very different from `equalize_denial_work`'s pre-auth
+                // path. A device row that fails this rehash cannot pass
+                // `HostConnectAuthorizer::authorize` either (see authorize.rs's own
+                // `Err(DeviceKeyError::BindingMismatch) => return ConnectDecision::Deny` arm), so
+                // no *new* session can even be opened for such a device. Reaching this line
+                // requires a session that was opened while the row was still sound, with the row
+                // corrupted underneath it afterward — and `Store::repair_device_keys`
+                // (spindle-vfs/src/store/mod.rs) re-validates the same binding before writing, so
+                // no store API this codebase exposes can produce that transition either. And even
+                // in that narrow window, `handle()`'s step-0 rate limiter
+                // (`crate::ratelimit::RateLimitConfig::default`: burst 200.0, refill_per_sec 50.0)
+                // bounds one peer to on the order of 50 requests/sec, so an unthrottled log line
+                // here is bounded by that limiter, not unbounded the way a pre-auth log would be.
+                tracing::error!(
+                    device_fp = %device_fp.redacted(),
+                    "verify_manifest_signature: stored device keys do not rehash to their own \
+                     device_fp; refusing to trust them for manifest verification"
+                );
+                return false;
+            }
+            Err(DeviceKeyError::Unverifiable) => return false,
         };
         let msg = manifest_signing_bytes(path, size, hash);
-        verify_bytes(&vk, &msg, sig).is_ok()
+        verify_bytes(&keys.sign_pk, &msg, sig).is_ok()
     }
 
     /// True if neither `grants_version` nor `cap_epoch` has moved since `session` was opened (or
@@ -1449,7 +1517,8 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         // only at `upload_open`), so a mid-transfer device-key change/revocation is caught before
         // the bytes ever land.
         if !self.verify_manifest_signature(
-            Some(ctx.device_fp),
+            member,
+            ctx.device_fp,
             &path_str,
             session.size,
             &session.hash,
@@ -1876,7 +1945,7 @@ fn paginate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spindle_core::identity::DeviceKey;
+    use spindle_core::identity::{device_fp_of, DeviceKey};
     use spindle_core::SigningKey;
     use spindle_vfs::model::{DevicePublicKeys, MemberId, ShareFlags, ShareId};
     use spindle_vfs::store::Store;
@@ -2046,6 +2115,57 @@ mod tests {
                     }),
                 )
                 .expect("add signing device");
+            (device_fp, signing_key)
+        }
+
+        /// Enrolls a device row (td-ad318f's regression scenario) whose stored keys are real,
+        /// parseable Ed25519/X25519 keys with `alg_id = ALG_ID_V1` — genuinely able to verify a
+        /// manifest signature — but which do NOT rehash to the `device_fp` the row is stored
+        /// under: the row is stored under "device A"'s fingerprint while its `sign_pk`/`agree_pk`
+        /// columns hold "device B"'s keys instead. `Store::add_device` performs no binding check
+        /// (see its own doc comment: "Deliberately out of scope: `add_device` is not changed to
+        /// perform this same binding check"), so this row is possible to construct even though no
+        /// real enrollment path would ever produce it.
+        ///
+        /// Returns device A's `device_fp` (the row's own key) and the `SigningKey` that
+        /// genuinely corresponds to the *stored* `sign_pk` (device B's) — so a caller can produce
+        /// a manifest signature that is cryptographically valid under the stored key, even though
+        /// the row itself is unbound. That combination — signature genuinely verifies under the
+        /// stored key, but the stored key does not belong to this `device_fp` — is exactly what a
+        /// pre-td-ad318f `verify_manifest_signature` (which only looked up `sign_pk` and verified
+        /// against it) would have accepted.
+        fn add_mismatched_signing_device(
+            &self,
+            member_id: MemberId,
+            label: &str,
+        ) -> (Fingerprint, SigningKey) {
+            let seed_for = |tag: &str| -> [u8; 32] {
+                let mut seed = [0u8; 32];
+                let digest = Fingerprint::of_parts(&[
+                    b"mismatched-device-seed",
+                    label.as_bytes(),
+                    tag.as_bytes(),
+                ]);
+                seed.copy_from_slice(digest.as_bytes());
+                seed
+            };
+            let device_a = DeviceKey::from_seeds(seed_for("a-sign"), seed_for("a-agree"));
+            let device_b = DeviceKey::from_seeds(seed_for("b-sign"), seed_for("b-agree"));
+            let device_fp = device_a.device_fp();
+            let signing_key = SigningKey::from_bytes(&seed_for("b-sign"));
+            self.store
+                .add_device(
+                    member_id,
+                    device_fp,
+                    label,
+                    0,
+                    Some(&DevicePublicKeys {
+                        alg_id: spindle_core::ALG_ID_V1,
+                        sign_pk: device_b.sign_public_key().as_bytes().to_vec(),
+                        agree_pk: device_b.agree_public_key().as_bytes().to_vec(),
+                    }),
+                )
+                .expect("add mismatched signing device");
             (device_fp, signing_key)
         }
     }
@@ -2952,6 +3072,286 @@ mod tests {
         );
     }
 
+    /// td-ad318f's actual regression test: before the fix, `verify_manifest_signature` fetched
+    /// only `sign_pk` for `device_fp` and verified the manifest signature against it, never
+    /// checking that `sign_pk` (together with `agree_pk`/`alg_id`) actually rehashes to
+    /// `device_fp`. This device's stored keys are real, parseable Ed25519/X25519 keys, and the
+    /// manifest signature below is genuinely produced by the `SigningKey` matching the *stored*
+    /// `sign_pk` — so it verifies cleanly under that key. But the stored keys belong to a
+    /// different device entirely; they do not rehash to this row's own `device_fp` (see
+    /// `Harness::add_mismatched_signing_device`). Before td-ad318f, this exact upload would have
+    /// been ACCEPTED. After the fix, `checked_device_keys`'s binding check must catch it.
+    #[test]
+    fn upload_open_with_signature_valid_under_a_mismatched_devices_stored_key_is_upload_rejected() {
+        let h = Harness::new();
+        let (member_id, _) = h.add_active_member("Alex");
+        let (device_fp, signing_key) =
+            h.add_mismatched_signing_device(member_id, "alex-mismatched");
+        let share_id = h.add_share(
+            "Drop",
+            "Drop",
+            ShareFlags {
+                read_only: false,
+                allow_upload: true,
+                show_hidden: false,
+            },
+        );
+        h.grant(member_id, share_id, "", Perms::UPLOAD);
+        let server = h.server();
+        let ctx = h.ctx_with_device(member_id, device_fp);
+
+        let data = b"hello".to_vec();
+        let hash = sha256(&data);
+        // Genuinely valid under the stored sign_pk — proves this is a binding failure, not a
+        // garden-variety bad signature.
+        let sig = sign_manifest(&signing_key, "Drop/a.bin", data.len() as u64, &hash);
+
+        let reply = server.handle(
+            &ctx,
+            1,
+            req(
+                1,
+                VfsRequest::UploadOpen {
+                    path: "Drop/a.bin".to_string(),
+                    size: data.len() as u64,
+                    hash,
+                    manifest_sig: sig,
+                },
+            ),
+        );
+        assert_eq!(
+            reply,
+            VfsReply::Error {
+                code: VfsErrorCode::UploadRejected
+            }
+        );
+    }
+
+    /// The commit-path twin of the test above. `handle_upload_commit` re-verifies via the exact
+    /// same `verify_manifest_signature` method `handle_upload_open` calls (DESIGN.md §A8:
+    /// re-verified "BEFORE move-into-place"), so a session for a mismatched device can never
+    /// legitimately exist to commit in the first place — the test above proves `upload_open`
+    /// already refuses to open one, and there is no store-level way to retroactively corrupt an
+    /// already-open session's device keys without also passing through the same binding check
+    /// (`Store::repair_device_keys` re-validates the binding, and no test-support backdoor exists
+    /// for overwriting `sign_pk`/`agree_pk` the way `set_device_alg_id_for_test` does for
+    /// `alg_id`). So instead of driving this through `VfsRequest::UploadCommit` end to end, this
+    /// calls `verify_manifest_signature` directly — the one function both call sites share —
+    /// which is the actual code the commit path would run against a mismatched device mid-session
+    /// if one somehow existed, and proves it rejects here exactly as the open path does.
+    #[test]
+    fn verify_manifest_signature_rejects_a_mismatched_devices_stored_key_the_same_way_upload_commit_would(
+    ) {
+        let h = Harness::new();
+        let (member_id, _) = h.add_active_member("Alex");
+        let (device_fp, signing_key) =
+            h.add_mismatched_signing_device(member_id, "alex-mismatched-commit");
+        let server = h.server();
+        let member = h
+            .store
+            .get_member(member_id)
+            .expect("get_member")
+            .expect("member exists");
+
+        let data = b"hello".to_vec();
+        let hash = sha256(&data);
+        let sig = sign_manifest(&signing_key, "Drop/a.bin", data.len() as u64, &hash);
+
+        assert!(
+            !server.verify_manifest_signature(
+                &member,
+                device_fp,
+                "Drop/a.bin",
+                data.len() as u64,
+                &hash,
+                &sig,
+            ),
+            "a signature valid under the stored sign_pk must still be rejected when that key \
+             does not rehash to device_fp"
+        );
+    }
+
+    /// Every other upload test in this module enrols exactly one device per member (see every
+    /// other caller of `Harness::add_signing_device`), so before this test the `find(|d|
+    /// d.device_fp == device_fp)` lookup in `verify_manifest_signature` could be replaced with
+    /// `member.devices.first()` and the whole suite would stay green (148 passed, 0 failed) —
+    /// `first()` always happens to pick the correct, and only, device row on a member. This test
+    /// enrolls two real, self-consistent signing devices on one member and deliberately opens the
+    /// session as whichever one does NOT come first in `member.devices`, so an index-based
+    /// lookup verifies the session device's signature against the *other* device's key instead of
+    /// its own.
+    ///
+    /// Both halves matter. The positive half — the session device's own correctly-signed
+    /// manifest — is what actually fails under a `.first()` neuter: the sibling device's key
+    /// would get used to verify a signature made by the session device's key, which does not
+    /// match, so a legitimate upload is wrongly rejected. The negative half pins the
+    /// complementary property this fix exists for: a manifest carrying a genuinely valid
+    /// signature, just from the wrong device of the same member, must still be refused when
+    /// verified through the session device's own lookup.
+    #[test]
+    fn upload_open_verifies_the_session_devices_own_key_not_whichever_device_is_first() {
+        let h = Harness::new();
+        let (member_id, _) = h.add_active_member("Alex");
+        let (fp_1, key_1) = h.add_signing_device(member_id, "device-one");
+        let (fp_2, key_2) = h.add_signing_device(member_id, "device-two");
+        let share_id = h.add_share(
+            "Drop",
+            "Drop",
+            ShareFlags {
+                read_only: false,
+                allow_upload: true,
+                show_hidden: false,
+            },
+        );
+        h.grant(member_id, share_id, "", Perms::UPLOAD);
+
+        // Discover the actual enrollment order rather than assuming it, and pick the session
+        // device to deliberately NOT be `member.devices[0]` -- the exact condition under which an
+        // index-based lookup diverges from the real, fingerprint-keyed one.
+        let member = h
+            .store
+            .get_member(member_id)
+            .expect("get_member")
+            .expect("member exists");
+        assert_eq!(
+            member.devices.len(),
+            2,
+            "expected exactly two enrolled devices"
+        );
+        let first_fp = member.devices[0].device_fp;
+        let (session_fp, session_key, sibling_key) = if first_fp == fp_1 {
+            (fp_2, key_2, key_1)
+        } else {
+            (fp_1, key_1, key_2)
+        };
+        assert_ne!(
+            session_fp, first_fp,
+            "session device must not be member.devices[0] -- that's the condition this test needs"
+        );
+
+        let server = h.server();
+        let ctx = h.ctx_with_device(member_id, session_fp);
+
+        // Positive half: the session device's own correctly-signed manifest must be accepted.
+        let data = b"hello from the session device".to_vec();
+        let hash = sha256(&data);
+        let sig = sign_manifest(&session_key, "Drop/own.bin", data.len() as u64, &hash);
+        let reply = server.handle(
+            &ctx,
+            1,
+            req(
+                1,
+                VfsRequest::UploadOpen {
+                    path: "Drop/own.bin".to_string(),
+                    size: data.len() as u64,
+                    hash,
+                    manifest_sig: sig,
+                },
+            ),
+        );
+        assert!(
+            matches!(reply, VfsReply::UploadOpen { .. }),
+            "expected UploadOpen to succeed for the session device's own signature, got {reply:?}"
+        );
+
+        // Negative half: a manifest signed by the sibling device's key -- a genuinely valid
+        // signature, just under the wrong device of the same member -- must still be refused when
+        // verified against the session device's own lookup.
+        let data2 = b"hello from the sibling device".to_vec();
+        let hash2 = sha256(&data2);
+        let sig2 = sign_manifest(&sibling_key, "Drop/sibling.bin", data2.len() as u64, &hash2);
+        let reply2 = server.handle(
+            &ctx,
+            2,
+            req(
+                1,
+                VfsRequest::UploadOpen {
+                    path: "Drop/sibling.bin".to_string(),
+                    size: data2.len() as u64,
+                    hash: hash2,
+                    manifest_sig: sig2,
+                },
+            ),
+        );
+        assert_eq!(
+            reply2,
+            VfsReply::Error {
+                code: VfsErrorCode::UploadRejected
+            }
+        );
+    }
+
+    /// A device whose stored `alg_id` names an algorithm other than v1 must never verify, even
+    /// with otherwise-well-formed real keys — `sign_pk`/`agree_pk` are parsed as Ed25519/X25519
+    /// unconditionally regardless of what `alg_id` claims (`checked_device_keys`'s doc comment).
+    /// `Store::add_device` rejects a non-v1 `alg_id` up front, so — exactly like
+    /// `authorize.rs`'s `denies_a_device_whose_stored_alg_id_names_an_unsupported_algorithm` —
+    /// this row is written as alg 1 first and then flipped via the `test-support`-gated
+    /// `set_device_alg_id_for_test`, using a `device_fp` genuinely computed under alg 2 so the
+    /// row is self-consistent (a `device_fp` computed under alg 1 sitting next to an `alg_id`
+    /// column claiming 2 would be internally inconsistent, catching a different failure).
+    #[test]
+    fn upload_open_with_non_v1_alg_id_device_is_upload_rejected() {
+        let h = Harness::new();
+        let (member_id, _) = h.add_active_member("Alex");
+        let dev = DeviceKey::from_seeds([0x60; 32], [0x61; 32]);
+        let alg2_fp = device_fp_of(2, &dev.sign_public_key(), &dev.agree_public_key());
+        let signing_key = SigningKey::from_bytes(&[0x60; 32]);
+        h.store
+            .add_device(
+                member_id,
+                alg2_fp,
+                "alex-alg2",
+                0,
+                Some(&DevicePublicKeys {
+                    alg_id: spindle_core::ALG_ID_V1,
+                    sign_pk: dev.sign_public_key().as_bytes().to_vec(),
+                    agree_pk: dev.agree_public_key().as_bytes().to_vec(),
+                }),
+            )
+            .expect("add_device");
+        h.store
+            .set_device_alg_id_for_test(alg2_fp, Some(2))
+            .expect("set_device_alg_id_for_test");
+
+        let share_id = h.add_share(
+            "Drop",
+            "Drop",
+            ShareFlags {
+                read_only: false,
+                allow_upload: true,
+                show_hidden: false,
+            },
+        );
+        h.grant(member_id, share_id, "", Perms::UPLOAD);
+        let server = h.server();
+        let ctx = h.ctx_with_device(member_id, alg2_fp);
+
+        let data = b"hello".to_vec();
+        let hash = sha256(&data);
+        let sig = sign_manifest(&signing_key, "Drop/a.bin", data.len() as u64, &hash);
+
+        let reply = server.handle(
+            &ctx,
+            1,
+            req(
+                1,
+                VfsRequest::UploadOpen {
+                    path: "Drop/a.bin".to_string(),
+                    size: data.len() as u64,
+                    hash,
+                    manifest_sig: sig,
+                },
+            ),
+        );
+        assert_eq!(
+            reply,
+            VfsReply::Error {
+                code: VfsErrorCode::UploadRejected
+            }
+        );
+    }
+
     #[test]
     fn upload_open_without_upload_perm_is_denied() {
         let fx = UploadFixture::new(Perms::BROWSE | Perms::DOWNLOAD); // no upload
@@ -2986,8 +3386,9 @@ mod tests {
         let server = fx.server();
         let data = b"x".to_vec();
         let hash = sha256(&data);
-        // No device on the session context at all -> can never verify (documented in
-        // `verify_manifest_signature`'s doc comment).
+        // The session's default device is enrolled with no keys on file at all (see
+        // `Harness::default_device`) -> `checked_device_keys` returns `Unverifiable` and
+        // `verify_manifest_signature` fails closed (documented on that method).
         let reply = server.handle(
             &fx.h.ctx(fx.member_id),
             1,

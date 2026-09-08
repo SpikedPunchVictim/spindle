@@ -24,6 +24,7 @@
 //! backed by a connection pool or an already-`Sync` store can implement `DeviceLookup` directly
 //! and skip the lock entirely.
 
+use crate::device_keys::{checked_device_keys, DeviceKeyError};
 use crate::ratelimit::{ConnectRateLimitConfig, ConnectRateLimiter};
 use spindle_core::artifacts::issue_capability;
 use spindle_core::identity::device_fp_of;
@@ -891,91 +892,44 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
             return deny_with_equalized_work();
         };
 
-        // 6. Either key is missing on file. Fail closed; a missing key is never "skip the check".
-        let (Some(sign_pk_bytes), Some(agree_pk_bytes)) = (&device.sign_pk, &device.agree_pk)
-        else {
-            return deny_with_equalized_work();
-        };
-
-        // 7. Either key fails to parse (wrong length, or — for the Ed25519 sign key — not a valid
-        // curve point).
-        let Ok(sign_pk_arr): Result<[u8; 32], _> = sign_pk_bytes.as_slice().try_into() else {
-            return deny_with_equalized_work();
-        };
-        // td-4bcf24 review note: this `Deny` routing through `deny_with_equalized_work()` was
-        // flagged as "over-equalized" (a failed decompression is already cheaper than a real
-        // `Allow`, so equalizing it further supposedly widens rather than closes the gap). That
-        // finding is wrong; recorded here so a future reviewer does not re-raise it. Let D = the
-        // cost of `VerifyingKey::from_bytes`'s point decompression, H = the cost of the
-        // `device_fp_of` rehash (checks 7/9 combined with an `Allow`'s later work), and Df = the
-        // (smaller) cost of a decompression that fails fast. A real `Allow` pays D+H. Without
-        // equalization, this failed-decompression `Deny` pays only Df — off from `Allow` by the
-        // full D+H, a large gap. WITH equalization (`deny_with_equalized_work` redoes a successful
+        // 6-9. Parse this device's stored keys and prove they are the exact preimage of its own
+        // `device_fp` (missing key, unparseable key, missing/non-v1 `alg_id`, and the binding
+        // rehash itself) — see `crate::device_keys::checked_device_keys`'s doc comment for the
+        // check-by-check reasoning. That helper lives in its own module, not here, because
+        // `crate::server`'s per-request upload-manifest path (`VfsRpcServer::verify_manifest_signature`)
+        // needs the identical check, and the two paths used to disagree about it (td-ad318f): the
+        // connect path rehashed before trusting the stored keys, the request path did not. The
+        // helper knows nothing about connect-path denial policy, so that policy is spelled out
+        // here at the call site instead.
+        //
+        // td-4bcf24 review note: routing `DeviceKeyError::Unverifiable` through
+        // `deny_with_equalized_work()` was flagged as "over-equalized" (a failed decompression is
+        // already cheaper than a real `Allow`, so equalizing it further supposedly widens rather
+        // than closes the gap). That finding is wrong; recorded here so a future reviewer does not
+        // re-raise it. Let D = the cost of `VerifyingKey::from_bytes`'s point decompression, H =
+        // the cost of the `device_fp_of` rehash (combined with an `Allow`'s later work), and Df =
+        // the (smaller) cost of a decompression that fails fast. A real `Allow` pays D+H. Without
+        // equalization, a failed-decompression `Deny` pays only Df — off from `Allow` by the full
+        // D+H, a large gap. WITH equalization (`deny_with_equalized_work` redoes a successful
         // decompression + rehash against the fixed dummy key), this `Deny` pays Df+D+H — off from
         // `Allow` by only Df, a tiny gap. Df+D+H is strictly closer to D+H than Df alone is:
         // equalizing here is strictly closer to indistinguishable, not further from it.
-        let Ok(sign_pk) = VerifyingKey::from_bytes(&sign_pk_arr) else {
-            return deny_with_equalized_work();
-        };
-        let Ok(agree_pk_arr): Result<[u8; 32], _> = agree_pk_bytes.as_slice().try_into() else {
-            return deny_with_equalized_work();
-        };
-        let agree_pk = X25519PublicKey::from(agree_pk_arr);
-
-        // 8. The stored `alg_id` is missing, or names anything other than `ALG_ID_V1` (td-6c01e3:
-        // `devices.alg_id`, DESIGN.md:225-227's `device_fp = H(DEVICE_FP_DOMAIN, alg_id, sign_pk,
-        // agree_pk)`). `sign_pk`/`agree_pk` were just parsed above as Ed25519/X25519
-        // unconditionally — that parsing is what pins the algorithm, not this integer — so a row
-        // whose `alg_id` is `None` (a row with keys but no algorithm — impossible after the
-        // SCHEMA_V9 backfill, but this module's house style never unwraps an invariant instead of
-        // failing closed) or names something other than v1 cannot be verified by this code path
-        // at all. Hashing that `alg_id` into `device_fp_of` anyway would manufacture a hash that
-        // matches for a row nobody can actually verify; denying is the only sound answer.
         //
-        // Written as an explicit bind-then-compare rather than `let Some(ALG_ID_V1) = device.alg_id
-        // else { ... }`. That form type-checks today only because `ALG_ID_V1` happens to resolve to
-        // an in-scope `const` in SCREAMING_SNAKE_CASE, which is a lexical convention Rust's pattern
-        // matching leans on but does not enforce — nothing about the type system requires it. A
-        // future rename away from that convention, or a local shadowing binding named `ALG_ID_V1`,
-        // would silently turn `Some(ALG_ID_V1)` from a refutable constant pattern into an
-        // irrefutable *binding* pattern that accepts every `Some(_)` — and it would still compile,
-        // because the name is used again on the next lines (as the now-shadowed binding, not the
-        // constant). That failure mode is silent and would not show up as a type or lint error, only
-        // as this check quietly accepting every alg_id. Binding the value under its own name and
-        // comparing with `!=` cannot be reinterpreted that way: renaming or shadowing `ALG_ID_V1`
-        // would break the `!=` comparison at compile time (or, at worst, compare against the wrong
-        // but still-explicit value), never silently widen this into a no-op check.
-        let Some(alg_id) = device.alg_id else {
-            return deny_with_equalized_work();
+        // `DeviceKeyError::BindingMismatch`'s `Deny` stays PLAIN — never routed through
+        // `deny_with_equalized_work()` — and that is deliberate, not a missed spot: every
+        // `Unverifiable` case above denies *before* performing the real
+        // `VerifyingKey::from_bytes`/`X25519PublicKey::from`/`device_fp_of` work an `Allow` also
+        // does, so equalizing them against a dummy recompute closes a real faster-than-`Allow`
+        // gap. A binding mismatch has already paid that exact cost for real (both key parses, the
+        // rehash itself) before reaching here — there is no gap left to close. Adding a second,
+        // redundant `equalize_denial_work()` call here would not equalize anything; it would make
+        // this specific `Deny` measurably *slower* than an `Allow` reaches the same point,
+        // manufacturing a new timing asymmetry pointing the other way.
+        let (sign_pk, agree_pk) = match checked_device_keys(device, from_fp) {
+            Ok(keys) => (keys.sign_pk, keys.agree_pk),
+            Err(DeviceKeyError::BindingMismatch) => return ConnectDecision::Deny,
+            Err(DeviceKeyError::Unverifiable) => return deny_with_equalized_work(),
         };
-        if alg_id != ALG_ID_V1 {
-            return deny_with_equalized_work();
-        }
-
-        // 9. The binding does not hold (DESIGN.md §A7b clarification-6 — the same check
-        // `verify_device_certificate` performs). This is what makes the stored key pair
-        // *self-verifying*: `device_fp` is the hash of exactly `(DEVICE_FP_DOMAIN, alg_id,
-        // sign_pk, agree_pk)`, so a row whose keys were corrupted, transposed, or swapped for
-        // another device's cannot silently authorize — it simply fails to rehash to `from_fp`.
-        // Uses `alg_id` (the value just read from and validated against this row), not a
-        // hardcoded `ALG_ID_V1` constant — check 8 above already proved they're equal for this
-        // row, but recomputing the hash from the row's own field, rather than a compile-time
-        // constant, is what makes this the actual device_fp recompute td-6c01e3 requires: a
-        // future second algorithm added as another `Some(alg_id) if alg_id != ALG_ID_V1` arm
-        // above would still rehash correctly here without this line needing to change at all.
-        //
-        // This `Deny` stays PLAIN — never routed through `deny_with_equalized_work()` — and that
-        // is deliberate, not a missed spot: every check above this one denies *before* performing
-        // the real `VerifyingKey::from_bytes`/`X25519PublicKey::from`/`device_fp_of` work an
-        // `Allow` also does, so equalizing them against a dummy recompute closes a real
-        // faster-than-`Allow` gap. This check has already paid that exact cost for real (the parse
-        // at checks 6-7, the rehash right above) before reaching here — there is no gap left to
-        // close. Adding a second, redundant `equalize_denial_work()` call here would not equalize
-        // anything; it would make this specific `Deny` measurably *slower* than an `Allow` reaches
-        // the same point, manufacturing a new timing asymmetry pointing the other way.
-        if device_fp_of(alg_id, &sign_pk, &agree_pk) != *from_fp {
-            return ConnectDecision::Deny;
-        }
 
         // 10. Mint the opportunistic member capability (DESIGN.md:286), if we can. This never
         // downgrades an `Allow` into a `Deny` — see `CapIssuer`'s doc comment for why an
@@ -2203,6 +2157,105 @@ mod tests {
              check: a rate-limited rejection reveals only limiter state, not membership, so \
              spending crypto work equalizing it would hand a flooder exactly the amplification \
              the rate limiter exists to deny."
+        );
+    }
+
+    /// td-ad318f: a neuter that changed the `Err(DeviceKeyError::BindingMismatch)` arm of
+    /// `authorize`'s check 6-9 `match` (the `checked_device_keys` call site) from a plain `Deny`
+    /// to `return deny_with_equalized_work();` left this whole suite green -- nothing here
+    /// distinguished the two `DeviceKeyError` arms' routing, only that both ended in `Deny`. This
+    /// test closes that half of the gap: it stores device B's own `sign_pk`/`agree_pk` (both
+    /// genuinely valid Ed25519/X25519 keys) under device A's `device_fp`, with `alg_id:
+    /// ALG_ID_V1`. Both keys parse cleanly and the alg_id is valid, so `checked_device_keys`
+    /// reaches its rehash, finds `device_fp_of(ALG_ID_V1, B.sign_pk, B.agree_pk) != A.device_fp`,
+    /// and returns `BindingMismatch` -- not `Unverifiable`.
+    #[tokio::test]
+    async fn a_binding_mismatch_denial_does_not_run_the_timing_equalization() {
+        reset_equalization_calls();
+        let (store, member_id) = store_with_active_member("alex");
+        let device_a = DeviceKey::from_seeds([0x70; 32], [0x71; 32]);
+        let device_b = DeviceKey::from_seeds([0x72; 32], [0x73; 32]);
+        let a_fp = device_a.device_fp();
+
+        // Store B's own (self-consistent, validly parsing) keys under A's device_fp -- `Store::
+        // add_device` does not validate the device_fp/keys binding (see its own doc comment), so
+        // this row is legal to write even though it can never rehash back to `a_fp`.
+        let mismatched_keys = DevicePublicKeys {
+            alg_id: ALG_ID_V1,
+            sign_pk: device_b.sign_public_key().as_bytes().to_vec(),
+            agree_pk: device_b.agree_public_key().as_bytes().to_vec(),
+        };
+        store
+            .add_device(member_id, a_fp, "laptop", 0, Some(&mismatched_keys))
+            .expect("add_device");
+
+        let authorizer =
+            HostConnectAuthorizer::new(SqliteDeviceLookup::new(store)).with_now_fn(|| 0);
+        match authorizer.authorize(&a_fp).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => {
+                panic!("expected Deny: the stored keys do not rehash to this row's device_fp")
+            }
+        }
+        assert_eq!(
+            equalization_calls(),
+            0,
+            "a BindingMismatch denial must never call equalize_denial_work() -- a binding \
+             mismatch is only reached after checked_device_keys has already paid the real \
+             VerifyingKey::from_bytes/X25519PublicKey::from/device_fp_of cost that \
+             equalize_denial_work exists to imitate, so equalizing it too would not close any \
+             gap: it would make this Deny measurably SLOWER than an Allow reaches the same point, \
+             manufacturing a new timing asymmetry pointing the other way. A nonzero count here \
+             means the DeviceKeyError::BindingMismatch arm in authorize() has been rewired \
+             through deny_with_equalized_work(), reversing the deliberate exception documented at \
+             that call site (td-ad318f, td-4bcf24's review note)."
+        );
+    }
+
+    /// td-ad318f: the other half of the same coverage gap. A device row with no keys at all fails
+    /// `checked_device_keys`'s very first check (`Unverifiable`, before any parse or rehash is
+    /// even attempted), so a neuter that reverted the `Err(DeviceKeyError::Unverifiable)` arm back
+    /// to a plain `Deny` would reopen the pre-crypto timing gap `deny_with_equalized_work` exists
+    /// to close -- and, symmetrically with the test above, nothing in this suite asserted that
+    /// this specific arm still runs the equalization.
+    ///
+    /// This keyless row is denied specifically at checked_device_keys's key check, not earlier at
+    /// checks 1-5 (membership/status/revocation): `store_with_active_member` + a fresh
+    /// `add_device(.., None)` produce an active member with a non-revoked device row, so
+    /// liveness_checks passes and authorize() reaches the key check before denying. A row denied
+    /// by an earlier check would still read equalization_calls() == 1 (those checks' own denials
+    /// are equalized too), for the wrong reason -- see
+    /// `denies_a_device_whose_stored_alg_id_names_an_unsupported_algorithm`'s comment for the same
+    /// "right number, wrong reason" trap.
+    #[tokio::test]
+    async fn an_unverifiable_denial_runs_the_timing_equalization() {
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x74; 32], [0x75; 32]);
+        let device_fp = device.device_fp();
+        store
+            .add_device(member_id, device_fp, "laptop", 0, None)
+            .expect("add_device");
+
+        reset_equalization_calls();
+        let authorizer =
+            HostConnectAuthorizer::new(SqliteDeviceLookup::new(store)).with_now_fn(|| 0);
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => {
+                panic!("expected Deny: a device with no stored keys can never be verified")
+            }
+        }
+        assert_eq!(
+            equalization_calls(),
+            1,
+            "an Unverifiable denial must call equalize_denial_work() exactly once -- this denial \
+             fires at checked_device_keys's very first check, before any of the real \
+             VerifyingKey::from_bytes/X25519PublicKey::from/device_fp_of work an Allow performs, \
+             so without equalize_denial_work it would be measurably FASTER than a live member's \
+             device reaches the same point -- exactly the pre-crypto timing gap \
+             deny_with_equalized_work exists to close. A count of 0 here means the \
+             DeviceKeyError::Unverifiable arm in authorize() has been reverted to a plain \
+             ConnectDecision::Deny."
         );
     }
 
