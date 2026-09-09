@@ -23,6 +23,27 @@
       "expected": "accept"
     },
     {
+      "name": "ed25519_identity_point_sign_bit_set",
+      "description": "y = 1, sign_bit = 1: the non-canonical encoding of the identity point (0, 1). RFC 8032 5.1.3's second canonicality rule (no 'negative zero' when x == 0) is violated. Bare VerifyingKey::from_bytes accepts this (dalek's conditional_negate has no x == 0 guard); checked_verifying_key (and noble's ed25519.Point.fromBytes) reject it.",
+      "curve": "ed25519",
+      "key_hex": "0100000000000000000000000000000000000000000000000000000000000080",
+      "expected": "reject"
+    },
+    {
+      "name": "ed25519_order2_point_sign_bit_set",
+      "description": "y = p - 1, sign_bit = 1: the non-canonical encoding of the order-2 point (0, -1). Same rule as ed25519_identity_point_sign_bit_set, at the curve's other x == 0 point. Must be rejected.",
+      "curve": "ed25519",
+      "key_hex": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expected": "reject"
+    },
+    {
+      "name": "ed25519_order2_point_sign_bit_clear",
+      "description": "y = p - 1, sign_bit = 0: the *canonical* encoding of the same order-2 point (0 is never negative, so 0 is the correct sign bit). Must stay ACCEPTED -- pins that the sign-bit-set fix above does not overreach into rejecting this legitimate encoding.",
+      "curve": "ed25519",
+      "key_hex": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "expected": "accept"
+    },
+    {
       "name": "x25519_low_order_point_u_eq_1",
       "description": "X25519 low-order point (u = 1). Deliberately ACCEPTED on both languages: X25519 public keys are unvalidated by design (x25519_dalek::PublicKey::from is infallible), and this pins that agreement rather than an oversight.",
       "curve": "x25519",

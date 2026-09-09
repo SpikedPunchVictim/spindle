@@ -153,8 +153,14 @@ export class BundleWireError extends Error {
    *
    * Use this, never `.message`/`.toString()`, anywhere a `BundleWireError` reaches a log call. */
   redacted(): string {
-    if (this.kind === "Proto" && this.protoError !== undefined) {
-      return this.protoError.redacted();
+    if (this.kind === "Proto") {
+      // `protoError` is declared optional (`ProtoError?`) so the type permits a `"Proto"`
+      // instance with no `protoError`, even though the only construction path today —
+      // `BundleWireError.proto()`, the constructor being `private` — always sets it. Fail
+      // closed rather than falling through to `this.message` (unsafe, peer-controlled text) if
+      // that ever stops being true: a future second `"Proto"` construction path that forgets to
+      // set `protoError` must not silently reopen this leak.
+      return this.protoError?.redacted() ?? "<BundleWireError: Proto with no protoError>";
     }
     return this.message;
   }

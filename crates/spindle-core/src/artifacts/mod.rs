@@ -117,56 +117,48 @@ pub(crate) fn check_skew(now: u64, ts: u64, max_skew_secs: u64) -> Result<(), Ar
     Ok(())
 }
 
-/// The Ed25519 field prime `p = 2^255 - 19` (RFC 8032 §5.1.3), little-endian, used by
-/// [`checked_verifying_key`] to reject a non-canonical point encoding.
-///
-/// `y = 0x7f...ed...` in the usual big-endian hex form; written here little-endian (byte 0 is the
-/// least-significant byte) to match the encoding `checked_verifying_key` compares against.
-const P_BYTES: [u8; 32] = [
-    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
-];
-
-/// Compares two 32-byte little-endian unsigned integers, returning `true` if `a >= b`. Written as
-/// an explicit byte-by-byte comparison (most-significant byte first) rather than bigint/u128
-/// arithmetic — boring and obvious over clever, per this repo's house style.
-fn ge_le_bytes(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    for i in (0..32).rev() {
-        if a[i] != b[i] {
-            return a[i] > b[i];
-        }
-    }
-    true // every byte equal
-}
-
 /// Parses a 32-byte Ed25519 public key encoding, enforcing RFC 8032 §5.1.3's canonical-encoding
-/// rule in addition to `VerifyingKey::from_bytes`'s point-decompression check.
+/// rule in full, in addition to `VerifyingKey::from_bytes`'s point-decompression check.
 ///
-/// `ed25519_dalek::VerifyingKey::from_bytes` is `CompressedEdwardsY::decompress`, which reads the
-/// low 255 bits of the encoding as a `y`-coordinate and decompresses any `y < 2^255` — it never
-/// checks `y < p`. A `y` in `[p, 2^255)` decodes to the same point as `y - p`, so two distinct byte
-/// strings can name the same public key. td-b8c68a measured this against `@noble/curves`'
-/// `ed25519.Point.fromBytes`, which does enforce `y < p` and rejects those non-canonical
-/// encodings (e.g. `[0xff; 32]`, the non-canonical encoding of `y = 18`); this helper closes that
-/// Rust/TS divergence by rejecting them here too, before decompression ever runs.
+/// §5.1.3 has two canonicality requirements, and `ed25519_dalek::VerifyingKey::from_bytes` (which
+/// is just `CompressedEdwardsY::decompress`, `ed25519-dalek-2.2.0/src/verifying.rs:165-173`)
+/// enforces neither:
+///
+/// 1. `y < p`. `from_bytes` decompresses any `y < 2^255`, so a `y` in `[p, 2^255)` decodes to the
+///    same point as `y - p` — two distinct byte strings naming the same public key.
+/// 2. When the decompressed `x == 0`, the sign bit must be 0 (there is no "negative zero"
+///    encoding). `curve25519-dalek-4.1.3/src/edwards.rs:230-232` unconditionally applies the
+///    requested sign bit via `X.conditional_negate(compressed_sign_bit)` with no `x == 0` guard,
+///    so a `sign_bit = 1` encoding of the identity `(0, 1)` or the order-2 point `(0, -1)` decodes
+///    without complaint.
+///
+/// td-b8c68a measured both divergences against `@noble/curves`' `ed25519.Point.fromBytes`
+/// (`@noble/curves@2.3.0/abstract/edwards.js:162-164` has the explicit `x=0 && sign` guard rule 2
+/// needs), which enforces the full rule and rejects all of these non-canonical encodings.
+///
+/// Rather than enumerating both rules by hand (as an earlier version of this function did for
+/// rule 1 only, comparing `y` against the field prime before ever decompressing), this checks
+/// canonicality with a round trip: decompress, re-compress, and require the result to equal the
+/// input bytes exactly. A non-canonical encoding by definition does not survive that round trip —
+/// `EdwardsPoint::compress` (`curve25519-dalek-4.1.3/src/edwards.rs:566-573`) always serializes
+/// the field-reduced `y` and a sign bit derived from the actual (canonical) sign of `x`, so it
+/// cannot reproduce a `y >= p` input, nor a `sign_bit = 1` input whose `x` is 0 (0 is never
+/// negative). One check catches both rules, and it is exactly as strict as noble by construction
+/// rather than by parallel case-by-case reasoning.
 ///
 /// X25519 (`agree_pk`) has no equivalent check anywhere in this codebase, and must not gain one:
 /// `x25519_dalek::PublicKey::from` is infallible by design (any 32 bytes are a valid Montgomery
 /// u-coordinate candidate) and TS mirrors that deliberately — see td-b8c68a.
 pub fn checked_verifying_key(bytes: &[u8; 32]) -> Option<ed25519_dalek::VerifyingKey> {
-    // The sign bit (encoding the sign of the x-coordinate) lives in the top bit of the last byte
-    // and plays no part in the canonicality check, which is purely about the magnitude of `y` —
-    // mask it off in a scratch copy, but pass the original `bytes` (sign bit intact) to
-    // `from_bytes` below.
-    let mut y = *bytes;
-    y[31] &= 0x7f;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(bytes).ok()?;
 
-    if ge_le_bytes(&y, &P_BYTES) {
-        // y >= p: not the canonical encoding of any point. Reject before decompression.
+    if key.to_edwards().compress().to_bytes() != *bytes {
+        // Decompressing `bytes` and re-compressing the result did not reproduce `bytes`: the
+        // input was not the canonical encoding of the point it names (RFC 8032 §5.1.3).
         return None;
     }
 
-    ed25519_dalek::VerifyingKey::from_bytes(bytes).ok()
+    Some(key)
 }
 
 pub(crate) fn parse_verifying_key(
@@ -236,6 +228,52 @@ mod checked_verifying_key_tests {
         assert!(
             checked_verifying_key(&bytes).is_some(),
             "a genuinely derived verifying key must be accepted"
+        );
+    }
+
+    /// RFC 8032 §5.1.3's second canonicality rule: when the decompressed `x == 0`, the sign bit
+    /// must be 0 (there is no "negative zero" encoding). `y = 1` decompresses to the identity
+    /// point `(0, 1)`; encoding it with `sign_bit = 1` is non-canonical and must be rejected, even
+    /// though bare `VerifyingKey::from_bytes` (and the pre-fix version of this function, which
+    /// only ever checked `y < p`) accepts it. Measured against noble: `ed25519.Point.fromBytes`
+    /// rejects this same encoding.
+    #[test]
+    fn identity_point_with_sign_bit_set_is_rejected() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 1; // y = 1, little-endian
+        bytes[31] = 0x80; // sign bit set
+        assert!(
+            checked_verifying_key(&bytes).is_none(),
+            "y=1, sign=1 is the non-canonical encoding of the identity point and must be rejected"
+        );
+    }
+
+    /// The same rule as above, at the other `x == 0` point: `y = p - 1` decompresses to the
+    /// order-2 point `(0, -1)`. Encoding it with `sign_bit = 1` is non-canonical and must be
+    /// rejected.
+    #[test]
+    fn order_2_point_with_sign_bit_set_is_rejected() {
+        let mut bytes = [0xffu8; 32];
+        bytes[0] = 0xec; // y = p - 1, little-endian
+        bytes[31] = 0xff; // canonical-range y (top bit already 0 within p-1) with sign bit set
+        assert!(
+            checked_verifying_key(&bytes).is_none(),
+            "y=p-1, sign=1 is the non-canonical encoding of the order-2 point and must be \
+             rejected"
+        );
+    }
+
+    /// Same `y = p - 1` order-2 point, but with `sign_bit = 0` — this is the *canonical* encoding
+    /// (`x == 0`, and 0 is never negative, so the correct sign bit is 0). This must stay accepted:
+    /// a fix for the two rejects above that also rejected this would be overreaching.
+    #[test]
+    fn order_2_point_with_sign_bit_clear_is_accepted() {
+        let mut bytes = [0xffu8; 32];
+        bytes[0] = 0xec; // y = p - 1, little-endian
+        bytes[31] = 0x7f; // sign bit clear
+        assert!(
+            checked_verifying_key(&bytes).is_some(),
+            "y=p-1, sign=0 is the canonical encoding of the order-2 point and must be accepted"
         );
     }
 }

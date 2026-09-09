@@ -1227,7 +1227,42 @@ fn key_validity_vectors() -> Json {
         "sanity: a genuinely derived key must be accepted"
     );
 
-    // Case 4: X25519 low-order point, u = 1. `x25519_dalek::PublicKey::from` is infallible by
+    // Case 4: `y = 1, sign_bit = 1` -- the non-canonical encoding of the identity point `(0, 1)`.
+    // RFC 8032 §5.1.3's second canonicality rule: when the decompressed `x == 0`, the sign bit
+    // must be 0 (there is no "negative zero" encoding). Measured (this fix's own review):
+    // `curve25519-dalek-4.1.3`'s `X.conditional_negate(compressed_sign_bit)`
+    // (`src/edwards.rs:230-232`) has no `x == 0` guard, so bare `VerifyingKey::from_bytes` ACCEPTS
+    // this; noble's `ed25519.Point.fromBytes` (`@noble/curves@2.3.0/abstract/edwards.js:162-164`)
+    // REJECTS it. `checked_verifying_key`'s round-trip check must reject it too.
+    let mut identity_sign_set = [0u8; 32];
+    identity_sign_set[0] = 1;
+    identity_sign_set[31] = 0x80;
+    assert!(
+        spindle_core::checked_verifying_key(&identity_sign_set).is_none(),
+        "sanity: identity point with sign bit set must be rejected"
+    );
+
+    // Case 5: `y = p - 1, sign_bit = 1` -- the non-canonical encoding of the order-2 point
+    // `(0, -1)`. Same rule as case 4, at the curve's other `x == 0` point.
+    let mut order2_sign_set = [0xffu8; 32];
+    order2_sign_set[0] = 0xec;
+    assert!(
+        spindle_core::checked_verifying_key(&order2_sign_set).is_none(),
+        "sanity: order-2 point with sign bit set must be rejected"
+    );
+
+    // Case 6: `y = p - 1, sign_bit = 0` -- the *canonical* encoding of that same order-2 point (0
+    // is never negative, so 0 is the only correct sign bit for it). This must stay ACCEPTED: a fix
+    // for cases 4-5 that also rejects this one has overreached.
+    let mut order2_sign_clear = [0xffu8; 32];
+    order2_sign_clear[0] = 0xec;
+    order2_sign_clear[31] = 0x7f;
+    assert!(
+        spindle_core::checked_verifying_key(&order2_sign_clear).is_some(),
+        "sanity: order-2 point with sign bit clear (canonical) must be accepted"
+    );
+
+    // Case 7: X25519 low-order point, u = 1. `x25519_dalek::PublicKey::from` is infallible by
     // construction (any 32 bytes are accepted as a Montgomery u-coordinate candidate, low-order
     // points included) -- this case pins that this is deliberate on both sides of the Rust/TS
     // boundary, not an oversight left over from before this ticket's Ed25519 fix.
@@ -1274,6 +1309,36 @@ fn key_validity_vectors() -> Json {
                     "A genuinely derived Ed25519 verifying key -- always canonically encoded.",
                     "ed25519",
                     &valid_key,
+                    true,
+                ),
+                key_validity_case(
+                    "ed25519_identity_point_sign_bit_set",
+                    "y = 1, sign_bit = 1: the non-canonical encoding of the identity point \
+                     (0, 1). RFC 8032 5.1.3's second canonicality rule (no 'negative zero' when \
+                     x == 0) is violated. Bare VerifyingKey::from_bytes accepts this (dalek's \
+                     conditional_negate has no x == 0 guard); checked_verifying_key (and noble's \
+                     ed25519.Point.fromBytes) reject it.",
+                    "ed25519",
+                    &identity_sign_set,
+                    false,
+                ),
+                key_validity_case(
+                    "ed25519_order2_point_sign_bit_set",
+                    "y = p - 1, sign_bit = 1: the non-canonical encoding of the order-2 point \
+                     (0, -1). Same rule as ed25519_identity_point_sign_bit_set, at the curve's \
+                     other x == 0 point. Must be rejected.",
+                    "ed25519",
+                    &order2_sign_set,
+                    false,
+                ),
+                key_validity_case(
+                    "ed25519_order2_point_sign_bit_clear",
+                    "y = p - 1, sign_bit = 0: the *canonical* encoding of the same order-2 point \
+                     (0 is never negative, so 0 is the correct sign bit). Must stay ACCEPTED -- \
+                     pins that the sign-bit-set fix above does not overreach into rejecting this \
+                     legitimate encoding.",
+                    "ed25519",
+                    &order2_sign_clear,
                     true,
                 ),
                 key_validity_case(
