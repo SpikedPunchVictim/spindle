@@ -106,6 +106,7 @@ mod encoding;
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use spindle_core::{Fingerprint, FingerprintError, IdentityError, VerifyingKey};
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 /// `SHA-256(domain_tag || prev_hash || deterministic_encoding(entry))`'s domain tag for entry
@@ -279,28 +280,90 @@ pub enum AuditError {
 
     #[error("page_size must be greater than zero")]
     ZeroPageSize,
+
+    /// td-c9b9bd: mirrors [`crate::store::StoreError::ConnectionPoisoned`] — see that variant's
+    /// doc comment for the full mechanism and recovery contract. `Audit` and `Store` share one
+    /// `rusqlite::Connection` and therefore one poison flag ([`crate::store::Store::poisoned`]),
+    /// so once either side poisons it, both refuse further writes. `Audit::append` checks this
+    /// before even issuing `BEGIN IMMEDIATE`, so a caller sees this variant specifically rather
+    /// than whatever raw SQLite error a doomed write would otherwise produce.
+    #[error(
+        "audit connection poisoned: a prior ROLLBACK/COMMIT failed to return this connection to \
+         autocommit mode, so appends are refused rather than risking a silent, undurable write \
+         into a stranded transaction; drop the owning Store and reopen a fresh one against the \
+         same file to recover"
+    )]
+    ConnectionPoisoned,
 }
 
 /// A borrowed view over the audit chain, backed by the same `rusqlite::Connection` as
 /// [`crate::store::Store`] — obtain one via [`crate::store::Store::audit`].
 pub struct Audit<'a> {
     conn: &'a Connection,
+    /// A borrow of [`crate::store::Store::poisoned`] — see that field's doc comment for the full
+    /// mechanism and recovery contract, and [`Audit::append`] for the only place this crate ever
+    /// sets it. `Audit<'a>` is a transient, freshly-constructed-per-call view (never held across
+    /// calls, never itself owning any state — see the module doc comment's "Transaction
+    /// discipline" section), so it cannot hold poison state itself; it can only borrow the flag
+    /// that lives on `Store`, exactly as it already borrows `Store`'s `Connection`.
+    poisoned: &'a AtomicBool,
 }
 
 impl<'a> Audit<'a> {
-    pub(crate) fn new(conn: &'a Connection) -> Self {
-        Audit { conn }
+    pub(crate) fn new(conn: &'a Connection, poisoned: &'a AtomicBool) -> Self {
+        Audit { conn, poisoned }
     }
 
     /// Appends one entry to the chain. See the module doc comment's "Transaction discipline"
     /// section for the `BEGIN IMMEDIATE` atomicity this provides.
+    ///
+    /// # Poisoning (td-c9b9bd)
+    ///
+    /// Refuses outright with [`AuditError::ConnectionPoisoned`] if a prior call already poisoned
+    /// this connection (checked before `BEGIN IMMEDIATE` is even issued, so a poisoned connection
+    /// never attempts another write at all). Otherwise, if the `ROLLBACK` that unwinds a failed
+    /// append — or the `COMMIT` that durably lands a successful one — itself fails, this method
+    /// does not just log and hope: it checks `Connection::is_autocommit()`, the direct observable
+    /// of "is this connection actually stuck inside a transaction" (a `ROLLBACK`/`COMMIT`
+    /// returning `Err` and the connection actually being stranded are NOT the same fact — one can
+    /// fail while the transaction still ended, and vice versa). If still not in autocommit mode,
+    /// it retries `ROLLBACK` exactly once (a single deterministic recovery attempt, since a
+    /// transient error should not need to brick every future write on this host); if that also
+    /// fails to restore autocommit mode, it poisons the shared `Store`/`Audit` connection
+    /// ([`crate::store::Store`]'s `poisoned` field, set via the reference this `Audit` borrows) so
+    /// every subsequent write — from this `Audit` or from any `Store` write method sharing the
+    /// same connection — fails
+    /// fast with [`AuditError::ConnectionPoisoned`]/[`crate::store::StoreError::ConnectionPoisoned`]
+    /// instead of silently executing inside the stranded transaction. See
+    /// [`crate::store::Store::poisoned`]'s doc comment for the recovery contract (drop and reopen
+    /// the `Store`).
+    ///
     pub fn append(&self, entry: AuditEntry) -> Result<AuditRecord, AuditError> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(AuditError::ConnectionPoisoned);
+        }
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         match self.append_inner(entry) {
-            Ok(record) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(record)
-            }
+            Ok(record) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(record),
+                Err(commit_error) => {
+                    // The append succeeded, but its COMMIT failed: the row is not (yet, or ever)
+                    // durable, and the connection may still be sitting inside the transaction
+                    // that was supposed to have ended. Until 5f0fa3a/td-c9b9bd this branch did not
+                    // exist at all — a failed COMMIT returned early via `?` with no rollback
+                    // attempt and no log line, the same stranding as a failed append's ROLLBACK
+                    // but completely silent. See `recover_from_non_autocommit` for what happens
+                    // next.
+                    tracing::error!(
+                        %commit_error,
+                        "audit COMMIT failed after a successful append; the row is not durable, \
+                         and the connection may be stuck mid-transaction, so subsequent writes on \
+                         it are not guaranteed durable until this is resolved"
+                    );
+                    self.recover_from_non_autocommit("a failed COMMIT");
+                    Err(AuditError::Sqlite(commit_error))
+                }
+            },
             Err(e) => {
                 // The append itself already failed; if the ROLLBACK meant to undo its partial
                 // work *also* fails, this connection is left sitting inside an open transaction
@@ -320,9 +383,60 @@ impl<'a> Audit<'a> {
                          mid-transaction, so subsequent writes on it are not guaranteed durable"
                     );
                 }
+                self.recover_from_non_autocommit("a failed append");
                 Err(e)
             }
         }
+    }
+
+    /// Shared recovery/poison decision for [`Audit::append`]'s two failure branches (a failed
+    /// `ROLLBACK` after a failed append, and a failed `COMMIT` after a successful one). `context`
+    /// is a short human-readable description of which branch called this, for the log lines only.
+    ///
+    /// Keys the decision on `Connection::is_autocommit()` — the direct, current-state observable
+    /// of "is this connection stuck inside a transaction" — rather than on whether the `ROLLBACK`/
+    /// `COMMIT` that triggered this call itself returned `Err`: those are different facts (a
+    /// statement can fail while SQLite still ends the transaction as a side effect, e.g. a
+    /// deferred foreign-key violation at `COMMIT` time auto-rollbacks and leaves autocommit mode
+    /// true despite `COMMIT` reporting an error).
+    ///
+    /// 1. If already back in autocommit mode, there is nothing to recover from: return.
+    /// 2. Otherwise, retry `ROLLBACK` once — a single deterministic recovery attempt, so one
+    ///    transient failure does not permanently brick every future write through this
+    ///    connection.
+    /// 3. If that retry restores autocommit mode, log it and return — still not poisoned.
+    /// 4. If the connection is still not in autocommit mode after the retry, poison it
+    ///    (`Store`'s `poisoned` field, via the reference this `Audit` borrows — see
+    ///    [`crate::store::Store::poisoned`]'s doc comment for the recovery contract) and log an
+    ///    `error!` naming that decision.
+    ///
+    fn recover_from_non_autocommit(&self, context: &'static str) {
+        if self.conn.is_autocommit() {
+            return;
+        }
+        tracing::warn!(
+            context,
+            "connection not in autocommit mode after {context}; retrying ROLLBACK once before \
+             considering this connection poisoned"
+        );
+        let retry_result = self.conn.execute_batch("ROLLBACK");
+        if self.conn.is_autocommit() {
+            tracing::info!(
+                context,
+                ?retry_result,
+                "recovery ROLLBACK restored autocommit mode; connection is not poisoned"
+            );
+            return;
+        }
+        self.poisoned.store(true, Ordering::SeqCst);
+        tracing::error!(
+            context,
+            ?retry_result,
+            "connection still not in autocommit mode after a retried ROLLBACK; poisoning it — \
+             every subsequent write sharing this connection will be refused with \
+             AuditError::ConnectionPoisoned/StoreError::ConnectionPoisoned until the owning Store \
+             is dropped and a fresh one is opened against the same file"
+        );
     }
 
     fn append_inner(&self, entry: AuditEntry) -> Result<AuditRecord, AuditError> {
@@ -912,5 +1026,239 @@ mod tests {
         let signer = TestHeadSigner::from_seed([13; 32]);
         let err = audit.verify_head(1, &signer.public_key()).unwrap_err();
         assert!(matches!(err, AuditError::NoSignedHead(1)));
+    }
+
+    // ---- Poisoning (td-c9b9bd): a failed ROLLBACK/COMMIT must not strand this connection ----
+    //
+    // The seam: `Connection::authorizer` (rusqlite `hooks` feature, dev-dependency only — see
+    // `Cargo.toml`'s comment) fires at statement *prepare* time and can `Deny` any statement,
+    // including the bare `ROLLBACK`/`COMMIT` `Audit::append` issues via `execute_batch`. Verified
+    // against the vendored sqlite3.c amalgamation (`sqlite3EndTransaction`): both `ROLLBACK` and
+    // `COMMIT` route through the same `SQLITE_TRANSACTION` authorizer check, with the literal op
+    // string `isRollback ? "ROLLBACK" : "COMMIT"`. rusqlite's `TransactionOperation::from_str`
+    // only names `"BEGIN"`/`"RELEASE"`/`"ROLLBACK"`, so `"COMMIT"` surfaces as `Unknown` — every
+    // test below that keys on `TransactionOperation::Unknown` relies on nothing else in that same
+    // test issuing any other transaction-control statement, so `Unknown` is unambiguously "the
+    // COMMIT" there. A denied statement never runs at all (SQLite never emits the `OP_AutoCommit`
+    // VDBE op for it), so this is a genuine reproduction of "the connection never left its
+    // transaction" — not a simulation of one.
+
+    #[test]
+    fn append_poisons_the_store_when_both_the_rollback_and_its_retry_are_denied() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        let store = Store::open_in_memory().expect("open");
+        // Deny the INSERT `append_inner` needs (forcing `append` into its failure/ROLLBACK
+        // branch) and deny every ROLLBACK — the initial attempt AND the single retry — so the
+        // connection can never leave the transaction `BEGIN IMMEDIATE` opened.
+        store
+            .connection()
+            .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Insert {
+                    table_name: "audit_log",
+                } => Authorization::Deny,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }));
+
+        let audit = store.audit();
+        let err = audit.append(entry("denied-insert")).unwrap_err();
+        assert!(
+            matches!(err, AuditError::Sqlite(_)),
+            "the original append_inner failure (denied INSERT) must be what's returned, not a \
+             poisoning-related error: {err:?}"
+        );
+
+        store
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+        assert!(
+            !store.connection().is_autocommit(),
+            "both ROLLBACK attempts were denied, so SQLite itself must still report this \
+             connection as inside a transaction"
+        );
+        assert!(
+            store.is_poisoned(),
+            "both the initial ROLLBACK and its single retry were denied, so the connection never \
+             left its transaction and must be poisoned"
+        );
+
+        // A poisoned connection refuses the very next append too — checked BEFORE it ever
+        // attempts `BEGIN IMMEDIATE` again (which would otherwise fail with a confusing raw
+        // "cannot start a transaction within a transaction" error instead of this named one).
+        let err2 = audit.append(entry("after-poison")).unwrap_err();
+        assert!(matches!(err2, AuditError::ConnectionPoisoned));
+    }
+
+    #[test]
+    fn append_poisons_on_a_denied_commit_and_the_row_never_becomes_durable() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.sqlite3");
+        let store = Store::open(&path).expect("open");
+
+        // Until this ticket, a failed COMMIT (unlike a failed ROLLBACK) was handled by no code at
+        // all — see `Audit::append`'s doc comment. Deny COMMIT itself, and deny the recovery
+        // ROLLBACK that follows it, so the connection is left stuck and poisoned exactly the way
+        // 5f0fa3a's `error!` line was added for the ROLLBACK side but never the COMMIT side.
+        store
+            .connection()
+            .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Unknown,
+                } => Authorization::Deny,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }));
+
+        let audit = store.audit();
+        let err = audit.append(entry("denied-commit")).unwrap_err();
+        assert!(
+            matches!(err, AuditError::Sqlite(_)),
+            "a failed COMMIT must be surfaced to the caller as an error, not silently swallowed: \
+             {err:?}"
+        );
+
+        store
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+        assert!(
+            store.is_poisoned(),
+            "COMMIT and the recovery ROLLBACK were both denied"
+        );
+
+        drop(store); // release the file lock before a second connection opens the same file
+
+        // A second, independent connection to the same file proves the row never became
+        // durable: the denied COMMIT means SQLite never applied it, regardless of what the first
+        // (poisoned, doomed) connection's aborted transaction briefly held.
+        let reopened = Store::open(&path).expect("reopen");
+        let head = reopened
+            .audit()
+            .verify_chain()
+            .expect("verify after reopen");
+        assert_eq!(
+            head.seq, 0,
+            "the never-committed row must not be durable, and reopening must not be poisoned"
+        );
+        assert!(!reopened.is_poisoned());
+    }
+
+    #[test]
+    fn append_recovers_and_is_not_poisoned_when_the_retried_rollback_succeeds() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+        use std::cell::Cell;
+
+        let store = Store::open_in_memory().expect("open");
+        let denied_once = Cell::new(false);
+        store
+            .connection()
+            .authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Insert {
+                    table_name: "audit_log",
+                } => Authorization::Deny,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => {
+                    if denied_once.get() {
+                        // The retry: let it through.
+                        Authorization::Allow
+                    } else {
+                        denied_once.set(true);
+                        Authorization::Deny
+                    }
+                }
+                _ => Authorization::Allow,
+            }));
+
+        let audit = store.audit();
+        let err = audit
+            .append(entry("denied-insert-then-recovered"))
+            .unwrap_err();
+        assert!(matches!(err, AuditError::Sqlite(_)));
+
+        store
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+        assert!(
+            store.connection().is_autocommit(),
+            "the retried ROLLBACK was allowed and must have returned this connection to \
+             autocommit mode"
+        );
+        assert!(
+            !store.is_poisoned(),
+            "the retried ROLLBACK succeeded, so this connection recovered and must not be \
+             poisoned"
+        );
+
+        // Full recovery, not just "the flag is unset": a normal append afterward must actually
+        // work, on a fresh, correctly-linked chain (the denied append never landed).
+        let record = audit
+            .append(entry("after-recovery"))
+            .expect("append after recovery must succeed");
+        assert_eq!(record.seq, 1);
+        assert_eq!(record.prev_hash, GENESIS_PREV_HASH);
+    }
+
+    #[test]
+    fn poisoned_connection_refuses_a_store_write_and_the_refused_write_does_not_land() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.sqlite3");
+        let store = Store::open(&path).expect("open");
+
+        store
+            .connection()
+            .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Insert {
+                    table_name: "audit_log",
+                } => Authorization::Deny,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }));
+
+        let _ = store.audit().append(entry("poisoning-append")).unwrap_err();
+
+        store
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        assert!(store.is_poisoned());
+
+        // The poison flag lives on `Store`, not just `Audit` — a plain `Store` write method
+        // sharing this connection must refuse too, not only `Audit::append`. `bump_cap_epoch` is
+        // deliberately a leaf write (a single bare `UPDATE ... RETURNING`, no call into any other
+        // guarded `Store` method) so this specifically exercises *its own*
+        // `check_not_poisoned` call, not a downstream one — `add_member`, for contrast, would
+        // still return `ConnectionPoisoned` even with its own top-level check removed, because it
+        // internally calls `bump_grants_version` (separately guarded); that masking is itself a
+        // useful defense-in-depth property, but it is not proof that any one call site matters,
+        // which is what this test is for.
+        let err = store.bump_cap_epoch().unwrap_err();
+        assert!(matches!(err, crate::store::StoreError::ConnectionPoisoned));
+
+        drop(store); // release the file lock
+
+        let reopened = Store::open(&path).expect("reopen");
+        assert_eq!(
+            reopened.cap_epoch().expect("cap_epoch"),
+            0,
+            "the refused bump_cap_epoch call must not have written anything durable"
+        );
+        assert!(
+            reopened.list_members().expect("list_members").is_empty(),
+            "no member was ever added in this test; this just confirms the reopened store is \
+             otherwise a normal, unpoisoned store"
+        );
     }
 }

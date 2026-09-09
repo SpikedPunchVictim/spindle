@@ -66,6 +66,7 @@ use crate::model::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use spindle_core::{Fingerprint, FingerprintError};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 /// `GroupId` of the built-in, implicit-all-rights, not-editable/not-grantable `Owner` group
@@ -248,6 +249,23 @@ pub enum StoreError {
          migration is {supported}); refusing to open it — upgrade the application"
     )]
     SchemaTooNew { found: i64, supported: i64 },
+
+    /// td-c9b9bd: this connection was poisoned after a failed `ROLLBACK`/`COMMIT` left it unable
+    /// to prove it is back in autocommit mode (see [`Store::poisoned`]'s doc comment for the full
+    /// mechanism and the recovery contract). Every write on this handle is refused from this point
+    /// on — an audit log (and every other table sharing this connection) must fail closed here
+    /// rather than risk silently accepting writes into a stranded transaction that may never
+    /// commit. Recovery: drop this `Store` and open a fresh one (`Store::open`/
+    /// `Store::open_in_memory`) against the same file — a new `rusqlite::Connection` starts
+    /// unpoisoned, and SQLite itself discards any partially-open transaction on the old
+    /// connection's `Drop`.
+    #[error(
+        "database connection poisoned: a prior ROLLBACK/COMMIT failed to return this connection \
+         to autocommit mode, so it is refused for further writes rather than risking a silent, \
+         undurable write into a stranded transaction; drop this Store and reopen a fresh one \
+         against the same file to recover"
+    )]
+    ConnectionPoisoned,
 }
 
 /// The atomically-persisted result of redeeming an invite nonce (DESIGN.md §A4: "the host stores
@@ -280,6 +298,34 @@ pub struct UploadedFile {
 pub struct Store {
     conn: Connection,
     limits: StoreLimits,
+    /// td-c9b9bd: set once, permanently, when [`crate::audit::Audit::append`] cannot prove this
+    /// connection made it back to autocommit mode after a failed `ROLLBACK` (or a failed
+    /// `COMMIT`, followed by a failed recovery `ROLLBACK`) — see that method's doc comment for the
+    /// exact sequence. `AtomicBool` rather than `Cell<bool>`: every `Store`/`Audit` method takes
+    /// `&self`, and `Store` derives `Debug` (a `Cell<bool>` would also be `Debug` and `&self`-
+    /// compatible, but this crate has no other interior-mutability precedent to match, and
+    /// `AtomicBool` costs nothing extra here — this flag is never on a hot path — while making the
+    /// "no torn read of the poison flag across threads" property explicit rather than incidental
+    /// to `Store` never actually being shared across threads today). `Ordering::SeqCst` throughout
+    /// (see [`Store::is_poisoned`]/[`Store::check_not_poisoned`] and
+    /// [`crate::audit::Audit::append`], the only place this flag is ever set): this flag is
+    /// set at most once and read rarely, so the strongest ordering costs nothing measurable and
+    /// removes any need to reason about weaker orderings later.
+    ///
+    /// **Recovery contract**: once poisoned, this `Store` refuses every write
+    /// ([`Store::check_not_poisoned`], called first by every mutating method here, and by
+    /// [`crate::audit::Audit::append`] via the reference [`Store::audit`] hands it) for the rest
+    /// of this `Store`'s lifetime — there is no in-place un-poisoning, deliberately: a
+    /// connection that failed to leave a transaction cleanly is not a state this code can safely
+    /// reason its way out of at runtime (see [`crate::audit::Audit::append`] for why a single
+    /// deterministic retry is attempted *before* poisoning, but not indefinitely). A caller that
+    /// observes [`Store::is_poisoned`] returning `true` (or a [`StoreError::ConnectionPoisoned`]
+    /// from any write) must drop this `Store` and open a fresh one
+    /// ([`Store::open`]/[`Store::open_in_memory`]) against the same file: a new
+    /// `rusqlite::Connection` starts in autocommit mode unconditionally, and SQLite discards
+    /// whatever transaction state the old, poisoned connection was stuck in in its own `Drop`
+    /// (`sqlite3_close_v2` — the disused connection's uncommitted transaction is never applied).
+    poisoned: AtomicBool,
 }
 
 impl Store {
@@ -293,7 +339,11 @@ impl Store {
     pub fn open_with_limits(path: &Path, limits: StoreLimits) -> Result<Self, StoreError> {
         let mut conn = Connection::open(path)?;
         schema::migrate(&mut conn)?;
-        let store = Store { conn, limits };
+        let store = Store {
+            conn,
+            limits,
+            poisoned: AtomicBool::new(false),
+        };
         store.check_persisted_share_overlaps()?;
         Ok(store)
     }
@@ -307,7 +357,11 @@ impl Store {
     pub fn open_in_memory_with_limits(limits: StoreLimits) -> Result<Self, StoreError> {
         let mut conn = Connection::open_in_memory()?;
         schema::migrate(&mut conn)?;
-        Ok(Store { conn, limits })
+        Ok(Store {
+            conn,
+            limits,
+            poisoned: AtomicBool::new(false),
+        })
     }
 
     /// Direct access to the underlying connection for [`crate::audit::Audit`], which persists to
@@ -319,8 +373,42 @@ impl Store {
 
     /// The audit chain for this host (DESIGN.md §A4b "Audit log"), backed by the same connection
     /// as every other table here — see `crate::audit`'s module doc comment for why that matters.
+    /// Also hands `Audit` a borrow of [`Store::poisoned`] (see that field's doc comment): `Audit`
+    /// is itself a transient, freshly-constructed-per-call borrowed view (`Audit<'a>` holds only
+    /// `&'a Connection`/`&'a AtomicBool`, never owns either), so the poison flag it can set on a
+    /// failed `ROLLBACK`/`COMMIT` outlives the individual `Audit` value and is visible to every
+    /// other `Store` method — and to the next `store.audit()` call — through the one `Store` both
+    /// borrow from.
     pub fn audit(&self) -> crate::audit::Audit<'_> {
-        crate::audit::Audit::new(self.connection())
+        crate::audit::Audit::new(self.connection(), &self.poisoned)
+    }
+
+    /// `true` once a prior write left this connection unable to prove it returned to autocommit
+    /// mode (see [`Store::poisoned`]'s doc comment for the mechanism and the recovery contract:
+    /// drop this `Store` and reopen a fresh one against the same file). Exposed so a caller
+    /// (`spindle-host-core`, a later slice) can observe the poison state directly — e.g. to log it
+    /// distinctly, or to decide when to recycle a pooled `Store` — rather than only ever
+    /// discovering it as a [`StoreError::ConnectionPoisoned`] from whichever write happened to run
+    /// next.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
+    }
+
+    /// The single choke point every mutating method in this file calls first (see each method's
+    /// call site) — refuses with [`StoreError::ConnectionPoisoned`] once
+    /// [`Store::poisoned`] is set, rather than letting the write attempt run and either fail with
+    /// a confusing raw SQLite error (for the methods that open their own transaction — SQLite
+    /// itself refuses a nested `BEGIN`) or, worse, silently execute inside a stranded transaction
+    /// (every bare `self.conn.execute` write here that opens no transaction of its own — exactly
+    /// the failure mode td-c9b9bd exists to close). Read-only methods deliberately do **not** call
+    /// this: a poisoned connection still answers `SELECT`s correctly, and refusing reads too would
+    /// only make a recoverable situation (an operator inspecting state before deciding to reopen)
+    /// harder to diagnose.
+    fn check_not_poisoned(&self) -> Result<(), StoreError> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(StoreError::ConnectionPoisoned);
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------------------
@@ -354,6 +442,7 @@ impl Store {
     /// the value handed back provably the one this statement's own `UPDATE` produced, in one
     /// atomic step.
     pub fn bump_cap_epoch(&self) -> Result<u64, StoreError> {
+        self.check_not_poisoned()?;
         Ok(self.conn.query_row(
             "UPDATE meta SET cap_epoch = cap_epoch + 1 WHERE id = 0 RETURNING cap_epoch",
             [],
@@ -366,6 +455,7 @@ impl Store {
     /// [`Store::bump_cap_epoch`], for the same reason: the returned value must be provably the
     /// one this statement's own `UPDATE` produced, not a value read back in a separate statement.
     fn bump_grants_version(&self) -> Result<u64, StoreError> {
+        self.check_not_poisoned()?;
         Ok(self.conn.query_row(
             "UPDATE meta SET grants_version = grants_version + 1 WHERE id = 0 RETURNING grants_version",
             [],
@@ -390,6 +480,7 @@ impl Store {
         display_name: &str,
         created: u64,
     ) -> Result<MemberId, StoreError> {
+        self.check_not_poisoned()?;
         self.conn.execute(
             "INSERT INTO members (root_fp, display_name, status, created) VALUES (?1, ?2, 'invited', ?3)",
             params![root_fp.to_vec(), display_name, created as i64],
@@ -519,6 +610,7 @@ impl Store {
         member_id: MemberId,
         new_status: MemberStatus,
     ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         let current = self
             .get_member(member_id)?
             .ok_or(StoreError::MemberNotFound(member_id))?
@@ -591,6 +683,7 @@ impl Store {
         &self,
         member_id: MemberId,
     ) -> Result<Option<u64>, StoreError> {
+        self.check_not_poisoned()?;
         let tx = self.conn.unchecked_transaction()?;
         // `root_fp` is read alongside `status` in the same query so this method's only
         // identifying detail for the `tracing` calls below comes for free — no extra round trip
@@ -669,6 +762,7 @@ impl Store {
         added: u64,
         keys: Option<&DevicePublicKeys>,
     ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         if self.get_member(member_id)?.is_none() {
             return Err(StoreError::MemberNotFound(member_id));
         }
@@ -748,6 +842,7 @@ impl Store {
         device_fp: Fingerprint,
         keys: &DevicePublicKeys,
     ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         if keys.alg_id != spindle_core::ALG_ID_V1 {
             return Err(StoreError::UnsupportedAlgId {
                 alg_id: keys.alg_id,
@@ -784,6 +879,7 @@ impl Store {
 
     /// Does **not** bump `cap_epoch` — see the module doc comment.
     pub fn revoke_device(&self, device_fp: Fingerprint) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         let changed = self.conn.execute(
             "UPDATE devices SET revoked = 1 WHERE device_fp = ?1",
             params![device_fp.to_vec()],
@@ -825,6 +921,7 @@ impl Store {
         &self,
         device_fp: Fingerprint,
     ) -> Result<Option<u64>, StoreError> {
+        self.check_not_poisoned()?;
         let tx = self.conn.unchecked_transaction()?;
         // `AND revoked = 0` is load-bearing: it is what makes re-revoking an already-revoked
         // device match zero rows (a no-op) instead of one, which is what lets the branch below
@@ -1003,6 +1100,7 @@ impl Store {
     // ---------------------------------------------------------------------------------------
 
     pub fn create_custom_group(&self, name: &str) -> Result<GroupId, StoreError> {
+        self.check_not_poisoned()?;
         self.conn.execute(
             "INSERT INTO groups (name, kind) VALUES (?1, 'custom')",
             params![name],
@@ -1065,6 +1163,7 @@ impl Store {
     /// Rejects a built-in group (DESIGN.md §A4b: "Owner ... not editable"; this protects both
     /// built-ins' identity, not just Owner's).
     pub fn rename_group(&self, group_id: GroupId, new_name: &str) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         let group = self
             .get_group(group_id)?
             .ok_or(StoreError::GroupNotFound(group_id))?;
@@ -1083,6 +1182,7 @@ impl Store {
         member_id: MemberId,
         group_id: GroupId,
     ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         if self.get_member(member_id)?.is_none() {
             return Err(StoreError::MemberNotFound(member_id));
         }
@@ -1102,6 +1202,7 @@ impl Store {
         member_id: MemberId,
         group_id: GroupId,
     ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         self.conn.execute(
             "DELETE FROM member_groups WHERE member_id = ?1 AND group_id = ?2",
             params![member_id.0 as i64, group_id.0 as i64],
@@ -1128,6 +1229,7 @@ impl Store {
         excludes: &[String],
         created: u64,
     ) -> Result<ShareId, StoreError> {
+        self.check_not_poisoned()?;
         // One `Immediate` transaction spans every check below and every write that follows.
         //
         // Without it the four checks are plain autocommitted reads, nothing holds a lock across
@@ -1306,6 +1408,7 @@ impl Store {
         share_id: ShareId,
         flags: ShareFlags,
     ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         if self.get_share(share_id)?.is_none() {
             return Err(StoreError::ShareNotFound(share_id));
         }
@@ -1323,6 +1426,7 @@ impl Store {
     }
 
     pub fn add_share_exclude(&self, share_id: ShareId, glob: &str) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         // Same `Immediate` transaction discipline as `add_share` above, for the same reason and
         // the same defect: the count check and the `INSERT` are otherwise separate autocommits,
         // so two concurrent callers each adding a *distinct* glob both read a stale count under
@@ -1401,6 +1505,7 @@ impl Store {
         subpath: &VirtualPath,
         perms: Perms,
     ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         let group = self
             .get_group(group_id)?
             .ok_or(StoreError::GroupNotFound(group_id))?;
@@ -1453,6 +1558,7 @@ impl Store {
         share_id: ShareId,
         subpath: &VirtualPath,
     ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         let fold_subpath = confine::fold_key(&subpath.to_path_string());
         self.conn.execute(
             "DELETE FROM entitlements WHERE group_id = ?1 AND share_id = ?2 AND fold_subpath = ?3",
@@ -1540,6 +1646,7 @@ impl Store {
         member_id: MemberId,
         delta: i64,
     ) -> Result<u64, StoreError> {
+        self.check_not_poisoned()?;
         self.conn.execute(
             "INSERT INTO member_upload_bytes (member_id, bytes) VALUES (?1, MAX(?2, 0)) \
              ON CONFLICT(member_id) DO UPDATE SET bytes = MAX(bytes + ?2, 0)",
@@ -1573,6 +1680,7 @@ impl Store {
         share_id: ShareId,
         delta: i64,
     ) -> Result<u64, StoreError> {
+        self.check_not_poisoned()?;
         self.conn.execute(
             "INSERT INTO share_upload_bytes (share_id, bytes) VALUES (?1, MAX(?2, 0)) \
              ON CONFLICT(share_id) DO UPDATE SET bytes = MAX(bytes + ?2, 0)",
@@ -1630,6 +1738,7 @@ impl Store {
         subpath: &str,
         bytes: u64,
     ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
         let fold_subpath = confine::fold_key(subpath);
@@ -1731,6 +1840,7 @@ impl Store {
         share_id: ShareId,
         subpath: &str,
     ) -> Result<Vec<(MemberId, u64)>, StoreError> {
+        self.check_not_poisoned()?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
         let fold_subpath = confine::fold_key(subpath);
@@ -1808,6 +1918,7 @@ impl Store {
         share_id: ShareId,
         subpath: &str,
     ) -> Result<Option<(MemberId, u64)>, StoreError> {
+        self.check_not_poisoned()?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
         let fold_subpath = confine::fold_key(subpath);
@@ -1851,6 +1962,7 @@ impl Store {
     /// they uploaded was since deleted) has no `GROUP BY` result at all, so without the reset its
     /// counter would be left at its last (now-stale) value instead of correctly reconciling to 0.
     pub fn reconcile_upload_counters(&self) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
         self.conn
@@ -1936,6 +2048,7 @@ impl Store {
         issued_cap: &[u8],
         now: u64,
     ) -> Result<IssuedCapRecord, StoreError> {
+        self.check_not_poisoned()?;
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO invite_nonces (nonce, member_id, issued_cap, redeemed_at) \
@@ -2001,6 +2114,7 @@ impl Store {
         device_fp: Fingerprint,
         alg_id: Option<i64>,
     ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
         let changed = self.conn.execute(
             "UPDATE devices SET alg_id = ?1 WHERE device_fp = ?2",
             params![alg_id, device_fp.to_vec()],
