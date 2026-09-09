@@ -29,20 +29,6 @@ pub enum ConnectDecision {
     Allow {
         sign_pk: spindle_core::VerifyingKey,
         agree_pk: X25519PublicKey,
-        /// The host's current member capability for this device's root, to be returned in the
-        /// connect answer (DESIGN.md:286 — member caps are "refreshed opportunistically on every
-        /// successful session" — and :289-290's renewal path, which re-issues "the current cap in
-        /// the reply"). `None` when the host has no cap-signing key online to mint with, which is
-        /// every host today (`spindle-hostd/src/main.rs` is a stub pending A4 key custody per
-        /// td-539ffa) — `None` is the honest answer for that case, not a placeholder for
-        /// "unimplemented".
-        ///
-        /// `spindle-net` never mints, inspects, or validates this value: it is opaque bytes the
-        /// injected authorizer supplies, and this crate only relays it into the answer envelope.
-        /// Minting requires host key material (the root public key, the capability op cert, the
-        /// op signing key) that A9c boundary rule 3 keeps out of this crate — see this module's
-        /// doc comment.
-        member_cap: Option<spindle_proto::artifacts::Capability>,
     },
     /// `from_fp` is unknown, not (yet) a member, or revoked. The caller must drop the offer with
     /// no distinguishable reply (DESIGN.md §A5's uniform-silent-drop philosophy) — see
@@ -50,18 +36,109 @@ pub enum ConnectDecision {
     Deny,
 }
 
+/// The outcome of [`ConnectAuthorizer::on_verified`] — the *post*-signature-verification half of a
+/// connect decision. See that method's doc comment for the boundary this type sits on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VerifiedDecision {
+    /// The connect may proceed. Carries the host's current member capability for this device's
+    /// root, to be returned in the connect answer (DESIGN.md:286 — member caps are "refreshed
+    /// opportunistically on every successful session" — and :289-290's renewal path, which
+    /// re-issues "the current cap in the reply").
+    ///
+    /// `member_cap: None` is a normal, non-exceptional answer, not a placeholder for
+    /// "unimplemented": it is what a host with no cap-signing key online supplies (which is every
+    /// host today — `spindle-hostd` installs a `CapIssuer` only if one is handed to it), and it is
+    /// also what a host supplies when minting was attempted and failed. An issuance failure must
+    /// never become a [`Self::Drop`]: it costs the peer a fresh capability, never the connect.
+    ///
+    /// `spindle-net` never mints, inspects, or validates this value: it is opaque bytes the
+    /// injected authorizer supplies, and this crate only relays it into the answer envelope.
+    /// Minting requires host key material (the root public key, the capability op cert, the op
+    /// signing key) that A9c boundary rule 3 keeps out of this crate — see this module's doc
+    /// comment.
+    Proceed {
+        member_cap: Option<spindle_proto::artifacts::Capability>,
+    },
+    /// The connect must be dropped, even though its signature verified. The caller drops the offer
+    /// with no distinguishable reply, exactly as it does for [`ConnectDecision::Deny`] — see
+    /// [`super::error::SignalingError::Denied`].
+    Drop,
+}
+
 /// Host-injected membership/authorization decision (DESIGN.md §A5). A real host implements this
 /// against its own member registry / revocation store; nothing in `spindle-net` may resolve it
 /// directly (see the module doc comment).
+///
+/// # Two methods, one signature-verification boundary
+///
+/// This trait deliberately splits one logical decision across two calls, because the two halves
+/// are reached with fundamentally different amounts of trust in `from_fp`:
+///
+/// - [`Self::authorize`] runs **before** any signature has been checked. Its `from_fp` is an
+///   unverified, attacker-chosen string of bytes lifted straight out of an unauthenticated NATS
+///   message. It is called precisely so the caller can obtain the `sign_pk` it will *then* verify
+///   the offer against — there is no earlier point at which the identity could have been proven.
+/// - [`Self::on_verified`] runs **only after** [`super::wire::open_offer`] has verified the
+///   offer's Ed25519 signature under the `sign_pk` that [`Self::authorize`] returned, and after
+///   every routing check has passed. Its `from_fp` is authenticated: only the holder of that
+///   device's signing key can cause this method to be called with it.
+///
+/// **The rule this split exists to enforce**: [`Self::authorize`] may charge only costs an
+/// attacker is allowed to impose on *everyone* — a global bound, a shared budget, work whose
+/// exhaustion degrades the host uniformly. It must never charge a cost against the **named
+/// identity**: not a per-`from_fp` token bucket, not an entry in a per-`from_fp` map, not a
+/// signature minted for that identity, not a counter, not a lockout. Any such charge is an
+/// attacker-directed weapon, because the attacker picks the name.
+///
+/// Stated plainly, because it is the defect this design was written to close: **moving a
+/// per-identity charge back into [`Self::authorize`] reintroduces a targeted denial-of-service
+/// against an arbitrary victim.** An attacker holding any valid device credential can publish to
+/// `host.<h>.connect` naming a victim's `from_fp`; nats-server evaluates publish permissions
+/// against the publish subject only, never the reply subject, so the offer reaches the host and
+/// passes [`super::subject::reply_prefix_ok`]. Every per-identity cost [`Self::authorize`] charges
+/// is therefore charged to the victim, by someone who could never produce the victim's signature.
+/// A per-fp token bucket becomes a remote "lock this specific device out" primitive; a bounded
+/// per-fp map becomes exhaustible with fabricated names; a mint becomes a free Ed25519 signature
+/// per attacker packet. None of that is reachable from [`Self::on_verified`], where the identity
+/// has been proven.
+///
+/// Per-identity costs are legitimate in [`Self::on_verified`] and belong there: a peer that can
+/// sign as `from_fp` **is** `from_fp`, so throttling it, tracking it, or minting for it charges
+/// exactly the party responsible for the work.
 pub trait ConnectAuthorizer: Send + Sync {
     /// Resolves a connect decision for `from_fp` (the offer's claimed sender, already extracted
     /// from the envelope but not yet cryptographically verified — the caller uses the returned
     /// `sign_pk`/`agree_pk` to perform that verification next, so an authorizer must not treat
     /// being asked as proof of anything about the envelope itself).
+    ///
+    /// Called with an **unverified, attacker-chosen** `from_fp`. Read this trait's own doc comment
+    /// before adding any work here: an implementation may charge only globally-bounded costs, and
+    /// must never charge anything against the identity `from_fp` names. A membership lookup (which
+    /// is what this method exists to perform) is fine; a per-`from_fp` bucket, map insert, counter,
+    /// or signature is not.
     fn authorize(
         &self,
         from_fp: &Fingerprint,
     ) -> impl std::future::Future<Output = ConnectDecision> + Send;
+
+    /// The post-verification half of the decision, called by [`super::host::process_offer`] once —
+    /// and only once — the offer's signature has verified under the `sign_pk` [`Self::authorize`]
+    /// returned for this same `from_fp`, and every routing check (reply prefix, `to_fp`, the
+    /// §A10.36 signed-`inbox` binding) has passed.
+    ///
+    /// `from_fp` is **authenticated** here. That is the entire point of the split: this method is
+    /// unreachable for a forged offer, so per-identity costs charged here are charged to the party
+    /// that actually incurred them. Put the per-`from_fp` token bucket, any per-identity bookkeeping,
+    /// and the member-capability mint here — never in [`Self::authorize`].
+    ///
+    /// Returning [`VerifiedDecision::Drop`] rejects the connect exactly as [`ConnectDecision::Deny`]
+    /// does: the caller produces `SignalingError::Denied` and drops the offer with no reply.
+    /// Returning [`VerifiedDecision::Proceed`] supplies the `member_cap` (possibly `None`) the host
+    /// relays into the connect answer.
+    fn on_verified(
+        &self,
+        from_fp: &Fingerprint,
+    ) -> impl std::future::Future<Output = VerifiedDecision> + Send;
 }
 
 #[cfg(test)]
@@ -86,14 +163,17 @@ mod tests {
                 ConnectDecision::Allow {
                     sign_pk: self.device.sign_public_key(),
                     agree_pk: self.device.agree_public_key(),
-                    // This fixture models a bare registry lookup, not cap issuance -- see
-                    // `ConnectDecision::Allow::member_cap`'s doc comment for why `None` is the
-                    // honest answer whenever no cap-signing key is wired in.
-                    member_cap: None,
                 }
             } else {
                 ConnectDecision::Deny
             }
+        }
+
+        async fn on_verified(&self, _from_fp: &Fingerprint) -> VerifiedDecision {
+            // This fixture models a bare registry lookup, not cap issuance -- see
+            // `VerifiedDecision::Proceed::member_cap`'s doc comment for why `None` is the honest
+            // answer whenever no cap-signing key is wired in.
+            VerifiedDecision::Proceed { member_cap: None }
         }
     }
 
@@ -104,17 +184,17 @@ mod tests {
         let authorizer = FixedAuthorizer { allowed, device };
 
         match authorizer.authorize(&allowed).await {
-            ConnectDecision::Allow {
-                sign_pk,
-                agree_pk,
-                member_cap,
-            } => {
+            ConnectDecision::Allow { sign_pk, agree_pk } => {
                 assert_eq!(sign_pk, authorizer.device.sign_public_key());
                 assert_eq!(agree_pk, authorizer.device.agree_public_key());
-                assert_eq!(member_cap, None);
             }
             ConnectDecision::Deny => panic!("expected Allow for the registered device_fp"),
         }
+        assert_eq!(
+            authorizer.on_verified(&allowed).await,
+            VerifiedDecision::Proceed { member_cap: None },
+            "this fixture mints nothing, so the post-verification half proceeds with no cap"
+        );
     }
 
     #[tokio::test]

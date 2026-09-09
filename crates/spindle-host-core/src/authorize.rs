@@ -29,7 +29,7 @@ use crate::ratelimit::{ConnectRateLimitConfig, ConnectRateLimiter};
 use spindle_core::artifacts::issue_capability;
 use spindle_core::identity::device_fp_of;
 use spindle_core::{Fingerprint, SigningKey, VerifyingKey, X25519PublicKey, ALG_ID_V1};
-use spindle_net::signaling::authorize::{ConnectAuthorizer, ConnectDecision};
+use spindle_net::signaling::authorize::{ConnectAuthorizer, ConnectDecision, VerifiedDecision};
 use spindle_proto::artifacts::{CapKind, Capability, HostOpKeyCert};
 use spindle_vfs::model::{Member, MemberStatus};
 use spindle_vfs::store::{Store, StoreError};
@@ -60,7 +60,9 @@ pub trait DeviceLookup: Send + Sync {
     /// own implementation delegates straight to `Store::member_and_cap_epoch` rather than calling
     /// this method. It is still implemented — by [`SqliteDeviceLookup`] and by several test
     /// doubles in this crate's `#[cfg(test)]` modules — only because implementing [`DeviceLookup`]
-    /// requires it; nothing anywhere invokes it.
+    /// requires it; nothing anywhere invokes it. (td-fc5a30 moved the minting caller from
+    /// `HostConnectAuthorizer::authorize` to `HostConnectAuthorizer::on_verified`; the rule is
+    /// unchanged — that method reads both values via [`Self::member_and_cap_epoch`].)
     ///
     /// Deliberately read through this same [`DeviceLookup`] rather than a second `Store` handle:
     /// `Store::bump_cap_epoch` (the *only* path that increments the epoch — see its own doc
@@ -113,8 +115,9 @@ pub trait DeviceLookup: Send + Sync {
     /// post-bump epoch. That makes it indistinguishable from a legitimately fresh capability to
     /// any consumer that only checks `cap.cap_epoch` against the host's current `cap_epoch` —
     /// exactly the check `cap_epoch` exists to make revocation defeat. See
-    /// [`HostConnectAuthorizer::authorize`]'s own comment at its call site for the concrete
-    /// exploit shape this closes.
+    /// [`HostConnectAuthorizer::on_verified`]'s own comment at its call site for the concrete
+    /// exploit shape this closes (td-fc5a30 moved that call site out of `authorize`, which no
+    /// longer mints; the race, and this method's role in closing it, are unchanged).
     ///
     /// An implementation must take one **database-level transaction** covering both reads, not
     /// merely one in-process lock: an in-process `Mutex`/lock only ever excludes other threads
@@ -131,8 +134,9 @@ pub trait DeviceLookup: Send + Sync {
     /// Any caller that is about to mint a capability from the result **must** use this method
     /// rather than [`Self::member_for_device_fp`] plus [`Self::cap_epoch`]. Callers that only need
     /// the membership decision and never touch `cap_epoch` — [`active_member_for_device`], and
-    /// through it [`crate::session::VfsSessionHandler`] — have no epoch to race against and keep
-    /// using [`Self::member_for_device_fp`] alone.
+    /// through it both [`crate::session::VfsSessionHandler`] and
+    /// [`HostConnectAuthorizer::authorize`] — have no epoch to race against and keep using
+    /// [`Self::member_for_device_fp`] alone.
     fn member_and_cap_epoch(
         &self,
         device_fp: Fingerprint,
@@ -278,8 +282,8 @@ pub(crate) fn active_member_for_device<L: DeviceLookup + ?Sized>(
     let member = match lookup.member_for_device_fp(device_fp) {
         Ok(member) => member,
         Err(e) => {
-            // Reachable from two independent pipelines: `HostConnectAuthorizer::authorize` when
-            // no `CapIssuer` is installed, and every session's own liveness re-check
+            // Reachable from two independent pipelines: `HostConnectAuthorizer::authorize`, and
+            // every session's own liveness re-check
             // (`crate::session::VfsSessionHandler::session_context`) — so this fires far more
             // often than just at connect time. Fails closed either way (per this function's own
             // doc comment), which is correct regardless of why the lookup failed; this line exists
@@ -311,9 +315,9 @@ pub(crate) fn active_member_for_device<L: DeviceLookup + ?Sized>(
 /// `Option<Member>` rather than performing the fetch itself. Factored out so DESIGN.md §A4's
 /// liveness rule is defined in exactly one place while still having two entry points: the plain,
 /// membership-only fetch ([`active_member_for_device`], used by [`crate::session::VfsSessionHandler`]
-/// and by [`HostConnectAuthorizer::authorize`] when no cap will be minted) and the atomic
-/// snapshot fetch ([`DeviceLookup::member_and_cap_epoch`], used by
-/// [`HostConnectAuthorizer::authorize`] when a cap might be minted from the result). Checks 1 and
+/// and by [`HostConnectAuthorizer::authorize`], neither of which mints) and the atomic snapshot
+/// fetch ([`DeviceLookup::member_and_cap_epoch`], used by
+/// [`HostConnectAuthorizer::on_verified`], which does). Checks 1 and
 /// 2 — the fetch itself, and its `None`/`Err` handling — are each entry point's own job, since
 /// they differ in how the member is obtained; this function starts from whatever `Option<Member>`
 /// the caller already has in hand.
@@ -345,16 +349,16 @@ fn liveness_checks(member: Option<Member>, device_fp: Fingerprint) -> Option<Mem
 ///
 /// Returns `Option<Capability>`, not `Result<Capability, _>`, and that is deliberate: an issuer
 /// that cannot sign right now (no key online, keystore locked, clock unavailable) yields `None`,
-/// and [`HostConnectAuthorizer::authorize`] treats that exactly like "no issuer installed" —
-/// `member_cap: None` in an otherwise-`Allow` decision. A cap-issuance failure must **never**
-/// turn an otherwise-valid connect into a `Deny`: the device simply gets an answer with no fresh
-/// cap and falls back to whatever cap it already holds. Denying here would be strictly worse than
+/// and [`HostConnectAuthorizer::on_verified`] treats that exactly like "no issuer installed" —
+/// `member_cap: None` in an otherwise-`Proceed` decision. A cap-issuance failure must **never**
+/// turn an otherwise-valid connect into a `Drop`: the device simply gets an answer with no fresh
+/// cap and falls back to whatever cap it already holds. Dropping here would be strictly worse than
 /// the status quo, because it would take a working connect path and break it over a problem
 /// (signing) that has nothing to do with whether this device is still a live member.
 pub trait CapIssuer: Send + Sync {
     /// Issues a `member`-kind capability for `subject` (see [`RootKeyCapIssuer`]'s doc comment
     /// for why `subject` must be the member's `root_fp`, never a device fp), stamped with
-    /// `cap_epoch` — the caller (`HostConnectAuthorizer::authorize`) reads that epoch live via
+    /// `cap_epoch` — the caller (`HostConnectAuthorizer::on_verified`) reads that epoch live via
     /// [`DeviceLookup::member_and_cap_epoch`], in the same snapshot as the membership check that
     /// gated this call, rather than caching it. Reading it via [`DeviceLookup::cap_epoch`] as a
     /// second, independent call — alongside a separate membership read — is precisely the TOCTOU
@@ -507,15 +511,18 @@ impl CapIssuer for RootKeyCapIssuer {
 ///
 /// Closes both of `spindle-net`'s `signaling::host` module doc comment's MUSTs for a
 /// `ConnectAuthorizer` implementation (`crates/spindle-net/src/signaling/host.rs`'s
-/// `process_offer` doc comment, ~line 194-197 as of this writing): "must rate-limit these lookups"
-/// is [`Self::limiter`], a [`ConnectRateLimiter`] consulted before any store access (see
-/// `authorize`'s check 0); "must make `Allow` and `Deny` indistinguishable to the caller in timing
-/// and observable behavior" is [`equalize_denial_work`], run on every pre-crypto `Deny` so an
-/// unenrolled `from_fp` costs roughly the same crypto work as an enrolled one. Neither is complete:
+/// `process_offer` doc comment): "must rate-limit these lookups" is [`Self::limiter`], a
+/// [`ConnectRateLimiter`] consulted before any store access (see `authorize`'s check 0); "must
+/// make `Allow` and `Deny` indistinguishable to the caller in timing and observable behavior" is
+/// [`equalize_denial_work`], run on every pre-crypto `Deny` so an unenrolled `from_fp` costs
+/// roughly the same crypto work as an enrolled one. Neither is complete:
 ///
-/// - the rate limiter's own state (which bucket a given `from_fp` lands in, whether the global
-///   bucket is exhausted) is itself observable via timing/behavior differences between callers —
-///   see [`ConnectRateLimiter`]'s own doc comment for the accepted "shared fate" cost this implies;
+/// - the rate limiter's global bucket state (whether it is exhausted right now) is itself
+///   observable via timing/behavior differences between callers — see [`ConnectRateLimiter`]'s own
+///   doc comment for the accepted "shared fate" cost this implies. Since td-fc5a30 the *per-fp*
+///   bucket is no longer part of that surface at all: it is charged only in [`Self::on_verified`],
+///   behind the signature check, so an unauthenticated peer cannot observe or influence any
+///   fingerprint's own bucket;
 /// - the timing equalization closes the crypto-work asymmetry (check 9's own comment explains why
 ///   it stops exactly there) but leaves the store-side cost difference between a registry hit and
 ///   a miss, plus SQLite page-cache and allocator jitter, unequalized — see
@@ -523,11 +530,16 @@ impl CapIssuer for RootKeyCapIssuer {
 ///   residual gap is bounded by the rate limiter and by §A5's uniform silent drop
 ///   (`SignalingError::Denied` produces no reply at all), not eliminated.
 ///
-/// Deliberately does **not**:
+/// [`Self::authorize`] deliberately does **not**:
 /// - verify the envelope signature — the caller does that next, using the `sign_pk`/`agree_pk`
 ///   this returns (see `ConnectAuthorizer::authorize`'s own doc comment: "an authorizer must not
 ///   treat being asked as proof of anything about the envelope itself");
-/// - consult `cap_epoch` — a connect decision is membership, not capability freshness.
+/// - consult `cap_epoch` — a connect decision is membership, not capability freshness;
+/// - charge anything to the identity `from_fp` names, or mint anything for it. Both moved to
+///   [`Self::on_verified`] in td-fc5a30, which runs only after the caller has verified that
+///   signature. See that method, `authorize`'s check 0, and
+///   [`spindle_net::signaling::authorize::ConnectAuthorizer`]'s own doc comment for the rule and
+///   the attack it exists to close.
 pub struct HostConnectAuthorizer<L: DeviceLookup> {
     lookup: L,
     /// The optional cap-issuing seam (td-c74122 slice C). Boxed as a trait object rather than a
@@ -612,6 +624,14 @@ impl<L: DeviceLookup> HostConnectAuthorizer<L> {
             limiter: ConnectRateLimiter::new(config),
             ..self
         }
+    }
+
+    /// Test-only view of how many per-`from_fp` buckets the limiter is tracking. Exists so
+    /// td-fc5a30's regression tests can assert that the *pre*-verification path inserts nothing
+    /// into that bounded map, which is not observable through `ConnectDecision` alone.
+    #[cfg(test)]
+    fn tracked_fps(&self) -> usize {
+        self.limiter.tracked_fps()
     }
 }
 
@@ -720,21 +740,27 @@ fn reset_equalization_calls() {
 /// DESIGN.md:481-483's v0.9.24 amendment records this same caveat; do not describe this function,
 /// in a future doc update, as closing the channel entirely — it does not.
 ///
-/// A second, larger gap in the same direction: once a [`CapIssuer`] is installed (see check 10 in
-/// [`HostConnectAuthorizer::authorize`]), an `Allow` that successfully mints a member cap performs
-/// an Ed25519 SIGNATURE — `issue_member_cap`'s whole reason for existing — that this function's
-/// crypto recompute never matches; it only redoes the parse/rehash work of checks 7 and 9, never a
-/// signature. Measured on one release-build machine: `equalize_denial_work` ≈ 3.3 µs/call,
-/// `issue_member_cap` ≈ 16.7 µs/call — an asymmetry roughly 5x LARGER than the parse/rehash gap
-/// this function closes, pointing the same direction (`Allow` slower than `Deny`). Nothing
-/// installs a `CapIssuer` today — only `spindle-hostd`'s `HostDaemon::with_cap_issuer`'s
-/// definition exists, nothing calls it yet — so this is latent, not live, but it goes live
-/// silently the moment Stage 7 wires the operating key in, with no change to this function
-/// required to trigger it. Equalizing it is NOT the fix: performing an Ed25519 signature on every
-/// denial, to match, would hand an attacker exactly the CPU-cost amplification
-/// [`ConnectRateLimiter`] exists to deny them — trading a timing side-channel for a cheap
-/// denial-of-service amplifier is a strictly worse trade. The right fix, whenever this goes live,
-/// is scoped to Stage 7, not to this function.
+/// **A second, larger gap in the same direction — CLOSED by td-fc5a30, recorded here because the
+/// shape of the fix is the point.** While the capability mint lived in
+/// [`HostConnectAuthorizer::authorize`] (its old "check 10"), an `Allow` that successfully minted a
+/// member cap performed an Ed25519 SIGNATURE — `issue_member_cap`'s whole reason for existing —
+/// that this function's crypto recompute never matched; it only redoes the parse/rehash work of
+/// checks 7 and 9, never a signature. Measured on one release-build machine:
+/// `equalize_denial_work` ≈ 3.3 µs/call, `issue_member_cap` ≈ 16.7 µs/call — an asymmetry roughly
+/// 5x LARGER than the parse/rehash gap this function closes, pointing the same direction (`Allow`
+/// slower than `Deny`).
+///
+/// Equalizing it was never the fix: performing an Ed25519 signature on every denial, to match,
+/// would hand an attacker exactly the CPU-cost amplification [`ConnectRateLimiter`] exists to deny
+/// them — trading a timing side-channel for a cheap denial-of-service amplifier is a strictly worse
+/// trade. The actual fix was to move the signature out of the pre-authentication path entirely:
+/// the mint now runs in [`HostConnectAuthorizer::on_verified`], reached only after the offer's
+/// signature has verified, so no `Deny` this function equalizes can be compared against an `Allow`
+/// that signed. Every `ConnectDecision::Allow` now does the same parse-and-rehash work and nothing
+/// more, which makes this function's ≈3.3 µs an imitation of the WHOLE of an `Allow`'s crypto cost
+/// rather than a fraction of it. Do not move a mint, or any other signature, back onto the
+/// `authorize` path — it would reopen this gap and, worse, hand every unauthenticated peer a free
+/// signature per packet.
 ///
 /// Wrapped in [`std::hint::black_box`] so the compiler cannot prove the result is unused and
 /// optimize the recompute away — an elided recompute would silently stop equalizing anything while
@@ -804,84 +830,57 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
         // doc comment: an implementation "must rate-limit these lookups", since the authorizer is
         // reached with an unverified, attacker-chosen `from_fp` before any signature is checked).
         //
+        // **GLOBAL bucket only** (td-fc5a30). `from_fp` is not authenticated here and never can
+        // be at this point — this method exists to resolve the key the signature will later be
+        // checked against — so nothing this method does may be charged to the identity `from_fp`
+        // names. The per-fp bucket, and the bounded map insert that comes with it, moved to
+        // `on_verified`. Note that `try_acquire_global` does not even take a `Fingerprint`: there
+        // is deliberately no name here for a future edit to accidentally charge.
+        //
+        // Restoring `try_acquire_fp` to this line reintroduces a remote, targeted lockout of an
+        // arbitrary victim device: an attacker with any valid device credential can publish to
+        // `host.<h>.connect` naming a victim's `from_fp` with `reply = _INBOX_<victim_fp>.…`
+        // (nats-server 2.10 checks publish permissions against the publish subject only, never the
+        // reply), so every per-identity token spent here is spent out of the victim's budget by
+        // someone who cannot produce the victim's signature. See `ConnectRateLimiter`'s doc
+        // comment for the measured numbers, and
+        // `tests::a_forged_offer_naming_a_victim_does_not_consume_the_victims_per_fp_bucket` for
+        // the regression that fails if this line is changed back.
+        //
         // This returns a PLAIN `Deny`, not `deny_with_equalized_work()`'s equalized one, and that
         // is deliberate, not an oversight:
-        // - a rate-limited rejection reveals only rate-limiter state (this bucket, or the shared
-        //   global one, is out of tokens right now), never membership — it leaks nothing about
-        //   whether `from_fp` is enrolled, so there is no membership-oracle signal here to hide
-        //   behind equalized crypto work;
+        // - a rate-limited rejection reveals only rate-limiter state (the shared global bucket is
+        //   out of tokens right now), never membership — it leaks nothing about whether `from_fp`
+        //   is enrolled, so there is no membership-oracle signal here to hide behind equalized
+        //   crypto work. Since td-fc5a30 this is stronger still: the bucket consulted here is not
+        //   keyed on `from_fp` at all, so its state cannot be about `from_fp` even in principle;
         // - spending crypto work on a request the limiter has already refused would hand a
         //   flooder exactly the amplification the limiter exists to deny: the whole point of
         //   checking the limiter first is to make a throttled request cheap, not merely
         //   indistinguishable-looking. Being measurably faster on this path is the correct
         //   trade-off, not a timing leak that needs closing.
-        if !self.limiter.try_acquire(*from_fp, (self.now_fn)()) {
+        if !self.limiter.try_acquire_global((self.now_fn)()) {
             return ConnectDecision::Deny;
         }
 
-        // 1-5, plus — when a `CapIssuer` is installed — the `cap_epoch` a freshly minted cap must
-        // carry, both resolved from ONE atomic snapshot via `DeviceLookup::member_and_cap_epoch`.
+        // 1-5. Membership and DESIGN.md §A4's liveness rule, via the plain, membership-only
+        // `active_member_for_device` — one lookup, no `cap_epoch` read at all, keeping this
+        // struct's own doc comment true ("a connect decision is membership, not capability
+        // freshness").
         //
-        // This used to be two independent reads: `active_member_for_device` (itself one
-        // `store.lock()`) for the member, then, after checks 6-8 below, a *separate*
-        // `self.lookup.cap_epoch()` call for the epoch. That shape has a TOCTOU race:
-        // `Store::revoke_member_and_bump_epoch` and `revoke_device_and_bump_epoch` each flip a
-        // member's status (or a device's `revoked` flag) *and* bump `cap_epoch` inside one
-        // transaction, and nothing stops such a transaction committing in the window between the
-        // two reads. When it does, the member snapshot already in hand is from *before* the
-        // revoke, but the `cap_epoch` read moments later is from *after* it — and minting from
-        // that pair produces a capability for a subject the store has already revoked, stamped
-        // with the post-bump epoch. Since the only thing most consumers check is `cap.cap_epoch`
-        // against the host's current `cap_epoch`, that capability is indistinguishable from a
-        // legitimately fresh one — which defeats `cap_epoch`'s entire purpose as the
-        // revocation-invalidation mechanism (DESIGN.md §A4). Do not "simplify" this back into two
-        // reads — see `DeviceLookup::member_and_cap_epoch`'s own doc comment for the same warning.
-        //
-        // When no issuer is installed, no capability will ever be minted from this call, so there
-        // is no epoch to race against: the plain, membership-only `active_member_for_device` is
-        // used instead, keeping this struct's own doc comment true ("a connect decision is
-        // membership, not capability freshness") — `cap_epoch` is never even read on this path.
-        //
-        // In the branch below, a `cap_epoch` read failure is likewise never a `Deny` — see
-        // `DeviceLookup::member_and_cap_epoch`'s doc comment: only a failure to read *membership*
-        // (an outer `Err`) denies; a missing epoch (`Ok((member, None))`) just means check 9
-        // mints no cap. The two failure modes share one `LookupError` type at the call site but
-        // must never share its fail-closed treatment.
-        let (member, cap_epoch_for_mint): (Option<Member>, Option<u64>) = match &self.issuer {
-            None => (active_member_for_device(&self.lookup, *from_fp), None),
-            Some(_) => match self.lookup.member_and_cap_epoch(*from_fp) {
-                // `cap_epoch` may legitimately be `None` here (see `DeviceLookup::
-                // member_and_cap_epoch`'s doc comment: a transient `cap_epoch` read failure,
-                // e.g. `SQLITE_BUSY` on `meta`, costs only the freshly-minted cap). That must
-                // NOT be conflated with the `Err` arm below: membership was read successfully,
-                // so an otherwise-live member still gets `Allow`, just with `member_cap: None`
-                // once check 9 finds no epoch to mint from.
-                Ok((member, cap_epoch)) => (liveness_checks(member, *from_fp), cap_epoch),
-                // Only a genuine `Err` — membership itself unprovable, or a poisoned lock — is a
-                // fail-closed `Deny`. Worth a line of its own: without it, this `Deny` is
-                // indistinguishable from "the device is not a member", when it is operationally a
-                // very different fact — the store could not be read at all.
-                Err(e) => {
-                    // Audited 2026-09-07: `%e` is a `LookupError`, whose only reachable content
-                    // here is a `rusqlite` message from this host's own store (its path is operator
-                    // configuration, exempt — see this crate's `lib.rs` `tracing` section) or a
-                    // fingerprint *length* complaint. `LookupError::Store` is typed over all of
-                    // `StoreError` though, and that enum's `Confine`/`Model`/`MountPathCollision`/
-                    // `DeviceNotFound` variants do carry real paths, virtual paths, and untruncated
-                    // fingerprints — so anything that widens what these lookups call must re-check
-                    // this line rather than trusting the redaction guard, which only reads binding
-                    // names.
-                    tracing::warn!(
-                        device_fp = %from_fp.redacted(),
-                        error = %e,
-                        "authorize: member_and_cap_epoch failed; denying connect due to a store \
-                         failure, not because the device is not a member"
-                    );
-                    (None, None)
-                }
-            },
-        };
-        let Some(member) = member else {
+        // td-fc5a30 note on what this block used to do. Until the mint moved to `on_verified`,
+        // this branched on whether a `CapIssuer` was installed: with one, it called
+        // `DeviceLookup::member_and_cap_epoch` so that the member and the `cap_epoch` a freshly
+        // minted cap would carry came from ONE atomic snapshot. That fused read exists solely to
+        // close a mint-time TOCTOU (a revoke committing between a member read and a separate epoch
+        // read lets a caller mint a validly-signed capability for an already-revoked subject,
+        // stamped with the post-bump epoch — see `DeviceLookup::member_and_cap_epoch`'s own doc
+        // comment for the full shape). With no mint on this path there is no epoch here to pair
+        // with anything, so there is nothing left to race: the fused read moved, intact and with
+        // its reasoning, to `on_verified`, which is now the only place a capability is minted.
+        // **Do not reintroduce a mint here**, and if one ever does come back, it must come back
+        // together with `member_and_cap_epoch` — never with a separate `cap_epoch()` call.
+        let Some(member) = active_member_for_device(&self.lookup, *from_fp) else {
             return deny_with_equalized_work();
         };
         // Re-finding the device row is redundant with what `active_member_for_device` already
@@ -931,34 +930,136 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
             Err(DeviceKeyError::Unverifiable) => return deny_with_equalized_work(),
         };
 
-        // 10. Mint the opportunistic member capability (DESIGN.md:286), if we can. This never
-        // downgrades an `Allow` into a `Deny` — see `CapIssuer`'s doc comment for why an
-        // issuance failure must be strictly no worse than the status quo (no fresh cap, not a
-        // broken connect).
+        // There is deliberately no check 10 here any more. Minting the opportunistic member
+        // capability (DESIGN.md:286) moved to `on_verified`, below — td-fc5a30: an Ed25519
+        // signature is a per-identity cost, and charging one for an unverified, attacker-chosen
+        // `from_fp` hands any peer a free signature per packet it sends.
         //
-        // `cap_epoch_for_mint` can legitimately be `None` even when `self.issuer` is `Some` — see
-        // `DeviceLookup::member_and_cap_epoch`'s doc comment: a tolerated `cap_epoch` read
-        // failure (e.g. `SQLITE_BUSY` on `meta`) reaches here as `None`, not as a `Deny` a few
-        // lines up. The `match` spells out every combination explicitly rather than `unwrap`ping
-        // an epoch that might not be there — this module's house style never unwraps an
-        // invariant instead of failing closed, and here there simply is no invariant to unwrap:
-        // "issuer installed" and "epoch available" are independent facts.
-        //
-        // `subject` is `member.root_fp`, not `from_fp`/`device_fp` — DESIGN.md:286: "`subject =
-        // root_fp` so every root-certified device of the person may use it". This is the central
-        // hazard of this slice: scoping the cap to the device fp instead would silently restrict
-        // it to the one device that happened to connect, breaking every other device the same
-        // person owns.
-        let member_cap = match (&self.issuer, cap_epoch_for_mint) {
-            (Some(issuer), Some(cap_epoch)) => issuer.issue_member_cap(member.root_fp, cap_epoch),
-            _ => None,
+        // Removing it makes `equalize_denial_work` STRICTLY STRONGER, and that is worth stating
+        // because it reverses a caveat that function's own doc comment carried for as long as the
+        // mint lived here. With a `CapIssuer` installed, an `Allow` used to perform an Ed25519
+        // signature (measured ≈16.7 µs/call) that no `Deny` path could match — an asymmetry
+        // roughly 5x LARGER than the parse/rehash gap the equalization closes (≈3.3 µs/call), and
+        // one the equalization could not close without handing a flooder exactly the CPU-cost
+        // amplification the rate limiter exists to deny. That asymmetry is now gone from this
+        // method entirely: every `Allow` returned here does the same parse-and-rehash work and
+        // nothing more, so `equalize_denial_work`'s ≈3.3 µs now imitates the whole of what an
+        // `Allow` actually does rather than a fraction of it. Nothing about the equalization
+        // machinery changed — it simply now has a smaller thing to imitate.
+        ConnectDecision::Allow { sign_pk, agree_pk }
+    }
+
+    /// The post-verification half (td-fc5a30). Reached only after
+    /// `spindle_net::signaling::host::process_offer` has verified the offer's Ed25519 signature
+    /// under the `sign_pk` [`Self::authorize`] returned for this same `from_fp`, and after every
+    /// routing check has passed — so `from_fp` is **authenticated** here, not merely claimed.
+    ///
+    /// Both things this method does are per-identity costs, which is exactly why they live here
+    /// and not in [`Self::authorize`]: the per-`from_fp` token bucket (plus the bounded-map slot
+    /// that comes with it) and the member-capability mint. A peer that can sign as `from_fp` *is*
+    /// `from_fp`, so charging it is charging the party responsible for the work. Moving either
+    /// back into [`Self::authorize`] reintroduces td-fc5a30's targeted denial-of-service — see
+    /// that method's check 0 comment and [`ConnectRateLimiter`]'s doc comment.
+    async fn on_verified(&self, from_fp: &Fingerprint) -> VerifiedDecision {
+        // The per-`from_fp` token bucket DESIGN.md §A5 calls for, charged at the first moment
+        // `from_fp` means anything. A refusal is a PLAIN `Drop` with no equalization work of any
+        // kind, for two reasons that both differ from check 0's:
+        // - this peer is authenticated, so revealing that its own bucket is empty is not a
+        //   membership oracle. It already knows it is a member; it just proved it. There is
+        //   nothing here for equalized timing to hide;
+        // - `equalize_denial_work` exists to make a `Deny` look like an `Allow` to an *unknown*
+        //   caller. This caller is known, and the connect is being throttled precisely to make it
+        //   cheap. Spending crypto work to disguise a throttle would defeat the throttle.
+        if !self.limiter.try_acquire_fp(*from_fp, (self.now_fn)()) {
+            return VerifiedDecision::Drop;
+        }
+
+        // No issuer installed: nothing to mint, and — importantly — no second store read at all.
+        // A host with no cap-signing key online pays exactly one lookup per connect, the same as
+        // before this split.
+        let Some(issuer) = &self.issuer else {
+            return VerifiedDecision::Proceed { member_cap: None };
         };
 
-        ConnectDecision::Allow {
-            sign_pk,
-            agree_pk,
-            member_cap,
-        }
+        // Minting needs two things `authorize` did not carry across: the member's `root_fp` (the
+        // cap's `subject`) and the host's current `cap_epoch`. So the lookup is redone here rather
+        // than plumbed through the `ConnectDecision`. That is one extra store read, and it is
+        // deliberately acceptable:
+        // - it happens on the SUCCESS path only. Every denial — unknown fp, revoked member,
+        //   revoked device, unverifiable keys, a failed signature, a mismatched inbox — returns
+        //   before this method is ever called, so an attacker cannot provoke it at all;
+        // - it is FRESHER. `authorize` ran before the signature check, the AEAD decryption, and
+        //   the routing checks; this read reflects the store as of now. A revoke that committed in
+        //   between is observed here, and (via `liveness_checks` below) results in no cap being
+        //   minted — the correct outcome.
+        //
+        // `member_and_cap_epoch`, never `member_for_device_fp` + `cap_epoch()`: the member and the
+        // epoch stamped onto the cap must come from ONE database-level snapshot. Two independent
+        // reads let `Store::revoke_member_and_bump_epoch` / `revoke_device_and_bump_epoch` commit
+        // in the window between them, pairing a pre-revoke member with a post-bump epoch and
+        // minting a validly-signed capability for an already-revoked subject that is
+        // indistinguishable from a legitimately fresh one — defeating `cap_epoch`'s entire purpose
+        // as the revocation-invalidation mechanism (DESIGN.md §A4). See
+        // `DeviceLookup::member_and_cap_epoch`'s own doc comment for the full statement of that
+        // race; this call site is the one that carries the hazard.
+        let (member, cap_epoch) = match self.lookup.member_and_cap_epoch(*from_fp) {
+            Ok(pair) => pair,
+            Err(e) => {
+                // Carried over verbatim in substance from the old check 10's rule (`CapIssuer`'s
+                // doc comment): a cap-issuance failure must NEVER be worse than the status quo.
+                // The peer has already proven it is who it says it is and every membership check
+                // has already passed in `authorize` — a store read failing *now* means only that
+                // this host cannot mint a fresh cap this time, so the connect proceeds with
+                // `member_cap: None` and the peer falls back to whatever cap it already holds.
+                // Returning `Drop` here would take a working, fully-verified connect and break it
+                // over a problem (a transient `SQLITE_BUSY`, say — reachable because
+                // `spindle-hostd` holds multiple independent connections to the same database
+                // file) that has nothing to do with whether this device may connect. That would be
+                // the fleet-wide lockout DESIGN.md:288-290's renewal path exists to prevent.
+                //
+                // Audited 2026-09-08: `%e` is a `LookupError`, whose only reachable content here
+                // is a `rusqlite` message from this host's own store (its path is operator
+                // configuration, exempt — see this crate's `lib.rs` `tracing` section) or a
+                // fingerprint *length* complaint. `LookupError::Store` is typed over all of
+                // `StoreError` though, and that enum's `Confine`/`Model`/`MountPathCollision`/
+                // `DeviceNotFound` variants do carry real paths, virtual paths, and untruncated
+                // fingerprints — so anything that widens what these lookups call must re-check
+                // this line rather than trusting the redaction guard, which only reads binding
+                // names.
+                tracing::warn!(
+                    device_fp = %from_fp.redacted(),
+                    error = %e,
+                    "on_verified: member_and_cap_epoch failed after the offer's signature \
+                     verified; proceeding with no freshly-minted member capability. The connect \
+                     is NOT denied — an issuance failure must never break an otherwise-valid \
+                     connect — but a persistent recurrence silently degrades this host to never \
+                     minting fresh member capabilities"
+                );
+                return VerifiedDecision::Proceed { member_cap: None };
+            }
+        };
+
+        // Re-apply §A4's liveness rule to this fresher snapshot. A member (or this device) revoked
+        // since `authorize` ran must not be minted a fresh capability — but, per the rule above,
+        // that still is not a `Drop`: `authorize` is the authority on whether this connect is
+        // permitted, and it already answered. This only decides whether a cap is issued.
+        //
+        // `subject` is `member.root_fp`, not `from_fp`/`device_fp` — DESIGN.md:286: "`subject =
+        // root_fp` so every root-certified device of the person may use it". Scoping the cap to
+        // the device fp instead would silently restrict it to the one device that happened to
+        // connect, breaking every other device the same person owns.
+        //
+        // `cap_epoch` can legitimately be `None` even here — see `DeviceLookup::
+        // member_and_cap_epoch`'s doc comment: a tolerated `cap_epoch` read failure (e.g.
+        // `SQLITE_BUSY` on `meta`) reaches this point as `Ok((member, None))`, not as the `Err`
+        // arm above. The `match` spells out every combination rather than `unwrap`ping an epoch
+        // that might not be there: "member is live" and "epoch available" are independent facts,
+        // and this module's house style never unwraps an invariant instead of failing closed.
+        let member_cap = match (liveness_checks(member, *from_fp), cap_epoch) {
+            (Some(member), Some(cap_epoch)) => issuer.issue_member_cap(member.root_fp, cap_epoch),
+            _ => None,
+        };
+        VerifiedDecision::Proceed { member_cap }
     }
 }
 
@@ -1028,21 +1129,18 @@ mod tests {
         let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store));
 
         match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow {
-                sign_pk,
-                agree_pk,
-                member_cap,
-            } => {
+            ConnectDecision::Allow { sign_pk, agree_pk } => {
                 assert_eq!(sign_pk, device.sign_public_key());
                 assert_eq!(agree_pk, device.agree_public_key());
-                assert_eq!(
-                    member_cap, None,
-                    "HostConnectAuthorizer::new deliberately installs no cap-issuing seam -- it \
-                     must supply None, never fabricate a cap"
-                );
             }
             ConnectDecision::Deny => panic!("expected Allow for an active member's own device"),
         }
+        assert_eq!(
+            authorizer.on_verified(&device_fp).await,
+            VerifiedDecision::Proceed { member_cap: None },
+            "HostConnectAuthorizer::new deliberately installs no cap-issuing seam -- it must \
+             supply None, never fabricate a cap"
+        );
     }
 
     #[tokio::test]
@@ -1320,12 +1418,18 @@ mod tests {
             HostConnectAuthorizer::with_issuer(SqliteDeviceLookup::new(store), Box::new(issuer));
 
         match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { member_cap, .. } => {
-                let cap = member_cap.expect("with_issuer must mint a cap for an Allow decision");
+            ConnectDecision::Allow { .. } => {}
+            ConnectDecision::Deny => panic!("expected Allow for an active member's own device"),
+        }
+        // The mint lives behind the signature-verification boundary (td-fc5a30), so the cap comes
+        // from `on_verified`, not from `authorize`'s `Allow`.
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Proceed { member_cap } => {
+                let cap = member_cap.expect("with_issuer must mint a cap for a verified connect");
                 verify_capability(&cap, 1_000)
                     .expect("the minted cap must verify its own root -> op-key -> sig chain");
             }
-            ConnectDecision::Deny => panic!("expected Allow for an active member's own device"),
+            VerifiedDecision::Drop => panic!("expected Proceed for an active member's own device"),
         }
     }
 
@@ -1343,8 +1447,8 @@ mod tests {
         let authorizer =
             HostConnectAuthorizer::with_issuer(SqliteDeviceLookup::new(store), Box::new(issuer));
 
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { member_cap, .. } => {
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Proceed { member_cap } => {
                 let cap = member_cap.expect("with_issuer must mint a cap");
                 assert!(
                     root_fp.matches(&cap.subject),
@@ -1355,7 +1459,7 @@ mod tests {
                     "DESIGN.md:286: subject must NOT be the connecting device's device_fp"
                 );
             }
-            ConnectDecision::Deny => panic!("expected Allow for an active member's own device"),
+            VerifiedDecision::Drop => panic!("expected Proceed for an active member's own device"),
         }
     }
 
@@ -1369,13 +1473,13 @@ mod tests {
         let authorizer =
             HostConnectAuthorizer::with_issuer(SqliteDeviceLookup::new(store), Box::new(issuer));
 
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { member_cap, .. } => {
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Proceed { member_cap } => {
                 let cap = member_cap.expect("with_issuer must mint a cap");
                 assert_eq!(cap.kind, CapKind::Member);
                 assert_eq!(cap.exp, now + MEMBER_CAP_DEFAULT_TTL_SECS);
             }
-            ConnectDecision::Deny => panic!("expected Allow for an active member's own device"),
+            VerifiedDecision::Drop => panic!("expected Proceed for an active member's own device"),
         }
     }
 
@@ -1400,11 +1504,11 @@ mod tests {
             Box::new(issuer),
         );
 
-        let first_epoch = match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { member_cap, .. } => {
+        let first_epoch = match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Proceed { member_cap } => {
                 member_cap.expect("with_issuer must mint a cap").cap_epoch
             }
-            ConnectDecision::Deny => panic!("expected Allow"),
+            VerifiedDecision::Drop => panic!("expected Proceed"),
         };
 
         // Independent connection #2, to the same file: bumps the epoch out from under the
@@ -1414,11 +1518,11 @@ mod tests {
         let bumped_epoch = bumping_store.bump_cap_epoch().expect("bump_cap_epoch");
         assert_eq!(bumped_epoch, first_epoch + 1);
 
-        let second_epoch = match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { member_cap, .. } => {
+        let second_epoch = match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Proceed { member_cap } => {
                 member_cap.expect("with_issuer must mint a cap").cap_epoch
             }
-            ConnectDecision::Deny => panic!("expected Allow"),
+            VerifiedDecision::Drop => panic!("expected Proceed"),
         };
         assert_eq!(
             second_epoch, bumped_epoch,
@@ -1447,16 +1551,16 @@ mod tests {
             Box::new(NeverIssues),
         );
 
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { member_cap, .. } => {
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Proceed { member_cap } => {
                 assert_eq!(
                     member_cap, None,
-                    "issuance failure must never turn an otherwise-valid connect into a Deny, \
+                    "issuance failure must never turn an otherwise-valid connect into a Drop, \
                      but it also must not fabricate a cap"
                 );
             }
-            ConnectDecision::Deny => {
-                panic!("issuance failure must never turn an otherwise-valid connect into a Deny")
+            VerifiedDecision::Drop => {
+                panic!("issuance failure must never turn an otherwise-valid connect into a Drop")
             }
         }
     }
@@ -1511,17 +1615,17 @@ mod tests {
         let issuer = test_cap_issuer([0x35; 32], [0x36; 32], 1_000);
         let authorizer = HostConnectAuthorizer::with_issuer(lookup, Box::new(issuer));
 
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { member_cap, .. } => {
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Proceed { member_cap } => {
                 assert_eq!(
                     member_cap, None,
                     "Ok((Some(live_member), None)) from member_and_cap_epoch means membership is \
-                     fine but there is no fresh cap_epoch to mint from this time -- Allow with no \
-                     cap is correct, the same 'issuance failure is never worse than the status \
+                     fine but there is no fresh cap_epoch to mint from this time -- Proceed with \
+                     no cap is correct, the same 'issuance failure is never worse than the status \
                      quo' rule CapIssuer's doc comment states for a failing issuer"
                 );
             }
-            ConnectDecision::Deny => panic!(
+            VerifiedDecision::Drop => panic!(
                 "regression: an active, non-revoked member's connect must not be denied just \
                  because member_and_cap_epoch could not read cap_epoch -- that conflates 'no fresh \
                  cap this time' with 'membership is unprovable', which would turn a transient \
@@ -1605,6 +1709,24 @@ mod tests {
             0,
             "a denied device must never reach the cap issuer"
         );
+
+        // td-fc5a30: the issuer is now unreachable from `authorize` for ANY fingerprint, denied or
+        // not -- `process_offer` never calls `on_verified` for an offer whose signature did not
+        // verify, so a denied device could not reach it even if it tried. Asserting the count is
+        // still 0 after the `on_verified` half runs for this same unenrolled fp pins the other
+        // half of the rule: a lookup that finds no live member mints nothing (and, per
+        // `CapIssuer`'s doc comment, still Proceeds rather than Dropping).
+        assert_eq!(
+            authorizer.on_verified(&stranger).await,
+            VerifiedDecision::Proceed { member_cap: None },
+            "on_verified for a fp with no live member must Proceed with no cap, never Drop -- an \
+             issuance failure must not break an otherwise-valid connect"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no live member means nothing to mint for, so the issuer is still never reached"
+        );
     }
 
     // ---- TOCTOU: member_and_cap_epoch must read member + cap_epoch as one snapshot (td brief) --
@@ -1676,8 +1798,9 @@ mod tests {
         }
 
         /// Total number of [`DeviceLookup`] calls (of any of the three methods) made on this
-        /// double. `authorize` must leave this at exactly 1: any second call, even a second
-        /// `member_and_cap_epoch`, is a second read of what would be a racing store.
+        /// double. The minting path (`on_verified` since td-fc5a30) must leave this at exactly 1:
+        /// any second call, even a second `member_and_cap_epoch`, is a second read of what would
+        /// be a racing store.
         fn lookup_calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
@@ -1731,7 +1854,7 @@ mod tests {
     }
 
     /// Forwards through an `Arc` so the tests can hold onto the double (to read `lookup_calls`
-    /// after `authorize` consumes its lookup by value) while still handing `with_issuer` an owned
+    /// after `with_issuer` consumes its lookup by value) while still handing it an owned
     /// `L: DeviceLookup`.
     impl DeviceLookup for std::sync::Arc<RacingDeviceLookup> {
         fn member_for_device_fp(
@@ -1788,17 +1911,20 @@ mod tests {
         let issuer = test_cap_issuer([0x2d; 32], [0x2e; 32], 1_000);
         let authorizer = HostConnectAuthorizer::with_issuer(Arc::clone(&lookup), Box::new(issuer));
 
-        let decision = authorizer.authorize(&device_fp).await;
+        // td-fc5a30 moved the mint from `authorize` to `on_verified`, so the minting path this
+        // test exercises is `on_verified`. The property is unchanged: whichever method mints must
+        // read the member and the epoch through exactly ONE `DeviceLookup` call.
+        let decision = authorizer.on_verified(&device_fp).await;
         assert_eq!(
             lookup.lookup_calls(),
             1,
-            "`authorize` must make exactly ONE DeviceLookup call on this path. A second call -- \
-             even another `member_and_cap_epoch` -- is a second read of a store a concurrent \
-             revoke can commit into between them, which is exactly the TOCTOU this method exists \
-             to close."
+            "`on_verified` must make exactly ONE DeviceLookup call on the minting path. A second \
+             call -- even another `member_and_cap_epoch` -- is a second read of a store a \
+             concurrent revoke can commit into between them, which is exactly the TOCTOU \
+             `member_and_cap_epoch` exists to close."
         );
         match decision {
-            ConnectDecision::Allow { member_cap, .. } => {
+            VerifiedDecision::Proceed { member_cap } => {
                 let cap = member_cap.expect(
                     "the member was Active in the atomic snapshot this call took -- must mint",
                 );
@@ -1813,9 +1939,9 @@ mod tests {
                      cap_epoch's entire purpose as the revocation-invalidation mechanism."
                 );
             }
-            ConnectDecision::Deny => panic!(
-                "expected Allow: the atomic snapshot must see the member Active -- the simulated \
-                 race only lands after a call returns, and `authorize` must make exactly one \
+            VerifiedDecision::Drop => panic!(
+                "expected Proceed: the atomic snapshot must see the member Active -- the simulated \
+                 race only lands after a call returns, and `on_verified` must make exactly one \
                  DeviceLookup call on this path, never a second one for it to land before"
             ),
         }
@@ -1836,17 +1962,18 @@ mod tests {
         let issuer = test_cap_issuer([0x31; 32], [0x32; 32], 1_000);
         let authorizer = HostConnectAuthorizer::with_issuer(Arc::clone(&lookup), Box::new(issuer));
 
-        let decision = authorizer.authorize(&device_fp).await;
+        // See the member-revoked twin above for why this drives `on_verified` (td-fc5a30).
+        let decision = authorizer.on_verified(&device_fp).await;
         assert_eq!(
             lookup.lookup_calls(),
             1,
-            "`authorize` must make exactly ONE DeviceLookup call on this path. A second call -- \
-             even another `member_and_cap_epoch` -- is a second read of a store a concurrent \
-             revoke can commit into between them, which is exactly the TOCTOU this method exists \
-             to close."
+            "`on_verified` must make exactly ONE DeviceLookup call on the minting path. A second \
+             call -- even another `member_and_cap_epoch` -- is a second read of a store a \
+             concurrent revoke can commit into between them, which is exactly the TOCTOU \
+             `member_and_cap_epoch` exists to close."
         );
         match decision {
-            ConnectDecision::Allow { member_cap, .. } => {
+            VerifiedDecision::Proceed { member_cap } => {
                 let cap = member_cap.expect(
                     "the device was non-revoked in the atomic snapshot this call took -- must mint",
                 );
@@ -1859,9 +1986,9 @@ mod tests {
                      and that device's cap must not come out looking fresh either."
                 );
             }
-            ConnectDecision::Deny => panic!(
-                "expected Allow: the atomic snapshot must see the device non-revoked -- the \
-                 simulated race only lands after a call returns, and `authorize` must make \
+            VerifiedDecision::Drop => panic!(
+                "expected Proceed: the atomic snapshot must see the device non-revoked -- the \
+                 simulated race only lands after a call returns, and `on_verified` must make \
                  exactly one DeviceLookup call on this path, never a second one for it to land \
                  before"
             ),
@@ -1873,10 +2000,12 @@ mod tests {
 
     /// The load-bearing test for `HostConnectAuthorizer`'s rate limiter being a security control,
     /// not an opt-in convenience: a plain `HostConnectAuthorizer::new(..)` -- never touching
-    /// `with_connect_rate_limit` -- must still throttle. If this regresses to `Allow` on the 11th
-    /// call, `new`/`with_issuer` have silently stopped installing a real `ConnectRateLimiter`.
+    /// `with_connect_rate_limit` -- must still throttle. Covers the PER-FP half, which since
+    /// td-fc5a30 is charged in `on_verified`, not `authorize`. If this regresses to `Proceed` on
+    /// the 11th connect, `new`/`with_issuer` have silently stopped installing a real
+    /// `ConnectRateLimiter`.
     #[tokio::test]
-    async fn the_rate_limiter_is_on_by_default_and_is_not_opt_in() {
+    async fn the_per_fp_rate_limiter_is_on_by_default_and_is_not_opt_in() {
         let (store, member_id) = store_with_active_member("alex");
         let device = DeviceKey::from_seeds([0x40; 32], [0x41; 32]);
         let device_fp = enroll_device(&store, member_id, "laptop", &device);
@@ -1887,26 +2016,99 @@ mod tests {
         let authorizer =
             HostConnectAuthorizer::new(SqliteDeviceLookup::new(store)).with_now_fn(|| 0);
 
+        // Each iteration is one whole connect: the pre-verification half, then the
+        // post-verification half `spindle_net::signaling::host::process_offer` reaches once the
+        // offer's signature has verified.
         for i in 0..10 {
             match authorizer.authorize(&device_fp).await {
                 ConnectDecision::Allow { .. } => {}
                 ConnectDecision::Deny => panic!(
-                    "call {i} of the documented default per-fp burst (10) must Allow -- a live, \
-                     active member device must not be throttled before its own burst is spent"
+                    "connect {i} must pass the pre-verification half: the default global burst \
+                     (200) is nowhere near spent by 10 connects"
+                ),
+            }
+            match authorizer.on_verified(&device_fp).await {
+                VerifiedDecision::Proceed { .. } => {}
+                VerifiedDecision::Drop => panic!(
+                    "connect {i} of the documented default per-fp burst (10) must Proceed -- a \
+                     live, active member device must not be throttled before its own burst is \
+                     spent"
                 ),
             }
         }
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Deny => {}
-            ConnectDecision::Allow { .. } => panic!(
+        assert!(
+            matches!(
+                authorizer.authorize(&device_fp).await,
+                ConnectDecision::Allow { .. }
+            ),
+            "the 11th connect must still pass the pre-verification half -- the per-fp bucket is \
+             not consulted there any more (td-fc5a30)"
+        );
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Drop => {}
+            VerifiedDecision::Proceed { .. } => panic!(
                 "the rate limiter is on by default and is NOT opt-in: HostConnectAuthorizer::new \
                  must install ConnectRateLimiter::new(ConnectRateLimitConfig::default()) even \
-                 though this test never called with_connect_rate_limit. An Allow on the 11th call \
-                 (one past the documented default per-fp burst of 10) would mean a host built via \
-                 HostConnectAuthorizer::new silently ran with no rate limiting at all -- exactly \
-                 the security regression this test exists to catch."
+                 though this test never called with_connect_rate_limit. A Proceed on the 11th \
+                 connect (one past the documented default per-fp burst of 10) would mean a host \
+                 built via HostConnectAuthorizer::new silently ran with no per-fp rate limiting at \
+                 all -- exactly the security regression this test exists to catch."
             ),
         }
+    }
+
+    /// The other half of the same default-on claim, and the one that matters most since
+    /// td-fc5a30: the PRE-verification path -- the only one an unauthenticated peer can reach --
+    /// must still be bounded, by the default global bucket, with no configuration. The documented
+    /// default global burst is 200, so exactly 200 pre-verification calls are admitted at a frozen
+    /// clock and the 201st is refused.
+    ///
+    /// This is the test that fails if a future edit removes the limiter from `authorize`
+    /// altogether under the mistaken impression that td-fc5a30 moved *all* limiting to
+    /// `on_verified`. It moved the per-identity half; the global half must stay exactly where it
+    /// is, because nothing else bounds an offer whose signature will never verify.
+    #[tokio::test]
+    async fn the_global_rate_limiter_is_on_by_default_and_bounds_the_pre_verification_path() {
+        let (store, _member_id) = store_with_active_member("alex");
+        let authorizer =
+            HostConnectAuthorizer::new(SqliteDeviceLookup::new(store)).with_now_fn(|| 0);
+
+        // Fabricated, never-enrolled fingerprints -- exactly what a flood consists of. Each is
+        // denied on membership, but check 0 runs first, so each still spends a global token.
+        let fabricated =
+            |i: usize| Fingerprint::of_parts(&[b"global-default-flood", &i.to_le_bytes()]);
+        let default_global_burst = ConnectRateLimitConfig::default().global.burst as usize;
+        assert_eq!(
+            default_global_burst, 200,
+            "this test's arithmetic tracks the documented default global burst"
+        );
+
+        for i in 0..default_global_burst {
+            // Every one of these is a `Deny` on membership, which is fine: what is being counted
+            // is whether check 0 let the request reach the membership lookup at all. The
+            // distinction is made by the 201st call below, which must be denied *before* the
+            // lookup -- proven by the equalization counter, which a membership denial increments
+            // and a rate-limit denial does not.
+            let _ = authorizer.authorize(&fabricated(i)).await;
+        }
+
+        reset_equalization_calls();
+        match authorizer
+            .authorize(&fabricated(default_global_burst))
+            .await
+        {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => unreachable!("a fabricated fp is never a member"),
+        }
+        assert_eq!(
+            equalization_calls(),
+            0,
+            "the 201st pre-verification call must be refused by the DEFAULT global bucket at \
+             check 0 -- before the membership lookup, and so without the equalized crypto work a \
+             membership denial performs. A count of 1 here means check 0 admitted the request and \
+             it was denied downstream on membership instead, i.e. the global bucket is not \
+             actually bounding the pre-verification path at its documented default of 200."
+        );
     }
 
     #[tokio::test]
@@ -1925,20 +2127,23 @@ mod tests {
                 max_tracked_fps: ConnectRateLimitConfig::default().max_tracked_fps,
             });
 
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { .. } => {}
-            ConnectDecision::Deny => panic!("first call must Allow: per-fp burst is 2"),
+        // The per-fp bucket is charged in `on_verified` (td-fc5a30), so that is what this test
+        // drives. `authorize` would never observe it.
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Proceed { .. } => {}
+            VerifiedDecision::Drop => panic!("first connect must Proceed: per-fp burst is 2"),
         }
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { .. } => {}
-            ConnectDecision::Deny => panic!("second call must Allow: per-fp burst is 2"),
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Proceed { .. } => {}
+            VerifiedDecision::Drop => panic!("second connect must Proceed: per-fp burst is 2"),
         }
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Deny => {}
-            ConnectDecision::Allow { .. } => panic!(
-                "third call must Deny: the per-fp burst of 2 is exhausted, refill_per_sec is 0, \
-                 and the clock is frozen at the same instant -- even a genuinely live, active \
-                 member device is throttled once its own bucket is empty"
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Drop => {}
+            VerifiedDecision::Proceed { .. } => panic!(
+                "third connect must Drop: the per-fp burst of 2 is exhausted, refill_per_sec is \
+                 0, and the clock is frozen at the same instant -- even a genuinely live, active \
+                 member device that has just proven its signature is throttled once its own \
+                 bucket is empty"
             ),
         }
     }
@@ -1961,25 +2166,25 @@ mod tests {
                 max_tracked_fps: ConnectRateLimitConfig::default().max_tracked_fps,
             });
 
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { .. } => {}
-            ConnectDecision::Deny => {
-                panic!("first call must Allow: burst is 1 and the bucket starts full")
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Proceed { .. } => {}
+            VerifiedDecision::Drop => {
+                panic!("first connect must Proceed: burst is 1 and the bucket starts full")
             }
         }
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Deny => {}
-            ConnectDecision::Allow { .. } => panic!(
-                "second call at the same instant must Deny: burst of 1 is exhausted and the \
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Drop => {}
+            VerifiedDecision::Proceed { .. } => panic!(
+                "second connect at the same instant must Drop: burst of 1 is exhausted and the \
                  clock has not advanced"
             ),
         }
         clock.store(1, Ordering::SeqCst);
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { .. } => {}
-            ConnectDecision::Deny => panic!(
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Proceed { .. } => {}
+            VerifiedDecision::Drop => panic!(
                 "one second later, at refill_per_sec = 1.0, exactly one token has refilled -- \
-                 this call must Allow"
+                 this connect must Proceed"
             ),
         }
     }
@@ -2119,11 +2324,61 @@ mod tests {
     /// through the equalizer too -- which check 0's own comment explains would hand a flooder
     /// exactly the crypto-work amplification the rate limiter exists to deny, since a rejection
     /// here reveals only limiter state, never membership.
+    ///
+    /// Since td-fc5a30 the bucket check 0 consults is the GLOBAL one, so that is what this test
+    /// exhausts (burst 1). That strengthens the property rather than weakening it: the bucket is
+    /// not keyed on `from_fp` at all any more, so a rejection here cannot be about `from_fp` even
+    /// in principle.
     #[tokio::test]
     async fn a_rate_limited_denial_does_not_run_the_timing_equalization() {
         reset_equalization_calls();
         let (store, member_id) = store_with_active_member("alex");
         let device = DeviceKey::from_seeds([0x64; 32], [0x65; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+        let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store))
+            .with_now_fn(|| 0)
+            .with_connect_rate_limit(ConnectRateLimitConfig {
+                per_fp: ConnectRateLimitConfig::default().per_fp,
+                global: RateLimitConfig {
+                    burst: 1.0,
+                    refill_per_sec: 0.0,
+                },
+                max_tracked_fps: ConnectRateLimitConfig::default().max_tracked_fps,
+            });
+
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Allow { .. } => {}
+            ConnectDecision::Deny => panic!("first call must Allow: global burst is 1"),
+        }
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Deny => {}
+            ConnectDecision::Allow { .. } => panic!(
+                "second call must Deny: the global burst of 1 is exhausted, refill_per_sec is 0, \
+                 and the clock is frozen at the same instant -- even this genuinely live, enrolled \
+                 device is denied once the shared budget is empty (DESIGN.md v0.9.24's accepted \
+                 shared-fate cost)"
+            ),
+        }
+        assert_eq!(
+            equalization_calls(),
+            0,
+            "a rate-limited denial (check 0) must never call equalize_denial_work() -- if this \
+             counter is nonzero, check 0 has been rewired to route through \
+             deny_with_equalized_work(), reversing the deliberate exception documented at that \
+             check: a rate-limited rejection reveals only limiter state, not membership, so \
+             spending crypto work equalizing it would hand a flooder exactly the amplification \
+             the rate limiter exists to deny."
+        );
+    }
+
+    /// The `on_verified` twin: a per-fp throttle drops the connect with no equalization work
+    /// either. The reasoning differs from check 0's and is spelled out at that call site -- this
+    /// peer is authenticated, so revealing its own bucket's state is not a membership oracle, and
+    /// spending crypto work to disguise a throttle would defeat the throttle.
+    #[tokio::test]
+    async fn an_on_verified_throttle_drops_without_running_the_timing_equalization() {
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x66; 32], [0x67; 32]);
         let device_fp = enroll_device(&store, member_id, "laptop", &device);
         let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store))
             .with_now_fn(|| 0)
@@ -2136,27 +2391,22 @@ mod tests {
                 max_tracked_fps: ConnectRateLimitConfig::default().max_tracked_fps,
             });
 
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Allow { .. } => {}
-            ConnectDecision::Deny => panic!("first call must Allow: per-fp burst is 1"),
-        }
-        match authorizer.authorize(&device_fp).await {
-            ConnectDecision::Deny => {}
-            ConnectDecision::Allow { .. } => panic!(
-                "second call must Deny: the per-fp burst of 1 is exhausted, refill_per_sec is 0, \
-                 and the clock is frozen at the same instant -- even this genuinely live, enrolled \
-                 device is throttled once its own bucket is empty"
+        assert!(matches!(
+            authorizer.on_verified(&device_fp).await,
+            VerifiedDecision::Proceed { .. }
+        ));
+        reset_equalization_calls();
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Drop => {}
+            VerifiedDecision::Proceed { .. } => panic!(
+                "the per-fp burst of 1 is exhausted at a frozen clock -- the second connect must \
+                 Drop"
             ),
         }
         assert_eq!(
             equalization_calls(),
             0,
-            "a rate-limited denial (check 0) must never call equalize_denial_work() -- if this \
-             counter is nonzero, check 0 has been rewired to route through \
-             deny_with_equalized_work(), reversing the deliberate exception documented at that \
-             check: a rate-limited rejection reveals only limiter state, not membership, so \
-             spending crypto work equalizing it would hand a flooder exactly the amplification \
-             the rate limiter exists to deny."
+            "on_verified's throttle path must never call equalize_denial_work()"
         );
     }
 
@@ -2256,6 +2506,292 @@ mod tests {
              deny_with_equalized_work exists to close. A count of 0 here means the \
              DeviceKeyError::Unverifiable arm in authorize() has been reverted to a plain \
              ConnectDecision::Deny."
+        );
+    }
+
+    // ---- td-fc5a30: the per-identity half of the decision lives behind the signature-
+    // verification boundary, so a forged offer naming a victim charges that victim nothing ----
+
+    /// **The regression test for the whole ticket.**
+    ///
+    /// The attack, measured: a device holding `pub host.<h>.connect` can publish to that subject
+    /// naming a *different* device's inbox as the NATS reply subject -- nats-server 2.10 evaluates
+    /// publish permissions against the publish subject only, never the reply -- so an attacker
+    /// with any valid device credential can send a host a connect offer claiming a VICTIM's
+    /// `from_fp` with `reply = _INBOX_<victim_fp>.…`, and it passes `reply_prefix_ok`. What it
+    /// cannot do is produce the victim's signature, so `spindle_net::signaling::wire::open_offer`
+    /// rejects it -- but only *after* the authorizer has already been consulted.
+    ///
+    /// Everything such an offer can reach is therefore exactly `HostConnectAuthorizer::authorize`,
+    /// which this test calls directly: the forged offer's entire footprint on this host, before it
+    /// is thrown away, is that one call. `on_verified` is deliberately NOT called here, because
+    /// `process_offer` would never call it for an offer whose signature failed -- pinned
+    /// separately by `spindle-net`'s
+    /// `a_forged_offer_naming_another_device_never_reaches_on_verified`.
+    ///
+    /// The assertion is that the victim's own per-fp budget is completely intact afterwards: the
+    /// victim can still make its full documented burst of successful connects. Before td-fc5a30,
+    /// `authorize` charged the victim's per-fp bucket, so 10 forged offers left the victim locked
+    /// out (measured by the td-4bcf24 review: a victim succeeded 0/60 during a sustained flood
+    /// while a bystander fp was allowed 10/10 at the same instant).
+    #[tokio::test]
+    async fn a_forged_offer_naming_a_victim_does_not_consume_the_victims_per_fp_bucket() {
+        let (store, member_id) = store_with_active_member("victim");
+        let victim_device = DeviceKey::from_seeds([0xa0; 32], [0xa1; 32]);
+        let victim_fp = enroll_device(&store, member_id, "laptop", &victim_device);
+        let per_fp_burst = 10.0;
+        let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store))
+            .with_now_fn(|| 0)
+            .with_connect_rate_limit(ConnectRateLimitConfig {
+                per_fp: RateLimitConfig {
+                    burst: per_fp_burst,
+                    // No refill at all, and the clock is frozen: if the flood spends even ONE of
+                    // the victim's tokens, nothing can give it back and the assertion below fails.
+                    refill_per_sec: 0.0,
+                },
+                // Generous enough that the flood cannot deny the victim via the shared global
+                // bucket instead -- this test is about the per-fp bucket specifically, and a
+                // global-bucket denial would be a right-answer-for-the-wrong-reason pass.
+                global: RateLimitConfig {
+                    burst: 100_000.0,
+                    refill_per_sec: 0.0,
+                },
+                max_tracked_fps: ConnectRateLimitConfig::default().max_tracked_fps,
+            });
+
+        // 50 forged offers, all naming the victim. Each reaches `authorize` and nothing else.
+        for _ in 0..50 {
+            match authorizer.authorize(&victim_fp).await {
+                // The lookup succeeds -- the victim IS a live member, which is the whole point of
+                // naming them -- so `authorize` answers Allow with the victim's real keys. The
+                // signature check downstream is what actually kills the offer.
+                ConnectDecision::Allow { .. } => {}
+                ConnectDecision::Deny => panic!(
+                    "fixture check: the victim is a live member, so authorize must Allow -- if \
+                     this Denies, the flood is being stopped for some unrelated reason and the \
+                     assertion below would pass vacuously"
+                ),
+            }
+        }
+
+        // The victim now connects for real: signature verifies, so `process_offer` reaches
+        // `on_verified`. Its full burst must be available, untouched.
+        for i in 0..(per_fp_burst as usize) {
+            assert!(
+                matches!(
+                    authorizer.authorize(&victim_fp).await,
+                    ConnectDecision::Allow { .. }
+                ),
+                "victim connect {i}: the pre-verification half must still allow"
+            );
+            match authorizer.on_verified(&victim_fp).await {
+                VerifiedDecision::Proceed { .. } => {}
+                VerifiedDecision::Drop => panic!(
+                    "victim connect {i} of {per_fp_burst} was throttled -- the 50 forged offers \
+                     above consumed the victim's own per-fp token bucket. This is td-fc5a30's \
+                     targeted denial-of-service: an attacker who cannot produce the victim's \
+                     signature locked the victim out anyway, by naming them. The per-fp charge \
+                     has been moved back into `authorize`, where `from_fp` is unverified and \
+                     attacker-chosen."
+                ),
+            }
+        }
+    }
+
+    /// The bounded-map half of the same attack. `ConnectRateLimiter`'s per-fp map is capped at
+    /// `max_tracked_fps` and, when full of still-throttled buckets, refuses every not-yet-tracked
+    /// fingerprint outright -- a hard denial, not a slowdown (the td-4bcf24 review measured 0/20
+    /// legitimate new devices admitted while the map sat at capacity with the global bucket full).
+    /// While the map insert happened in `authorize`, filling it cost an attacker nothing but
+    /// fabricated names.
+    ///
+    /// After the split, a fabricated `from_fp` reaches only `try_acquire_global`, which takes no
+    /// fingerprint at all, so the map cannot grow from unauthenticated traffic.
+    #[tokio::test]
+    async fn forged_offers_with_fabricated_from_fps_do_not_grow_the_bounded_tracking_map() {
+        let (store, _member_id) = store_with_active_member("alex");
+        let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store))
+            .with_now_fn(|| 0)
+            .with_connect_rate_limit(ConnectRateLimitConfig {
+                per_fp: RateLimitConfig {
+                    burst: 1.0,
+                    refill_per_sec: 0.0,
+                },
+                global: RateLimitConfig {
+                    burst: 100_000.0,
+                    refill_per_sec: 0.0,
+                },
+                // Deliberately tiny: under the old shape, 4 fabricated fingerprints would fill
+                // this map and the 5th legitimate device would be refused outright.
+                max_tracked_fps: 4,
+            });
+
+        for i in 0..1_000u32 {
+            let fabricated = Fingerprint::of_parts(&[b"td-fc5a30-fabricated", &i.to_le_bytes()]);
+            match authorizer.authorize(&fabricated).await {
+                ConnectDecision::Deny => {}
+                ConnectDecision::Allow { .. } => {
+                    unreachable!("a fabricated fingerprint is never an enrolled device")
+                }
+            }
+        }
+
+        assert_eq!(
+            authorizer.tracked_fps(),
+            0,
+            "1000 forged offers with 1000 distinct fabricated from_fps must leave the bounded \
+             per-fp map completely empty. Any nonzero count means the pre-verification path is \
+             inserting attacker-chosen names into a capacity-limited map again -- which, once \
+             full of throttled buckets, refuses every legitimate device the map does not already \
+             track (td-fc5a30 / td-4bcf24 mode 2)."
+        );
+    }
+
+    /// The positive end-to-end of the split, with a real issuer: a connect that passes both halves
+    /// still gets its member capability, minted from its new home in `on_verified`, and it
+    /// verifies its full root -> op-key -> signature chain. Without this, a fix that simply
+    /// deleted the mint would look correct to every negative test above.
+    #[tokio::test]
+    async fn a_successful_staged_connect_still_receives_a_verifiable_member_cap() {
+        let (store, member_id) = store_with_active_member("alex");
+        let root_fp = Fingerprint::of_parts(&[b"alex"]); // matches store_with_active_member
+        let device = DeviceKey::from_seeds([0xa2; 32], [0xa3; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+        let now = 1_000;
+        let issuer = test_cap_issuer([0xa4; 32], [0xa5; 32], now);
+        let authorizer =
+            HostConnectAuthorizer::with_issuer(SqliteDeviceLookup::new(store), Box::new(issuer))
+                .with_now_fn(|| 0);
+
+        // Half one: the pre-verification decision, which resolves the keys and mints nothing.
+        match authorizer.authorize(&device_fp).await {
+            ConnectDecision::Allow { sign_pk, agree_pk } => {
+                assert_eq!(sign_pk, device.sign_public_key());
+                assert_eq!(agree_pk, device.agree_public_key());
+            }
+            ConnectDecision::Deny => panic!("expected Allow for an active member's own device"),
+        }
+
+        // Half two: the post-verification decision, which is where the cap now comes from.
+        match authorizer.on_verified(&device_fp).await {
+            VerifiedDecision::Proceed { member_cap } => {
+                let cap = member_cap.expect(
+                    "a verified connect from a live member, with an issuer installed, must \
+                     receive a freshly-minted member capability -- the mint still works from its \
+                     new home in on_verified",
+                );
+                verify_capability(&cap, now)
+                    .expect("the minted cap must verify its own root -> op-key -> sig chain");
+                assert_eq!(cap.kind, CapKind::Member);
+                assert!(
+                    root_fp.matches(&cap.subject),
+                    "DESIGN.md:286: subject must still be the member's root_fp after the move"
+                );
+            }
+            VerifiedDecision::Drop => panic!("expected Proceed for an active member's own device"),
+        }
+    }
+
+    /// `authorize` must never mint, for anyone. A live member's pre-verification decision performs
+    /// no issuance at all -- which is what makes the Ed25519 signature unreachable to an
+    /// unauthenticated peer, and what lets `equalize_denial_work` imitate the whole of an `Allow`'s
+    /// crypto cost rather than a fraction of it (see that function's doc comment).
+    #[tokio::test]
+    async fn authorize_never_reaches_the_issuer_even_for_a_live_member() {
+        struct CountingIssuer {
+            calls: Arc<AtomicUsize>,
+        }
+        impl CapIssuer for CountingIssuer {
+            fn issue_member_cap(&self, subject: Fingerprint, cap_epoch: u64) -> Option<Capability> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                test_cap_issuer([0xa6; 32], [0xa7; 32], 1_000).issue_member_cap(subject, cap_epoch)
+            }
+        }
+
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0xa8; 32], [0xa9; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let authorizer = HostConnectAuthorizer::with_issuer(
+            SqliteDeviceLookup::new(store),
+            Box::new(CountingIssuer {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .with_now_fn(|| 0);
+
+        for _ in 0..5 {
+            assert!(matches!(
+                authorizer.authorize(&device_fp).await,
+                ConnectDecision::Allow { .. }
+            ));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "authorize must never mint. Five pre-verification decisions for a genuinely live \
+             member produced five Allows and zero signatures -- a nonzero count here means the \
+             mint has been moved back onto the pre-authentication path, handing every \
+             unauthenticated peer a free Ed25519 signature per packet it sends and reopening the \
+             Allow-signs/Deny-doesn't timing oracle."
+        );
+
+        // ... and one post-verification call does mint, exactly once.
+        assert!(matches!(
+            authorizer.on_verified(&device_fp).await,
+            VerifiedDecision::Proceed {
+                member_cap: Some(_)
+            }
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the mint happens exactly once, in on_verified"
+        );
+    }
+
+    /// A lookup that fails outright inside `on_verified` must degrade to `Proceed { member_cap:
+    /// None }`, never to `Drop`. The peer has already proven its signature and every membership
+    /// check already passed in `authorize`; a store read failing *now* means only that this host
+    /// cannot mint a fresh cap this time. Dropping instead would turn a transient `SQLITE_BUSY`
+    /// (reachable because `spindle-hostd` holds multiple independent connections to one database
+    /// file) into a host that refuses every connect -- the fleet-wide lockout DESIGN.md:288-290's
+    /// renewal path exists to prevent. This is check 10's original rule, carried over to its new
+    /// home.
+    #[tokio::test]
+    async fn on_verified_with_a_failing_lookup_proceeds_without_a_cap_rather_than_dropping() {
+        struct AlwaysFails;
+        impl DeviceLookup for AlwaysFails {
+            fn member_for_device_fp(
+                &self,
+                _device_fp: Fingerprint,
+            ) -> Result<Option<Member>, LookupError> {
+                Err(LookupError::LockPoisoned)
+            }
+
+            fn cap_epoch(&self) -> Result<u64, LookupError> {
+                Err(LookupError::LockPoisoned)
+            }
+
+            fn member_and_cap_epoch(
+                &self,
+                _device_fp: Fingerprint,
+            ) -> Result<(Option<Member>, Option<u64>), LookupError> {
+                Err(LookupError::LockPoisoned)
+            }
+        }
+
+        let issuer = test_cap_issuer([0xaa; 32], [0xab; 32], 1_000);
+        let authorizer =
+            HostConnectAuthorizer::with_issuer(AlwaysFails, Box::new(issuer)).with_now_fn(|| 0);
+        let some_fp = DeviceKey::from_seeds([0xac; 32], [0xad; 32]).device_fp();
+
+        assert_eq!(
+            authorizer.on_verified(&some_fp).await,
+            VerifiedDecision::Proceed { member_cap: None },
+            "a LookupError inside on_verified must cost the connect only its fresh capability, \
+             never the connect itself. A Drop here breaks an already-verified connect over a \
+             problem that has nothing to do with whether this device may connect."
         );
     }
 

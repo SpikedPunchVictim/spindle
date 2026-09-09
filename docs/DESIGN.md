@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.24) + Execution Plan
+# Spindle — System Design Document (draft v0.9.25) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -66,6 +66,13 @@
 > (targeted lockout of a named `from_fp`, and outright refusal of untracked devices once the bounded map is full and
 > throttled) recorded alongside it, the first gated on an unproven expectation that §A5's permission set refuses a
 > publish carrying another device's inbox as its reply (user decision, 2026-09-08).
+> v0.9.25: S1 measured that §A5's expectation does not hold — the NATS permission set does **not** refuse a publish
+> naming another device's inbox as its reply subject, so both v0.9.24 denial modes are live, not conditional, and
+> the broker cannot be made to enforce the rule (subject permissions ignore the reply field; wildcards are
+> full-token, so no narrower rule is writable). The mitigation moves the per-`from_fp` charge and the cap mint past
+> the signature-verification boundary — the authorizer's pre-verification half charges only the global bucket, a
+> post-verification callback charges the per-`from_fp` bucket and mints the cap — closing both denial modes and the
+> `Allow`/`Deny` mint-timing asymmetry it also surfaced (2026-09-08; td-fc5a30).
 
 ---
 
@@ -485,8 +492,9 @@ Photos because they're in Family") derived directly from the union model.
   two connections to three. Finalized in S1, amended in S5; recorded in ADR-002's
   topology table.
 - **Host MUST validate** on every `connect`: reply subject starts with `_INBOX_<from_fp>.`; sender is an active member
-  device (cheap check **before** crypto) or holds a valid unused invite; per-`from_fp` token bucket **and** a global
-  token bucket over the connect endpoint [v0.9.24], and max-concurrent-sessions; `sid` not bound to a different
+  device (cheap check **before** crypto) or holds a valid unused invite; a global token bucket over the connect
+  endpoint charged pre-verification and a per-`from_fp` token bucket charged post-verification [v0.9.24, staged
+  v0.9.25 — see mitigation below], and max-concurrent-sessions; `sid` not bound to a different
   `from_fp`. All rejections are **uniform silent drops** (no distinguishable not-member / rate-limited / bad-envelope
   responses, timing included).
 - **Why the per-`from_fp` bucket cannot stand alone** [v0.9.24]: the connect authorizer is structurally forced to run
@@ -505,13 +513,36 @@ Photos because they're in Family") derived directly from the union model.
   that victim's bucket and locks that one device out for as long as the flood runs — a targeted denial the global
   bucket cannot even see, since a per-`from_fp` refusal short-circuits before the global bucket is consulted.
   Reaching the authorizer under a spoofed `from_fp` additionally requires publishing with a reply subject of
-  `_INBOX_<victim_fp>.`, because the host validates the reply prefix *before* consulting the authorizer, and §A5's
-  own permission set (`sub _INBOX_<own>.>`) is expected to refuse exactly that publish. **That expectation is not
-  yet proven**, and it is the single check that decides whether this mode is live at all. (2) When the bounded map
-  is full and every tracked bucket is still throttled, a device the map is not already tracking is refused
-  outright — a harder denial than shared fate, and one that bites even while the global bucket is completely full.
-  Failing closed is still correct there (the alternative is the unbounded allocation the bound exists to prevent),
-  but it is a stronger cost than "slows legitimate connects", and is named separately so the two are not confused.
+  `_INBOX_<victim_fp>.`, because the host validates the reply prefix *before* consulting the authorizer. That was
+  expected to be refused by §A5's own permission set (`sub _INBOX_<own>.>`). **Measured 2026-09-08 (S1): it is
+  not.** A device holding only `pub host.<h>.connect` published to that subject naming another device's inbox as
+  the reply; no violation was raised and the host received the message with the foreign reply intact. Both modes
+  here are therefore **live, not conditional**, and the global bucket's shared-fate cost is load-bearing rather
+  than paid for a threat the broker already blocks. (2) When the bounded map is full and every tracked bucket is
+  still throttled, a device the map is not already tracking is refused outright — a harder denial than shared fate,
+  and one that bites even while the global bucket is completely full. Failing closed is still correct there (the
+  alternative is the unbounded allocation the bound exists to prevent), but it is a stronger cost than "slows
+  legitimate connects", and is named separately so the two are not confused.
+
+  **The broker cannot be made to enforce this** [v0.9.25], which is why the reply subject must be treated as
+  attacker-controlled everywhere it appears. In nats-server 2.10 a publish's permissions are evaluated against the
+  *subject* only; the reply is tested solely by `isReservedReply`, a structural check for NATS-internal prefixes.
+  The `Permissions Violation for Publish with Reply` error is not a permission decision despite its name. Seven
+  permission shapes were measured — including `allow_responses` and a full-token deny proven to match the target
+  subject — with zero effect; the only shape that blocked the spoof did so by denying `host.<h>.connect` outright,
+  which breaks every legitimate connect. Nor is a narrower rule writable: NATS wildcards are full-token, so
+  `_INBOX_<other_fp>` cannot be named as a subject class without one explicit deny per fleet member.
+- **Mitigation: nothing an unauthenticated peer names may cost a *specific* identity** [v0.9.25]. The two modes
+  above share one root cause: the connect path charges the per-`from_fp` bucket, inserts into the bounded map, and
+  mints the member cap while `from_fp` is still unverified — all of it before the offer's signature is checked. The
+  fix is to split that work across the verification boundary rather than to keep tuning the limiter. The
+  authorizer's pre-verification half does the membership lookup and charges only the **global** bucket; a
+  post-verification callback charges the per-`from_fp` bucket and mints the cap. A forged offer never reaches the
+  callback, so an attacker lacking the victim's signing key can neither drain that victim's bucket (mode 1) nor
+  allocate map entries (mode 2) — both become unreachable rather than bounded, and what remains is the uniform
+  shared-fate degradation already accepted above. Deferring the mint also closes the `Allow`/`Deny` timing
+  asymmetry minting introduced (an `Allow` signs, a `Deny` does not — measured at ~16.7 µs/mint against ~3.3 µs for
+  the equalization work), which §A5's timing equalization cannot close on its own.
 - Consequences: an A1 attacker cannot reach/enumerate/flood hosts it has no cap for, cannot see/inject into other
   clients' sessions, cannot read other inboxes, cannot proxy through a host; an A5 attacker with fresh keys gets no
   connection at all.

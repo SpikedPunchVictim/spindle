@@ -35,7 +35,7 @@ use spindle_proto::signaling::{AnswerPayload, IcePayload, Transport};
 
 use crate::quic::{ControlStream, QuicServer, SessionCert};
 
-use super::authorize::{ConnectAuthorizer, ConnectDecision};
+use super::authorize::{ConnectAuthorizer, ConnectDecision, VerifiedDecision};
 use super::bridge_incoming_ice;
 use super::error::SignalingError;
 use super::ice::{drive_ice_agent_trickle, start_local_ice};
@@ -195,6 +195,38 @@ fn build_answer_payload(
 /// unauthenticated lookup is an amplification surface), and it must make `Allow` and `Deny`
 /// indistinguishable to the caller in timing and observable behavior, per §A5's uniform-silent-drop
 /// philosophy — otherwise the connect endpoint becomes a membership oracle.
+///
+/// # Why the decision is split in two (td-fc5a30)
+///
+/// "Attacker-controlled `from_fp`" is not a theoretical caveat, and the mitigation above
+/// ("rate-limit these lookups") is not, on its own, sufficient — it was in fact the vulnerability.
+/// A device holding `pub host.<h>.connect` can publish to that subject naming a **different**
+/// device's inbox as the NATS reply subject: measured against nats-server 2.10, publish permissions
+/// are evaluated against the publish *subject* only, never the reply, so nothing at the broker
+/// refuses it. An attacker with any valid device credential can therefore send this host an offer
+/// claiming a **victim's** `from_fp` with `reply = _INBOX_<victim_fp>.…`, which sails through
+/// [`reply_prefix_ok`] and reaches [`ConnectAuthorizer::authorize`]. Every cost the authorizer
+/// charges against the *named* identity at that point is charged to the victim by someone who
+/// cannot produce the victim's signature: a per-`from_fp` token bucket becomes a targeted lockout,
+/// a bounded per-`from_fp` map becomes exhaustible with fabricated names, and a per-`Allow`
+/// capability mint becomes a free Ed25519 signature per attacker packet (and, since only `Allow`
+/// signs, a timing oracle for membership).
+///
+/// The structural constraint on `authorize` cannot be removed — the signature genuinely cannot be
+/// checked before the key that checks it has been resolved. So the *work* moves instead of the
+/// ordering: [`ConnectAuthorizer::on_verified`] is a second callback this function makes only after
+/// [`super::wire::open_offer`] has verified the offer's signature under the resolved `sign_pk` and
+/// after every routing check has passed. A forged offer never reaches it. `authorize` is left
+/// holding only costs that are bounded globally rather than per-identity; per-identity charges —
+/// the per-`from_fp` bucket, the mint — live in `on_verified`, where `from_fp` is authenticated.
+/// See [`ConnectAuthorizer`]'s own doc comment for the rule an implementer must follow, and why
+/// moving a per-identity charge back into `authorize` reintroduces the targeted denial-of-service.
+///
+/// `on_verified` is called last, after the `inbox` equality check, so that every routing check has
+/// already passed: an offer that is going to be rejected for *any* reason this function can see is
+/// rejected before the host does per-identity work for it. A [`VerifiedDecision::Drop`] produces
+/// [`SignalingError::Denied`] — the same uniform silent drop as every other rejection here, with no
+/// distinguishable reply (DESIGN.md §A5).
 pub async fn process_offer<A: ConnectAuthorizer>(
     payload: &[u8],
     reply: Option<&str>,
@@ -209,12 +241,8 @@ pub async fn process_offer<A: ConnectAuthorizer>(
         return Err(SignalingError::BadReplyPrefix);
     }
 
-    let (sign_pk, agree_pk, member_cap) = match authorizer.authorize(&from_fp).await {
-        ConnectDecision::Allow {
-            sign_pk,
-            agree_pk,
-            member_cap,
-        } => (sign_pk, agree_pk, member_cap),
+    let (sign_pk, agree_pk) = match authorizer.authorize(&from_fp).await {
+        ConnectDecision::Allow { sign_pk, agree_pk } => (sign_pk, agree_pk),
         ConnectDecision::Deny => return Err(SignalingError::Denied),
     };
 
@@ -228,6 +256,23 @@ pub async fn process_offer<A: ConnectAuthorizer>(
     if reply != Some(opened.offer.inbox.as_str()) {
         return Err(SignalingError::ReplyInboxMismatch);
     }
+
+    // The post-verification half of the authorization decision (td-fc5a30) — see this function's
+    // "Why the decision is split in two" section. `from_fp` is authenticated from here on: the
+    // envelope signature verified under the `sign_pk` `authorize` resolved for this exact
+    // fingerprint, so only the holder of that device's signing key can have got this far. This is
+    // therefore the first point at which it is safe for the host to charge anything against the
+    // identity `from_fp` names.
+    //
+    // Deliberately placed after the `inbox` check rather than immediately after `open_offer`: an
+    // offer this function is going to reject for a routing reason must cost the host no
+    // per-identity work at all.
+    let member_cap = match authorizer.on_verified(&from_fp).await {
+        VerifiedDecision::Proceed { member_cap } => member_cap,
+        // Uniform silent drop, identical in every observable way to a `ConnectDecision::Deny` or a
+        // malformed envelope (DESIGN.md §A5) — the caller replies to none of them.
+        VerifiedDecision::Drop => return Err(SignalingError::Denied),
+    };
 
     Ok((opened, member_cap))
 }
@@ -472,7 +517,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use spindle_core::VerifyingKey;
     use spindle_proto::signaling::OfferPayload;
@@ -515,10 +560,37 @@ mod tests {
     struct KeyAuthorizer {
         sign_pk: VerifyingKey,
         agree_pk: X25519PublicKey,
-        /// td-c74122 slice B: the `member_cap` this fixture hands back on every `Allow`. `None`
+        /// td-c74122 slice B: the `member_cap` this fixture hands back from `on_verified`. `None`
         /// in every existing test (mirroring every host today, which has no cap-signing key);
         /// `Some(cap)` only in the tests that specifically pin the cap-relay behavior below.
+        ///
+        /// td-fc5a30 moved this from `authorize`'s `Allow` to `on_verified`'s `Proceed`: the
+        /// production authorizer's mint moved across the signature-verification boundary, and a
+        /// fixture that still handed the cap back from `authorize` could not model that.
         member_cap: Option<Capability>,
+        /// Counts `on_verified` calls, so a test can prove the post-verification half is reached
+        /// exactly once on the happy path and *not at all* when an earlier check rejects.
+        on_verified_calls: AtomicUsize,
+    }
+
+    impl KeyAuthorizer {
+        fn new(sign_pk: VerifyingKey, agree_pk: X25519PublicKey) -> Self {
+            KeyAuthorizer {
+                sign_pk,
+                agree_pk,
+                member_cap: None,
+                on_verified_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_member_cap(mut self, cap: Capability) -> Self {
+            self.member_cap = Some(cap);
+            self
+        }
+
+        fn on_verified_calls(&self) -> usize {
+            self.on_verified_calls.load(Ordering::SeqCst)
+        }
     }
 
     impl ConnectAuthorizer for KeyAuthorizer {
@@ -526,6 +598,12 @@ mod tests {
             ConnectDecision::Allow {
                 sign_pk: self.sign_pk,
                 agree_pk: self.agree_pk,
+            }
+        }
+
+        async fn on_verified(&self, _from_fp: &Fingerprint) -> VerifiedDecision {
+            self.on_verified_calls.fetch_add(1, Ordering::SeqCst);
+            VerifiedDecision::Proceed {
                 member_cap: self.member_cap.clone(),
             }
         }
@@ -537,6 +615,30 @@ mod tests {
     impl ConnectAuthorizer for DenyAuthorizer {
         async fn authorize(&self, _from_fp: &Fingerprint) -> ConnectDecision {
             ConnectDecision::Deny
+        }
+
+        async fn on_verified(&self, _from_fp: &Fingerprint) -> VerifiedDecision {
+            panic!("on_verified must be unreachable when authorize denies")
+        }
+    }
+
+    /// An authorizer that `Allow`s with real keys (so the signature genuinely verifies) but then
+    /// drops the connect in its post-verification half — the `VerifiedDecision::Drop` path.
+    struct DropOnVerifiedAuthorizer {
+        sign_pk: VerifyingKey,
+        agree_pk: X25519PublicKey,
+    }
+
+    impl ConnectAuthorizer for DropOnVerifiedAuthorizer {
+        async fn authorize(&self, _from_fp: &Fingerprint) -> ConnectDecision {
+            ConnectDecision::Allow {
+                sign_pk: self.sign_pk,
+                agree_pk: self.agree_pk,
+            }
+        }
+
+        async fn on_verified(&self, _from_fp: &Fingerprint) -> VerifiedDecision {
+            VerifiedDecision::Drop
         }
     }
 
@@ -560,6 +662,10 @@ mod tests {
             self.called.store(true, Ordering::SeqCst);
             ConnectDecision::Deny
         }
+
+        async fn on_verified(&self, _from_fp: &Fingerprint) -> VerifiedDecision {
+            panic!("on_verified must be unreachable when authorize denies")
+        }
     }
 
     #[tokio::test]
@@ -576,11 +682,10 @@ mod tests {
             &host.device.agree_public_key(),
             &payload,
         );
-        let authorizer = KeyAuthorizer {
-            sign_pk: client.device.sign_public_key(),
-            agree_pk: client.device.agree_public_key(),
-            member_cap: None,
-        };
+        let authorizer = KeyAuthorizer::new(
+            client.device.sign_public_key(),
+            client.device.agree_public_key(),
+        );
         let reply = client_inbox(&client.fp);
 
         let (opened, member_cap) = process_offer(
@@ -641,11 +746,10 @@ mod tests {
             &host.device.agree_public_key(),
             &sample_offer_payload(&client_inbox(&client.fp)),
         );
-        let authorizer = KeyAuthorizer {
-            sign_pk: client.device.sign_public_key(),
-            agree_pk: client.device.agree_public_key(),
-            member_cap: None,
-        };
+        let authorizer = KeyAuthorizer::new(
+            client.device.sign_public_key(),
+            client.device.agree_public_key(),
+        );
         // Well-formed _INBOX subject, but scoped to a different device than the offer's own
         // from_fp -- the exact NATS-level spoof `reply_prefix_ok` exists to catch.
         let bad_reply = format!("_INBOX_{}.abc123", host.fp);
@@ -685,11 +789,10 @@ mod tests {
             &host.device.agree_public_key(),
             &sample_offer_payload(&signed_inbox),
         );
-        let authorizer = KeyAuthorizer {
-            sign_pk: client.device.sign_public_key(),
-            agree_pk: client.device.agree_public_key(),
-            member_cap: None,
-        };
+        let authorizer = KeyAuthorizer::new(
+            client.device.sign_public_key(),
+            client.device.agree_public_key(),
+        );
         // A different, but still validly-prefixed, inbox of the same client's -- what a
         // substituting broker would report as `msg.reply` instead of the signed `inbox`.
         let reported_reply = format!("_INBOX_{}.zzz999", client.fp);
@@ -726,11 +829,10 @@ mod tests {
             &host.device.agree_public_key(),
             &payload,
         );
-        let authorizer = KeyAuthorizer {
-            sign_pk: client.device.sign_public_key(),
-            agree_pk: client.device.agree_public_key(),
-            member_cap: None,
-        };
+        let authorizer = KeyAuthorizer::new(
+            client.device.sign_public_key(),
+            client.device.agree_public_key(),
+        );
 
         let (opened, _member_cap) = process_offer(
             &offer_env.to_canonical_bytes(),
@@ -758,11 +860,10 @@ mod tests {
             &host.device.agree_public_key(),
             &sample_offer_payload(&client_inbox(&client.fp)),
         );
-        let authorizer = KeyAuthorizer {
-            sign_pk: client.device.sign_public_key(),
-            agree_pk: client.device.agree_public_key(),
-            member_cap: None,
-        };
+        let authorizer = KeyAuthorizer::new(
+            client.device.sign_public_key(),
+            client.device.agree_public_key(),
+        );
 
         // `reply_prefix_ok(None, _)` is unconditionally false (`Option::is_some_and`) -- a missing
         // reply is rejected the same way a wrong-prefix one is, not treated as some other case.
@@ -799,11 +900,11 @@ mod tests {
             &host.device.agree_public_key(),
             &sample_offer_payload(&client_inbox(&client.fp)),
         );
-        let authorizer = KeyAuthorizer {
-            sign_pk: impostor.device.sign_public_key(), // wrong pinned key
-            agree_pk: client.device.agree_public_key(),
-            member_cap: None,
-        };
+        // The authorizer resolves `from_fp` to the WRONG signing key (an impostor's).
+        let authorizer = KeyAuthorizer::new(
+            impostor.device.sign_public_key(),
+            client.device.agree_public_key(),
+        );
         let reply = client_inbox(&client.fp);
 
         let err = process_offer(
@@ -858,6 +959,197 @@ mod tests {
         );
     }
 
+    // ---- td-fc5a30: the authorization decision is split across the signature-verification
+    // boundary, so a forged offer never reaches the per-identity half ------------------------
+
+    /// The crate-level regression test for td-fc5a30. An attacker publishes an offer that *names*
+    /// the victim's `from_fp` and carries a reply subject shaped like the victim's own inbox —
+    /// which is exactly what nats-server permits, since it evaluates publish permissions against
+    /// the publish subject only. `reply_prefix_ok` therefore passes, `authorize` is consulted for
+    /// the victim's fingerprint, and only `open_offer`'s signature check can tell the difference:
+    /// the attacker cannot sign as the victim.
+    ///
+    /// What this pins is that `on_verified` is **never called** for such an offer. Everything the
+    /// host charges to the named identity — its per-`from_fp` token bucket, its slot in the bounded
+    /// tracking map, an Ed25519 capability mint — now lives behind that call, so "never called"
+    /// is exactly "the victim was charged nothing". Move any of it back into `authorize` and this
+    /// test still passes, which is why `spindle-host-core`'s
+    /// `a_forged_offer_naming_a_victim_does_not_consume_the_victims_per_fp_bucket` exists too: this
+    /// one pins the control flow, that one pins the consequence.
+    #[tokio::test]
+    async fn a_forged_offer_naming_another_device_never_reaches_on_verified() {
+        let victim = peer(0x80, 0x81);
+        let attacker = peer(0x82, 0x83);
+        let host = peer(0x84, 0x85);
+        let ctx = wire::new_offer_context();
+
+        // The attacker seals an offer with its OWN key material but stamps the victim's
+        // fingerprint on the envelope, and uses the victim's inbox as the reply subject.
+        let victim_reply = client_inbox(&victim.fp);
+        let offer_env = wire::seal_offer(
+            &ctx,
+            &attacker.device,
+            victim.fp,
+            host.fp,
+            &host.device.agree_public_key(),
+            &sample_offer_payload(&victim_reply),
+        );
+
+        // The host's registry resolves the victim's fingerprint to the VICTIM's real keys — the
+        // honest lookup a real authorizer performs, and the reason the forgery is detectable at
+        // all.
+        let authorizer = KeyAuthorizer::new(
+            victim.device.sign_public_key(),
+            victim.device.agree_public_key(),
+        );
+
+        let err = process_offer(
+            &offer_env.to_canonical_bytes(),
+            Some(victim_reply.as_str()),
+            &host.device,
+            host.fp,
+            &authorizer,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SignalingError::Envelope(spindle_core::envelope::EnvelopeError::BadSignature)
+            ),
+            "expected Envelope(BadSignature): the attacker cannot sign as the victim, got {err:?}"
+        );
+        assert_eq!(
+            authorizer.on_verified_calls(),
+            0,
+            "on_verified must never run for an offer whose signature did not verify. Every \
+             per-identity cost the host charges (the per-from_fp token bucket, the bounded \
+             tracking map, the capability mint) lives behind this call precisely so a forged \
+             offer naming a victim charges that victim nothing -- a nonzero count here means the \
+             post-verification boundary has been moved or bypassed, reopening td-fc5a30's \
+             targeted denial-of-service."
+        );
+    }
+
+    /// The routing-check twin: an offer whose signature is genuine but whose reply subject is not
+    /// the one the sender signed (§A10.36's substituting-broker case) must also stop short of
+    /// `on_verified`. This is why the call is placed after the `inbox` equality check rather than
+    /// immediately after `open_offer`.
+    #[tokio::test]
+    async fn a_reply_subject_the_client_did_not_sign_never_reaches_on_verified() {
+        let client = peer(0x86, 0x87);
+        let host = peer(0x88, 0x89);
+        let ctx = wire::new_offer_context();
+        let signed_inbox = client_inbox(&client.fp);
+        let offer_env = wire::seal_offer(
+            &ctx,
+            &client.device,
+            client.fp,
+            host.fp,
+            &host.device.agree_public_key(),
+            &sample_offer_payload(&signed_inbox),
+        );
+        let authorizer = KeyAuthorizer::new(
+            client.device.sign_public_key(),
+            client.device.agree_public_key(),
+        );
+        let reported_reply = format!("_INBOX_{}.zzz999", client.fp);
+        assert_ne!(signed_inbox, reported_reply);
+
+        let err = process_offer(
+            &offer_env.to_canonical_bytes(),
+            Some(reported_reply.as_str()),
+            &host.device,
+            host.fp,
+            &authorizer,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SignalingError::ReplyInboxMismatch));
+        assert_eq!(
+            authorizer.on_verified_calls(),
+            0,
+            "on_verified must run only after EVERY routing check has passed, so an offer rejected \
+             for a routing reason costs the host no per-identity work at all"
+        );
+    }
+
+    /// The positive half: a fully valid offer reaches `on_verified` exactly once.
+    #[tokio::test]
+    async fn a_valid_offer_reaches_on_verified_exactly_once() {
+        let client = peer(0x8a, 0x8b);
+        let host = peer(0x8c, 0x8d);
+        let ctx = wire::new_offer_context();
+        let reply = client_inbox(&client.fp);
+        let offer_env = wire::seal_offer(
+            &ctx,
+            &client.device,
+            client.fp,
+            host.fp,
+            &host.device.agree_public_key(),
+            &sample_offer_payload(&reply),
+        );
+        let authorizer = KeyAuthorizer::new(
+            client.device.sign_public_key(),
+            client.device.agree_public_key(),
+        );
+
+        process_offer(
+            &offer_env.to_canonical_bytes(),
+            Some(reply.as_str()),
+            &host.device,
+            host.fp,
+            &authorizer,
+        )
+        .await
+        .expect("a well-formed offer from an authorized sender must open");
+        assert_eq!(
+            authorizer.on_verified_calls(),
+            1,
+            "a verified offer must consult the post-verification half exactly once -- not zero \
+             times (the per-identity charge and the mint would never happen) and not twice (the \
+             peer would be charged twice for one connect)"
+        );
+    }
+
+    /// `VerifiedDecision::Drop` rejects the connect with the same uniform silent drop every other
+    /// rejection uses: `SignalingError::Denied`, indistinguishable from a `ConnectDecision::Deny`.
+    #[tokio::test]
+    async fn on_verified_drop_yields_denied() {
+        let client = peer(0x8e, 0x8f);
+        let host = peer(0x90, 0x91);
+        let ctx = wire::new_offer_context();
+        let reply = client_inbox(&client.fp);
+        let offer_env = wire::seal_offer(
+            &ctx,
+            &client.device,
+            client.fp,
+            host.fp,
+            &host.device.agree_public_key(),
+            &sample_offer_payload(&reply),
+        );
+        let authorizer = DropOnVerifiedAuthorizer {
+            sign_pk: client.device.sign_public_key(),
+            agree_pk: client.device.agree_public_key(),
+        };
+
+        let err = process_offer(
+            &offer_env.to_canonical_bytes(),
+            Some(reply.as_str()),
+            &host.device,
+            host.fp,
+            &authorizer,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, SignalingError::Denied),
+            "a VerifiedDecision::Drop must produce the same SignalingError::Denied a \
+             ConnectDecision::Deny does -- no reply, and nothing that distinguishes the two to \
+             the peer. Got {err:?}"
+        );
+    }
+
     // ---- td-c74122 slice B: the authorizer's `member_cap` decision flows into the answer ----
 
     /// A dummy `Capability` — never verified by anything in this test, only carried as opaque
@@ -900,11 +1192,11 @@ mod tests {
             &sample_offer_payload(&reply),
         );
         let cap = sample_capability();
-        let authorizer = KeyAuthorizer {
-            sign_pk: client.device.sign_public_key(),
-            agree_pk: client.device.agree_public_key(),
-            member_cap: Some(cap.clone()),
-        };
+        let authorizer = KeyAuthorizer::new(
+            client.device.sign_public_key(),
+            client.device.agree_public_key(),
+        )
+        .with_member_cap(cap.clone());
 
         let (opened, member_cap) = process_offer(
             &offer_env.to_canonical_bytes(),
@@ -968,11 +1260,10 @@ mod tests {
             &host.device.agree_public_key(),
             &sample_offer_payload(&reply),
         );
-        let authorizer = KeyAuthorizer {
-            sign_pk: client.device.sign_public_key(),
-            agree_pk: client.device.agree_public_key(),
-            member_cap: None,
-        };
+        let authorizer = KeyAuthorizer::new(
+            client.device.sign_public_key(),
+            client.device.agree_public_key(),
+        );
 
         let (opened, member_cap) = process_offer(
             &offer_env.to_canonical_bytes(),

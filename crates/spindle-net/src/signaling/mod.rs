@@ -50,7 +50,7 @@ pub mod seq;
 pub mod subject;
 pub mod wire;
 
-pub use authorize::{ConnectAuthorizer, ConnectDecision};
+pub use authorize::{ConnectAuthorizer, ConnectDecision, VerifiedDecision};
 pub use client::{ConnectOptions, HostIdentity, SignalingClient};
 pub use error::SignalingError;
 pub use host::{HostOptions, SessionHandler, SignalingHost};

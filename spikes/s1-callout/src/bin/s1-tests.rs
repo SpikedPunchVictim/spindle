@@ -12,8 +12,17 @@
 //! synchronous error from the client call that attempted it — `client.publish`/`client.subscribe`
 //! return `Ok` regardless of whether the server will honor the action. The exact wire text is:
 //! - `Permissions Violation for Publish to "<subject>"`
-//! - `Permissions Violation for Publish with Reply of "<reply>"`
 //! - `Permissions Violation for Subscription to "<subject>"` (or `... using queue "<queue>"`)
+//!
+//! `Permissions Violation for Publish with Reply of "<reply>"` also exists on the wire, but despite
+//! its name it is **not** a publish-permission decision: live measurement against nats-server 2.10
+//! (see `device_a_can_pub_with_another_devices_inbox_as_reply` below) found that publish permissions
+//! are evaluated against `c.pa.subject` only — the reply subject named on an otherwise-permitted
+//! publish is never checked against the permission set at all. This wire text is instead emitted by
+//! `isReservedReply`, a structural check that fires only when the reply subject collides with a
+//! reserved prefix (`$SRV.`, `$JS.ACK.`, gateway prefixes). An arbitrary foreign `_INBOX_*` reply is
+//! not such a prefix, so this error never fires for it, and no permission configuration changes
+//! that.
 //!
 //! `async-nats` surfaces these via `ConnectOptions::event_callback` as
 //! `Event::ServerError(ServeError::Other(text))` (the crate's fixed `ServerError` enum has no
@@ -737,6 +746,155 @@ async fn main() -> anyhow::Result<ExitCode> {
                         ),
                     ))
                 })
+                .await;
+
+            // ========================================================================================
+            // (d.1) REGRESSION PIN (td-fc5a30): can device A publish to `host.<H>.connect` naming
+            // ANOTHER device's inbox as the reply subject -- i.e. reply `_INBOX_<device_b's
+            // fp>.something` sent by device A? `spindle_net::signaling::host::process_offer` checks
+            // the reply-subject prefix BEFORE consulting the authorizer, so reaching the authorizer
+            // under a spoofed `from_fp` requires exactly this publish to succeed. The device
+            // permission set grants `pub host.<h>.connect` (spindle-helper/src/permissions.rs:124-
+            // 129) without any visible constraint on the reply subject, so it was originally expected
+            // that nats-server's own `Permissions Violation for Publish with Reply of "<reply>"` check
+            // (see module docs' "Detection method" section) would block this before it ever reaches
+            // process_offer.
+            //
+            // MEASURED AND DISPROVEN, live, against nats-server 2.10: it does not block this. The
+            // host's dedicated subscription receives the canary with `msg.reply` carrying the foreign
+            // inbox intact. Seven distinct permission variants were tried against the broker config
+            // (`allow_responses`, `_INBOX_*.>`, `_INBOX_>`, full-token `*.reply1`, allow-narrowing,
+            // and others) and every one of them left this behavior unchanged; a positive control
+            // (denying `host.*.connect` outright) proved the permission plumbing itself works, by
+            // breaking 3 unrelated legitimate checks when applied. Reading nats-server 2.10's
+            // `processInboundClientMsg` confirms why: publish permissions are evaluated against
+            // `c.pa.subject` only, never the reply subject. The reply subject is checked solely by
+            // `isReservedReply`, which is a structural check for reserved prefixes (`$SRV.`,
+            // `$JS.ACK.`, gateway prefixes) -- it is not a permission decision at all, and an
+            // arbitrary foreign `_INBOX_*` reply is not a reserved prefix, so nothing there stops it
+            // either. See the module doc's "Detection method" section, which has been corrected to
+            // stop implying otherwise.
+            //
+            // This check now PINS that measured, negative result: it asserts the host DOES receive
+            // the canary carrying the foreign reply subject. If a future nats-server version starts
+            // refusing this publish, THIS CHECK WILL FAIL -- and that failure is GOOD NEWS worth
+            // investigating (the broker would have grown a protection this suite doesn't yet rely on),
+            // not a regression to silently paper over by flipping the assertion back. The real
+            // mitigation for the underlying spoofing risk lives in the host authorizer, not in broker
+            // publish permissions -- broker permissions cannot enforce this at any price, per the above.
+            // It is NOT "validate `from_fp` against the connection's own device identity": the host cannot
+            // do that, because the authorizer is structurally forced to run BEFORE any signature is
+            // checked -- resolving `from_fp` to a `sign_pk` is precisely what makes verification possible.
+            // The mitigation is instead to split the authorizer across the signature-verification
+            // boundary (td-fc5a30): the pre-verification half charges only a global token bucket, while a
+            // post-verification callback charges the per-`from_fp` bucket and mints the member capability.
+            // A spoofed offer never reaches that callback, so nothing an unauthenticated peer names can be
+            // charged to the identity it named.
+            //
+            // Contrast with `device_a_cannot_sub_other_devices_inbox` (which PASSES): device A cannot
+            // *subscribe* to device B's inbox, but it CAN *name* that inbox as a reply subject on its
+            // own otherwise-legal publish. Naming a subject is not the same permission as subscribing
+            // to it, and nats-server does not treat them the same.
+            //
+            // Placed here -- immediately after `reply_prefix_bypass_suite` and BEFORE `host_sub` is
+            // re-subscribed just below -- so that `host_sub`'s `host.<H>.>` wildcard is still
+            // unsubscribed while this check runs. That sidesteps the exact double-delivery hazard
+            // `reply_prefix_bypass_suite`'s long comment documents (the same publish landing on both
+            // a fresh dedicated subscription and the long-lived wildcard, double-counting
+            // `allow_responses`/reply-tracking bookkeeping) -- it cannot occur here. Do not move it.
+            checks
+                .run(
+                    "device_a_can_pub_with_another_devices_inbox_as_reply",
+                    async {
+                        // A fresh, dedicated subscription on host.<H>.connect -- deliberately not
+                        // `host_sub` -- for the same stale-canary reason given in
+                        // `reply_prefix_bypass_suite`'s comment: earlier checks published several
+                        // canaries that also match the `host.<H>.>` wildcard and were never drained
+                        // from it, so reusing a long-lived subscription here risks picking up one of
+                        // those instead of this check's own publish. A brand-new subscription only
+                        // ever sees messages published after it is created.
+                        let mut host_req_sub = host_conn
+                            .subscribe(format!("host.{}.connect", host_h.host_fp))
+                            .await?;
+                        host_conn.flush().await?;
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+
+                        let foreign_reply = format!("_INBOX_{}.reply1", device_b.device_fp);
+                        let marker = format!("s1-canary-{}", rand::random::<u64>());
+                        // device A IS permitted to publish to host.<H>.connect itself (proven by
+                        // `device_a_can_pub_host_h_connect` above) -- the only thing under test here
+                        // is whether nats-server independently polices the *reply* subject named on
+                        // that otherwise-legal publish. publish_with_reply() returns Ok even when the
+                        // server will refuse the publish server-side (async denial, see module
+                        // docs), so the interesting signal is what happens next, not this call's
+                        // Result.
+                        let _ = client_a
+                            .publish_with_reply(
+                                format!("host.{}.connect", host_h.host_fp),
+                                foreign_reply.clone(),
+                                marker.clone().into(),
+                            )
+                            .await;
+                        let _ = client_a.flush().await;
+
+                        let violation_seen = wait_for_violation(
+                            &events_a,
+                            &[
+                                "Permissions Violation for Publish with Reply",
+                                &foreign_reply,
+                            ],
+                            800,
+                        )
+                        .await;
+
+                        // Independently: did the host's dedicated subscription receive the message
+                        // at all, and if so, what was `msg.reply` actually set to? Compare via
+                        // `as_deref()` against `&str` (the same idiom `reply_prefix_bypass_suite`
+                        // uses for `req_msg.reply`) -- NOT by comparing `Debug`-formatted strings,
+                        // which would compare `Subject`'s derived `Debug` output (a `{ bytes: ... }`
+                        // struct dump) against a plain quoted string and never match, silently
+                        // forcing a false PASS regardless of what was actually observed.
+                        let received =
+                            timeout(Duration::from_millis(500), host_req_sub.next()).await;
+                        let (host_received, observed_reply, carried_foreign_reply) = match &received
+                        {
+                            Ok(Some(msg)) if msg.payload.as_ref() == marker.as_bytes() => (
+                                true,
+                                format!("{:?}", msg.reply.as_deref()),
+                                msg.reply.as_deref() == Some(foreign_reply.as_str()),
+                            ),
+                            Ok(Some(msg)) => (
+                                false,
+                                format!(
+                                    "unrelated message received (not this check's canary), reply={:?}",
+                                    msg.reply.as_deref()
+                                ),
+                                false,
+                            ),
+                            _ => (false, "<no message received>".to_string(), false),
+                        };
+
+                        // Measured property under test (see the block comment above this check):
+                        // the host DOES receive the canary carrying the foreign reply subject intact
+                        // -- nats-server does not police the reply subject on an otherwise-permitted
+                        // publish. If this ever flips to `false`, nats-server has started refusing
+                        // the publish (or scrubbing/rejecting the reply) -- see this check's header
+                        // comment for why that would be GOOD NEWS, not a bug to chase here.
+                        let passed = carried_foreign_reply;
+                        let mut detail = format!(
+                            "violation_seen={violation_seen} host_received={host_received} observed_reply={observed_reply}"
+                        );
+                        if !violation_seen && !host_received {
+                            detail.push_str(
+                                " -- AMBIGUOUS: no violation event observed AND no delivery observed; \
+                                 this combination does not distinguish a (newly) denied publish from a \
+                                 lost/undelivered one -- it would fail this pin either way, so treat it \
+                                 as worth investigating rather than assuming a broker-side denial.",
+                            );
+                        }
+                        Ok((passed, detail))
+                    },
+                )
                 .await;
 
             // Re-subscribe `host_sub` (unsubscribed above for the duration of

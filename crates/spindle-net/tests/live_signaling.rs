@@ -133,7 +133,7 @@ use spindle_net::framing::{read_frame, write_frame};
 use spindle_net::quic::ControlStream;
 use spindle_net::signaling::{
     ConnectAuthorizer, ConnectDecision, ConnectOptions, HostIdentity, HostOptions, SessionHandler,
-    SignalingClient, SignalingHost,
+    SignalingClient, SignalingHost, VerifiedDecision,
 };
 use spindle_proto::artifacts::Capability;
 use x25519_dalek::PublicKey as X25519PublicKey;
@@ -215,12 +215,20 @@ impl ConnectAuthorizer for RegistryAuthorizer {
                 allowed: hit.is_some(),
             });
         match hit {
-            Some((sign_pk, agree_pk)) => ConnectDecision::Allow {
-                sign_pk,
-                agree_pk,
-                member_cap: self.member_cap.clone(),
-            },
+            Some((sign_pk, agree_pk)) => ConnectDecision::Allow { sign_pk, agree_pk },
             None => ConnectDecision::Deny,
+        }
+    }
+
+    /// td-fc5a30 moved the `member_cap` this fixture hands back from `authorize`'s `Allow` to
+    /// here, mirroring `HostConnectAuthorizer`: the cap is minted only once the offer's signature
+    /// has verified. Deliberately does NOT append to `calls` — that log exists to prove the
+    /// *pre*-verification lookup ran on the live path with the fingerprint the test expects, and
+    /// mixing a second, post-verification event into it would break every count assertion that
+    /// reads it.
+    async fn on_verified(&self, _from_fp: &Fingerprint) -> VerifiedDecision {
+        VerifiedDecision::Proceed {
+            member_cap: self.member_cap.clone(),
         }
     }
 }
