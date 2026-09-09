@@ -110,6 +110,8 @@ pub enum RefusalReason {
     BadCapabilitySignature,
     #[error("host operating-key certificate expired")]
     HostCertificateExpired,
+    #[error("host operating-key certificate is bound to a different session key")]
+    HostCertificateSessionMismatch,
     #[error("host operating-key certificate signature invalid")]
     BadHostSignature,
     #[error("admission mode is invite-only and no admission token was presented")]
@@ -521,6 +523,20 @@ pub fn decide_host_connect(
     // 1. Cheap field check.
     if now > presented.host_op_cert.exp {
         return AuthzDecision::Refused(RefusalReason::HostCertificateExpired);
+    }
+
+    // The cert's own `nats_fp` is the *entire* mechanism binding a root-signed host cert to one
+    // NATS session (DESIGN.md:286 "signs its operating key (sig_host_root(host_op_pk, nats_fp,
+    // ts))"; DESIGN.md:349 "a host connection presents sig_host_root(host_op_pk, nats_fp, ts)").
+    // `verify_host_op_key_cert` below checks chain-to-root, signature and `exp` — it does not
+    // compare `nats_fp` against the session that is actually presenting, and no other caller does
+    // either. Without this comparison, the never-expiring op cert embedded in every member
+    // `Capability` (DESIGN.md:306) authorizes a CONNECT from any nkey at all: `verify_nkey_sig`
+    // only proves possession of whichever nkey is presenting, not that it is the one the cert was
+    // issued for (td-0bcab4). This belongs among the cheap checks, not the crypto below — it's a
+    // byte comparison, and the file orders cheap-before-crypto (see the ordering tests below).
+    if !presented.nats_fp.matches(&presented.host_op_cert.nats_fp) {
+        return AuthzDecision::Refused(RefusalReason::HostCertificateSessionMismatch);
     }
 
     // 2. Cheap hash.
@@ -1106,23 +1122,27 @@ mod tests {
 
     // ---- decide_host_connect --------------------------------------------------------------
 
-    fn host_setup() -> (RootKey, SigningKey, HostOpKeyCert, Fingerprint) {
+    /// `session_fp` is the `nats_fp` the returned cert is issued for — callers must present the
+    /// same fingerprint in `HostConnectPresented.nats_fp` (td-0bcab4: `decide_host_connect` now
+    /// enforces that the two match).
+    fn host_setup(session_fp: Fingerprint) -> (RootKey, SigningKey, HostOpKeyCert, Fingerprint) {
         let host_root = RootKey::from_seed([0x51; 32]);
         let op_signing = SigningKey::from_bytes(&[0x52; 32]);
         let op_pk = op_signing.verifying_key();
-        let cert = issue_host_op_key_cert(&host_root, &op_pk, fp(b"host-nats"), 1_000, 2_000_000);
+        let cert = issue_host_op_key_cert(&host_root, &op_pk, session_fp, 1_000, 2_000_000);
         let host_fp = host_root.root_fp();
         (host_root, op_signing, cert, host_fp)
     }
 
     #[test]
     fn host_with_valid_cert_but_no_admission_record_in_invite_mode_is_refused() {
-        let (host_root, _op, cert, _hfp) = host_setup();
+        let session_fp = fp(b"host-session");
+        let (host_root, _op, cert, _hfp) = host_setup(session_fp);
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
             admission_token: None,
-            nats_fp: fp(b"host-session"),
+            nats_fp: session_fp,
         };
         let mut view = MockView {
             mode: AdmissionMode::Invite,
@@ -1137,12 +1157,13 @@ mod tests {
 
     #[test]
     fn host_admission_closed_refuses_new_hosts_but_not_existing_ones() {
-        let (host_root, _op, cert, host_fp) = host_setup();
+        let session_fp = fp(b"host-session");
+        let (host_root, _op, cert, host_fp) = host_setup(session_fp);
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert.clone(),
             admission_token: None,
-            nats_fp: fp(b"host-session"),
+            nats_fp: session_fp,
         };
         let mut view = MockView {
             mode: AdmissionMode::Closed,
@@ -1154,7 +1175,8 @@ mod tests {
             AuthzDecision::Refused(RefusalReason::AdmissionClosed)
         );
 
-        // Now simulate an already-admitted host: closed mode must not affect it.
+        // Now simulate an already-admitted host: closed mode must not affect it. Same cert, same
+        // session — this test is about admission-mode behavior, not session rebinding.
         view.records.insert(
             host_fp,
             AdmissionRecord {
@@ -1168,7 +1190,7 @@ mod tests {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
             admission_token: None,
-            nats_fp: fp(b"host-session-2"),
+            nats_fp: session_fp,
         };
         let decision2 = decide_host_connect(&presented2, || true, 1_500, &mut view, 0);
         assert!(
@@ -1179,12 +1201,13 @@ mod tests {
 
     #[test]
     fn host_admission_open_mode_cert_alone_suffices() {
-        let (host_root, _op, cert, _hfp) = host_setup();
+        let session_fp = fp(b"host-session");
+        let (host_root, _op, cert, _hfp) = host_setup(session_fp);
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
             admission_token: None,
-            nats_fp: fp(b"host-session"),
+            nats_fp: session_fp,
         };
         let mut view = MockView {
             mode: AdmissionMode::Open,
@@ -1196,12 +1219,13 @@ mod tests {
 
     #[test]
     fn host_admission_closed_refuses_before_any_signature_work() {
-        let (host_root, _op, cert, _hfp) = host_setup();
+        let session_fp = fp(b"host-session");
+        let (host_root, _op, cert, _hfp) = host_setup(session_fp);
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
             admission_token: None,
-            nats_fp: fp(b"host-session"),
+            nats_fp: session_fp,
         };
         let mut view = MockView {
             mode: AdmissionMode::Closed,
@@ -1227,7 +1251,8 @@ mod tests {
 
     #[test]
     fn host_with_valid_admission_token_is_authorized_and_token_burned_exactly_once() {
-        let (host_root, _op, cert, host_fp) = host_setup();
+        let session_fp = fp(b"host-session");
+        let (host_root, _op, cert, host_fp) = host_setup(session_fp);
         let operator = SigningKey::from_bytes(&[0x61; 32]);
         let token = issue_admission_token(
             &operator,
@@ -1246,7 +1271,7 @@ mod tests {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert.clone(),
             admission_token: Some(token.clone()),
-            nats_fp: fp(b"host-session"),
+            nats_fp: session_fp,
         };
         let decision = decide_host_connect(&presented, || true, 1_500, &mut view, 0);
         let AuthzDecision::Authorized(auth) = decision else {
@@ -1260,13 +1285,15 @@ mod tests {
              device_fp None, not invent a placeholder value"
         );
 
-        // Idempotent replay: same nonce, same host, presented again (e.g. a retried CONNECT
-        // after a lost reply). Must not burn a second time and must yield the same record.
+        // Idempotent replay: same nonce, same host, same session, presented again (e.g. a
+        // retried CONNECT after a lost reply — the cert is bound to `session_fp`, so the retry
+        // must present that same fingerprint too). Must not burn a second time and must yield
+        // the same record.
         let presented_again = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
             admission_token: Some(token),
-            nats_fp: fp(b"host-session-retry"),
+            nats_fp: session_fp,
         };
         let decision2 = decide_host_connect(&presented_again, || true, 1_500, &mut view, 0);
         assert!(decision2.is_authorized());
@@ -1322,18 +1349,98 @@ mod tests {
 
     #[test]
     fn host_cert_expired_is_refused() {
-        let (host_root, _op, cert, _hfp) = host_setup();
+        let session_fp = fp(b"host-session");
+        let (host_root, _op, cert, _hfp) = host_setup(session_fp);
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
             admission_token: None,
-            nats_fp: fp(b"host-session"),
+            nats_fp: session_fp,
         };
         let mut view = MockView::default();
         let decision = decide_host_connect(&presented, || true, 3_000_000, &mut view, 0);
         assert_eq!(
             decision,
             AuthzDecision::Refused(RefusalReason::HostCertificateExpired)
+        );
+    }
+
+    /// td-0bcab4, live-reproduced by
+    /// `live_capability_op_cert_must_not_authorize_a_host_connect`
+    /// (crates/spindle-net/tests/live_signaling.rs): a host op-key cert's own `nats_fp` is the
+    /// entire mechanism binding a root-signed cert to one NATS session (DESIGN.md:286, :349). A
+    /// cert issued for one session fingerprint, presented alongside a *different* session's
+    /// fingerprint, must be refused — even for an already-admitted host, so the refusal cannot be
+    /// attributed to admission rather than the session binding.
+    #[test]
+    fn host_op_cert_bound_to_a_different_nkey_is_refused() {
+        let issued_for = fp(b"host-session");
+        let (host_root, _op, cert, host_fp) = host_setup(issued_for);
+        let presented_fp = fp(b"host-session-attacker");
+        let presented = HostConnectPresented {
+            host_root_pk: host_root.public_key(),
+            host_op_cert: cert,
+            admission_token: None,
+            nats_fp: presented_fp,
+        };
+        let mut view = MockView::default();
+        view.records.insert(
+            host_fp,
+            AdmissionRecord {
+                host_fp,
+                label: "workshop-nas".to_string(),
+                admitted_at: 500,
+                quota_profile: "default".to_string(),
+            },
+        );
+        let decision = decide_host_connect(&presented, || true, 1_500, &mut view, 0);
+        assert_eq!(
+            decision,
+            AuthzDecision::Refused(RefusalReason::HostCertificateSessionMismatch)
+        );
+    }
+
+    #[test]
+    fn host_op_cert_session_mismatch_is_refused_before_any_signature_work() {
+        let issued_for = fp(b"host-session");
+        let (host_root, _op, cert, host_fp) = host_setup(issued_for);
+        let presented_fp = fp(b"host-session-attacker");
+        let presented = HostConnectPresented {
+            host_root_pk: host_root.public_key(),
+            host_op_cert: cert,
+            admission_token: None,
+            nats_fp: presented_fp,
+        };
+        let mut view = MockView::default();
+        view.records.insert(
+            host_fp,
+            AdmissionRecord {
+                host_fp,
+                label: "workshop-nas".to_string(),
+                admitted_at: 500,
+                quota_profile: "default".to_string(),
+            },
+        );
+        let nkey_calls = Cell::new(0u32);
+        let decision = decide_host_connect(
+            &presented,
+            || {
+                nkey_calls.set(nkey_calls.get() + 1);
+                true
+            },
+            1_500,
+            &mut view,
+            0,
+        );
+        assert_eq!(
+            decision,
+            AuthzDecision::Refused(RefusalReason::HostCertificateSessionMismatch)
+        );
+        assert_eq!(
+            nkey_calls.get(),
+            0,
+            "the nkey signature must never be checked when the session-mismatch check already \
+             refuses"
         );
     }
 

@@ -1101,3 +1101,69 @@ async fn live_revocation_kicks_and_then_refuses_the_devices_reconnect_within_the
          timing finding, not a test bug — do not weaken this assertion to make it pass."
     );
 }
+
+/// Security regression for td-0bcab4: `spindle_helper::authz::decide_host_connect` verifies a
+/// `HostOpKeyCert` chains to `host_root_pk` and has not expired
+/// (`spindle_core::artifacts::verify_host_op_key_cert`), but never compares the cert's own
+/// `nats_fp` field against the nkey the connection actually authenticated with. This test pins
+/// the invariant that must hold instead: a host op cert authorizes ONLY the nkey named in its own
+/// `nats_fp` field, never whichever nkey happens to present it.
+///
+/// The attack material here is not contrived. Every member `Capability` this host issues embeds
+/// exactly this shape of cert (`host_root_pk` + `op_cert`, DESIGN.md:306) —
+/// [`HostRootIdentity::capability_op_cert`] builds it with a dummy, never-used `nats_fp` and
+/// `exp: u64::MAX`, because `verify_capability` never inspects a capability's embedded
+/// `op_cert.nats_fp`. Any member this host has ever admitted already holds one of these certs
+/// today. If `decide_host_connect` also skips the `nats_fp` check, that same cert lets the member
+/// CONNECT to NATS *as the host itself*.
+///
+/// The positive control below is what makes a refusal meaningful: it proves the live stack
+/// genuinely admits this host identity at all, so the attack's refusal afterward can only mean
+/// the `nats_fp` binding is enforced — not that the stack is unreachable or this host was never
+/// admitted in the first place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live stack required: run `docker compose -f deploy/docker-compose.yml up -d` first, \
+            then `cargo test -p spindle-net --test live_signaling -- --ignored --nocapture`. \
+            When run, an unreachable stack fails loudly — this test never skips."]
+async fn live_capability_op_cert_must_not_authorize_a_host_connect() {
+    let url = nats_url();
+    assert_stack_rejects_anonymous(&url).await;
+
+    // A host identity not used by any other test in this file.
+    let host = HostRootIdentity::new([0x91; 32], [0x92; 32]);
+
+    // ---- positive control: this host identity is genuinely admitted by the live stack ----------
+    // Connects for real, the normal way (`connect_host`, the host's own op-key cert bound to its
+    // own session nkey's nats_fp). This proves the stack admits `host` at all, so a refusal in the
+    // attack below can only mean the nats_fp binding is enforced — not that the stack is broken or
+    // this host is unadmitted.
+    let exp = fixtures::now() + 3600;
+    let (host_nats, _host_events) = connect_host(&url, &host, exp).await;
+    drop(host_nats);
+
+    // ---- the attack: an unrelated attacker nkey, authenticated with the host's never-expiring,
+    // dummy-nats_fp capability-issuance cert instead of a real op-key cert bound to itself --------
+    let cap_cert = host.capability_op_cert();
+    let token = fixtures::host_auth_token(&host.root.public_key().to_bytes(), &cap_cert);
+    let attacker = nkeys::KeyPair::new_user();
+    let (opts, _events) = base_opts();
+    let result = opts
+        .nkey(attacker.seed().expect("attacker nkey seed"))
+        .token(token)
+        .connect(&url)
+        .await;
+
+    let host_fp = host.host_fp;
+    assert!(
+        result.is_err(),
+        "an attacker's own, unrelated nkey CONNECTed to the live stack using this host's \
+         capability-embedded op cert (never expires, bound to a dummy nats_fp belonging to no \
+         real session) and the stack ADMITTED it. Every member `Capability` this host issues \
+         embeds exactly this cert (`host_root_pk` + `op_cert`, DESIGN.md:306) — since \
+         `decide_host_connect` never checks that cert's `nats_fp` against the connecting nkey, \
+         any member who decodes its own capability can authenticate to NATS *as the host itself*, \
+         gaining `sub host.{host_fp}.>`, `pub host.{host_fp}.sess.*.*.h2c`, and `pub \
+         registry.revoke.{host_fp}` (permissions::host_permissions). This is td-0bcab4; it must \
+         be reported as a genuine finding, not papered over by weakening this assertion."
+    );
+}
