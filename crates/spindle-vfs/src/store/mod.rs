@@ -463,11 +463,11 @@ impl Store {
     /// oversight.
     ///
     /// This protection depends on unwinding actually happening: under a consumer crate's
-    /// `panic = "abort"` profile (no `Cargo.toml` in this workspace sets one — grepped) the
-    /// process dies immediately instead of reaching `catch_unwind` at all. That is not a
-    /// false-success, just a different failure mode: the process is gone rather than continuing
-    /// with a mis-poisoned `Store`, and SQLite recovers the hot journal itself the next time the
-    /// database file is opened.
+    /// `panic = "abort"` profile (no `Cargo.toml` in this workspace sets one — grepped) `f` still
+    /// runs, but the process aborts before unwinding starts, so `catch_unwind` never runs. That
+    /// is not a false-success, just a different failure mode: the process is gone rather than
+    /// continuing with an un-poisoned, stranded `Store`, and SQLite recovers the hot journal
+    /// itself the next time the database file is opened.
     ///
     /// `context` is a short, static, human-readable label (e.g. `"revoke_member_and_bump_epoch"`)
     /// passed straight through to [`recover_from_non_autocommit`] for its log lines only.
