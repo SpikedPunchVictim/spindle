@@ -160,9 +160,11 @@ async fn connect_device(
 ) -> anyhow::Result<(async_nats::Client, EventLog, Fingerprint)> {
     let session = KeyPair::new_user();
     let nats_fp = fixtures::nats_fp_of_nkey(&session.public_key())?;
-    let cert = fixtures::device_certificate(device, nats_fp, now(), exp);
+    let ts = now();
+    let cert = fixtures::device_certificate(device, ts, exp);
+    let session_attest = fixtures::session_attestation(device, nats_fp, ts);
     let root_pk_bytes = device.root.public_key().to_bytes();
-    let token = fixtures::device_auth_token(&root_pk_bytes, &cert, &caps);
+    let token = fixtures::device_auth_token(&root_pk_bytes, &cert, &session_attest, &caps);
     let inbox_prefix = format!("_INBOX_{}", device.device_fp);
     let (opts, events) = base_opts();
     let client = opts

@@ -1,5 +1,5 @@
 // Golden-vector conformance against `vectors/signed/*.json` (real Ed25519 signatures, TEST-ONLY
-// seeds — see `crates/spindle-core/src/bin/gen_crypto_vectors.rs`) for the six non-Envelope A7b
+// seeds — see `crates/spindle-core/src/bin/gen_crypto_vectors.rs`) for the eight non-Envelope A7b
 // signed-artifact types. The Envelope vector (session key, nonce, AAD, ciphertext, seal/open) has
 // its own suite: `test/envelope-vectors.test.ts`.
 //
@@ -23,6 +23,7 @@ import {
   HostDeviceCert,
   HostOpKeyCert,
   RevocationRecord,
+  SessionAttestation,
 } from "@spindle/proto";
 import { describe, expect, it } from "vitest";
 
@@ -35,6 +36,7 @@ import {
   verifyHostDeviceCert,
   verifyHostOpKeyCert,
   verifyRevocationRecord,
+  verifySessionAttestation,
 } from "../src/artifacts.js";
 import { ed25519PublicKeyFromSeed, ed25519Sign, x25519PublicKeyFromSeed } from "../src/backend.js";
 import { deviceFpOf, rootFpOf } from "../src/fingerprint.js";
@@ -48,6 +50,7 @@ import {
   parseHostDeviceCert,
   parseHostOpKeyCert,
   parseRevocationRecord,
+  parseSessionAttestation,
 } from "./helpers.js";
 
 async function expectArtifactError(fn: () => Promise<void>, kind: string): Promise<void> {
@@ -116,7 +119,6 @@ describe("device-certificate.json", () => {
     algId: number;
     signPk: Uint8Array;
     agreePk: Uint8Array;
-    natsFp: Uint8Array;
     ts: bigint;
     exp: bigint;
   }): Promise<DeviceCertificate> {
@@ -126,7 +128,6 @@ describe("device-certificate.json", () => {
       alg_id: params.algId,
       sign_pk: params.signPk,
       agree_pk: params.agreePk,
-      nats_fp: params.natsFp,
       ts: params.ts,
       exp: params.exp,
       sig_root: new Uint8Array(64),
@@ -145,7 +146,6 @@ describe("device-certificate.json", () => {
       algId: 1,
       signPk: dev.signPk,
       agreePk: dev.agreePk,
-      natsFp: new Uint8Array(32).fill(0xaa),
       ts: 1_000n,
       exp: 2_000n,
     });
@@ -170,7 +170,6 @@ describe("device-certificate.json", () => {
       algId: 1,
       signPk: dev.signPk,
       agreePk: dev.agreePk,
-      natsFp: new Uint8Array(32).fill(0xaa),
       ts: 1_000n,
       exp: 2_000n,
     });
@@ -194,7 +193,6 @@ describe("device-certificate.json", () => {
       algId: 1,
       signPk: dev.signPk,
       agreePk: dev.agreePk,
-      natsFp: new Uint8Array(32).fill(0xaa),
       ts: 1_000n,
       exp: 2_000n,
     });
@@ -236,7 +234,6 @@ describe("device-certificate.json", () => {
       alg_id: 1,
       sign_pk: deviceB.signPk,
       agree_pk: deviceB.agreePk,
-      nats_fp: new Uint8Array(32).fill(0xaa),
       ts: 1_000n,
       exp: 2_000n,
       sig_root: new Uint8Array(64),
@@ -262,7 +259,6 @@ describe("device-certificate.json", () => {
       algId: 1,
       signPk: dev.signPk,
       agreePk: dev.agreePk,
-      natsFp: new Uint8Array(32).fill(0xaa),
       ts: 1_000n,
       exp: 2_000n,
     });
@@ -283,7 +279,6 @@ describe("device-certificate.json", () => {
       algId: 1,
       signPk: dev.signPk,
       agreePk: dev.agreePk,
-      natsFp: new Uint8Array(32).fill(0xaa),
       ts: 1_000n,
       exp: 2_000n,
     });
@@ -304,7 +299,6 @@ describe("device-certificate.json", () => {
       algId: 1,
       signPk: dev.signPk,
       agreePk: dev.agreePk,
-      natsFp: new Uint8Array(32).fill(0xaa),
       ts: 1_000n,
       exp: 2_000n,
     });
@@ -521,6 +515,46 @@ describe("host-op-key-cert.json", () => {
       }
     });
   }
+});
+
+describe("session-attestation.json", () => {
+  const doc = loadSignedVectorFile("session-attestation.json");
+  const deviceSignPk = hexToBytes(doc.signer.public_key_hex);
+
+  for (const c of doc.cases) {
+    it(`${c.name}: signing input matches`, () => {
+      const att = parseSessionAttestation(c.decoded);
+      expect(bytesToHex(SessionAttestation.signingInput(att))).toBe(c.signing_input_hex);
+    });
+
+    it(`${c.name}: verifySessionAttestation(now=ts) is ${c.signature_valid ? "ok" : "BadSignature"}`, async () => {
+      const att = parseSessionAttestation(c.decoded);
+      if (c.signature_valid) {
+        await expect(
+          verifySessionAttestation(att, deviceSignPk, att.nats_fp, att.ts),
+        ).resolves.toBeUndefined();
+      } else {
+        await expectArtifactError(
+          () => verifySessionAttestation(att, deviceSignPk, att.nats_fp, att.ts),
+          "BadSignature",
+        );
+      }
+    });
+  }
+
+  // ---- td-0bcab4 binding check: a well-signed attestation naming a different session key must
+  // never verify, even against its own genuine signer (mirrors session-attestation.test.ts's
+  // hand-fixture coverage of the same check, here run against the golden `valid` vector). ----
+  it("rejects the valid case's own attestation when expectedNatsFp names a different session key", async () => {
+    const valid = doc.cases.find((c: { name: string }) => c.name === "valid");
+    const att = parseSessionAttestation(valid.decoded);
+    const wrongNatsFp = new Uint8Array(att.nats_fp);
+    wrongNatsFp[0] ^= 0xff;
+    await expectArtifactError(
+      () => verifySessionAttestation(att, deviceSignPk, wrongNatsFp, att.ts),
+      "SessionKeyMismatch",
+    );
+  });
 });
 
 describe("host-device-cert.json", () => {

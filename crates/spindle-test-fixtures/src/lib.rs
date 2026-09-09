@@ -27,10 +27,13 @@ pub mod fixtures {
     use base64::Engine as _;
     use spindle_core::artifacts::{
         issue_capability, issue_device_certificate, issue_host_op_key_cert,
+        issue_session_attestation,
     };
     use spindle_core::identity::{DeviceKey, RootKey};
     use spindle_core::{Fingerprint, SigningKey};
-    use spindle_proto::artifacts::{CapKind, Capability, DeviceCertificate, HostOpKeyCert};
+    use spindle_proto::artifacts::{
+        CapKind, Capability, DeviceCertificate, HostOpKeyCert, SessionAttestation,
+    };
     use spindle_proto::canonical::CborValue;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -84,17 +87,30 @@ pub mod fixtures {
             self.root.root_fp()
         }
 
-        pub fn certificate(&self, nats_fp: Fingerprint, ts: u64, exp: u64) -> DeviceCertificate {
+        /// [amended v0.9.29, td-0bcab4 §A4 step 2]: no longer takes a `nats_fp` — the certificate
+        /// itself no longer binds to a session key at all (that field is gone from
+        /// `DeviceCertificate`). Session binding now happens per-connection, via
+        /// [`Self::session_attestation`].
+        pub fn certificate(&self, ts: u64, exp: u64) -> DeviceCertificate {
             let device = self.device_key();
             issue_device_certificate(
                 &self.root,
                 device.alg_id(),
                 &device.sign_public_key(),
                 &device.agree_public_key(),
-                nats_fp,
                 ts,
                 exp,
             )
+        }
+
+        /// The §A4-step-2 artifact (td-0bcab4, added v0.9.29) that binds this device's
+        /// **identity** key to one connecting session nkey's `nats_fp`. This is the fix for the
+        /// bearer-token defect: previously `{root_pk, device_cert, caps}` alone authorized a
+        /// connection from *any* nkey, because nothing at CONNECT ever exercised the device's own
+        /// identity key. A caller mints one of these per session, over that session's own
+        /// `nats_fp`, and presents it alongside the (now session-agnostic) certificate.
+        pub fn session_attestation(&self, nats_fp: Fingerprint, ts: u64) -> SessionAttestation {
+            issue_session_attestation(&self.device_key(), nats_fp, ts)
         }
     }
 
@@ -181,9 +197,14 @@ pub mod fixtures {
 
     /// The device CONNECT `auth_token`, byte-compatible with
     /// `spindle_helper::auth_token::decode_auth_token`'s `kind: "device"` arm.
+    ///
+    /// `session_attest` (added v0.9.29, td-0bcab4 §A4 step 2) is required — see
+    /// `spindle_helper::auth_token`'s module doc for why this field, unlike the host arm's
+    /// `admission_token`, has no "absent" case.
     pub fn device_auth_token(
         root_pk_bytes: &[u8; 32],
         device_cert: &DeviceCertificate,
+        session_attest: &SessionAttestation,
         caps: &[Capability],
     ) -> String {
         let cap_bytes: Vec<CborValue> = caps
@@ -196,6 +217,10 @@ pub mod fixtures {
             (
                 "device_cert",
                 CborValue::bytes(device_cert.to_canonical_bytes()),
+            ),
+            (
+                "session_attest",
+                CborValue::bytes(session_attest.to_canonical_bytes()),
             ),
             ("caps", CborValue::array(cap_bytes)),
         ]);
@@ -257,9 +282,11 @@ pub fn base_opts() -> (async_nats::ConnectOptions, EventLog) {
 }
 
 /// Connects a device to the live stack through the real Auth Callout: fresh session nkey,
-/// root-signed device certificate binding it to that key's `nats_fp`, `auth_token` carrying
-/// `caps`, and the `_INBOX_<device_fp>` prefix §A5 grants. Also returns the session nkey's own
-/// public-key string (`session.public_key()`) — the same value nats-server's own
+/// root-signed device certificate (no longer session-bound — see
+/// [`fixtures::DeviceIdentity::certificate`]), a [`spindle_proto::artifacts::SessionAttestation`]
+/// binding that key's `nats_fp` to the device's own identity key (§A4 step 2, td-0bcab4),
+/// `auth_token` carrying `caps`, and the `_INBOX_<device_fp>` prefix §A5 grants. Also returns the
+/// session nkey's own public-key string (`session.public_key()`) — the same value nats-server's own
 /// `$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT` advisories carry at `client.user`
 /// (`spindle_helper::presence`'s module doc names this field), so a caller can later recognize
 /// *this exact connection* in a live advisory stream (the S9 revocation test needs this; neither
@@ -273,8 +300,15 @@ pub async fn connect_device(
     let session = nkeys::KeyPair::new_user();
     let user_pk = session.public_key();
     let nats_fp = fixtures::nats_fp_of_nkey(&user_pk);
-    let cert = device.certificate(nats_fp, fixtures::now(), exp);
-    let token = fixtures::device_auth_token(&device.root.public_key().to_bytes(), &cert, caps);
+    let ts = fixtures::now();
+    let cert = device.certificate(ts, exp);
+    let session_attest = device.session_attestation(nats_fp, ts);
+    let token = fixtures::device_auth_token(
+        &device.root.public_key().to_bytes(),
+        &cert,
+        &session_attest,
+        caps,
+    );
     let (opts, events) = base_opts();
     let client = opts
         .nkey(session.seed().expect("session nkey seed"))

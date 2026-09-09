@@ -1,9 +1,10 @@
 # vectors/
 
 Golden test vectors: canonical CBOR bytes for every A7b signed-artifact type (envelope,
-member/invite capability, admission token, device certificate, revocation record, admin command,
-host op-key certificate, host device certificate), plus a primitive-level canonical CBOR encoding
-vector file — the single source of truth for what "correct wire format" means across languages.
+member/invite capability, admission token, device certificate, session attestation, revocation
+record, admin command, host op-key certificate, host device certificate), plus a primitive-level
+canonical CBOR encoding vector file — the single source of truth for what "correct wire format"
+means across languages.
 
 ## Files
 
@@ -12,7 +13,8 @@ vector file — the single source of truth for what "correct wire format" means 
 | `envelope.json` | `Envelope` (A7) — 3 cases: first message with `eph_pk`, a later message with `eph_pk` omitted, and a `seq` value large enough to require the 8-byte canonical uint form. |
 | `capability.json` | `Capability` (A4) — 2 cases: `invite` and `member` kinds. |
 | `admission-token.json` | `AdmissionToken` (A3b) — 2 cases: default and custom quota profiles. |
-| `device-certificate.json` | `DeviceCertificate` (A4) — 2 cases: freshly issued, re-signed on contact. **No `label` field** — see the discrepancy note on `DeviceCertificate` in `crates/spindle-proto/src/artifacts.rs` and the schema table in `crates/spindle-proto/src/lib.rs`. |
+| `device-certificate.json` | `DeviceCertificate` (A4) — 2 cases: freshly issued, re-signed on contact. **No `label` field** — see the discrepancy note on `DeviceCertificate` in `crates/spindle-proto/src/artifacts.rs` and the schema table in `crates/spindle-proto/src/lib.rs`. **No `nats_fp` field** as of DESIGN.md v0.9.29 (A10.39, td-0bcab4): that binding moved to its own artifact, `session-attestation.json` below, closing a bearer-bundle vulnerability where nothing at CONNECT ever exercised the device's identity key. Domain tag is now `spindle-dev-cert-v2` (was `spindle-dev-cert-v1`). |
+| `session-attestation.json` | `SessionAttestation` (A4, A10.39, added v0.9.29, td-0bcab4) — 2 cases: a freshly-issued attestation, and a second attestation for a different session nkey (per-session rotation). Binds a device's identity key to exactly one NATS session key via `sig_device(nats_fp, ts)`; unlike the other artifacts here, it is minted fresh per session rather than persisting across many. |
 | `revocation-record.json` | `RevocationRecord` (A4) — 3 cases, including a zero-length `revoked` array (empty-array encoding edge case). |
 | `admin-command.json` | `AdminCommand` (A3b/A7b) — 3 cases exercising `args` as a map, a text-valued map, and CBOR `null`. |
 | `host-op-key-cert.json` | `HostOpKeyCert` (A4) — 2 cases: freshly issued, rotated. |

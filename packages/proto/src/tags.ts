@@ -18,8 +18,11 @@ export const ENVELOPE_V1: Uint8Array = encoder.encode("spindle-env-v1");
 export const CAPABILITY_V1: Uint8Array = encoder.encode("spindle-cap-v1");
 /** `AdmissionToken` (A3b) — signed by the operator admission key. */
 export const ADMISSION_TOKEN_V1: Uint8Array = encoder.encode("spindle-adm-v1");
-/** `DeviceCertificate` (A4) — signed by the identity root. */
-export const DEVICE_CERT_V1: Uint8Array = encoder.encode("spindle-dev-cert-v1");
+/** `DeviceCertificate` (A4) — signed by the identity root. Bumped to v2 in v0.9.29: this artifact
+ * carries no `v` field, so per DESIGN.md §A7b the domain tag *is* the version discriminant, and
+ * v0.9.29 removed `nats_fp` from the certificate — a wire-visible change — which is expressed
+ * here as `spindle-dev-cert-v1` -> `spindle-dev-cert-v2` rather than as a field-level version. */
+export const DEVICE_CERT_V2: Uint8Array = encoder.encode("spindle-dev-cert-v2");
 /** `RevocationRecord` (A4) — signed by the host operating key or an identity root. */
 export const REVOCATION_V1: Uint8Array = encoder.encode("spindle-rev-v1");
 /** `AdminCommand` (A3b/A7b) — signed by the operator admission key. */
@@ -28,6 +31,12 @@ export const ADMIN_COMMAND_V1: Uint8Array = encoder.encode("spindle-adm-cmd-v1")
 export const HOST_OP_KEY_CERT_V1: Uint8Array = encoder.encode("spindle-host-cert-v1");
 /** `HostDeviceCert` (A4/A10.35) — signed by the host operating key. */
 export const HOST_DEVICE_CERT_V1: Uint8Array = encoder.encode("spindle-host-dev-cert-v1");
+/** `SessionAttestation` (A4/A7b, added v0.9.29) — signed by the device identity key. Device
+ * identity keys now sign two artifact types — `Envelope` (`spindle-env-v1`) and
+ * `SessionAttestation` (`spindle-sess-attest-v1`) — both produced online by the same key on the
+ * same connection, so this tag is the only thing preventing cross-artifact signature confusion
+ * between them (DESIGN.md §A7b). */
+export const SESSION_ATTESTATION_V1: Uint8Array = encoder.encode("spindle-sess-attest-v1");
 
 /**
  * Concatenates a domain tag with a byte string — `tag || bytes`. No hashing, no signing: this

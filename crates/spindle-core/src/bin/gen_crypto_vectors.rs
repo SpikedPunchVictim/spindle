@@ -16,9 +16,10 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use spindle_core::artifacts::{
     issue_admin_command, issue_admission_token, issue_capability, issue_device_certificate,
-    issue_host_device_cert, issue_host_op_key_cert, issue_revocation_record, verify_admin_command,
-    verify_admission_token, verify_capability, verify_device_certificate, verify_host_device_cert,
-    verify_host_op_key_cert, verify_revocation_record,
+    issue_host_device_cert, issue_host_op_key_cert, issue_revocation_record,
+    issue_session_attestation, verify_admin_command, verify_admission_token, verify_capability,
+    verify_device_certificate, verify_host_device_cert, verify_host_op_key_cert,
+    verify_revocation_record, verify_session_attestation,
 };
 use spindle_core::envelope::{
     derive_bootstrap_key, derive_session_key, open, seal, OpenParams, SealParams,
@@ -236,6 +237,11 @@ fn main() {
         "device-certificate.json",
         device_certificate_vectors(),
     );
+    write_vector_file(
+        &dir,
+        "session-attestation.json",
+        session_attestation_vectors(),
+    );
     write_vector_file(&dir, "capability.json", capability_vectors());
     write_vector_file(&dir, "host-op-key-cert.json", host_op_key_cert_vectors());
     write_vector_file(&dir, "host-device-cert.json", host_device_cert_vectors());
@@ -301,7 +307,6 @@ fn device_certificate_vectors() -> Json {
     // device identity `envelope_vectors` already uses) so the vector files describe one
     // consistent device.
     let device = DeviceKey::from_seeds(DEVICE_A_SIGN_SEED, DEVICE_A_AGREE_SEED);
-    let nats_fp = Fingerprint::of_parts(&[b"gen-crypto-vectors:device-certificate:nats"]);
     let ts = 1_755_907_200;
     let exp = 1_787_443_200; // ts + 1 year
 
@@ -310,7 +315,6 @@ fn device_certificate_vectors() -> Json {
         device.alg_id(),
         &device.sign_public_key(),
         &device.agree_public_key(),
-        nats_fp,
         ts,
         exp,
     );
@@ -322,7 +326,6 @@ fn device_certificate_vectors() -> Json {
             ("alg_id", Json::UInt(c.alg_id as u64)),
             ("sign_pk", Json::hex(&c.sign_pk)),
             ("agree_pk", Json::hex(&c.agree_pk)),
-            ("nats_fp", Json::hex(&c.nats_fp)),
             ("ts", Json::UInt(c.ts)),
             ("exp", Json::UInt(c.exp)),
             ("sig_root", Json::hex(&c.sig_root)),
@@ -356,12 +359,77 @@ fn device_certificate_vectors() -> Json {
 
     artifact_file(
         "DeviceCertificate",
-        spindle_proto::tags::DEVICE_CERT_V1,
+        spindle_proto::tags::DEVICE_CERT_V2,
         Json::Obj(vec![
             ("role", Json::Str("identity_root".into())),
             ("seed", seed_field("TEST-ONLY", &PERSON_ROOT_SEED)),
             ("public_key_hex", Json::hex(root.public_key().as_bytes())),
             ("root_fp_hex", Json::hex(&root.root_fp().to_vec())),
+        ]),
+        cases,
+    )
+}
+
+// ---- SessionAttestation ----
+
+/// td-0bcab4: reuses `DEVICE_A_*` (the same device identity `envelope_vectors`/
+/// `device_certificate_vectors` already use) so this generator's vector files describe one
+/// consistent device throughout, rather than inventing a fresh identity just for this artifact.
+fn session_attestation_vectors() -> Json {
+    let device = DeviceKey::from_seeds(DEVICE_A_SIGN_SEED, DEVICE_A_AGREE_SEED);
+    let nats_fp = Fingerprint::of_parts(&[b"gen-crypto-vectors:session-attestation:nats"]);
+    let ts = 1_755_907_200;
+
+    let att = issue_session_attestation(&device, nats_fp, ts);
+    assert!(verify_session_attestation(&att, &device.sign_public_key(), &nats_fp, ts).is_ok());
+
+    fn decoded(a: &spindle_proto::artifacts::SessionAttestation) -> Json {
+        Json::Obj(vec![
+            ("nats_fp", Json::hex(&a.nats_fp)),
+            ("ts", Json::UInt(a.ts)),
+            ("sig_device", Json::hex(&a.sig_device)),
+        ])
+    }
+
+    let mut tampered = att.clone();
+    tampered.sig_device = flip_last_byte(&att.sig_device);
+    assert!(
+        verify_session_attestation(&tampered, &device.sign_public_key(), &nats_fp, ts).is_err()
+    );
+
+    let cases = vec![
+        case(
+            "valid",
+            "Session attestation binding the device's identity key to one freshly-established NATS \
+             session key (td-0bcab4): sig_device(nats_fp, ts).",
+            decoded(&att),
+            &att.to_canonical_bytes(),
+            &att.signing_input(),
+            &att.sig_device,
+            true,
+        ),
+        case(
+            "tampered_signature_last_byte",
+            "sig_device's last byte flipped; verify_session_attestation must reject with \
+             BadSignature.",
+            decoded(&tampered),
+            &tampered.to_canonical_bytes(),
+            &tampered.signing_input(),
+            &tampered.sig_device,
+            false,
+        ),
+    ];
+
+    artifact_file(
+        "SessionAttestation",
+        spindle_proto::tags::SESSION_ATTESTATION_V1,
+        Json::Obj(vec![
+            ("role", Json::Str("device_identity".into())),
+            ("sign_seed", seed_field("TEST-ONLY", &DEVICE_A_SIGN_SEED)),
+            (
+                "public_key_hex",
+                Json::hex(device.sign_public_key().as_bytes()),
+            ),
         ]),
         cases,
     )

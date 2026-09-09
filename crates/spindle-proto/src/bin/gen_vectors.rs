@@ -13,7 +13,7 @@
 
 use spindle_proto::artifacts::{
     AdminCommand, AdmissionToken, CapKind, Capability, DeviceCertificate, Envelope, HostDeviceCert,
-    HostOpKeyCert, RevocationRecord,
+    HostOpKeyCert, RevocationRecord, SessionAttestation,
 };
 use spindle_proto::bootstrap::{
     BundleEntry, DeviceBootstrapBundle, BUNDLE_CURRENT_V, MAX_REGISTRY_LEN,
@@ -241,6 +241,11 @@ fn main() {
         &vectors_dir,
         "device-certificate.json",
         device_certificate_vectors(),
+    );
+    write_vector_file(
+        &vectors_dir,
+        "session-attestation.json",
+        session_attestation_vectors(),
     );
     write_vector_file(
         &vectors_dir,
@@ -495,7 +500,6 @@ fn device_certificate_vectors() -> Json {
         alg_id: 1,
         sign_pk: rep(0x77, 32),
         agree_pk: rep(0x78, 32),
-        nats_fp: rep(0x72, 32),
         ts: 1_755_907_200,
         exp: 1_787_443_200, // ts + 1 year
         sig_root: rep(0x73, 64),
@@ -505,7 +509,6 @@ fn device_certificate_vectors() -> Json {
         alg_id: 1,
         sign_pk: rep(0x79, 32),
         agree_pk: rep(0x7a, 32),
-        nats_fp: rep(0x75, 32),
         ts: 1_756_000_000, // re-signed on contact, per A4
         exp: 1_787_536_000,
         sig_root: rep(0x76, 64),
@@ -517,7 +520,6 @@ fn device_certificate_vectors() -> Json {
             ("alg_id", Json::UInt(c.alg_id as u64)),
             ("sign_pk", Json::hex(&c.sign_pk)),
             ("agree_pk", Json::hex(&c.agree_pk)),
-            ("nats_fp", Json::hex(&c.nats_fp)),
             ("ts", Json::UInt(c.ts)),
             ("exp", Json::UInt(c.exp)),
             ("sig_root", Json::hex(&c.sig_root)),
@@ -541,7 +543,55 @@ fn device_certificate_vectors() -> Json {
             &c2.signing_input(),
         ),
     ];
-    artifact_file("DeviceCertificate", tags::DEVICE_CERT_V1, cases)
+    artifact_file("DeviceCertificate", tags::DEVICE_CERT_V2, cases)
+}
+
+// ---- SessionAttestation ----
+
+fn session_attestation_vectors() -> Json {
+    // sig_device here is structural filler, not a real Ed25519 signature — this crate has no
+    // crypto dependency (A9c boundary rule 3) and cannot produce one. Real-signature validity
+    // vectors for this artifact are `spindle-core`'s `gen-crypto-vectors` job (see module docs).
+    let a1 = SessionAttestation {
+        nats_fp: rep(0xb1, 32),
+        ts: 1_755_907_200,
+        sig_device: rep(0xb2, 64),
+    };
+    let a2 = SessionAttestation {
+        nats_fp: rep(0xb3, 32), // a different session nkey than a1's
+        ts: 1_755_907_260,
+        sig_device: rep(0xb4, 64),
+    };
+
+    fn decoded(a: &SessionAttestation) -> Json {
+        Json::Obj(vec![
+            ("nats_fp", Json::hex(&a.nats_fp)),
+            ("ts", Json::UInt(a.ts)),
+            ("sig_device", Json::hex(&a.sig_device)),
+        ])
+    }
+
+    let cases = vec![
+        case(
+            "freshly_issued",
+            "Session attestation binding a device's identity key to one freshly-established NATS \
+             session key (td-0bcab4): sig_device(nats_fp, ts).",
+            decoded(&a1),
+            &a1.to_canonical_bytes(),
+            &a1.signing_input(),
+        ),
+        case(
+            "different_session_nkey",
+            "A second attestation, same device, naming a different nats_fp: this artifact's whole \
+             purpose is being minted fresh per session (unlike DeviceCertificate/Capability, which \
+             persist across many sessions), so two attestations from the same device legitimately \
+             differ only in which session key they name and when.",
+            decoded(&a2),
+            &a2.to_canonical_bytes(),
+            &a2.signing_input(),
+        ),
+    ];
+    artifact_file("SessionAttestation", tags::SESSION_ATTESTATION_V1, cases)
 }
 
 // ---- RevocationRecord ----

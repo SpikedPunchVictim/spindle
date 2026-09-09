@@ -16,8 +16,11 @@ pub const ENVELOPE_V1: &[u8] = b"spindle-env-v1";
 pub const CAPABILITY_V1: &[u8] = b"spindle-cap-v1";
 /// `AdmissionToken` (A3b) — signed by the operator admission key.
 pub const ADMISSION_TOKEN_V1: &[u8] = b"spindle-adm-v1";
-/// `DeviceCertificate` (A4) — signed by the identity root.
-pub const DEVICE_CERT_V1: &[u8] = b"spindle-dev-cert-v1";
+/// `DeviceCertificate` (A4) — signed by the identity root. Bumped to v2 in v0.9.29: this artifact
+/// carries no `v` field, so per DESIGN.md §A7b the domain tag *is* the version discriminant, and
+/// v0.9.29 removed `nats_fp` from the certificate — a wire-visible change — which is expressed
+/// here as `spindle-dev-cert-v1` → `spindle-dev-cert-v2` rather than as a field-level version.
+pub const DEVICE_CERT_V2: &[u8] = b"spindle-dev-cert-v2";
 /// `RevocationRecord` (A4) — signed by the host operating key or an identity root.
 pub const REVOCATION_V1: &[u8] = b"spindle-rev-v1";
 /// `AdminCommand` (A3b/A7b) — signed by the operator admission key.
@@ -26,6 +29,12 @@ pub const ADMIN_COMMAND_V1: &[u8] = b"spindle-adm-cmd-v1";
 pub const HOST_OP_KEY_CERT_V1: &[u8] = b"spindle-host-cert-v1";
 /// `HostDeviceCert` (A4/A10.35) — signed by the host operating key.
 pub const HOST_DEVICE_CERT_V1: &[u8] = b"spindle-host-dev-cert-v1";
+/// `SessionAttestation` (A4/A7b, added v0.9.29) — signed by the device identity key. Device
+/// identity keys now sign two artifact types — `Envelope` (`spindle-env-v1`) and
+/// `SessionAttestation` (`spindle-sess-attest-v1`) — both produced online by the same key on the
+/// same connection, so this tag is the only thing preventing cross-artifact signature confusion
+/// between them (DESIGN.md §A7b).
+pub const SESSION_ATTESTATION_V1: &[u8] = b"spindle-sess-attest-v1";
 
 /// Concatenates a domain tag with a byte string — `tag || bytes`. No hashing, no signing: this
 /// crate only assembles the exact byte sequence that `spindle-core` will later sign or verify.
@@ -52,16 +61,17 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_tags_distinct() {
+    fn all_nine_tags_distinct() {
         let tags = [
             ENVELOPE_V1,
             CAPABILITY_V1,
             ADMISSION_TOKEN_V1,
-            DEVICE_CERT_V1,
+            DEVICE_CERT_V2,
             REVOCATION_V1,
             ADMIN_COMMAND_V1,
             HOST_OP_KEY_CERT_V1,
             HOST_DEVICE_CERT_V1,
+            SESSION_ATTESTATION_V1,
         ];
         for i in 0..tags.len() {
             for j in 0..tags.len() {

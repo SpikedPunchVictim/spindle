@@ -1764,6 +1764,7 @@ fn handle_one(
                 device_cert: d.device_cert,
                 caps: d.caps,
                 nats_fp,
+                session_attest: d.session_attest,
             };
             let decision =
                 authz::decide_device_connect(&presented, verify_nkey_sig, now, view, jitter);

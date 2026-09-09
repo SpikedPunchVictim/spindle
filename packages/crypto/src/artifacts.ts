@@ -13,6 +13,7 @@
 // | RevocationRecord | host op key or identity root |
 // | AdmissionToken | operator admission key |
 // | AdminCommand | operator admission key |
+// | SessionAttestation | device identity key |
 //
 // This module never reads a system clock: every time check takes a caller-supplied `now: bigint`
 // (Unix seconds), consistent with DESIGN.md §A7 ("clients compute an offset" from helper server
@@ -28,6 +29,7 @@ import {
   HostDeviceCert,
   HostOpKeyCert,
   RevocationRecord,
+  SessionAttestation,
 } from "@spindle/proto";
 
 import { ed25519 } from "@noble/curves/ed25519.js";
@@ -41,6 +43,9 @@ const ALG_ID_V1 = 1;
 
 /** `|ts - now| <= 2 min` (DESIGN.md §A7b), same window as the envelope's clock-skew rule. */
 export const ADMIN_COMMAND_CLOCK_SKEW_SECS = 120n;
+
+/** A7b time rule for `SessionAttestation`: `ts` ±2 min against helper server time. */
+export const SESSION_ATTESTATION_CLOCK_SKEW_SECS = 120n;
 
 /** Errors from verifying any A7b signed artifact in this module (DESIGN.md §A7b). Every `verify*`
  * function fails closed on the first check it fails — never silently. Mirrors `spindle-core`'s
@@ -56,7 +61,8 @@ export type ArtifactErrorKind =
   | "MalformedOpCert"
   | "DeviceFingerprintMismatch"
   | "UnsupportedAlgId"
-  | "VersionTooLow";
+  | "VersionTooLow"
+  | "SessionKeyMismatch";
 
 export class ArtifactError extends Error {
   readonly kind: ArtifactErrorKind;
@@ -120,6 +126,12 @@ export class ArtifactError extends Error {
       "VersionTooLow",
       `artifact version ${found} is below the minimum ${minimum}`,
       { found, minimum },
+    );
+  }
+  static sessionKeyMismatch(): ArtifactError {
+    return new ArtifactError(
+      "SessionKeyMismatch",
+      "session attestation does not name the connecting session key",
     );
   }
 }
@@ -401,4 +413,58 @@ export async function verifyHostDeviceCert(
 
   // 8. exp check.
   checkExp(now, cert.exp);
+}
+
+/** Verifies a session attestation: `sig_device(nats_fp, ts)` (DESIGN.md §A3, §A4 step 2, §A7b,
+ * added v0.9.29) — the per-session binding by which a device's **identity** key authorizes
+ * exactly one NATS session nkey. A7b properties: signer = the device identity key (`deviceSignPk`,
+ * the same key certified in the device's own `DeviceCertificate.sign_pk`); time rule = `ts`
+ * checked ±2 min against the caller-supplied `now` (`SESSION_ATTESTATION_CLOCK_SKEW_SECS`);
+ * replay rule = n/a — the artifact is inert without the nkey secret it names, whose possession the
+ * callout proves separately via the server-nonce signature. There is no `exp` field on this
+ * artifact; the `ts` skew window is its sole time bound.
+ *
+ * **`expectedNatsFp` is a required argument, deliberately and non-negotiably.** This artifact
+ * exists because of td-0bcab4: `DeviceCertificate.nats_fp` was carried on the wire for exactly
+ * this purpose — binding a device to one NATS session key — and no verifier in either language
+ * ever read it, so the bundle `{root_pk, device_cert, caps}` was a pure bearer token: the device's
+ * identity key was never exercised at CONNECT, so anyone holding a copy could connect from any
+ * nkey. A `verifySessionAttestation` that resolved for a well-signed attestation naming somebody
+ * else's session key would reproduce that defect exactly, one artifact later — a verify function
+ * that takes the artifact but not the value it is supposed to be bound to is exactly how this bug
+ * happened. There is no valid caller that wants the signature checked without the binding, so this
+ * API does not offer one.
+ *
+ * Checks run cheap-structural-before-crypto (§A6), in this order:
+ * 1. `expectedNatsFp` matches `attestation.nats_fp` — the binding check td-0bcab4 exists for, run
+ *    first because it is both the cheapest possible rejection and the one this function exists to
+ *    enforce.
+ * 2. Clock skew: `|now - attestation.ts| <= 2 min`, via the same `checkSkew` idiom
+ *    `verifyAdminCommand` uses (its internal `absDiff` orders the subtraction to avoid
+ *    underflow-wrap on the unsigned `now`/`ts` wire values).
+ * 3. `deviceSignPk` parses as a valid Ed25519 public key, and `sig_device` verifies over
+ *    `SessionAttestation.signingInput(attestation)`. */
+export async function verifySessionAttestation(
+  attestation: SessionAttestation,
+  deviceSignPk: Uint8Array,
+  expectedNatsFp: Uint8Array,
+  now: bigint,
+  opts?: BackendOption,
+): Promise<void> {
+  // 1. nats_fp binding — the check this artifact exists for (td-0bcab4). Must run before any
+  // crypto work, per §A6, and before the skew check too: naming the wrong session key is a
+  // structural mismatch, cheaper to reject than either the timestamp or the signature.
+  if (!bytesEqual(expectedNatsFp, attestation.nats_fp)) throw ArtifactError.sessionKeyMismatch();
+
+  // 2. Clock skew.
+  checkSkew(now, attestation.ts, SESSION_ATTESTATION_CLOCK_SKEW_SECS);
+
+  // 3. Signature, under the device's own identity key.
+  requireEd25519PublicKey(deviceSignPk);
+  await verifySigOrThrow(
+    deviceSignPk,
+    SessionAttestation.signingInput(attestation),
+    attestation.sig_device,
+    opts?.backend,
+  );
 }

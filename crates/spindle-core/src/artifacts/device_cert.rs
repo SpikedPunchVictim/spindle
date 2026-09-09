@@ -5,20 +5,25 @@ use ed25519_dalek::{Verifier, VerifyingKey};
 use spindle_proto::artifacts::DeviceCertificate;
 use x25519_dalek::PublicKey as X25519PublicKey;
 
-/// Issues `sig_root(device_fp, alg_id, sign_pk, agree_pk, nats_fp, ts)` (DESIGN.md §A4, as
-/// amended v0.9.16 A10.34) — only an identity root may sign a device certificate ("secondary
-/// devices cannot mint devices").
+/// Issues `sig_root(device_fp, alg_id, sign_pk, agree_pk, ts)` (DESIGN.md §A4, as amended
+/// v0.9.16 A10.34) — only an identity root may sign a device certificate ("secondary devices
+/// cannot mint devices").
 ///
 /// `device_fp` is derived here from `(alg_id, sign_pk, agree_pk)` via
 /// [`crate::identity::device_fp_of`] rather than accepted from the caller: an inconsistent
 /// certificate (one whose `device_fp` does not match its own preimage) is unconstructible through
 /// this API.
+///
+/// **[amended v0.9.29, A10.39]**: `nats_fp` is gone from this certificate; the session binding is
+/// now [`super::verify_session_attestation`] over a `SessionAttestation` artifact, signed online
+/// by the device's own identity key. Enforcing the certificate field instead was never a real
+/// alternative — the certificate is root-signed, so a per-session nkey would demand the person's
+/// root key warm on every connect, defeating DESIGN.md §A3's "rotated per session".
 pub fn issue_device_certificate(
     root: &RootKey,
     alg_id: u8,
     sign_pk: &VerifyingKey,
     agree_pk: &X25519PublicKey,
-    nats_fp: Fingerprint,
     ts: u64,
     exp: u64,
 ) -> DeviceCertificate {
@@ -28,7 +33,6 @@ pub fn issue_device_certificate(
         alg_id,
         sign_pk: sign_pk.as_bytes().to_vec(),
         agree_pk: agree_pk.as_bytes().to_vec(),
-        nats_fp: nats_fp.to_vec(),
         ts,
         exp,
         sig_root: Vec::new(),
@@ -95,13 +99,11 @@ mod tests {
     fn issue_and_verify_round_trip() {
         let root = RootKey::from_seed([0x01; 32]);
         let dev = device(0x50);
-        let nats_fp = Fingerprint::of_parts(&[b"nats"]);
         let cert = issue_device_certificate(
             &root,
             dev.alg_id(),
             &dev.sign_public_key(),
             &dev.agree_public_key(),
-            nats_fp,
             1_000,
             2_000,
         );
@@ -118,7 +120,6 @@ mod tests {
             dev.alg_id(),
             &dev.sign_public_key(),
             &dev.agree_public_key(),
-            Fingerprint::of_parts(&[b"n"]),
             1_000,
             2_000,
         );
@@ -143,7 +144,6 @@ mod tests {
             dev.alg_id(),
             &dev.sign_public_key(),
             &dev.agree_public_key(),
-            Fingerprint::of_parts(&[b"n"]),
             1_000,
             2_000,
         );
@@ -165,7 +165,6 @@ mod tests {
             dev.alg_id(),
             &dev.sign_public_key(),
             &dev.agree_public_key(),
-            Fingerprint::of_parts(&[b"n"]),
             1_000,
             2_000,
         );
@@ -206,7 +205,6 @@ mod tests {
             alg_id: device_b.alg_id(),
             sign_pk: device_b.sign_public_key().as_bytes().to_vec(),
             agree_pk: device_b.agree_public_key().as_bytes().to_vec(),
-            nats_fp: Fingerprint::of_parts(&[b"n"]).to_vec(),
             ts: 1_000,
             exp: 2_000,
             sig_root: Vec::new(),
@@ -229,7 +227,6 @@ mod tests {
             dev.alg_id(),
             &dev.sign_public_key(),
             &dev.agree_public_key(),
-            Fingerprint::of_parts(&[b"n"]),
             1_000,
             2_000,
         );
@@ -248,7 +245,6 @@ mod tests {
             dev.alg_id(),
             &dev.sign_public_key(),
             &dev.agree_public_key(),
-            Fingerprint::of_parts(&[b"n"]),
             1_000,
             2_000,
         );
@@ -267,7 +263,6 @@ mod tests {
             dev.alg_id(),
             &dev.sign_public_key(),
             &dev.agree_public_key(),
-            Fingerprint::of_parts(&[b"n"]),
             1_000,
             2_000,
         );
@@ -287,7 +282,6 @@ mod tests {
             dev.alg_id(),
             &dev.sign_public_key(),
             &dev.agree_public_key(),
-            Fingerprint::of_parts(&[b"n"]),
             1_000,
             2_000,
         );
@@ -306,7 +300,6 @@ mod tests {
             dev.alg_id(),
             &dev.sign_public_key(),
             &dev.agree_public_key(),
-            Fingerprint::of_parts(&[b"n"]),
             1_000,
             2_000,
         );
@@ -325,7 +318,6 @@ mod tests {
             dev.alg_id(),
             &dev.sign_public_key(),
             &dev.agree_public_key(),
-            Fingerprint::of_parts(&[b"n"]),
             1_000,
             2_000,
         );

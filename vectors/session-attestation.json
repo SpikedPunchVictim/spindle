@@ -1,0 +1,28 @@
+{
+  "artifact": "SessionAttestation",
+  "domain_tag": "spindle-sess-attest-v1",
+  "cases": [
+    {
+      "name": "freshly_issued",
+      "description": "Session attestation binding a device's identity key to one freshly-established NATS session key (td-0bcab4): sig_device(nats_fp, ts).",
+      "decoded": {
+        "nats_fp": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+        "ts": 1755907200,
+        "sig_device": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+      },
+      "canonical_cbor_hex": "a36274731a68a90480676e6174735f66705820b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b16a7369675f6465766963655840b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+      "signing_input_hex": "7370696e646c652d736573732d6174746573742d7631a26274731a68a90480676e6174735f66705820b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+    },
+    {
+      "name": "different_session_nkey",
+      "description": "A second attestation, same device, naming a different nats_fp: this artifact's whole purpose is being minted fresh per session (unlike DeviceCertificate/Capability, which persist across many sessions), so two attestations from the same device legitimately differ only in which session key they name and when.",
+      "decoded": {
+        "nats_fp": "b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3",
+        "ts": 1755907260,
+        "sig_device": "b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4"
+      },
+      "canonical_cbor_hex": "a36274731a68a904bc676e6174735f66705820b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b36a7369675f6465766963655840b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4",
+      "signing_input_hex": "7370696e646c652d736573732d6174746573742d7631a26274731a68a904bc676e6174735f66705820b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3"
+    }
+  ]
+}

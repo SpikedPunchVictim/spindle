@@ -31,7 +31,7 @@
 use spindle_core::artifacts::ArtifactError;
 use spindle_core::{root_fp_of, Fingerprint, VerifyingKey};
 use spindle_proto::artifacts::{
-    AdmissionToken, CapKind, Capability, DeviceCertificate, HostOpKeyCert,
+    AdmissionToken, CapKind, Capability, DeviceCertificate, HostOpKeyCert, SessionAttestation,
 };
 
 use crate::permissions::{self, Limits, SubjectPermissions};
@@ -100,6 +100,22 @@ pub enum RefusalReason {
     DeviceCertificateExpired,
     #[error("device certificate signature invalid")]
     BadDeviceCertificate,
+    /// §A4 step 2 (td-0bcab4). A **single** reason covers every way
+    /// [`spindle_core::artifacts::verify_session_attestation`] (or the cheap pre-check in
+    /// [`decide_device_connect`]) can fail: a mismatched `nats_fp`, a `ts` outside the skew
+    /// window, or a bad `sig_device`. This mirrors [`RefusalReason::BadDeviceCertificate`] and
+    /// [`RefusalReason::BadHostSignature`] above/below — not [`RefusalReason::HostCertificateSessionMismatch`],
+    /// which *is* split from `BadHostSignature` because it is a distinct check at a distinct point
+    /// (a cheap field comparison, run before the crypto). Here, both call sites (cheap pre-check
+    /// and authoritative verification) test the *same* fact — does this session_attest bind to
+    /// this session — so collapsing them to one reason isn't losing information a caller needs;
+    /// it's declining to hand a would-be attacker a way to distinguish "wrong session key" from
+    /// "bad signature" from a refused connection, when every `Refused` variant collapses to the
+    /// same [`UNIFORM_REFUSAL_MESSAGE`] on the wire anyway (§A5 uniform silent drops) — the
+    /// distinction would only ever be observable through timing or side channels this module's
+    /// ordering discipline already exists to close off.
+    #[error("device session attestation is missing, malformed, or names a different session key")]
+    BadSessionAttestation,
     #[error("no presented capability's subject matches the presenting identity root")]
     CapabilitySubjectMismatch,
     #[error("subject is revoked for this host")]
@@ -318,8 +334,10 @@ pub trait HelperView {
 /// What a device presents on CONNECT (DESIGN.md §A4 step 1), already decoded from the wire.
 /// `root_pk` is the identity root's public key carried alongside the device certificate chain —
 /// [`spindle_proto::artifacts::DeviceCertificate`] itself carries no `root_pk` field (only
-/// `device_fp`/`nats_fp`/`ts`/`exp`/`sig_root`), so the verifier needs it presented out of band,
-/// the same way `HostOpKeyCert` needs `host_root_pk` (see [`HostConnectPresented`]).
+/// `device_fp`/`alg_id`/`sign_pk`/`agree_pk`/`ts`/`exp`/`sig_root` — `nats_fp` was removed from it
+/// in v0.9.29, td-0bcab4; see [`SessionAttestation`] below), so the verifier needs `root_pk`
+/// presented out of band, the same way `HostOpKeyCert` needs `host_root_pk` (see
+/// [`HostConnectPresented`]).
 pub struct DeviceConnectPresented {
     pub root_pk: VerifyingKey,
     pub device_cert: DeviceCertificate,
@@ -328,6 +346,14 @@ pub struct DeviceConnectPresented {
     pub caps: Vec<Capability>,
     /// The session nkey's fingerprint, for the session record.
     pub nats_fp: Fingerprint,
+    /// §A4 step 2 (added v0.9.29, td-0bcab4): `sig_device(nats_fp, ts)`, proving the device's own
+    /// **identity** key — not just whichever nkey happens to be presenting — authorized this
+    /// session. Before this artifact existed, `{root_pk, device_cert, caps}` was a pure bearer
+    /// bundle: `verify_nkey_sig` only proves possession of the presenting nkey, and nothing
+    /// anywhere compared a device-bound fingerprint against it, so anyone holding a copy of the
+    /// bundle could connect as that member from any nkey. See [`decide_device_connect`]'s two
+    /// check sites for how this is enforced.
+    pub session_attest: SessionAttestation,
 }
 
 fn cap_host_fp(cap: &Capability) -> Option<Fingerprint> {
@@ -362,6 +388,21 @@ pub fn decide_device_connect(
     // 2. Cheap field check — plain integer comparison, no crypto.
     if now > presented.device_cert.exp {
         return AuthzDecision::Refused(RefusalReason::DeviceCertificateExpired);
+    }
+
+    // A cheap early rejection, not the authoritative check — that's check (ii) below, after
+    // `verify_device_certificate` succeeds. This is a byte comparison against the caller-supplied
+    // `nats_fp` (derived from whichever nkey is presenting, before any crypto has run), so a
+    // stolen `{root_pk, device_cert, caps, session_attest}` bundle replayed from an attacker's own
+    // nkey — exactly the attack td-0bcab4 closes — gets refused here rather than costing the
+    // callout two Ed25519 verifications (`verify_nkey_sig` plus `verify_session_attestation`)
+    // first (DESIGN.md §A12 #24; see the module docs' "Ordering" section and this file's
+    // `Cell`-counter ordering tests). It is deliberately redundant with check (ii): a
+    // self-consistent forged bundle could in principle carry a `session_attest.nats_fp` that
+    // matches `presented.nats_fp` while everything else is garbage, so this alone proves nothing
+    // — only that the cheap case can be dismissed without paying for crypto.
+    if !presented.nats_fp.matches(&presented.session_attest.nats_fp) {
+        return AuthzDecision::Refused(RefusalReason::BadSessionAttestation);
     }
 
     // 3. Cheap hashes (not signature verifications) deriving the presenting identity.
@@ -413,6 +454,32 @@ pub fn decide_device_connect(
     .is_err()
     {
         return AuthzDecision::Refused(RefusalReason::BadDeviceCertificate);
+    }
+
+    // (ii) The authoritative session-binding check (§A4 step 2, td-0bcab4) — and it must sit
+    // exactly here, after `verify_device_certificate` has succeeded and before any capability is
+    // trusted. `presented.device_cert.sign_pk` is only trustworthy once the certificate carrying
+    // it has been verified against the pinned root above: verifying `session_attest` against an
+    // *unverified* certificate's `sign_pk` would let an attacker present a self-made, unsigned (or
+    // wrongly-signed) certificate naming their own key and satisfy the attestation check with a
+    // signature they themselves produced — checking a signature against a key the attacker chose
+    // proves nothing about the device this connection claims to be. The cheap comparison in (i)
+    // above is not a substitute for this: it only ever inspects field bytes, never a signature.
+    let Ok(sign_pk_bytes) = <[u8; 32]>::try_from(presented.device_cert.sign_pk.as_slice()) else {
+        return AuthzDecision::Refused(RefusalReason::BadSessionAttestation);
+    };
+    let Some(device_sign_pk) = spindle_core::checked_verifying_key(&sign_pk_bytes) else {
+        return AuthzDecision::Refused(RefusalReason::BadSessionAttestation);
+    };
+    if spindle_core::artifacts::verify_session_attestation(
+        &presented.session_attest,
+        &device_sign_pk,
+        &presented.nats_fp,
+        now,
+    )
+    .is_err()
+    {
+        return AuthzDecision::Refused(RefusalReason::BadSessionAttestation);
     }
 
     let mut full_hosts: Vec<Fingerprint> = Vec::new();
@@ -632,6 +699,7 @@ mod tests {
     use super::*;
     use spindle_core::artifacts::{
         issue_admission_token, issue_capability, issue_device_certificate, issue_host_op_key_cert,
+        issue_session_attestation,
     };
     use spindle_core::identity::{DeviceKey, RootKey};
     use spindle_core::SigningKey;
@@ -792,23 +860,37 @@ mod tests {
         }
     }
 
-    fn device_setup() -> (RootKey, DeviceCertificate, Fingerprint) {
+    /// `session_fp` is the `nats_fp` the returned [`SessionAttestation`] is issued for — callers
+    /// must present that same fingerprint in `DeviceConnectPresented.nats_fp` (td-0bcab4:
+    /// `decide_device_connect` now enforces that the two match). Mirrors `host_setup` below, and
+    /// exists for the identical reason: this helper previously hardcoded a `nats_fp` (baked into
+    /// the now-removed `DeviceCertificate.nats_fp` field) that no caller ever matched — the exact
+    /// trap `host_setup`'s own doc comment / commit 7903370 flags on the host side. Every call
+    /// site below passes `fp(b"nats-session")`, the same value it puts in
+    /// `DeviceConnectPresented.nats_fp`, so the valid-path tests genuinely exercise a *matching*
+    /// binding, not merely a present-but-unchecked field.
+    fn device_setup(
+        session_fp: Fingerprint,
+    ) -> (RootKey, DeviceCertificate, SessionAttestation, Fingerprint) {
         let root = RootKey::from_seed([0x01; 32]);
         // A10.34: `issue_device_certificate` derives device_fp from real device keys now, so a
         // certificate that must pass its own binding check needs a genuine `DeviceKey` rather
         // than a fabricated fingerprint.
         let device = DeviceKey::from_seeds([0x02; 32], [0x03; 32]);
-        let nats_fp = fp(b"nats-1");
         let cert = issue_device_certificate(
             &root,
             device.alg_id(),
             &device.sign_public_key(),
             &device.agree_public_key(),
-            nats_fp,
             1_000,
             2_000_000,
         );
-        (root, cert, device.device_fp())
+        // ts=1_500 matches every caller's `now` argument to `decide_device_connect` below — the
+        // attestation's own clock-skew window (±120s, `SESSION_ATTESTATION_CLOCK_SKEW_SECS`) is a
+        // property of `verify_session_attestation` itself (already covered by that function's own
+        // unit tests in spindle-core), not something this file's tests need to re-prove.
+        let session_attest = issue_session_attestation(&device, session_fp, 1_500);
+        (root, cert, session_attest, device.device_fp())
     }
 
     fn member_cap(host: &TestHost, subject: Fingerprint, epoch: u64, exp: u64) -> Capability {
@@ -841,13 +923,14 @@ mod tests {
 
     #[test]
     fn fresh_key_with_no_cap_is_refused() {
-        let (_root, cert, _dfp) = device_setup();
+        let (_root, cert, attest, _dfp) = device_setup(fp(b"nats-session"));
         let root_pk = RootKey::from_seed([0x01; 32]).public_key();
         let presented = DeviceConnectPresented {
             root_pk,
             device_cert: cert,
             caps: vec![],
             nats_fp: fp(b"nats-session"),
+            session_attest: attest,
         };
         let mut view = MockView::default();
         let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
@@ -859,7 +942,7 @@ mod tests {
 
     #[test]
     fn expired_cap_with_bad_signature_is_refused() {
-        let (root, cert, _dfp) = device_setup();
+        let (root, cert, attest, _dfp) = device_setup(fp(b"nats-session"));
         let root_fp = root.root_fp();
         let host = test_host([0x11; 32], [0x12; 32]);
         let mut cap = member_cap(&host, root_fp, 0, 1_000); // already expired at now=1_500
@@ -869,6 +952,7 @@ mod tests {
             device_cert: cert,
             caps: vec![cap],
             nats_fp: fp(b"nats-session"),
+            session_attest: attest,
         };
         let mut view = MockView::default();
         let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
@@ -880,7 +964,7 @@ mod tests {
 
     #[test]
     fn capability_subject_mismatch_is_refused() {
-        let (root, cert, _dfp) = device_setup();
+        let (root, cert, attest, _dfp) = device_setup(fp(b"nats-session"));
         let host = test_host([0x11; 32], [0x12; 32]);
         let cap = member_cap(&host, fp(b"someone-else"), 0, 2_000_000);
         let presented = DeviceConnectPresented {
@@ -888,6 +972,7 @@ mod tests {
             device_cert: cert,
             caps: vec![cap],
             nats_fp: fp(b"nats-session"),
+            session_attest: attest,
         };
         let mut view = MockView::default();
         let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
@@ -899,7 +984,7 @@ mod tests {
 
     #[test]
     fn revoked_subject_is_refused_outright_never_connect_only() {
-        let (root, cert, _dfp) = device_setup();
+        let (root, cert, attest, _dfp) = device_setup(fp(b"nats-session"));
         let root_fp = root.root_fp();
         let host = test_host([0x11; 32], [0x12; 32]);
         let host_fp = host.host_fp;
@@ -910,6 +995,7 @@ mod tests {
             device_cert: cert,
             caps: vec![cap],
             nats_fp: fp(b"nats-session"),
+            session_attest: attest,
         };
         let mut view = MockView::default();
         view.revoked.insert((host_fp, root_fp));
@@ -923,7 +1009,7 @@ mod tests {
 
     #[test]
     fn expired_but_signature_valid_member_cap_is_connect_only() {
-        let (root, cert, device_fp) = device_setup();
+        let (root, cert, attest, device_fp) = device_setup(fp(b"nats-session"));
         let root_fp = root.root_fp();
         let host = test_host([0x11; 32], [0x12; 32]);
         let host_fp = host.host_fp;
@@ -933,6 +1019,7 @@ mod tests {
             device_cert: cert,
             caps: vec![cap],
             nats_fp: fp(b"nats-session"),
+            session_attest: attest,
         };
         let mut view = MockView::default();
         let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
@@ -945,7 +1032,7 @@ mod tests {
 
     #[test]
     fn stale_epoch_signature_valid_member_cap_is_connect_only_renewal_path() {
-        let (root, cert, device_fp) = device_setup();
+        let (root, cert, attest, device_fp) = device_setup(fp(b"nats-session"));
         let root_fp = root.root_fp();
         let host = test_host([0x11; 32], [0x12; 32]);
         let host_fp = host.host_fp;
@@ -955,6 +1042,7 @@ mod tests {
             device_cert: cert,
             caps: vec![cap],
             nats_fp: fp(b"nats-session"),
+            session_attest: attest,
         };
         let mut view = MockView::default();
         view.epochs.insert(host_fp, 5); // helper's high-water is ahead of the cap's epoch
@@ -971,7 +1059,7 @@ mod tests {
 
     #[test]
     fn stale_epoch_and_revoked_is_refused_not_connect_only() {
-        let (root, cert, _dfp) = device_setup();
+        let (root, cert, attest, _dfp) = device_setup(fp(b"nats-session"));
         let root_fp = root.root_fp();
         let host = test_host([0x11; 32], [0x12; 32]);
         let host_fp = host.host_fp;
@@ -981,6 +1069,7 @@ mod tests {
             device_cert: cert,
             caps: vec![cap],
             nats_fp: fp(b"nats-session"),
+            session_attest: attest,
         };
         let mut view = MockView::default();
         view.epochs.insert(host_fp, 5);
@@ -994,7 +1083,7 @@ mod tests {
 
     #[test]
     fn too_many_capabilities_is_refused_before_any_signature_work() {
-        let (root, cert, _dfp) = device_setup();
+        let (root, cert, attest, _dfp) = device_setup(fp(b"nats-session"));
         let host = test_host([0x11; 32], [0x12; 32]);
         let caps: Vec<Capability> = (0..(MAX_CAPS_PER_CONNECTION + 1))
             .map(|_| member_cap(&host, root.root_fp(), 0, 2_000_000))
@@ -1004,6 +1093,7 @@ mod tests {
             device_cert: cert,
             caps,
             nats_fp: fp(b"nats-session"),
+            session_attest: attest,
         };
         let mut view = MockView::default();
         let nkey_calls = Cell::new(0u32);
@@ -1030,7 +1120,7 @@ mod tests {
 
     #[test]
     fn invite_cap_is_always_connect_only_even_when_fresh() {
-        let (root, cert, device_fp) = device_setup();
+        let (root, cert, attest, device_fp) = device_setup(fp(b"nats-session"));
         let root_fp = root.root_fp();
         let host = test_host([0x11; 32], [0x12; 32]);
         let host_fp = host.host_fp;
@@ -1040,6 +1130,7 @@ mod tests {
             device_cert: cert,
             caps: vec![cap],
             nats_fp: fp(b"nats-session"),
+            session_attest: attest,
         };
         let mut view = MockView::default();
         let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
@@ -1054,17 +1145,18 @@ mod tests {
 
     #[test]
     fn valid_member_cap_is_fully_authorized() {
-        let (root, cert, device_fp) = device_setup();
+        let nats_fp = fp(b"nats-session");
+        let (root, cert, attest, device_fp) = device_setup(nats_fp);
         let root_fp = root.root_fp();
         let host = test_host([0x11; 32], [0x12; 32]);
         let host_fp = host.host_fp;
         let cap = member_cap(&host, root_fp, 0, 2_000_000);
-        let nats_fp = fp(b"nats-session");
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,
             caps: vec![cap],
             nats_fp,
+            session_attest: attest,
         };
         let mut view = MockView::default();
         let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 42);
@@ -1090,7 +1182,8 @@ mod tests {
 
     #[test]
     fn mixed_full_and_connect_only_hosts_merge_permissions() {
-        let (root, cert, device_fp) = device_setup();
+        let nats_fp = fp(b"nats-session");
+        let (root, cert, attest, device_fp) = device_setup(nats_fp);
         let root_fp = root.root_fp();
         // Two distinct hosts (distinct root seeds, not just distinct op seeds) — host_fp is now
         // root-derived (A10.30), so two hosts must differ at the root to land in different
@@ -1101,12 +1194,12 @@ mod tests {
         let stale_host = host_b.host_fp;
         let full_cap = member_cap(&host_a, root_fp, 0, 2_000_000);
         let stale_cap = member_cap(&host_b, root_fp, 0, 1_000); // expired -> connect-only
-        let nats_fp = fp(b"nats-session");
         let presented = DeviceConnectPresented {
             root_pk: root.public_key(),
             device_cert: cert,
             caps: vec![full_cap, stale_cap],
             nats_fp,
+            session_attest: attest,
         };
         let mut view = MockView::default();
         let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
@@ -1118,6 +1211,115 @@ mod tests {
                 permissions::client_connect_only_permissions(device_fp, &[stale_host]),
             );
         assert_eq!(auth.permissions, expected);
+    }
+
+    /// td-0bcab4 §A4 step 2, unit-level twin of the live repro this fix closes: before this
+    /// change, `{root_pk, device_cert, caps}` was a pure bearer bundle — a copy of it authorized a
+    /// connection from *any* nkey, not just the one it was issued for. Here every artifact in the
+    /// bundle is otherwise genuinely valid (a real cert, a real member cap, a real
+    /// `SessionAttestation`) — the *only* thing wrong is that the attestation names a different
+    /// session key than the one actually connecting. That must still be refused.
+    #[test]
+    fn device_bundle_presented_from_a_different_nkey_is_refused() {
+        let issued_for = fp(b"nats-session");
+        let (root, cert, attest, _dfp) = device_setup(issued_for);
+        let root_fp = root.root_fp();
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let cap = member_cap(&host, root_fp, 0, 2_000_000);
+        let presented_fp = fp(b"nats-session-attacker");
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![cap],
+            nats_fp: presented_fp,
+            session_attest: attest,
+        };
+        let mut view = MockView::default();
+        let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
+        assert_eq!(
+            decision,
+            AuthzDecision::Refused(RefusalReason::BadSessionAttestation)
+        );
+    }
+
+    /// This is the test that would fail if someone later "optimized away" the Ed25519 verification
+    /// in check (ii) and kept only the cheap `nats_fp` comparison from check (i): the attestation
+    /// here *does* name the connecting session key, so the cheap check alone would wave it
+    /// through. The signature, however, was produced by a different device's identity key than the
+    /// one `device_cert` (and its `sign_pk`) actually names — so only the authoritative check in
+    /// `decide_device_connect`, which verifies `sig_device` under the certificate's own (now
+    /// cert-verified) `sign_pk`, can catch this.
+    #[test]
+    fn device_session_attestation_with_wrong_device_signature_is_refused() {
+        let nats_fp = fp(b"nats-session");
+        let (root, cert, _genuine_attest, _dfp) = device_setup(nats_fp);
+        let root_fp = root.root_fp();
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let cap = member_cap(&host, root_fp, 0, 2_000_000);
+        // A different device's identity key signs an attestation naming the *correct* nats_fp —
+        // the binding field matches, but the signature does not belong to the device the
+        // certificate names.
+        let attacker_device = DeviceKey::from_seeds([0x88; 32], [0x89; 32]);
+        // ts=1_500 matches `now` below so this test fails on the signature check specifically,
+        // not incidentally on clock skew.
+        let forged_attest = issue_session_attestation(&attacker_device, nats_fp, 1_500);
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![cap],
+            nats_fp,
+            session_attest: forged_attest,
+        };
+        let mut view = MockView::default();
+        let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
+        assert_eq!(
+            decision,
+            AuthzDecision::Refused(RefusalReason::BadSessionAttestation)
+        );
+    }
+
+    /// Mirrors `host_op_cert_session_mismatch_is_refused_before_any_signature_work` — the cheap
+    /// pre-check (i) in `decide_device_connect` must refuse a mismatched `session_attest.nats_fp`
+    /// without ever calling `verify_nkey_sig`, exactly like the host half's ordering test proves
+    /// for `HostCertificateSessionMismatch` (DESIGN.md §A12 #24; see the module docs' "Ordering"
+    /// section).
+    #[test]
+    fn device_session_mismatch_is_refused_before_any_signature_work() {
+        let issued_for = fp(b"nats-session");
+        let (root, cert, attest, _dfp) = device_setup(issued_for);
+        let root_fp = root.root_fp();
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let cap = member_cap(&host, root_fp, 0, 2_000_000);
+        let presented_fp = fp(b"nats-session-attacker");
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![cap],
+            nats_fp: presented_fp,
+            session_attest: attest,
+        };
+        let mut view = MockView::default();
+        let nkey_calls = Cell::new(0u32);
+        let decision = decide_device_connect(
+            &presented,
+            || {
+                nkey_calls.set(nkey_calls.get() + 1);
+                true
+            },
+            1_500,
+            &mut view,
+            0,
+        );
+        assert_eq!(
+            decision,
+            AuthzDecision::Refused(RefusalReason::BadSessionAttestation)
+        );
+        assert_eq!(
+            nkey_calls.get(),
+            0,
+            "the nkey signature must never be checked when the session-attestation mismatch \
+             check already refuses"
+        );
     }
 
     // ---- decide_host_connect --------------------------------------------------------------

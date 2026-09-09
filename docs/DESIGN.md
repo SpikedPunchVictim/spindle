@@ -282,13 +282,17 @@ signer, result).
 - *Device* = keypair generated on-device: Ed25519 (sign) + X25519 (agree); `alg_id` is a **suite version byte**
   (`1` = Ed25519/X25519/AES-256-GCM; no P-256 fallback — all target browsers ship Ed25519/X25519);
   `device_fp = base32(SHA-256("spindle-dev-v1" || alg_id || sign_pk || agree_pk))`. Carries a **device certificate
-  signed only by the root**: `sig_root(device_fp, alg_id, sign_pk, agree_pk, nats_fp, ts)`. **[amended v0.9.16,
-  A10.34]** The certificate now publishes the `sign_pk`/`agree_pk` preimage that `device_fp` already commits to
-  (above), giving A7's `X25519(dev_self, dev_agree_peer)` term a defined source; a verifier recomputes `device_fp`
-  locally and checks it, so this is not a new trust assumption. Dropping `label` is not a change — A7b already
-  recorded that the device certificate carries no `label`; this notation was simply stale. **Secondary devices cannot mint
-  devices** (a compromised secondary cannot amplify); browsers are never root holders. Adding a device = scan QR from the
-  primary device (or enter the recovery phrase on the new device, which then becomes primary).
+  signed only by the root**: `sig_root(device_fp, alg_id, sign_pk, agree_pk, ts)`. **[amended v0.9.16, A10.34]** The
+  certificate now publishes the `sign_pk`/`agree_pk` preimage that `device_fp` already commits to (above), giving A7's
+  `X25519(dev_self, dev_agree_peer)` term a defined source; a verifier recomputes `device_fp` locally and checks it, so
+  this is not a new trust assumption. Dropping `label` is not a change — A7b already recorded that the device certificate
+  carries no `label`; this notation was simply stale. **[amended v0.9.29]** `nats_fp` is likewise gone from this notation
+  — but unlike `label`, that one **is** a change: the field really was on the wire and really was in the signed preimage,
+  and no verifier in either language ever read it. The session binding is now the per-session attestation
+  `sig_device(nats_fp, ts)` (§A3, §A4 step 2); because this artifact carries no `v` field, the removal is expressed by the
+  tag: `spindle-dev-cert-v1` → `spindle-dev-cert-v2` (A10.39). **Secondary devices cannot mint devices** (a compromised
+  secondary cannot amplify); browsers are never root holders. Adding a device = scan QR from the primary device (or enter
+  the recovery phrase on the new device, which then becomes primary).
 - *Host* = has a **host identity root** (`host_fp = hash(host_root_pk)`, backed up with the share config / recovery
   phrase) that signs its **operating key** (`sig_host_root(host_op_pk, nats_fp, ts)`). Members pin `host_fp`; rotating
   or reinstalling the operating key from backup does **not** trigger the key-change wall; losing the host root = new

@@ -14,6 +14,7 @@
 //! | [`RevocationRecord`](spindle_proto::artifacts::RevocationRecord) | host op key or identity root |
 //! | [`AdmissionToken`](spindle_proto::artifacts::AdmissionToken) | operator admission key |
 //! | [`AdminCommand`](spindle_proto::artifacts::AdminCommand) | operator admission key |
+//! | [`SessionAttestation`](spindle_proto::artifacts::SessionAttestation) | device identity key (the one artifact here whose `verify_*` takes the value it binds — the connecting session's `nats_fp` — as a required argument rather than checking only a signature) |
 //!
 //! This crate never reads a system clock: every time check takes a caller-supplied `now: u64`
 //! (Unix seconds), consistent with DESIGN.md §A7 ("clients compute an offset" from helper server
@@ -37,6 +38,7 @@ mod device_cert;
 mod host_device_cert;
 mod host_op_key_cert;
 mod revocation;
+mod session_attest;
 
 pub use admin_command::{issue_admin_command, verify_admin_command};
 pub use admission_token::{issue_admission_token, verify_admission_token};
@@ -49,6 +51,9 @@ pub use device_cert::{issue_device_certificate, verify_device_certificate};
 pub use host_device_cert::{issue_host_device_cert, verify_host_device_cert};
 pub use host_op_key_cert::{issue_host_op_key_cert, verify_host_op_key_cert};
 pub use revocation::{is_newer_epoch, issue_revocation_record, verify_revocation_record};
+pub use session_attest::{
+    issue_session_attestation, verify_session_attestation, SESSION_ATTESTATION_CLOCK_SKEW_SECS,
+};
 
 use thiserror::Error;
 
@@ -91,6 +96,15 @@ pub enum ArtifactError {
     /// [`crate::envelope::EnvelopeError::VersionTooLow`]'s ordering.
     #[error("artifact version {found} is below the minimum {minimum}")]
     VersionTooLow { found: u8, minimum: u8 },
+    /// [`session_attest::verify_session_attestation`] (td-0bcab4, DESIGN.md §A4 step 2): the
+    /// attestation names a different session key than the one presenting it. This is plainly the
+    /// check whose absence made `{root_pk, device_cert, caps}` a bearer bundle: `DeviceCertificate`
+    /// used to carry a `nats_fp` field meant to bind a device to one NATS session key, but no
+    /// verifier in either language ever read it. `SessionAttestation` exists to be that binding
+    /// for real — checked first, before any signature work — so this error can only fire because
+    /// the check ran and the byte comparison failed, not because the check was skipped.
+    #[error("session attestation does not name the connecting session key")]
+    SessionKeyMismatch,
 }
 
 /// The version-floor check shared by [`capability::verify_capability`] and

@@ -13,12 +13,13 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use spindle_core::artifacts::{
     verify_admin_command, verify_admission_token, verify_capability, verify_device_certificate,
     verify_host_device_cert, verify_host_op_key_cert, verify_revocation_record,
+    verify_session_attestation,
 };
 use spindle_core::envelope::{open, OpenParams};
 use spindle_core::{root_fp_of, Fingerprint};
 use spindle_proto::artifacts::{
     AdminCommand, AdmissionToken, Capability, DeviceCertificate, Envelope, HostDeviceCert,
-    HostOpKeyCert, RevocationRecord,
+    HostOpKeyCert, RevocationRecord, SessionAttestation,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -316,7 +317,6 @@ fn device_certificate_vectors_verify() {
             alg_id: case.get("decoded").get("alg_id").as_u64() as u8,
             sign_pk: case.get("decoded").get("sign_pk").hex(),
             agree_pk: case.get("decoded").get("agree_pk").hex(),
-            nats_fp: case.get("decoded").get("nats_fp").hex(),
             ts: case.get("decoded").get("ts").as_u64(),
             exp: case.get("decoded").get("exp").as_u64(),
             sig_root: case.get("decoded").get("sig_root").hex(),
@@ -329,6 +329,42 @@ fn device_certificate_vectors_verify() {
 
         let now = case.get("decoded").get("ts").as_u64();
         let result = verify_device_certificate(&cert, &root_pk, &root_fp, now);
+        assert_eq!(
+            result.is_ok(),
+            case.get("signature_valid").as_bool(),
+            "case `{}`",
+            case.get("name").as_str()
+        );
+    }
+}
+
+// ================================================================================================
+// SessionAttestation: signer key supplied out of band (device identity key here); expected_nats_fp
+// is read per-case from the case's own `decoded.nats_fp` — this artifact's `nats_fp` field IS the
+// value `verify_session_attestation` requires the caller to already expect, so there is no separate
+// top-level field for it (unlike `signer`, which is the same key across every case).
+// ================================================================================================
+
+#[test]
+fn session_attestation_vectors_verify() {
+    let doc = load("session-attestation.json");
+    let device_sign_pk = verifying_key_from_hex(doc.get("signer").get("public_key_hex"));
+
+    for case in doc.get("cases").as_arr() {
+        let att = SessionAttestation {
+            nats_fp: case.get("decoded").get("nats_fp").hex(),
+            ts: case.get("decoded").get("ts").as_u64(),
+            sig_device: case.get("decoded").get("sig_device").hex(),
+        };
+        assert_eq!(
+            att.to_canonical_bytes(),
+            case.get("canonical_cbor_hex").hex()
+        );
+        assert_eq!(att.signing_input(), case.get("signing_input_hex").hex());
+
+        let expected_nats_fp = fingerprint_from_hex(case.get("decoded").get("nats_fp"));
+        let now = case.get("decoded").get("ts").as_u64();
+        let result = verify_session_attestation(&att, &device_sign_pk, &expected_nats_fp, now);
         assert_eq!(
             result.is_ok(),
             case.get("signature_valid").as_bool(),

@@ -19,11 +19,24 @@
 //! per-request correlation key used only to address the response back to the right pending
 //! connection (confirmed empirically: `probe.rs`'s captured request shows the two differ; using
 //! the wrong one made every signature check fail with `BadNkeySignature` while surfacing on the
-//! wire only as a bare `AuthorizationViolation` — see RESULTS.md). There is no separate
-//! `sig_device(nats_fp, ts)` artifact in `spindle_proto` (see `fixtures.rs`'s module docs) —
-//! this spike treats the NATS-level nkey proof-of-possession as satisfying that DESIGN.md
-//! sentence, since both express the same fact (this session's nkey is genuinely held by whoever
-//! is connecting), and no wire type exists for a distinct second signature.
+//! wire only as a bare `AuthorizationViolation` — see RESULTS.md).
+//!
+//! **[amended v0.9.29, td-0bcab4]**: this module used to say there was no separate
+//! `sig_device(nats_fp, ts)` artifact in `spindle_proto`, and that this spike treated the
+//! NATS-level nkey proof-of-possession above as satisfying that DESIGN.md sentence, "since both
+//! express the same fact." They do not: `verify_nkey_sig` only proves possession of whichever
+//! nkey is presenting — for a stolen `{root_pk, device_cert, caps}` bundle, the attacker's own —
+//! and never exercises the device's own identity key at all. That made the bundle a pure bearer
+//! token: anyone holding a copy connected as that member from any nkey and inherited its full
+//! permissions. This spike named the missing artifact correctly; the gap it worked around by
+//! substitution turned out to be exactly the vulnerability td-0bcab4 fixes.
+//! `spindle_proto::artifacts::SessionAttestation` is that artifact now (`sig_device` =
+//! `SessionAttestation.sig_device`). It is decoded from `auth_token`'s `session_attest` field
+//! (see `fixtures.rs`'s module docs) and passed into `DeviceConnectPresented::session_attest`
+//! below, where `decide_device_connect` verifies it binds to the connecting nkey under the
+//! certificate's `sign_pk` — cryptographically, after `verify_nkey_sig` above and
+//! `verify_device_certificate` have both already succeeded — rather than treating
+//! `verify_nkey_sig` as a substitute for it.
 //!
 //! # HelperView
 //! This spike uses an in-memory, all-permissive `HelperView` (no revocations, `open` admission
@@ -386,6 +399,7 @@ fn handle_one(
                 device_cert: d.device_cert,
                 caps: d.caps,
                 nats_fp,
+                session_attest: d.session_attest,
             };
             let decision =
                 authz::decide_device_connect(&presented, verify_nkey_sig, now, view, jitter_source);

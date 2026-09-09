@@ -837,8 +837,15 @@ async fn assert_revoked_device_cannot_reconnect(
         // under test here.
         let session = nkeys::KeyPair::new_user();
         let nats_fp = fixtures::nats_fp_of_nkey(&session.public_key());
-        let cert = device.certificate(nats_fp, fixtures::now(), exp);
-        let token = fixtures::device_auth_token(&device.root.public_key().to_bytes(), &cert, caps);
+        let ts = fixtures::now();
+        let cert = device.certificate(ts, exp);
+        let session_attest = device.session_attestation(nats_fp, ts);
+        let token = fixtures::device_auth_token(
+            &device.root.public_key().to_bytes(),
+            &cert,
+            &session_attest,
+            caps,
+        );
         let (opts, _events) = base_opts();
         let result = opts
             .nkey(session.seed().expect("session nkey seed"))
@@ -1165,5 +1172,95 @@ async fn live_capability_op_cert_must_not_authorize_a_host_connect() {
          gaining `sub host.{host_fp}.>`, `pub host.{host_fp}.sess.*.*.h2c`, and `pub \
          registry.revoke.{host_fp}` (permissions::host_permissions). This is td-0bcab4; it must \
          be reported as a genuine finding, not papered over by weakening this assertion."
+    );
+}
+
+/// Security regression for td-0bcab4 §A4 step 2: a stolen `{root_pk, device_cert, caps,
+/// session_attest}` bundle — everything a device presents at CONNECT — must not authorize a
+/// connection from a DIFFERENT nkey than the one `session_attest` names. Before
+/// `SessionAttestation` existed, `{root_pk, device_cert, caps}` alone was a pure bearer token:
+/// anyone holding a copy connected as that member from any nkey whatsoever and inherited its full
+/// permissions, because nothing at CONNECT ever exercised the device's own identity key —
+/// `verify_nkey_sig()` only ever proves possession of whichever nkey happens to be presenting,
+/// the attacker's own. `SessionAttestation` is `sig_device(nats_fp, ts)`: it is supposed to make
+/// the bundle useless without also holding the identity signing key, by binding it to the one
+/// session nkey it names.
+///
+/// The attack material here is not contrived: it is the *entire* bundle a thief would obtain by
+/// copying one real CONNECT's credentials — including the genuine `SessionAttestation` minted for
+/// that connection's own session nkey. The thief neither forges an attestation nor omits one;
+/// they replay the real one, from a different key. If `decide_device_connect` verified only that
+/// `session_attest` decodes and carries a valid `sig_device` — without checking that it names the
+/// *connecting* session's own `nats_fp` — this bundle would still authorize the attacker's own,
+/// completely unrelated nkey as this device.
+///
+/// The positive control below is what makes a refusal meaningful: it proves the live stack
+/// genuinely admits this device identity at all, so the attack's refusal afterward can only mean
+/// the session-attestation binding is enforced — not that the stack is unreachable or this device
+/// was never admitted in the first place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live stack required: run `docker compose -f deploy/docker-compose.yml up -d` first, \
+            then `cargo test -p spindle-net --test live_signaling -- --ignored --nocapture`. \
+            When run, an unreachable stack fails loudly — this test never skips."]
+async fn live_a_stolen_device_bundle_must_not_authorize_a_connect_from_another_nkey() {
+    let url = nats_url();
+    assert_stack_rejects_anonymous(&url).await;
+
+    // A host + device identity not used by any other test in this file.
+    let host_root = HostRootIdentity::new([0xA1; 32], [0xA2; 32]);
+    let device = DeviceIdentity::new([0xA3; 32], [0xA4; 32], [0xA5; 32]);
+    let exp = fixtures::now() + 3600;
+    let cap = host_root.member_capability(device.root_fp(), exp, vec![0xA6]);
+
+    // ---- positive control: this device identity is genuinely admitted by the live stack -------
+    // Connects for real, the normal way (`connect_device`, whose session attestation is
+    // genuinely bound to the session nkey it names). This proves the stack admits `device` at
+    // all, so a refusal in the attack below can only mean the session-attestation binding is
+    // enforced — not that the stack is broken or this device is unadmitted.
+    let (victim_nats, _victim_events, victim_user_pk) =
+        connect_device(&url, &device, std::slice::from_ref(&cap), exp).await;
+    drop(victim_nats);
+
+    // ---- the attack: the complete bundle a thief would obtain from that real connection —
+    // root_pk, device_cert, member caps, and its genuine SessionAttestation — presented from a
+    // freshly generated, unrelated attacker nkey ---------------------------------------------
+    //
+    // Rebuilding the attestation over the victim's own already-connected session nkey (rather
+    // than forging one, or omitting the field entirely) is deliberate and is the entire point of
+    // this test: it proves the refusal below comes from the *binding* — the attestation names a
+    // session key the attacker does not hold the seed for — not merely from a missing or
+    // malformed field. A test that omitted `session_attest` would pass for the wrong reason.
+    let victim_nats_fp = fixtures::nats_fp_of_nkey(&victim_user_pk);
+    let ts = fixtures::now();
+    let cert = device.certificate(ts, exp);
+    let genuine_session_attest = device.session_attestation(victim_nats_fp, ts);
+    let token = fixtures::device_auth_token(
+        &device.root.public_key().to_bytes(),
+        &cert,
+        &genuine_session_attest,
+        &[cap],
+    );
+
+    let attacker = nkeys::KeyPair::new_user();
+    let (opts, _events) = base_opts();
+    let result = opts
+        .nkey(attacker.seed().expect("attacker nkey seed"))
+        .token(token)
+        .connect(&url)
+        .await;
+
+    let device_fp = device.device_fp;
+    assert!(
+        result.is_err(),
+        "an attacker's own, unrelated nkey CONNECTed to the live stack presenting a stolen \
+         device bundle — root_pk, device_cert, member caps, and the victim's OWN genuine \
+         SessionAttestation (naming the victim's already-connected session nkey, not the \
+         attacker's) — and the stack ADMITTED it. `SessionAttestation` (td-0bcab4, DESIGN.md §A4 \
+         step 2) exists precisely so `{{root_pk, device_cert, caps}}` cannot be replayed as a \
+         bearer token from any nkey; if `decide_device_connect` accepts an attestation that does \
+         not name the connecting session's own nats_fp, this device's identity (device_fp \
+         {device_fp}) is fully impersonable by anyone who ever observes one of its real \
+         connections. This is td-0bcab4; it must be reported as a genuine finding, not papered \
+         over by weakening this assertion."
     );
 }

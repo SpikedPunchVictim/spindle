@@ -16,6 +16,7 @@ import type {
   HostDeviceCert,
   HostOpKeyCert,
   RevocationRecord,
+  SessionAttestation,
 } from "@spindle/proto";
 import { CapKind, canonicalDecode } from "@spindle/proto";
 import type { CborValue } from "@spindle/proto";
@@ -76,10 +77,18 @@ export function parseDeviceCertificate(d: any): DeviceCertificate {
     alg_id: Number(d.alg_id),
     sign_pk: hexToBytes(d.sign_pk),
     agree_pk: hexToBytes(d.agree_pk),
-    nats_fp: hexToBytes(d.nats_fp),
     ts: BigInt(d.ts),
     exp: BigInt(d.exp),
     sig_root: hexToBytes(d.sig_root),
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function parseSessionAttestation(d: any): SessionAttestation {
+  return {
+    nats_fp: hexToBytes(d.nats_fp),
+    ts: BigInt(d.ts),
+    sig_device: hexToBytes(d.sig_device),
   };
 }
 

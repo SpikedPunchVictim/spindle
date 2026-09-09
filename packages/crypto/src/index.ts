@@ -37,6 +37,7 @@ export {
   ADMIN_COMMAND_CLOCK_SKEW_SECS,
   ArtifactError,
   isNewerEpoch,
+  SESSION_ATTESTATION_CLOCK_SKEW_SECS,
   verifyAdminCommand,
   verifyAdmissionToken,
   verifyCapability,
@@ -44,6 +45,7 @@ export {
   verifyHostDeviceCert,
   verifyHostOpKeyCert,
   verifyRevocationRecord,
+  verifySessionAttestation,
 } from "./artifacts.js";
 
 export type { BundleErrorKind, VerifiedBundle, VerifiedBundleEntry } from "./bootstrap.js";

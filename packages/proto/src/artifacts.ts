@@ -558,7 +558,7 @@ export const AdmissionToken = {
 // DeviceCertificate (A4)
 // ============================================================================================
 
-/** `DeviceCertificate { device_fp, alg_id, sign_pk, agree_pk, nats_fp, ts, exp, sig_root }`
+/** `DeviceCertificate { device_fp, alg_id, sign_pk, agree_pk, ts, exp, sig_root }`
  * (DESIGN.md §A4).
  *
  * **Label discrepancy**: see the discrepancy note on `DeviceCertificate` in
@@ -573,13 +573,20 @@ export const AdmissionToken = {
  * `DeviceCertificate.toCbor`) — a verifier is expected to recompute `device_fp` from them and
  * reject on mismatch (§A7b clarification 6); this package only carries the bytes structurally and
  * does not itself perform that recomputation or any key-length/curve validation — that belongs to
- * `@spindle/crypto`. */
+ * `@spindle/crypto`.
+ *
+ * **[amended v0.9.29, A10.39]**: the certificate previously carried `nats_fp` as its intended
+ * session binding to a NATS connect key, but no verifier in either language ever read it. The
+ * session binding is now the `SessionAttestation` artifact (`spindle-sess-attest-v1`), signed by
+ * the device's own identity key. Enforcing the certificate's field instead was never a real
+ * alternative — the certificate is root-signed, so a per-session nkey would demand the person's
+ * root key warm on every connect, defeating DESIGN §A3's "rotated per session". With no `v` field,
+ * the removal is expressed by the domain tag: `spindle-dev-cert-v1` -> `spindle-dev-cert-v2`. */
 export interface DeviceCertificate {
   device_fp: Uint8Array;
   alg_id: number;
   sign_pk: Uint8Array;
   agree_pk: Uint8Array;
-  nats_fp: Uint8Array;
   ts: bigint;
   exp: bigint;
   sig_root: Uint8Array;
@@ -590,7 +597,6 @@ const DEVICE_CERT_FIELDS = [
   "alg_id",
   "sign_pk",
   "agree_pk",
-  "nats_fp",
   "ts",
   "exp",
   "sig_root",
@@ -603,7 +609,6 @@ export const DeviceCertificate = {
       ["alg_id", CborValue.uint(cert.alg_id)],
       ["sign_pk", CborValue.bytes(cert.sign_pk)],
       ["agree_pk", CborValue.bytes(cert.agree_pk)],
-      ["nats_fp", CborValue.bytes(cert.nats_fp)],
       ["ts", CborValue.uint(cert.ts)],
       ["exp", CborValue.uint(cert.exp)],
     ];
@@ -631,7 +636,6 @@ export const DeviceCertificate = {
       alg_id: m.u8("alg_id"),
       sign_pk: m.bytes("sign_pk"),
       agree_pk: m.bytes("agree_pk"),
-      nats_fp: m.bytes("nats_fp"),
       ts: m.u64("ts"),
       exp: m.u64("exp"),
       sig_root: m.bytes("sig_root"),
@@ -642,11 +646,85 @@ export const DeviceCertificate = {
     return DeviceCertificate.fromCbor(decodeCanonicalOrThrow(bytes));
   },
 
-  /** `"spindle-dev-cert-v1" || canonical(self minus sig_root)` (A7b). */
+  /** `"spindle-dev-cert-v2" || canonical(self minus sig_root)` (A7b). */
   signingInput(cert: DeviceCertificate): Uint8Array {
     return tags.signingInput(
-      tags.DEVICE_CERT_V1,
+      tags.DEVICE_CERT_V2,
       canonicalEncode(DeviceCertificate.unsignedCbor(cert)),
+    );
+  },
+};
+
+// ============================================================================================
+// SessionAttestation (A3/A4/A7b, added v0.9.29)
+// ============================================================================================
+
+/** `SessionAttestation { nats_fp, ts, sig_device }` (DESIGN.md §A3, §A4 step 2, §A7b, added
+ * v0.9.29).
+ *
+ * `sig_device(nats_fp, ts)` — the per-session attestation by which a device's **identity** key
+ * authorizes one NATS session nkey. It is what makes the bundle `{root_pk, device_cert, caps}`
+ * non-bearer: without it the device identity key is never exercised at CONNECT, and a copy of
+ * that bundle connects from any nkey at all.
+ *
+ * A7b time rule: `ts` is checked ±2 minutes against the helper server's clock. Replay rule: n/a —
+ * this artifact is inert without the nkey secret it names, whose possession the callout proves
+ * separately via the server-nonce signature.
+ *
+ * No `v` field (the domain tag, `spindle-sess-attest-v1`, is the version discriminant) and no
+ * `exp` (the `ts` skew window is the sole time bound).
+ *
+ * This package carries bytes only and performs no verification — that is `@spindle/crypto`'s job
+ * (A9c boundary rule 3). */
+export interface SessionAttestation {
+  nats_fp: Uint8Array;
+  ts: bigint;
+  sig_device: Uint8Array;
+}
+
+const SESSION_ATTESTATION_FIELDS = ["nats_fp", "ts", "sig_device"] as const;
+
+export const SessionAttestation = {
+  unsignedEntries(att: SessionAttestation): Array<[string, CborValue]> {
+    return [
+      ["nats_fp", CborValue.bytes(att.nats_fp)],
+      ["ts", CborValue.uint(att.ts)],
+    ];
+  },
+
+  unsignedCbor(att: SessionAttestation): CborValue {
+    return CborValue.map(SessionAttestation.unsignedEntries(att));
+  },
+
+  toCbor(att: SessionAttestation): CborValue {
+    const entries = SessionAttestation.unsignedEntries(att);
+    entries.push(["sig_device", CborValue.bytes(att.sig_device)]);
+    return CborValue.map(entries);
+  },
+
+  toCanonicalBytes(att: SessionAttestation): Uint8Array {
+    return canonicalEncode(SessionAttestation.toCbor(att));
+  },
+
+  fromCbor(v: CborValue): SessionAttestation {
+    const m = new MapReader(v);
+    m.denyUnknownFields(SESSION_ATTESTATION_FIELDS);
+    return {
+      nats_fp: m.bytes("nats_fp"),
+      ts: m.u64("ts"),
+      sig_device: m.bytes("sig_device"),
+    };
+  },
+
+  fromCanonicalBytes(bytes: Uint8Array): SessionAttestation {
+    return SessionAttestation.fromCbor(decodeCanonicalOrThrow(bytes));
+  },
+
+  /** `"spindle-sess-attest-v1" || canonical(self minus sig_device)` (A7b). */
+  signingInput(att: SessionAttestation): Uint8Array {
+    return tags.signingInput(
+      tags.SESSION_ATTESTATION_V1,
+      canonicalEncode(SessionAttestation.unsignedCbor(att)),
     );
   },
 };
@@ -899,12 +977,12 @@ export const HostOpKeyCert = {
  * **self-verifying**: it embeds `host_fp`, `host_root_pk`, and the complete canonical `op_cert`
  * encoding, needing no external registry lookup to walk root -> op -> device.
  *
- * **Why no `nats_fp` field**: the person/device `DeviceCertificate` binds `nats_fp` because that
- * callout ties a NATS session key to a device identity. The host's NATS connection is
- * authenticated separately, by its own `HostOpKeyCert`, which already carries the host's
- * `nats_fp`. This artifact is purely the §A7 envelope identity — adding `nats_fp` here would
- * duplicate (or, on a bug, contradict) the op cert's own binding rather than serve any need of its
- * own.
+ * **Why no `nats_fp` field**: neither device-shaped certificate carries `nats_fp` any more. A
+ * person/device's NATS session binding is the separate `SessionAttestation` artifact (added
+ * v0.9.29); the host's NATS connection is authenticated by its own `HostOpKeyCert`, which carries
+ * the host's `nats_fp` and — since v0.9.29 — is checked against the connecting nkey at the
+ * callout. This artifact is purely the §A7 envelope identity, so a `nats_fp` here would duplicate
+ * (or, on a bug, contradict) the op cert's binding rather than serve any need of its own.
  *
  * **[A10.34 preimage discipline, mirrored from `DeviceCertificate`]**: `alg_id`/`sign_pk`/
  * `agree_pk` are the exact preimage `host_device_fp` commits to

@@ -1,4 +1,4 @@
-// Golden-vector conformance for all eight A7b wire types (vectors/*.json, excluding
+// Golden-vector conformance for all nine A7b wire types (vectors/*.json, excluding
 // canonical-cbor.json — see canonical.test.ts for that one) plus negative mutation tests: swap
 // key order, lengthen an integer's encoding, and add an unrecognized field, each asserted to be
 // rejected by the strict decoder / closed-schema artifact reader.
@@ -20,6 +20,7 @@ import {
   HostOpKeyCert,
   ProtoError,
   RevocationRecord,
+  SessionAttestation,
 } from "../src/artifacts.js";
 import {
   addUnknownKey,
@@ -34,6 +35,7 @@ import {
   parseHostDeviceCert,
   parseHostOpKeyCert,
   parseRevocationRecord,
+  parseSessionAttestation,
   swapFirstTwoEntries,
 } from "./helpers.js";
 
@@ -177,6 +179,14 @@ runArtifactSuite({
   toCanonicalBytes: DeviceCertificate.toCanonicalBytes,
   fromCanonicalBytes: DeviceCertificate.fromCanonicalBytes,
   signingInput: DeviceCertificate.signingInput,
+});
+
+runArtifactSuite({
+  fileName: "session-attestation.json",
+  parse: parseSessionAttestation,
+  toCanonicalBytes: SessionAttestation.toCanonicalBytes,
+  fromCanonicalBytes: SessionAttestation.fromCanonicalBytes,
+  signingInput: SessionAttestation.signingInput,
 });
 
 runArtifactSuite({

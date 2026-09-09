@@ -107,9 +107,10 @@ async fn connect_device(
 ) -> anyhow::Result<(async_nats::Client, EventLog)> {
     let session = KeyPair::new_user();
     let nats_fp = fixtures::nats_fp_of_nkey(&session.public_key())?;
-    let cert = fixtures::device_certificate(device, nats_fp, now(), exp);
+    let cert = fixtures::device_certificate(device, now(), exp);
+    let attest = fixtures::session_attestation(device, nats_fp, now());
     let root_pk_bytes = device.root.public_key().to_bytes();
-    let token = fixtures::device_auth_token(&root_pk_bytes, &cert, &caps);
+    let token = fixtures::device_auth_token(&root_pk_bytes, &cert, &attest, &caps);
     // Real devices use a session-scoped custom inbox prefix (`_INBOX_<device_fp>`), matching the
     // subject table's `sub _INBOX_<own>.>` grant — the library's own default `_INBOX.<nuid>`
     // prefix would never match that allow pattern.
@@ -439,9 +440,10 @@ async fn main() -> anyhow::Result<ExitCode> {
         .run("fresh_key_no_cap_refused", async {
             let session = KeyPair::new_user();
             let nats_fp = fixtures::nats_fp_of_nkey(&session.public_key())?;
-            let cert = fixtures::device_certificate(&device_a, nats_fp, now(), exp);
+            let cert = fixtures::device_certificate(&device_a, now(), exp);
+            let attest = fixtures::session_attestation(&device_a, nats_fp, now());
             let root_pk_bytes = device_a.root.public_key().to_bytes();
-            let token = fixtures::no_cap_auth_token(&root_pk_bytes, &cert);
+            let token = fixtures::no_cap_auth_token(&root_pk_bytes, &cert, &attest);
             let (opts, _events) = base_opts();
             let result = opts.nkey(session.seed()?).token(token).connect(&url).await;
             Ok((

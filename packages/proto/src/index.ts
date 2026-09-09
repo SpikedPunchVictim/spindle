@@ -25,6 +25,7 @@ export {
   Capability,
   AdmissionToken,
   DeviceCertificate,
+  SessionAttestation,
   RevocationRecord,
   AdminCommand,
   HostOpKeyCert,

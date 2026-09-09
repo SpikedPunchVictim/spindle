@@ -9,28 +9,43 @@
 //! defines a minimal one, gap flagged here rather than silently invented:
 //!
 //! ```text
-//! device connection: { "kind": "device", "root_pk": bytes32, "device_cert": bytes, "caps": [bytes, ...] }
+//! device connection: { "kind": "device", "root_pk": bytes32, "device_cert": bytes,
+//!                       "session_attest": bytes, "caps": [bytes, ...] }
 //! host connection:   { "kind": "host", "host_root_pk": bytes32, "host_op_cert": bytes,
 //!                       "admission_token": bytes (present only if a token accompanies this connect) }
 //! ```
-//! `device_cert`/`host_op_cert`/`caps[i]`/`admission_token` are each the artifact's own
-//! `to_canonical_bytes()` output re-embedded as a CBOR byte string — this only needs to be
-//! symmetric with itself (encoder and decoder live in this same crate), not compatible with any
-//! other wire format. The whole envelope is canonical-CBOR-encoded, then base64url (no padding)
-//! for the CONNECT `auth_token` string, matching DESIGN.md's presentation rule.
+//! `device_cert`/`session_attest`/`host_op_cert`/`caps[i]`/`admission_token` are each the
+//! artifact's own `to_canonical_bytes()` output re-embedded as a CBOR byte string — this only
+//! needs to be symmetric with itself (encoder and decoder live in this same crate), not
+//! compatible with any other wire format, though it happens to match
+//! `spindle_helper::auth_token`'s later, graduated envelope field-for-field. The whole envelope is
+//! canonical-CBOR-encoded, then base64url (no padding) for the CONNECT `auth_token` string,
+//! matching DESIGN.md's presentation rule.
 //!
-//! There is no separate "session-nkey attestation" artifact in this envelope: see
-//! `src/bin/responder.rs`'s module docs for why `verify_nkey_sig` is satisfied by the real NATS
-//! CONNECT-level nkey signature (the callout request's `connect_opts.sig`/`nats.user_nkey`)
-//! rather than a bespoke `sig_device(nats_fp, ts)` artifact spindle-proto doesn't define.
+//! **[amended v0.9.29, td-0bcab4]**: this module used to note here that there was no separate
+//! "session-nkey attestation" artifact in this envelope, and that `verify_nkey_sig` — the real
+//! NATS CONNECT-level nkey signature (`connect_opts.sig`/`nats.user_nkey`) — was treated as
+//! satisfying DESIGN.md's `sig_device(nats_fp, ts)` sentence "since both express the same fact."
+//! They do not express the same fact: `verify_nkey_sig` proves only that whoever is connecting
+//! holds *some* nkey — for a stolen `{root_pk, device_cert, caps}` bundle, the attacker's own — and
+//! never exercises the device's own identity key at all. That made the bundle a pure bearer token:
+//! anyone holding a copy connected as that member from any nkey and inherited its full
+//! permissions. This spike named the missing artifact correctly (`sig_device(nats_fp, ts)`,
+//! DESIGN.md §A3) before it existed; the gap it worked around by substitution turned out to be
+//! exactly the vulnerability td-0bcab4 fixes. `spindle_proto::artifacts::SessionAttestation` is
+//! that artifact now, and this envelope's `session_attest` field carries it — see
+//! `src/bin/responder.rs`'s module docs for how the responder wires it into
+//! `decide_device_connect`.
 
 use base64::Engine;
 use nkeys::KeyPair;
-use spindle_core::artifacts::{issue_capability, issue_device_certificate, issue_host_op_key_cert};
+use spindle_core::artifacts::{
+    issue_capability, issue_device_certificate, issue_host_op_key_cert, issue_session_attestation,
+};
 use spindle_core::identity::{DeviceKey, RootKey};
 use spindle_core::{root_fp_of, Fingerprint};
 use spindle_proto::artifacts::{
-    AdmissionToken, CapKind, Capability, DeviceCertificate, HostOpKeyCert,
+    AdmissionToken, CapKind, Capability, DeviceCertificate, HostOpKeyCert, SessionAttestation,
 };
 use spindle_proto::canonical::CborValue;
 
@@ -82,22 +97,31 @@ pub fn new_device_identity(
     }
 }
 
-/// Issues a device certificate for `identity` binding it to `nats_fp`, `ts`, `exp`.
-pub fn device_certificate(
-    identity: &DeviceIdentity,
-    nats_fp: Fingerprint,
-    ts: u64,
-    exp: u64,
-) -> DeviceCertificate {
+/// Issues a device certificate for `identity` binding it to `ts`, `exp`. No longer binds a
+/// `nats_fp` — that field was removed from `DeviceCertificate` in v0.9.29 (td-0bcab4; see
+/// `spindle_proto::artifacts::DeviceCertificate`'s doc comment). The session binding now lives in
+/// a separate `SessionAttestation`, built by [`session_attestation`] below.
+pub fn device_certificate(identity: &DeviceIdentity, ts: u64, exp: u64) -> DeviceCertificate {
     issue_device_certificate(
         &identity.root,
         identity.device.alg_id(),
         &identity.device.sign_public_key(),
         &identity.device.agree_public_key(),
-        nats_fp,
         ts,
         exp,
     )
+}
+
+/// Issues the `SessionAttestation` (`sig_device(nats_fp, ts)`, DESIGN.md §A3/§A4 step 2/§A7b,
+/// added v0.9.29, td-0bcab4) binding `identity`'s device identity key to `nats_fp` at `ts` — the
+/// per-session proof that this connecting nkey was actually authorized by the device, not merely
+/// possessed by whoever is presenting it.
+pub fn session_attestation(
+    identity: &DeviceIdentity,
+    nats_fp: Fingerprint,
+    ts: u64,
+) -> SessionAttestation {
+    issue_session_attestation(&identity.device, nats_fp, ts)
 }
 
 /// A test host identity: host root key + operating key.
@@ -193,9 +217,14 @@ pub fn invite_capability(
 
 /// Builds the base64url canonical-CBOR `auth_token` for a device CONNECT (see module docs for
 /// the envelope shape). `caps` may be empty (the fresh-key/no-cap negative test).
+/// `session_attest` is required (td-0bcab4) — every caller must build one, matching the
+/// connecting session's own `nats_fp`, via [`session_attestation`]. Emitted as
+/// `session_attest.to_canonical_bytes()` under the `"session_attest"` key, byte-compatible with
+/// `spindle_helper::auth_token::decode_auth_token`.
 pub fn device_auth_token(
     root_pk_bytes: &[u8; 32],
     device_cert: &DeviceCertificate,
+    session_attest: &SessionAttestation,
     caps: &[Capability],
 ) -> String {
     let cap_bytes: Vec<CborValue> = caps
@@ -208,6 +237,10 @@ pub fn device_auth_token(
         (
             "device_cert",
             CborValue::bytes(device_cert.to_canonical_bytes()),
+        ),
+        (
+            "session_attest",
+            CborValue::bytes(session_attest.to_canonical_bytes()),
         ),
         ("caps", CborValue::array(cap_bytes)),
     ]);
@@ -243,15 +276,24 @@ pub fn host_auth_token(
 
 /// A fresh key presenting a syntactically-empty device auth_token (no capabilities at all) —
 /// the "fresh key with no cap" negative test (DESIGN.md §A13/§A5: "A connection presenting no
-/// valid cap is refused").
-pub fn no_cap_auth_token(root_pk_bytes: &[u8; 32], device_cert: &DeviceCertificate) -> String {
-    device_auth_token(root_pk_bytes, device_cert, &[])
+/// valid cap is refused"). Still requires a real, matching `session_attest` — this test's point
+/// is the missing capability, not a bad session binding, so it must not accidentally exercise (or
+/// get refused by) the td-0bcab4 check instead of the one it's named for.
+pub fn no_cap_auth_token(
+    root_pk_bytes: &[u8; 32],
+    device_cert: &DeviceCertificate,
+    session_attest: &SessionAttestation,
+) -> String {
+    device_auth_token(root_pk_bytes, device_cert, session_attest, &[])
 }
 
 /// Decoded device auth_token payload, for the responder side.
 pub struct DecodedDevicePayload {
     pub root_pk_bytes: [u8; 32],
     pub device_cert: DeviceCertificate,
+    /// §A4 step 2 (td-0bcab4): the device identity key's attestation binding this bundle to the
+    /// connecting session nkey — required, decoded unconditionally below.
+    pub session_attest: SessionAttestation,
     pub caps: Vec<Capability>,
 }
 
@@ -295,6 +337,14 @@ pub fn decode_auth_token(token: &str) -> anyhow::Result<DecodedPayload> {
                 .ok_or_else(|| anyhow::anyhow!("missing device_cert"))?;
             let device_cert = DeviceCertificate::from_canonical_bytes(device_cert_bytes)
                 .map_err(|e| anyhow::anyhow!("bad device_cert: {e}"))?;
+            // Required, not optional (td-0bcab4) — a missing `session_attest` fails the whole
+            // decode via `?`, exactly like `device_cert` above. Making this optional would
+            // silently reinstate the bearer-token defect for any client that simply omitted it.
+            let session_attest_bytes = get("session_attest")
+                .and_then(|v| v.as_bytes())
+                .ok_or_else(|| anyhow::anyhow!("missing session_attest"))?;
+            let session_attest = SessionAttestation::from_canonical_bytes(session_attest_bytes)
+                .map_err(|e| anyhow::anyhow!("bad session_attest: {e}"))?;
             let caps_arr = get("caps")
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| anyhow::anyhow!("missing caps"))?;
@@ -311,6 +361,7 @@ pub fn decode_auth_token(token: &str) -> anyhow::Result<DecodedPayload> {
             Ok(DecodedPayload::Device(DecodedDevicePayload {
                 root_pk_bytes,
                 device_cert,
+                session_attest,
                 caps,
             }))
         }

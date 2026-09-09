@@ -553,7 +553,7 @@ impl AdmissionToken {
 // DeviceCertificate (A4)
 // ============================================================================================
 
-/// `DeviceCertificate { device_fp, alg_id, sign_pk, agree_pk, nats_fp, ts, exp, sig_root }`
+/// `DeviceCertificate { device_fp, alg_id, sign_pk, agree_pk, ts, exp, sig_root }`
 /// (DESIGN.md §A4).
 ///
 /// **Label discrepancy (flagged per the task brief)**: A4's inline notation for the signature
@@ -575,13 +575,23 @@ impl AdmissionToken {
 /// reject on mismatch (§A7b clarification 6); this crate only carries the bytes structurally and
 /// does not itself perform that recomputation or any key-length/curve validation — that belongs to
 /// `spindle-core` (A9c boundary rule 3).
+///
+/// **[amended v0.9.29, A10.39]**: `nats_fp` is gone. The certificate used to carry it as the
+/// intended session binding to a NATS connect key, but no verifier in either language ever read
+/// it — it was dead weight on the wire, not an enforced binding. The session binding is now the
+/// [`SessionAttestation`] artifact (`spindle-sess-attest-v1`), signed online by the device's own
+/// identity key at connect time. Enforcing the field that used to live here instead was never a
+/// real alternative: this certificate is root-signed, so making the certificate itself carry the
+/// per-session nkey would demand the person's root key be warm on every connect, defeating
+/// DESIGN.md §A3's "rotated per session" for the very key A3 cares most about keeping cold. Since
+/// this artifact has no `v` field, the removal is expressed the only way §A7b allows: the domain
+/// tag bumped from `spindle-dev-cert-v1` to `spindle-dev-cert-v2` (see [`tags::DEVICE_CERT_V2`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceCertificate {
     pub device_fp: Vec<u8>,
     pub alg_id: u8,
     pub sign_pk: Vec<u8>,
     pub agree_pk: Vec<u8>,
-    pub nats_fp: Vec<u8>,
     pub ts: u64,
     pub exp: u64,
     pub sig_root: Vec<u8>,
@@ -592,7 +602,6 @@ const DEVICE_CERT_FIELDS: &[&str] = &[
     "alg_id",
     "sign_pk",
     "agree_pk",
-    "nats_fp",
     "ts",
     "exp",
     "sig_root",
@@ -605,7 +614,6 @@ impl DeviceCertificate {
             ("alg_id", CborValue::uint(self.alg_id as u64)),
             ("sign_pk", CborValue::bytes(self.sign_pk.clone())),
             ("agree_pk", CborValue::bytes(self.agree_pk.clone())),
-            ("nats_fp", CborValue::bytes(self.nats_fp.clone())),
             ("ts", CborValue::uint(self.ts)),
             ("exp", CborValue::uint(self.exp)),
         ]
@@ -633,7 +641,6 @@ impl DeviceCertificate {
             alg_id: m.u8("alg_id")?,
             sign_pk: m.bytes("sign_pk")?,
             agree_pk: m.bytes("agree_pk")?,
-            nats_fp: m.bytes("nats_fp")?,
             ts: m.u64("ts")?,
             exp: m.u64("exp")?,
             sig_root: m.bytes("sig_root")?,
@@ -644,10 +651,93 @@ impl DeviceCertificate {
         Self::from_cbor(&canonical_decode(bytes)?)
     }
 
-    /// `"spindle-dev-cert-v1" || canonical(self minus sig_root)` (A7b).
+    /// `"spindle-dev-cert-v2" || canonical(self minus sig_root)` (A7b).
     pub fn signing_input(&self) -> Vec<u8> {
         tags::signing_input(
-            tags::DEVICE_CERT_V1,
+            tags::DEVICE_CERT_V2,
+            &canonical_encode(&self.unsigned_cbor()),
+        )
+    }
+}
+
+// ============================================================================================
+// SessionAttestation (A3/A4/A7b, added v0.9.29)
+// ============================================================================================
+
+/// `SessionAttestation { nats_fp, ts, sig_device }` (DESIGN.md §A3/§A4 step 2/§A7b, added
+/// v0.9.29).
+///
+/// This is `sig_device(nats_fp, ts)` — the per-session attestation by which a device's
+/// **identity** key authorizes one NATS session nkey. It is what makes the bundle
+/// `{root_pk, device_cert, caps}` non-bearer: without it, the device identity key is never
+/// exercised at CONNECT at all, and a copy of that bundle connects from any nkey whatsoever. With
+/// it, a copy of the bundle is useless without also holding the identity signing key — the
+/// callout still has to prove possession of the *session* nkey separately, via the server-nonce
+/// signature, so the two signatures together bind identity to session.
+///
+/// **A7b time rule**: `ts` is checked ±2 minutes against helper server time, the same skew window
+/// as every other `ts` in this crate.
+///
+/// **Replay rule**: n/a. Unlike artifacts with a `nonce` field, this one needs none — the
+/// artifact is inert without the nkey secret it names, and the callout proves possession of that
+/// nkey separately (the server-nonce signature above). A replayed `SessionAttestation` alone
+/// authorizes nothing.
+///
+/// It carries no `v` field (per §A7b, the domain tag `spindle-sess-attest-v1` is the version
+/// discriminant) and no `exp` — the `ts` skew window above is the sole time bound, there being no
+/// separate validity period to express.
+///
+/// This crate carries these bytes structurally only and performs no verification of them — that
+/// is `spindle-core`'s job (A9c boundary rule 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAttestation {
+    pub nats_fp: Vec<u8>,
+    pub ts: u64,
+    pub sig_device: Vec<u8>,
+}
+
+const SESSION_ATTESTATION_FIELDS: &[&str] = &["nats_fp", "ts", "sig_device"];
+
+impl SessionAttestation {
+    fn unsigned_entries(&self) -> Vec<(&str, CborValue)> {
+        vec![
+            ("nats_fp", CborValue::bytes(self.nats_fp.clone())),
+            ("ts", CborValue::uint(self.ts)),
+        ]
+    }
+
+    pub fn unsigned_cbor(&self) -> CborValue {
+        CborValue::map(self.unsigned_entries())
+    }
+
+    pub fn to_cbor(&self) -> CborValue {
+        let mut entries = self.unsigned_entries();
+        entries.push(("sig_device", CborValue::bytes(self.sig_device.clone())));
+        CborValue::map(entries)
+    }
+
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        canonical_encode(&self.to_cbor())
+    }
+
+    pub fn from_cbor(v: &CborValue) -> Result<Self, ProtoError> {
+        let m = MapReader::new(v)?;
+        m.deny_unknown_fields(SESSION_ATTESTATION_FIELDS)?;
+        Ok(SessionAttestation {
+            nats_fp: m.bytes("nats_fp")?,
+            ts: m.u64("ts")?,
+            sig_device: m.bytes("sig_device")?,
+        })
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ProtoError> {
+        Self::from_cbor(&canonical_decode(bytes)?)
+    }
+
+    /// `"spindle-sess-attest-v1" || canonical(self minus sig_device)` (A7b).
+    pub fn signing_input(&self) -> Vec<u8> {
+        tags::signing_input(
+            tags::SESSION_ATTESTATION_V1,
             &canonical_encode(&self.unsigned_cbor()),
         )
     }
@@ -902,11 +992,13 @@ impl HostOpKeyCert {
 /// **self-verifying**: it embeds `host_fp`, `host_root_pk`, and the complete canonical `op_cert`
 /// encoding, needing no external registry lookup to walk root → op → device.
 ///
-/// **Why no `nats_fp` field**: the person/device [`DeviceCertificate`] binds `nats_fp` because
-/// that callout ties a NATS session key to a device identity. The host's NATS connection is
-/// authenticated separately, by its own [`HostOpKeyCert`], which already carries the host's
-/// `nats_fp`. This artifact is purely the §A7 envelope identity — adding `nats_fp` here would
-/// duplicate (or, on a bug, contradict) the op cert's own binding rather than serve any need of
+/// **Why no `nats_fp` field [amended v0.9.29]**: neither device-shaped certificate carries
+/// `nats_fp` any more. A person/device's NATS session binding is the separate
+/// [`SessionAttestation`] artifact (v0.9.29), signed online by the device's own identity key. The
+/// host's NATS connection, meanwhile, is authenticated by its own [`HostOpKeyCert`], which
+/// carries the host's `nats_fp` and — since v0.9.29 — is checked against the connecting nkey at
+/// the callout. This artifact is purely the §A7 envelope identity, so a `nats_fp` field here
+/// would duplicate (or, on a bug, contradict) the op cert's binding rather than serve any need of
 /// its own.
 ///
 /// **[A10.34 preimage discipline, mirrored from `DeviceCertificate`]**: `alg_id`/`sign_pk`/
@@ -1144,7 +1236,6 @@ mod tests {
             alg_id: 1,
             sign_pk: vec![0x12; 32],
             agree_pk: vec![0x13; 32],
-            nats_fp: fp(0x20),
             ts: 1_755_900_000,
             exp: 1_787_436_000,
             sig_root: sig(0x30),
@@ -1232,7 +1323,35 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_signing_inputs_start_with_distinct_tags() {
+    fn session_attestation_round_trip() {
+        let att = SessionAttestation {
+            nats_fp: fp(0x21),
+            ts: 1_755_950_000,
+            sig_device: sig(0x22),
+        };
+        let bytes = att.to_canonical_bytes();
+        let decoded = SessionAttestation::from_canonical_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, att);
+        assert_eq!(decoded.to_canonical_bytes(), bytes);
+    }
+
+    #[test]
+    fn session_attestation_rejects_unknown_field() {
+        let att = SessionAttestation {
+            nats_fp: fp(0x23),
+            ts: 1_755_951_000,
+            sig_device: sig(0x24),
+        };
+        let mut entries = att.unsigned_entries();
+        entries.push(("sig_device", CborValue::bytes(att.sig_device.clone())));
+        entries.push(("bogus", CborValue::uint(0)));
+        let bytes = canonical_encode(&CborValue::map(entries));
+        let err = SessionAttestation::from_canonical_bytes(&bytes).unwrap_err();
+        assert_eq!(err, ProtoError::UnknownField("bogus".to_string()));
+    }
+
+    #[test]
+    fn all_nine_signing_inputs_start_with_distinct_tags() {
         let env = sample_envelope(true);
         let cap = sample_capability(CapKind::Member);
         let tok = AdmissionToken {
@@ -1247,7 +1366,6 @@ mod tests {
             alg_id: 1,
             sign_pk: vec![1; 32],
             agree_pk: vec![2; 32],
-            nats_fp: fp(2),
             ts: 1,
             exp: 2,
             sig_root: sig(1),
@@ -1288,6 +1406,11 @@ mod tests {
             exp: 2,
             sig_host_op: sig(1),
         };
+        let session_attestation = SessionAttestation {
+            nats_fp: fp(3),
+            ts: 1,
+            sig_device: sig(1),
+        };
 
         let inputs = [
             env.signing_input(),
@@ -1298,16 +1421,18 @@ mod tests {
             admin.signing_input(),
             host_cert.signing_input(),
             host_device_cert.signing_input(),
+            session_attestation.signing_input(),
         ];
         let tags = [
             tags::ENVELOPE_V1,
             tags::CAPABILITY_V1,
             tags::ADMISSION_TOKEN_V1,
-            tags::DEVICE_CERT_V1,
+            tags::DEVICE_CERT_V2,
             tags::REVOCATION_V1,
             tags::ADMIN_COMMAND_V1,
             tags::HOST_OP_KEY_CERT_V1,
             tags::HOST_DEVICE_CERT_V1,
+            tags::SESSION_ATTESTATION_V1,
         ];
         for (input, tag) in inputs.iter().zip(tags.iter()) {
             assert!(input.starts_with(tag));
