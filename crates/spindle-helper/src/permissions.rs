@@ -73,13 +73,21 @@ pub fn universal_denies() -> Vec<String> {
 /// host.<own>.sess.*.*.h2c`, `pub registry.revoke.<own>`, `allow_responses {max:1, expires:
 /// "2m"}`, plus the universal denies.
 ///
-/// **Ambiguity flagged, not resolved**: DESIGN.md §A5's permission-list bullet says `pub
-/// registry.revoke` (no `.<hfp>` suffix), but the same section's subject table lists the subject
-/// as `registry.revoke.<hfp>` ("host `hfp` only" as publisher) and ADR-002 repeats the same
-/// subject-table row verbatim. This module follows the task brief and the subject table —
-/// `registry.revoke.<own>` — since a bare `registry.revoke` would let any host publish into
-/// every other host's revocation subject, which contradicts "helper asserts subject token ==
-/// record `host_fp`" a few lines later in the same section.
+/// **Ambiguity RESOLVED in DESIGN.md v0.9.26 (td-40a2d0), in favour of what this module already
+/// did.** §A5's permission-list bullet used to say `pub registry.revoke` with no `.<hfp>` suffix,
+/// contradicting the same section's own subject table (`registry.revoke.<hfp>`, "host `hfp` only"
+/// as publisher) and ADR-002, which repeats the subject-table row verbatim. The bullet is now
+/// corrected to the scoped `pub registry.revoke.<own>`, so DESIGN and this code agree. The
+/// reasoning is kept because it is what decided it: a bare `registry.revoke` would let any host
+/// publish into every other host's revocation subject, contradicting "helper asserts subject
+/// token == record `host_fp`" a few lines later in the same section.
+///
+/// **Known unimplemented grant**: as of DESIGN.md v0.9.27, §A5 also specifies `pub
+/// registry.devcert.<own>` for hosts (A10.37 — the host republishes its device certificate on
+/// every connect to the registry). This function does NOT grant it, deliberately: there is no
+/// `registry.devcert.<hfp>` handler in this crate either, so granting publish rights to a subject
+/// nothing consumes would widen the surface for no benefit. §A5b records both halves as
+/// specified-but-unimplemented. Add the grant and the handler together, not separately.
 pub fn host_permissions(own_host_fp: Fingerprint) -> SubjectPermissions {
     SubjectPermissions {
         publish_allow: vec![

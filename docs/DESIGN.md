@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.26) + Execution Plan
+# Spindle — System Design Document (draft v0.9.27) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -79,6 +79,16 @@
 > corrected to the scoped `pub registry.revoke.<own>`; new per-host token buckets (for this section's resync
 > subject and for the two already specified in §A5) flagged as specified but unimplemented (user decisions,
 > 2026-09-08).
+> v0.9.27: §A5b added — the canonical subject registry, folding in the `$SYS` plane for the first time, plus
+> **A10.37 (ratified 2026-09-01 user decision): the host publishes its `HostDeviceCert` to `registry.devcert.<hfp>`
+> on every registry connect**, not only after rotation. A10.37's stated cost justification is corrected: there is no
+> per-host token bucket bounding it — §A4c [v0.9.26] already recorded all three specified buckets, including this
+> one, as unimplemented. The CONNZ divergence is corrected too: the SYS connection, not the callout connection, is
+> the intended path for the startup `$SYS.REQ.SERVER.PING.CONNZ` request, with an unset `SYS_CONN_SEED` falling
+> back to the callout connection as a documented degraded mode. §A5's host permission bullet gains
+> `pub registry.devcert.<own>`, closing **td-40a2d0**. Verification also found that two of the four unimplemented
+> subjects — `helper.devcert.get.<nfp>` and `helper.revoke.<nfp>` — are missing their permission grants as well as
+> their handlers (user decisions, 2026-09-08).
 
 ---
 
@@ -617,11 +627,15 @@ buckets are an outstanding implementation obligation.
 
 **Permissions issued by callout**
 - Host: `sub host.<own>.>`, `pub host.<own>.sess.*.*.h2c`, `pub registry.revoke.<own>`,
-  `allow_responses {max:1, expires:"2m"}`; explicit deny of `_INBOX.>`, `$SYS.>`, `$JS.>`. **[corrected v0.9.26]**
-  the bare `pub registry.revoke` this bullet previously listed contradicted this section's own subject table above
-  (`registry.revoke.<hfp>`, "host `hfp` only"); the scoped form is what the implementation grants
-  (`permissions::host_permissions`) and what makes the subject safe — a bare grant would let any host publish into
-  every other host's revocation subject.
+  `pub registry.devcert.<own>`, `allow_responses {max:1, expires:"2m"}`; explicit deny of `_INBOX.>`, `$SYS.>`,
+  `$JS.>`. **[corrected v0.9.26]** the bare `pub registry.revoke` this bullet previously listed contradicted this
+  section's own subject table above (`registry.revoke.<hfp>`, "host `hfp` only"); the scoped form is what the
+  implementation grants (`permissions::host_permissions`) and what makes the subject safe — a bare grant would let
+  any host publish into every other host's revocation subject. **[corrected v0.9.27, closes td-40a2d0]** this
+  bullet previously omitted `registry.devcert` entirely, although the subject table above names hosts as its
+  publisher; added here in the same scoped form as `registry.revoke.<own>`. `permissions::host_permissions` does
+  not grant it yet — see §A5b's divergence list — so this closes the documentation half of the gap, not the
+  implementation.
 - Client, for each host `h` in its verified caps: `pub host.<h>.connect`, `pub host.<h>.sess.<own>.*.c2h`,
   `sub host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus `sub _INBOX_<own>.>`,
   `pub helper.presence.get.<own nfp>`, `pub helper.turn.get.<own nfp>`, `pub helper.devcert.get.<own nfp>`,
@@ -638,9 +652,13 @@ buckets are an outstanding implementation obligation.
 - **Helper account bridging [DEFAULT]**: the broker helper holds **three separate NATS connections**, not two
   **[amended v0.9.9, S5]** — (1) a **callout connection** on the dedicated AUTH account (`auth_callout.account`;
   holds only the callout responder user — the JWT issuer key belongs to the APP account): callout responder on
-  `$SYS.REQ.USER.AUTH`, plus the startup `$SYS.REQ.SERVER.PING.CONNZ` request; (2) a **SYS-account connection**
-  (dedicated nkey, genuine SYS-account member): subscribes `$SYS.ACCOUNT.*.CONNECT|DISCONNECT` and will carry the
-  kick relay (`$SYS.REQ.SERVER.<id>.KICK`) once it lands; (3) an **APP-account connection**: `helper.*`
+  `$SYS.REQ.USER.AUTH` only; (2) a **SYS-account connection** (dedicated nkey, genuine SYS-account member):
+  subscribes `$SYS.ACCOUNT.*.CONNECT|DISCONNECT`, issues the startup `$SYS.REQ.SERVER.PING.CONNZ` request that seeds
+  the presence and kick maps, and will carry the kick relay (`$SYS.REQ.SERVER.<id>.KICK`) once it lands —
+  **[corrected v0.9.27]** this bullet previously placed the startup CONNZ request on the callout connection; the
+  implementation issues it on the SYS connection, falling back to the callout connection with a logged warning when
+  `SYS_CONN_SEED` is unset — a documented degraded mode, not the intended path (§A5b); (3) an **APP-account
+  connection**: `helper.*`
   request/reply, `host.<hfp>.presence` publishing, `registry.*` subscriptions. The split is forced by nats-server
   itself: in server-config auth-callout mode the callout responder structurally lives in its own AUTH account, and
   the server special-cases only `$SYS.REQ.USER.AUTH`/`$SYS.REQ.SERVER.PING.CONNZ` to answer cross-account —
@@ -703,6 +721,163 @@ buckets are an outstanding implementation obligation.
 - Consequences: an A1 attacker cannot reach/enumerate/flood hosts it has no cap for, cannot see/inject into other
   clients' sessions, cannot read other inboxes, cannot proxy through a host; an A5 attacker with fresh keys gets no
   connection at all.
+
+## A5b. Subject registry (canonical) + A10.37 HostDeviceCert residency (→ ADR-002 rev)
+
+**Why this section exists.** Subject information is currently spread across A5's subject table, A5's permission
+bullets, A5's "Helper account bridging" prose, ADR-002, and the spike results — and the `$SYS.*` subjects the
+helper depends on appear in **none** of the tables, only in prose. Building this list against the actual source
+found four divergences between DESIGN and the implementation; three are fixed — one already in §A4c [v0.9.26],
+two more in this same pass — and one remains open (see "Known DESIGN divergences" below). This section is the
+single canonical list; where it disagrees with prose elsewhere in the document, this section is authoritative.
+
+**Status column**: ✅ implemented and exercised · ❌ specified but not implemented · ⚠️ implemented but DESIGN
+describes it incorrectly.
+
+**Application plane (APP account)**
+
+| Subject | Publisher | Subscriber | Purpose | Status |
+|---------|-----------|------------|---------|--------|
+| `host.<hfp>.connect` | devices holding a cap for `hfp` | host `hfp` | request/reply; A7 envelope carrying the client's inbox, bound to the reply subject (A10.36) | ✅ |
+| `host.<hfp>.sess.<cfp>.<sid>.c2h` | client `cfp` only | host `hfp` | trickle ICE + session control, client→host | ✅ |
+| `host.<hfp>.sess.<cfp>.<sid>.h2c` | host `hfp` | client `cfp` only | trickle ICE + session control, host→client | ✅ |
+| `host.<hfp>.presence` | broker helper | devices holding a cap for `hfp` | push deltas `{host_fp, state, last_seen}` only | ✅ |
+| `host.<hfp>.revoke-resync` | broker helper | host `hfp` | asks the host to republish its full revoked set; no reply | ❌ specified in §A4c [v0.9.26]; not implemented |
+| `_INBOX_<dfp>.>` | host, via `allow_responses` after a prefix check | owning device `dfp` | private reply inbox prefix | ✅ |
+
+**Helper request/reply (APP account)**
+
+Every subject here is parametrized by the caller's **session nkey** `<nfp>`. Caller identity is always the
+callout-granted subject token, never anything in the payload — the helper authorizes from the session record keyed by
+that `nfp`.
+
+| Subject | Publisher | Subscriber | Purpose | Status |
+|---------|-----------|------------|---------|--------|
+| `helper.presence.get.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply presence snapshot for the caller's hosts | ✅ |
+| `helper.turn.get.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply TURN credentials; per-root monthly quota | ✅ |
+| `helper.devcert.get.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply fetch of a host device certificate; payload names the target `host_fp`, served only if that host is in the caller's session record, so it cannot enumerate hosts the caller holds no cap for | ❌ no handler exists |
+| `helper.revoke.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply deposit of a **root-signed** `spindle-self-rev-v1` self-revocation (S14); accepted only if the signer is the `root_fp` in the caller's session record | ❌ no handler exists |
+
+**Registry ingest (APP account)**
+
+| Subject | Publisher | Subscriber | Purpose | Status |
+|---------|-----------|------------|---------|--------|
+| `registry.revoke.<hfp>` | host `hfp` only | broker helper | host-signed revocation/epoch records; durable; helper asserts subject token == record `host_fp`; per-host token bucket | ✅ |
+| `registry.devcert.<hfp>` | host `hfp` only | broker helper | host-signed device certificate; durable; republished on **every** host connect (A10.37); helper asserts subject token == the cert's `host_fp`; per-host token bucket | ❌ no handler exists |
+| `registry.admin.>` | operator (mTLS + operator cert) | broker helper | signed admin commands (A3b); replies via `allow_responses` | ❌ no handler exists |
+
+**System plane (`$SYS`) — absent from A5's tables until now**
+
+These are the subjects the broker helper uses against nats-server itself. They were previously documented only in
+prose and in the spike results, which is how the CONNZ divergence below went unnoticed.
+
+| Subject | Publisher | Subscriber | Purpose | Status |
+|---------|-----------|------------|---------|--------|
+| `$SYS.REQ.USER.AUTH` | nats-server | helper **callout** connection (AUTH account) | the auth callout request/reply — every connection in the system is authorized here | ✅ |
+| `$SYS.REQ.SERVER.PING.CONNZ` | helper **SYS** connection (falls back to the **callout** connection if `SYS_CONN_SEED` is unset) | nats-server | connection listing; seeds both the presence map and the kick map at startup, and backs the on-demand kick fallback | ✅ |
+| `$SYS.REQ.SERVER.<server_id>.KICK` | helper **SYS** connection | nats-server | disconnects one client; payload field is **`cid`**, not `id`; there is **no** `PING.KICK` broadcast form, so a concrete `server_id` is always required; **a reply is not proof of a kick** — a failed kick still replies, with an `error` key | ✅ |
+| `$SYS.ACCOUNT.*.CONNECT` | nats-server | helper **SYS** connection (falls back to the **callout** connection if `SYS_CONN_SEED` is unset) | connection advisory; feeds the presence map and the kick map | ✅ |
+| `$SYS.ACCOUNT.*.DISCONNECT` | nats-server | helper **SYS** connection (falls back to the **callout** connection if `SYS_CONN_SEED` is unset) | disconnect advisory; feeds presence, the kick map, and the session-record cleanup | ✅ |
+| `$SYS.>` | — | — | explicitly **denied** to every client and host connection by the callout | ✅ |
+
+**CONNZ degraded-mode footnote [corrected v0.9.27].** The **SYS** connection is the intended, primary path for the
+startup `$SYS.REQ.SERVER.PING.CONNZ` request and for the `$SYS.ACCOUNT.*` advisories
+(`connz_request(sys_client)`; `seed_maps(sys_ref, …)` in `crates/spindle-helper/src/bin/helper.rs`). `sys_client` —
+and therefore `sys_ref` — is built only when `config.sys_conn_seed` is `Some`; when `SYS_CONN_SEED` is unset the
+helper logs a `tracing::warn!` and falls back to `sys_ref = &callout_client` (`helper.rs:663-681`), so the CONNZ
+request and the advisory subscriptions then go out on the **callout** connection instead. Both paths get a reply —
+nats-server special-cases `$SYS.REQ.USER.AUTH` and `$SYS.REQ.SERVER.PING.CONNZ` to answer across accounts — so this
+is a **documented degraded mode**, not a second intended topology: it exists to keep the helper limping when
+`SYS_CONN_SEED` is misconfigured, matching pre-S5 behavior, not as an alternative the system is meant to run in.
+A5's "Helper account bridging" prose previously stated, unconditionally, that the callout connection makes the
+startup CONNZ request — that was the documentation error this section identified, and A5 is corrected in the same
+pass to name the SYS connection as primary with this fallback noted.
+
+**Known DESIGN divergences this list exposes**
+
+1. **Fixed in v0.9.26.** A5's host permission bullet granted a bare `pub registry.revoke` with no `.<hfp>` suffix,
+   contradicting the subject table above it. The §A4c merge corrected the bullet to the scoped
+   `pub registry.revoke.<own>`, matching the implementation (`permissions::host_permissions`). Tracked as
+   **td-40a2d0**.
+2. **Fixed in v0.9.27 (this pass).** A5's host permission bullet omitted `registry.devcert` entirely, although the
+   subject table above names hosts as its publisher. The bullet now grants `pub registry.devcert.<own>` in the
+   same scoped form as `pub registry.revoke.<own>`. `permissions::host_permissions` does not grant it in code yet —
+   that is folded into item 4 below — but the DESIGN-level gap is closed. Closes **td-40a2d0** (item 1 above closed
+   the other half).
+3. **Fixed in v0.9.27 (this pass).** CONNZ is issued on the **SYS** connection, not the callout connection A5
+   previously described; A5's "Helper account bridging" prose is corrected, and the `SYS_CONN_SEED`-unset fallback
+   is recorded as a documented degraded mode (see the footnote above).
+4. **❌ Still open: four specified subjects have no implementation**: `helper.devcert.get.<nfp>`,
+   `registry.devcert.<hfp>`, `registry.admin.>`, and `helper.revoke.<nfp>`. Verification found this is stronger
+   than "missing handlers" for two of the four: `client_member_permissions`
+   (`crates/spindle-helper/src/permissions.rs:112-135`) grants a member connection only
+   `helper.presence.get.<nfp>` and `helper.turn.get.<nfp>` — `helper.devcert.get.<nfp>` and `helper.revoke.<nfp>`
+   are absent from the permission grant itself, not merely unhandled, even though §A5's callout-permissions bullet
+   lists both as granted. Those two are DESIGN-only aspirations end to end: implementing either costs a
+   permission-grant change plus a handler, not a handler alone. The first two subjects in this list are addressed
+   by A10.37 below; `helper.revoke.<nfp>` is S14, tracked as **td-b5d50c**; `registry.admin.>` is the A3b admin
+   plane and needs its own task.
+
+**A10.37 — Where the `HostDeviceCert` lives**
+
+**DECIDED 2026-09-01: one authority, two caches.** The certificate is minted and owned by the host, cached durably at
+the registry for distribution, and pinned by the client.
+
+- **Authoritative — the host.** The host mints the cert (its **operating** key signs it, per A10.35) and persists it
+  in its own store. The host is its only writer.
+- **Distribution cache — the broker helper.** The host publishes on `registry.devcert.<hfp>` **on every connect to
+  the registry** (see Open items); the helper stores it durably and serves it on demand via
+  `helper.devcert.get.<nfp>`. The helper is an **untrusted carrier by construction**: A10.34 requires the cert to
+  reach the peer over a self-verifying root→op→device signature chain, "never by trusting the carrier", so caching
+  it at the registry adds no trust and grants the registry nothing.
+- **Pinned copy — the client.** The invite carries the host's keys at first contact (A10.3); the client pins the
+  **root** and verifies every subsequent certificate's chain up to it.
+
+**Why the registry must serve it, and the invite alone cannot.** A client's first message on `host.<hfp>.connect` is
+an A7 envelope **sealed to the host's agreement key**. The client therefore needs the host device certificate
+*before* it can address the host at all — so the cert can never be fetched from the host in band, and an offline host
+can supply nothing. The invite covers first contact only; it cannot cover (a) a host that has **rotated** its device
+key — and A7's stated mitigation for the offer's forward-secrecy gap depends on that rotation being practical — or
+(b) a member enrolled long ago whose invite is gone.
+
+**Rotation must not trigger the pinning wall [normative].** A4's "later key change = hard, non-dismissable wall"
+applies to the **root**. A device-key change presented under a valid root→op→device chain is accepted **silently**;
+only a changed root, or an op key that does not chain to the pinned root, raises the wall. A10.35's stated benefit is
+that rotating a dedicated device key "touches nothing else" — that benefit is lost entirely if every rotation walls
+every member.
+
+**Crate residency (A9c).** Schema in `spindle-proto`; issue/verify in `spindle-core`; host-side persistence in
+`spindle-vfs`; registry-side cache and serving in `spindle-helper`; fetch, pin, and chain verification in
+`spindle-client-core`. The first two already exist; the rest do not.
+
+**Rejected alternatives.**
+
+- *Invite-only distribution.* Cannot deliver a rotated certificate to existing members, which makes A7's rotation
+  mitigation unusable in practice.
+- *Host serves it in band.* Structurally impossible — the client needs the agreement key to construct its first
+  message, and an offline host serves nothing.
+- *Helper mints or re-signs it.* Rejected for exactly the reason A10.34 rejected registry-minted agreement keys: it
+  places the registry inside the trust chain, destroying A7's "registry cannot read or forge" property.
+
+**Open items**
+
+- **DECIDED 2026-09-01 (user): publish on every host connect.** The host republishes its device certificate to
+  `registry.devcert.<hfp>` each time it connects to the registry, not only after a rotation. Every-connect covers
+  every scenario through one code path: it needs no rotation-detection state on the host, it is idempotent at the
+  helper (an identical cert overwrites itself harmlessly), and it self-heals a helper that lost its cached copy —
+  whereas rotation-only leaves a host permanently unreachable by new clients if the single publish that mattered was
+  dropped. The cost is one small publish per host connect. **[corrected v0.9.27]** this was previously justified as
+  "already bounded by the per-host token bucket" — no such bucket exists. §A5 specifies a per-host token bucket for
+  `registry.devcert.<hfp>` (and for `registry.revoke.<hfp>` and `host.<hfp>.revoke-resync`), and §A4c [v0.9.26]
+  records that **none of the three is implemented**: `spindle-helper` has no rate limiter of any kind today
+  (`crates/spindle-helper/src/revoke.rs`'s module doc). The bound this cost is nominally subject to is therefore an
+  outstanding implementation obligation, not an existing facility — the decision to publish on every connect stands
+  regardless, since one small publish per connect is cheap either way.
+- **Not settled by the above.** A4c's two `[USER DECISION]` items — periodic revocation reconciliation versus
+  trigger-driven only, and whether the digest earns its keep — remain open. This decision is consistent with A4c's
+  existing host-connect trigger but does not answer either question.
+- **No owner yet.** `apps/host/` is still a README, so nothing exists to publish the certificate or answer a resync.
+  Specify now, implement with the host daemon.
 
 ## A6. Signaling flows
 
@@ -1104,6 +1279,7 @@ Docker is explicitly not the primary dev environment.
 | 34 | Device agreement-key distribution | **DECIDED 2026-08-31:** the agreement key is published in the device certificate and reaches the peer over a self-verifying root→op→device signature chain, never by trusting the carrier (A7). Rejected: registry/helper-minted agreement keys — gives the registry both private halves of every static-static term in `k0`/`k1`, making it a passive full-session eavesdropper and destroying §A7's stated "registry cannot read or forge SDP/ICE" property; also rejected: the Ed25519→X25519 birational map. (S2 leg A step A finding, 2026-08-30.) |
 | 35 | Host device identity for E2E envelopes | **DECIDED 2026-08-31:** a host's envelope identity is a dedicated host device keypair (Ed25519 sign + X25519 agree) certified by the host **operating** key, chaining root→op→device. Rejected: the root signing directly (A10.30 keeps the root cold); the op key doubling up as the device key (forces an Ed25519→X25519 birational map). Interacts with A10.34. (S2 leg A step A finding, 2026-08-30.) |
 | 36 | Envelope `inbox` field semantics | **DECIDED 2026-08-31:** binding. The client MUST set the offer's signed `inbox` to the exact NATS reply subject it listens on; the host MUST reject any offer whose decrypted `inbox` differs from the reply subject the transport reported. §A6's `_INBOX_<c>.` prefix check is unchanged and still runs first — it needs no key, whereas the equality check is only possible after decryption. Rejected: "redundant" (leaves the field decorative, and it had already drifted); "authoritative" (the host would publish to a client-asserted subject, would still need the prefix check, and would abandon NATS request/reply for no gain). Forced by a latent defect found while deciding it: the client minted `inbox` from a second `new_inbox()` call while `request()` generated its own reply subject internally, so the signed value never matched the real one — invisible because nothing read the field. (S2 leg A step A finding, 2026-08-30.) |
+| 37 | `HostDeviceCert` residency | **DECIDED 2026-09-01:** one authority, two caches — the host mints and owns the cert (operating key, per A10.35); the registry caches it durably at `registry.devcert.<hfp>`, published on every host connect, and serves it via `helper.devcert.get.<nfp>` as an untrusted-by-construction carrier; the client pins the root at first contact (A10.3) and verifies every cert's chain up to it. A device-key rotation under a valid chain must not trigger A4's pinning wall — only a root or op-key break does. Rejected: invite-only distribution (can't reach existing members after rotation); host serves it in band (structurally impossible — the client needs the agreement key to construct its first message); helper mints/re-signs it (destroys §A7's "registry cannot read or forge" property, same reasoning as A10.34). See §A5b. |
 
 ## A11. Alternatives considered
 
@@ -1302,6 +1478,25 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.27 (2026-09-08)** — §A5b added: the canonical subject registry, consolidating A5's subject table, A5's
+  permission bullets, A5's "Helper account bridging" prose, ADR-002, and the spike results into one list, and
+  folding in the `$SYS` plane the helper depends on for the first time (previously prose-only). Ratifies
+  **A10.37 (user decision, 2026-09-01): one authority, two caches** for the `HostDeviceCert` — the host mints and
+  owns it, the registry caches and distributes it at `registry.devcert.<hfp>` **published on every host connect**
+  (not only after rotation), and the client pins the root and verifies the chain; rotation under a valid
+  root→op→device chain must not trigger A4's pinning wall. The decision's stated cost justification is corrected:
+  it previously claimed the per-connect publish was "already bounded by the per-host token bucket" — no such
+  bucket exists. §A5 specifies a per-host token bucket for `registry.devcert.<hfp>`, and §A4c [v0.9.26] already
+  recorded that none of its three specified buckets is implemented, so the bound is an outstanding obligation, not
+  an existing facility; the decision to publish on every connect stands regardless. Also corrects the CONNZ
+  divergence §A5b's audit found: the **SYS** connection, not the callout connection, is the intended path for the
+  startup `$SYS.REQ.SERVER.PING.CONNZ` request, with an unset `SYS_CONN_SEED` falling back to the callout
+  connection as a documented degraded mode rather than a second intended topology; §A5's "Helper account bridging"
+  prose is corrected to match. §A5's host permission bullet gains `pub registry.devcert.<own>`, closing
+  **td-40a2d0** (its other half — the bare `pub registry.revoke` — was closed by the §A4c merge in v0.9.26).
+  Verification also found that two of the four subjects §A5b lists as unimplemented — `helper.devcert.get.<nfp>`
+  and `helper.revoke.<nfp>` — are missing their permission grants in `client_member_permissions`, not just their
+  handlers, so implementing either costs a permission change plus a handler, not a handler alone.
 - **v0.9.26 (2026-09-08)** — §A4c added: revocation convergence by state reconciliation, closing the gap where a
   host-side crash, partition, or dropped publish between the store-commit and the NATS-publish loses a
   `RevocationRecord` permanently and the registry-side cut-off silently never happens (S9's `< 5 s` target violated
