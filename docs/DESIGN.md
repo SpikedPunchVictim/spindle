@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.27) + Execution Plan
+# Spindle — System Design Document (draft v0.9.28) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -89,6 +89,10 @@
 > `pub registry.devcert.<own>`, closing **td-40a2d0**. Verification also found that two of the four unimplemented
 > subjects — `helper.devcert.get.<nfp>` and `helper.revoke.<nfp>` — are missing their permission grants as well as
 > their handlers (user decisions, 2026-09-08).
+> v0.9.28: §A7 adds **public-key encoding validity** as a normative cross-implementation rule (A10.38) — Ed25519
+> encodings must be canonical per RFC 8032 §5.1.3 (`y < p`, and sign bit 0 when `x = 0`); X25519 stays
+> unvalidated beyond length on both sides. The document previously pinned no such rule, so native and browser had
+> diverged without contradicting it; `vectors/key-validity.json` now pins the contract for both.
 
 ---
 
@@ -960,6 +964,17 @@ its own retransmits).
 **Browser crypto**: WebCrypto Ed25519/X25519 (Firefox 129+, Safari 17+, Chrome 137+) with `@noble/curves` fallback;
 AES-GCM/HKDF native. **Clock skew**: the helper returns server time in the callout reply; clients compute an offset
 for `ts`/`exp` checks and the UI warns on large skew.
+**Public-key encoding validity [added v0.9.28]**: an **Ed25519** public key MUST be the *canonical*
+encoding of its point (RFC 8032 §5.1.3), and a verifier MUST reject one that is not. Two rules, both
+required: the encoded `y` is `< p` (`p = 2^255 − 19`), and when the decompressed `x` is 0 the sign bit
+is 0 — there is no "negative zero" encoding. An **X25519** public key is **not** validated beyond its
+32-byte length: any 32 bytes are accepted as a Montgomery u-coordinate, matching `x25519-dalek`'s
+infallible `PublicKey::from`. Contributory behaviour is not checked. Both rules are **normative for
+every implementation**: the native and browser stacks MUST return the identical accept/reject verdict
+for every 32-byte input, and `vectors/key-validity.json` pins that contract as a golden vector file
+consumed by both. This is a consensus rule, not a local hygiene check — `device_fp` hashes the raw key
+bytes, so a key one language accepts and the other rejects makes the *same* certificate, capability or
+bootstrap bundle valid on a native client and invalid in a browser.
 **Properties**: registry cannot read or forge SDP/ICE; replay/splicing/downgrade rejected. **Forward secrecy is
 message-scoped [amended v0.9.14]**: the answer and every message after it are sealed under `k1` and stay secret
 against later device-key compromise, but the **offer is not** — `k0` is derivable from the host's static agreement
@@ -1280,6 +1295,7 @@ Docker is explicitly not the primary dev environment.
 | 35 | Host device identity for E2E envelopes | **DECIDED 2026-08-31:** a host's envelope identity is a dedicated host device keypair (Ed25519 sign + X25519 agree) certified by the host **operating** key, chaining root→op→device. Rejected: the root signing directly (A10.30 keeps the root cold); the op key doubling up as the device key (forces an Ed25519→X25519 birational map). Interacts with A10.34. (S2 leg A step A finding, 2026-08-30.) |
 | 36 | Envelope `inbox` field semantics | **DECIDED 2026-08-31:** binding. The client MUST set the offer's signed `inbox` to the exact NATS reply subject it listens on; the host MUST reject any offer whose decrypted `inbox` differs from the reply subject the transport reported. §A6's `_INBOX_<c>.` prefix check is unchanged and still runs first — it needs no key, whereas the equality check is only possible after decryption. Rejected: "redundant" (leaves the field decorative, and it had already drifted); "authoritative" (the host would publish to a client-asserted subject, would still need the prefix check, and would abandon NATS request/reply for no gain). Forced by a latent defect found while deciding it: the client minted `inbox` from a second `new_inbox()` call while `request()` generated its own reply subject internally, so the signed value never matched the real one — invisible because nothing read the field. (S2 leg A step A finding, 2026-08-30.) |
 | 37 | `HostDeviceCert` residency | **DECIDED 2026-09-01:** one authority, two caches — the host mints and owns the cert (operating key, per A10.35); the registry caches it durably at `registry.devcert.<hfp>`, published on every host connect, and serves it via `helper.devcert.get.<nfp>` as an untrusted-by-construction carrier; the client pins the root at first contact (A10.3) and verifies every cert's chain up to it. A device-key rotation under a valid chain must not trigger A4's pinning wall — only a root or op-key break does. Rejected: invite-only distribution (can't reach existing members after rotation); host serves it in band (structurally impossible — the client needs the agreement key to construct its first message); helper mints/re-signs it (destroys §A7's "registry cannot read or forge" property, same reasoning as A10.34). See §A5b. |
+| 38 | Public-key encoding validity | **DECIDED 2026-09-08:** tighten Rust to RFC 8032 §5.1.3 canonical rather than loosen TypeScript. Ed25519 encodings must be canonical (`y < p`, and sign bit 0 when `x = 0`); X25519 stays unvalidated beyond length on **both** sides, mirroring `x25519-dalek`'s infallible `PublicKey::from`. Forced by measurement, not review: the ticket asserted Rust validated X25519 — it does not (`impl From<[u8; 32]> for PublicKey` is infallible), so adding the "missing" TypeScript check would have *created* a split; and `ed25519-dalek`'s `VerifyingKey::from_bytes` is only `CompressedEdwardsY::decompress`, which accepts `y ≥ p` where `@noble/curves` rejects it. Rejected: loosening TS to dalek's semantics (hand-rolled curve code in a package designed to delegate primitives); leaving the split documented (ships a known consensus fork). Verifiers implement the rule as a decompress/re-compress **round trip**, which subsumes both clauses by construction — the first attempt enumerated them and shipped only one. Parity proven over 4128 inputs, zero mismatches (§A7). |
 
 ## A11. Alternatives considered
 
@@ -1478,6 +1494,21 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.28 (2026-09-09)** — §A7 gains **public-key encoding validity** as a normative, cross-implementation
+  rule, and A10.38 records the decision behind it. Ed25519 public keys must be canonically encoded per RFC 8032
+  §5.1.3 — both `y < p` *and* sign bit 0 when the decompressed `x` is 0 — and a verifier must reject a
+  non-canonical encoding; X25519 public keys stay **unvalidated beyond length on both sides**, matching
+  `x25519-dalek`'s infallible `PublicKey::from`. The document previously pinned **no** rule for key-encoding
+  validity anywhere, so the two implementations had diverged without contradicting it. Both divergences were
+  found by measurement rather than review: `ed25519-dalek`'s `VerifyingKey::from_bytes` is only
+  `CompressedEdwardsY::decompress` and accepts `y ≥ p`, which `@noble/curves` rejects; and the belief that Rust
+  validated X25519 was simply false. The consensus stake is that `device_fp` hashes raw key bytes, so a
+  one-sided rejection makes the same artifact valid natively and invalid in a browser. Recorded here because
+  the first implementation of the rule enforced only the `y < p` half and looked complete — green gate, biting
+  neuter, passing golden vectors — while the unenforced half was reachable by writing a constant into a
+  `sign_pk` field, where the half it did enforce needed a ~2⁻²⁵⁰ coincidence. Verifiers now implement the rule
+  as a decompress/re-compress round trip, which subsumes both clauses by construction rather than by
+  enumeration, and `vectors/key-validity.json` pins the contract for both languages.
 - **v0.9.27 (2026-09-08)** — §A5b added: the canonical subject registry, consolidating A5's subject table, A5's
   permission bullets, A5's "Helper account bridging" prose, ADR-002, and the spike results into one list, and
   folding in the `$SYS` plane the helper depends on for the first time (previously prose-only). Ratifies
