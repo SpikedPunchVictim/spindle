@@ -298,17 +298,22 @@ pub struct UploadedFile {
 pub struct Store {
     conn: Connection,
     limits: StoreLimits,
-    /// td-c9b9bd: set once, permanently, when [`crate::audit::Audit::append`] cannot prove this
-    /// connection made it back to autocommit mode after a failed `ROLLBACK` (or a failed
-    /// `COMMIT`, followed by a failed recovery `ROLLBACK`) — see that method's doc comment for the
-    /// exact sequence. `AtomicBool` rather than `Cell<bool>`: every `Store`/`Audit` method takes
-    /// `&self`, and `Store` derives `Debug` (a `Cell<bool>` would also be `Debug` and `&self`-
-    /// compatible, but this crate has no other interior-mutability precedent to match, and
-    /// `AtomicBool` costs nothing extra here — this flag is never on a hot path — while making the
-    /// "no torn read of the poison flag across threads" property explicit rather than incidental
-    /// to `Store` never actually being shared across threads today). `Ordering::SeqCst` throughout
-    /// (see [`Store::is_poisoned`]/[`Store::check_not_poisoned`] and
-    /// [`crate::audit::Audit::append`], the only place this flag is ever set): this flag is
+    /// td-c9b9bd: set once, permanently, by [`recover_from_non_autocommit`] when it cannot prove
+    /// this connection made it back to autocommit mode after a failed `ROLLBACK` (or a failed
+    /// `COMMIT`, followed by a failed recovery `ROLLBACK`) — see that free function's doc comment
+    /// for the exact sequence. That function is the **only** place this flag is ever set, but it
+    /// runs from several call sites sharing this one connection: [`crate::audit::Audit::append`]'s
+    /// three failure branches (a failed `BEGIN`, a failed post-append `ROLLBACK`, and a failed
+    /// `COMMIT`), every `&self` write method here via [`Store::with_transaction`], and
+    /// [`Store::burn_invite_nonce`]'s bespoke manual wiring (see that method's doc comment for why
+    /// it cannot use `with_transaction`). `AtomicBool` rather than `Cell<bool>`: every `Store`/
+    /// `Audit` method takes `&self`, and `Store` derives `Debug` (a `Cell<bool>` would also be
+    /// `Debug` and `&self`-compatible, but this crate has no other interior-mutability precedent
+    /// to match, and `AtomicBool` costs nothing extra here — this flag is never on a hot path —
+    /// while making the "no torn read of the poison flag across threads" property explicit rather
+    /// than incidental to `Store` never actually being shared across threads today).
+    /// `Ordering::SeqCst` throughout (see [`Store::is_poisoned`]/[`Store::check_not_poisoned`] and
+    /// [`recover_from_non_autocommit`], the only place this flag is ever set): this flag is
     /// set at most once and read rarely, so the strongest ordering costs nothing measurable and
     /// removes any need to reason about weaker orderings later.
     ///
@@ -317,7 +322,7 @@ pub struct Store {
     /// [`crate::audit::Audit::append`] via the reference [`Store::audit`] hands it) for the rest
     /// of this `Store`'s lifetime — there is no in-place un-poisoning, deliberately: a
     /// connection that failed to leave a transaction cleanly is not a state this code can safely
-    /// reason its way out of at runtime (see [`crate::audit::Audit::append`] for why a single
+    /// reason its way out of at runtime (see [`recover_from_non_autocommit`] for why a single
     /// deterministic retry is attempted *before* poisoning, but not indefinitely). A caller that
     /// observes [`Store::is_poisoned`] returning `true` (or a [`StoreError::ConnectionPoisoned`]
     /// from any write) must drop this `Store` and open a fresh one
@@ -396,19 +401,107 @@ impl Store {
 
     /// The single choke point every mutating method in this file calls first (see each method's
     /// call site) — refuses with [`StoreError::ConnectionPoisoned`] once
-    /// [`Store::poisoned`] is set, rather than letting the write attempt run and either fail with
-    /// a confusing raw SQLite error (for the methods that open their own transaction — SQLite
-    /// itself refuses a nested `BEGIN`) or, worse, silently execute inside a stranded transaction
-    /// (every bare `self.conn.execute` write here that opens no transaction of its own — exactly
-    /// the failure mode td-c9b9bd exists to close). Read-only methods deliberately do **not** call
-    /// this: a poisoned connection still answers `SELECT`s correctly, and refusing reads too would
-    /// only make a recoverable situation (an operator inspecting state before deciding to reopen)
-    /// harder to diagnose.
+    /// [`Store::poisoned`] is set (via [`recover_from_non_autocommit`] — see that function's doc
+    /// comment for the only place this flag is ever actually written), rather than letting the
+    /// write attempt run and either fail with a confusing raw SQLite error (for the methods that
+    /// open their own transaction — SQLite itself refuses a nested `BEGIN`) or, worse, silently
+    /// execute inside a stranded transaction (every bare `self.conn.execute` write here that opens
+    /// no transaction of its own — exactly the failure mode td-c9b9bd exists to close). Read-only
+    /// methods deliberately do **not** call this: a poisoned connection still answers `SELECT`s
+    /// correctly, and refusing reads too would only make a recoverable situation (an operator
+    /// inspecting state before deciding to reopen) harder to diagnose. [`Store::member_and_cap_epoch`]
+    /// is the one exception that reads without writing yet still calls this: it wraps its two reads
+    /// in a transaction for snapshot consistency (see its own doc comment) via
+    /// [`Store::with_transaction`], the same wrapper every write method uses, and so picks up this
+    /// check as a side effect of closing the identical stranding vulnerability for its own commit.
     fn check_not_poisoned(&self) -> Result<(), StoreError> {
         if self.poisoned.load(Ordering::SeqCst) {
             return Err(StoreError::ConnectionPoisoned);
         }
         Ok(())
+    }
+
+    /// td-c9b9bd follow-up: the `&self` transaction wrapper every ordinary mutating method below
+    /// uses — every one except [`Store::burn_invite_nonce`], which needs `&mut self` for
+    /// `Connection::transaction` and is wired by hand instead (see its own doc comment for why).
+    ///
+    /// **The guarantee this closes**: before this wrapper existed, each of those methods opened
+    /// its own transaction and ended with a trailing `tx.commit()?`. If that `commit()` failed, or
+    /// if an earlier `?` inside the method body returned early, the `Transaction` value was simply
+    /// dropped — and `rusqlite` 0.32.1's `Transaction::drop` retries `ROLLBACK` under
+    /// `#[allow(unused_must_use)]`, silently discarding the error if that retry *also* fails. A
+    /// connection left that way — still inside an open transaction, `is_autocommit() == false` —
+    /// was never poisoned, because nothing on that path ever called
+    /// [`recover_from_non_autocommit`]: every subsequent write then silently executed inside the
+    /// stranded transaction and reported success while remaining undurable. `with_transaction`
+    /// closes this by making the call unconditional: it runs [`recover_from_non_autocommit`] after
+    /// `f` returns by *any* path, not only after a successful `commit()`.
+    ///
+    /// The inner closure is what makes that guarantee airtight, not an RAII `Drop` ordering trick:
+    /// `f`, and the `Transaction` it borrows, live entirely inside the immediately-invoked closure
+    /// `(|| { ... })()`. By the time that expression finishes — whether `f` returned `Err` and `?`
+    /// unwound out of the closure (dropping the un-committed `Transaction`, which attempts its own
+    /// `ROLLBACK`), or `f` returned `Ok` and this wrapper's own `tx.commit()?` ran — the
+    /// transaction has already been fully resolved one way or the other. Only then does
+    /// [`recover_from_non_autocommit`] run, so it always observes the connection's *final*
+    /// autocommit state for this call, never a mid-resolution one.
+    ///
+    /// `context` is a short, static, human-readable label (e.g. `"revoke_member_and_bump_epoch"`)
+    /// passed straight through to [`recover_from_non_autocommit`] for its log lines only.
+    ///
+    /// # `behavior`: DEFERRED vs IMMEDIATE
+    ///
+    /// This parameter is load-bearing, not a style choice, and callers must keep passing whichever
+    /// value the call site used before this wrapper existed:
+    /// - `TransactionBehavior::Deferred` for [`Store::revoke_member_and_bump_epoch`],
+    ///   [`Store::revoke_device_and_bump_epoch`], and [`Store::member_and_cap_epoch`] — exactly
+    ///   what their prior direct `self.conn.unchecked_transaction()` call already began (see
+    ///   below for why that call is always DEFERRED on this crate's connections).
+    /// - `TransactionBehavior::Immediate` for [`Store::add_share`], [`Store::add_share_exclude`],
+    ///   [`Store::record_upload`], [`Store::remove_uploads_under`], [`Store::remove_upload_row`],
+    ///   and [`Store::reconcile_upload_counters`] — exactly what their prior direct
+    ///   `Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)` call already
+    ///   began.
+    ///
+    /// Do not simplify this to one fixed behavior for every caller. The two groups need opposite
+    /// answers to the same question, for reasons each carries on its own doc comment:
+    /// [`Store::member_and_cap_epoch`]'s doc comment argues in detail why DEFERRED is correct
+    /// *there* specifically — that method never writes, so the RESERVED lock IMMEDIATE takes
+    /// unconditionally at `BEGIN` would only serialize its read against every writer on the file
+    /// for no benefit; DEFERRED instead takes nothing until the first statement runs, and then
+    /// only a SHARED lock, held across the gap between its two reads all the way to `COMMIT` — the
+    /// entire isolation guarantee that method relies on. The six IMMEDIATE callers are the mirror
+    /// case: each has a documented read-then-write gap (a count check before an `INSERT`, an
+    /// existing-row lookup before an upsert) that two concurrent callers could otherwise both
+    /// cross before either commits — see e.g. [`Store::add_share`]'s own doc comment for the
+    /// "both scan, both see no conflict, both commit" race IMMEDIATE's up-front RESERVED lock
+    /// closes. Swapping either group's behavior is a live regression: DEFERRED on the six would
+    /// reopen exactly those races; IMMEDIATE on the three would needlessly serialize a
+    /// snapshot-consistency read against every writer.
+    ///
+    /// Verified against `rusqlite` 0.32.1's source (`transaction.rs`) that
+    /// `Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)` is byte-identical
+    /// to what `self.conn.unchecked_transaction()` already did: `Connection::unchecked_transaction`
+    /// calls `Transaction::new_unchecked(self, self.transaction_behavior)`, and every `Connection`
+    /// constructor in that crate defaults `transaction_behavior` to `TransactionBehavior::
+    /// Deferred`. Nothing in this crate calls `Connection::set_transaction_behavior` to override
+    /// that default, so passing `TransactionBehavior::Deferred` here continues that exact
+    /// `"BEGIN DEFERRED"` behavior rather than changing it.
+    fn with_transaction<T>(
+        &self,
+        context: &'static str,
+        behavior: TransactionBehavior,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.check_not_poisoned()?;
+        let result = (|| {
+            let tx = Transaction::new_unchecked(&self.conn, behavior)?;
+            let value = f(&tx)?;
+            tx.commit()?;
+            Ok(value)
+        })();
+        recover_from_non_autocommit(&self.conn, &self.poisoned, context);
+        result
     }
 
     // ---------------------------------------------------------------------------------------
@@ -656,16 +749,22 @@ impl Store {
     /// unchanged) — it is an additional, atomic entry point a caller can use instead.
     ///
     /// The whole operation — reading the member's current status, writing
-    /// `status = 'revoked'`, and bumping `cap_epoch` — happens inside one
-    /// `self.conn.unchecked_transaction()`, committed at the end. `unchecked_transaction` (rather
-    /// than `rusqlite::Connection::transaction`, which requires `&mut Connection`) is used
-    /// because every `Store` method takes `&self` and `Store` holds a single `Connection` with no
-    /// nesting, so this is the only constructor available without rippling a `&mut self` API
-    /// break through every method here and every caller in `spindle-host-core`. Because it is one
-    /// transaction, the crash-window defect above is now unreachable: a crash before commit rolls
-    /// back the status write too, so a retry sees the member still in its pre-crash status and
-    /// takes the ordinary forward-transition path again, rather than wedging on a terminal state
-    /// with no bump to show for it.
+    /// `status = 'revoked'`, and bumping `cap_epoch` — happens inside one transaction, via
+    /// [`Store::with_transaction`] (`TransactionBehavior::Deferred`, matching what this method's
+    /// direct `self.conn.unchecked_transaction()` call began before that wrapper existed — see its
+    /// doc comment for why DEFERRED is the right behavior here and IMMEDIATE would not be).
+    /// `with_transaction` is used (rather than `rusqlite::Connection::transaction`, which requires
+    /// `&mut Connection`) because every `Store` method takes `&self` and `Store` holds a single
+    /// `Connection` with no nesting, so this is the only shape available without rippling a
+    /// `&mut self` API break through every method here and every caller in `spindle-host-core`.
+    /// Because it is one transaction, the crash-window defect above is now unreachable: a crash
+    /// before commit rolls back the status write too, so a retry sees the member still in its
+    /// pre-crash status and takes the ordinary forward-transition path again, rather than wedging
+    /// on a terminal state with no bump to show for it. `with_transaction` additionally guarantees
+    /// (td-c9b9bd follow-up) that a failed commit — or an early `?` return from inside this
+    /// method's closure — still runs [`recover_from_non_autocommit`] before returning, so a
+    /// `ROLLBACK`/`COMMIT` that fails to restore autocommit mode poisons the connection instead of
+    /// silently stranding it.
     ///
     /// Returns:
     /// - `Err(StoreError::MemberNotFound(member_id))` if the member does not exist.
@@ -684,44 +783,48 @@ impl Store {
         member_id: MemberId,
     ) -> Result<Option<u64>, StoreError> {
         self.check_not_poisoned()?;
-        let tx = self.conn.unchecked_transaction()?;
-        // `root_fp` is read alongside `status` in the same query so this method's only
-        // identifying detail for the `tracing` calls below comes for free — no extra round trip
-        // just to log.
-        let current: Option<(String, Vec<u8>)> = tx
-            .query_row(
-                "SELECT status, root_fp FROM members WHERE member_id = ?1",
-                params![member_id.0 as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((status_str_val, root_fp_bytes)) = current else {
-            return Err(StoreError::MemberNotFound(member_id));
-        };
-        let root_fp = Fingerprint::from_slice(&root_fp_bytes)?;
-        if parse_status(&status_str_val) == MemberStatus::Revoked {
-            // Nothing to write, nothing to bump — commit (equivalent to rollback here, since
-            // nothing was written) and report "no-op" to the caller.
-            tx.commit()?;
-            tracing::debug!(
-                member_fp = %root_fp.redacted(),
-                "revoke_member_and_bump_epoch: member already revoked; cap_epoch not bumped \
-                 (idempotent no-op)"
-            );
-            return Ok(None);
-        }
-        tx.execute(
-            "UPDATE members SET status = 'revoked' WHERE member_id = ?1",
-            params![member_id.0 as i64],
-        )?;
-        let new_epoch = bump_cap_epoch_in_tx(&tx)?;
-        tx.commit()?;
-        tracing::info!(
-            member_fp = %root_fp.redacted(),
-            %new_epoch,
-            "member revoked; cap_epoch bumped"
-        );
-        Ok(Some(new_epoch))
+        self.with_transaction(
+            "revoke_member_and_bump_epoch",
+            TransactionBehavior::Deferred,
+            |tx| {
+                // `root_fp` is read alongside `status` in the same query so this method's only
+                // identifying detail for the `tracing` calls below comes for free — no extra
+                // round trip just to log.
+                let current: Option<(String, Vec<u8>)> = tx
+                    .query_row(
+                        "SELECT status, root_fp FROM members WHERE member_id = ?1",
+                        params![member_id.0 as i64],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((status_str_val, root_fp_bytes)) = current else {
+                    return Err(StoreError::MemberNotFound(member_id));
+                };
+                let root_fp = Fingerprint::from_slice(&root_fp_bytes)?;
+                if parse_status(&status_str_val) == MemberStatus::Revoked {
+                    // Nothing to write, nothing to bump — `with_transaction`'s single commit at
+                    // the end still runs on this early return, but that's a no-op (equivalent to
+                    // rollback here, since nothing was written); report "no-op" to the caller.
+                    tracing::debug!(
+                        member_fp = %root_fp.redacted(),
+                        "revoke_member_and_bump_epoch: member already revoked; cap_epoch not \
+                         bumped (idempotent no-op)"
+                    );
+                    return Ok(None);
+                }
+                tx.execute(
+                    "UPDATE members SET status = 'revoked' WHERE member_id = ?1",
+                    params![member_id.0 as i64],
+                )?;
+                let new_epoch = bump_cap_epoch_in_tx(tx)?;
+                tracing::info!(
+                    member_fp = %root_fp.redacted(),
+                    %new_epoch,
+                    "member revoked; cap_epoch bumped"
+                );
+                Ok(Some(new_epoch))
+            },
+        )
     }
 
     // ---------------------------------------------------------------------------------------
@@ -892,7 +995,7 @@ impl Store {
 
     /// Atomically revokes a device and bumps `cap_epoch`, or does neither — the device
     /// counterpart to [`Store::revoke_member_and_bump_epoch`]; see that method's doc comment for
-    /// why `unchecked_transaction` is used and why one transaction closes the crash window the
+    /// why `Store::with_transaction` is used and why one transaction closes the crash window the
     /// old two-autocommit-statement sequencing left open. This method does not change
     /// [`Store::revoke_device`]'s existing behavior at all — it is an additional, atomic entry
     /// point a caller can use instead.
@@ -922,45 +1025,51 @@ impl Store {
         device_fp: Fingerprint,
     ) -> Result<Option<u64>, StoreError> {
         self.check_not_poisoned()?;
-        let tx = self.conn.unchecked_transaction()?;
-        // `AND revoked = 0` is load-bearing: it is what makes re-revoking an already-revoked
-        // device match zero rows (a no-op) instead of one, which is what lets the branch below
-        // distinguish "no-op" from "not found" and avoid an unnecessary `cap_epoch` bump.
-        let changed = tx.execute(
-            "UPDATE devices SET revoked = 1 WHERE device_fp = ?1 AND revoked = 0",
-            params![device_fp.to_vec()],
-        )?;
-        if changed == 0 {
-            let exists: Option<i64> = tx
-                .query_row(
-                    "SELECT revoked FROM devices WHERE device_fp = ?1",
+        self.with_transaction(
+            "revoke_device_and_bump_epoch",
+            TransactionBehavior::Deferred,
+            |tx| {
+                // `AND revoked = 0` is load-bearing: it is what makes re-revoking an
+                // already-revoked device match zero rows (a no-op) instead of one, which is what
+                // lets the branch below distinguish "no-op" from "not found" and avoid an
+                // unnecessary `cap_epoch` bump.
+                let changed = tx.execute(
+                    "UPDATE devices SET revoked = 1 WHERE device_fp = ?1 AND revoked = 0",
                     params![device_fp.to_vec()],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            return match exists {
-                None => Err(StoreError::DeviceNotFound(device_fp)),
-                Some(_) => {
-                    // Row exists and is already revoked — commit (equivalent to rollback here,
-                    // since nothing was written) and report "no-op" to the caller.
-                    tx.commit()?;
-                    tracing::debug!(
-                        device_fp = %device_fp.redacted(),
-                        "revoke_device_and_bump_epoch: device already revoked; cap_epoch not \
-                         bumped (idempotent no-op)"
-                    );
-                    Ok(None)
+                )?;
+                if changed == 0 {
+                    let exists: Option<i64> = tx
+                        .query_row(
+                            "SELECT revoked FROM devices WHERE device_fp = ?1",
+                            params![device_fp.to_vec()],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    return match exists {
+                        None => Err(StoreError::DeviceNotFound(device_fp)),
+                        Some(_) => {
+                            // Row exists and is already revoked — `with_transaction`'s single
+                            // commit at the end still runs on this early return, but that's a
+                            // no-op (equivalent to rollback here, since nothing was written);
+                            // report "no-op" to the caller.
+                            tracing::debug!(
+                                device_fp = %device_fp.redacted(),
+                                "revoke_device_and_bump_epoch: device already revoked; cap_epoch \
+                                 not bumped (idempotent no-op)"
+                            );
+                            Ok(None)
+                        }
+                    };
                 }
-            };
-        }
-        let new_epoch = bump_cap_epoch_in_tx(&tx)?;
-        tx.commit()?;
-        tracing::info!(
-            device_fp = %device_fp.redacted(),
-            %new_epoch,
-            "device revoked; cap_epoch bumped"
-        );
-        Ok(Some(new_epoch))
+                let new_epoch = bump_cap_epoch_in_tx(tx)?;
+                tracing::info!(
+                    device_fp = %device_fp.redacted(),
+                    %new_epoch,
+                    "device revoked; cap_epoch bumped"
+                );
+                Ok(Some(new_epoch))
+            },
+        )
     }
 
     /// Resolves the [`Member`] owning `device_fp` — the connect-time lookup direction. `device_fp`
@@ -1023,8 +1132,8 @@ impl Store {
     /// then [`Store::get_member`], which itself issues separate queries for the member row, its
     /// devices, and its groups), so outside of a transaction it could already return an internally
     /// torn `Member` if another connection's write landed mid-sequence. Wrapping the whole read in
-    /// one `unchecked_transaction` makes every statement inside it see one consistent database
-    /// state, not just the two top-level reads.
+    /// one transaction (via [`Store::with_transaction`]) makes every statement inside it see one
+    /// consistent database state, not just the two top-level reads.
     ///
     /// Read order is deliberate defense in depth: `cap_epoch` is read **before** the member, not
     /// after (the reverse of the naive order). If this transaction were ever weakened or removed
@@ -1048,51 +1157,34 @@ impl Store {
     /// order costs nothing and removes one more way a future change could silently reopen this
     /// hole.
     ///
-    /// Uses `unchecked_transaction` rather than `rusqlite::Connection::transaction`. "Every
-    /// `Store` method takes `&self`, and `transaction()` requires `&mut Connection`" is true but
-    /// incomplete as a reason, because `&mut Connection` is not the only alternative avoided —
-    /// this file's dominant transaction idiom is actually `Transaction::new_unchecked`, which also
-    /// takes `&self`. Counting every other transaction site in this file: two —
-    /// [`Store::revoke_member_and_bump_epoch`] and [`Store::revoke_device_and_bump_epoch`] — use
-    /// `unchecked_transaction` like this method; one — [`Store::burn_invite_nonce`] — takes
-    /// `&mut self` and uses `self.conn.transaction()`; and six — [`Store::add_share`],
-    /// [`Store::add_share_exclude`], [`Store::record_upload`], [`Store::remove_uploads_under`],
-    /// [`Store::remove_upload_row`], and [`Store::reconcile_upload_counters`] — take `&self` and
-    /// use `Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)`. So the
-    /// question this method actually has to answer is not "`&self` or `&mut self`" —
-    /// `Transaction::new_unchecked` would have satisfied `&self` just as well — but DEFERRED
-    /// versus IMMEDIATE, since `unchecked_transaction` and `Transaction::new_unchecked` differ
-    /// only in which behavior they request.
-    ///
-    /// DEFERRED is the correct answer for this method, and IMMEDIATE would be a regression.
-    /// IMMEDIATE takes a RESERVED lock at `BEGIN` unconditionally, which is right for the six
-    /// share/upload sites above because they are about to write and want that lock claimed up
-    /// front — but this method never writes, so the same RESERVED lock would only serialize this
-    /// read against every writer on the file for no benefit. DEFERRED instead takes nothing until
-    /// the first statement actually runs, and then only a SHARED lock — and it keeps that SHARED
-    /// lock held across the gap between this method's two reads, all the way to `COMMIT`. That
-    /// retention across the statement boundary is the entire isolation guarantee this method
-    /// relies on, not anything about what `BEGIN` itself acquires. Verified against rusqlite
-    /// 0.32.1's source (`transaction.rs`): `Connection::unchecked_transaction` calls
-    /// `Transaction::new_unchecked(self, self.transaction_behavior)`, and every `Connection`
-    /// constructor in that crate defaults `transaction_behavior` to `TransactionBehavior::
-    /// Deferred`, which `new_unchecked` turns into exactly `"BEGIN DEFERRED"`. Nothing in this
-    /// crate calls `Connection::set_transaction_behavior` to override that default, so this
-    /// method's `unchecked_transaction()` call always begins DEFERRED.
+    /// Goes through [`Store::with_transaction`] with `TransactionBehavior::Deferred` — see that
+    /// method's doc comment for the full DEFERRED-vs-IMMEDIATE argument (moved there from this
+    /// doc comment, since it now applies to a wrapper shared with the other transaction-opening
+    /// methods in this file, not just this one): in short, DEFERRED is the correct answer for
+    /// this method specifically, because it never writes, so IMMEDIATE's unconditional RESERVED
+    /// lock at `BEGIN` would only serialize this read against every writer on the file for no
+    /// benefit, whereas DEFERRED's SHARED lock — held across the gap between this method's two
+    /// reads, all the way to `COMMIT` — is the entire isolation guarantee this method relies on.
+    /// `with_transaction` additionally means a failed commit here now runs
+    /// [`recover_from_non_autocommit`] (td-c9b9bd follow-up) instead of leaving this connection
+    /// silently stranded the way it could before that wrapper existed; that also means this
+    /// method now calls [`Store::check_not_poisoned`] (via the wrapper) even though it is
+    /// otherwise a read — see that method's doc comment for why this is the one such exception.
     pub fn member_and_cap_epoch(
         &self,
         device_fp: Fingerprint,
     ) -> Result<(Option<Member>, u64), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
-        // Epoch first, member second — see the doc comment above for why this order is the
-        // fail-safe one.
-        let cap_epoch = self.cap_epoch()?;
-        let member = self.member_for_device_fp(device_fp)?;
-        // Nothing was written, so commit and rollback are equivalent here; commit is clearest and
-        // matches this file's other read/write transactions (e.g.
-        // `Store::revoke_member_and_bump_epoch`'s no-op branch).
-        tx.commit()?;
-        Ok((member, cap_epoch))
+        self.with_transaction(
+            "member_and_cap_epoch",
+            TransactionBehavior::Deferred,
+            |_tx| {
+                // Epoch first, member second — see the doc comment above for why this order is
+                // the fail-safe one.
+                let cap_epoch = self.cap_epoch()?;
+                let member = self.member_for_device_fp(device_fp)?;
+                Ok((member, cap_epoch))
+            },
+        )
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1230,7 +1322,8 @@ impl Store {
         created: u64,
     ) -> Result<ShareId, StoreError> {
         self.check_not_poisoned()?;
-        // One `Immediate` transaction spans every check below and every write that follows.
+        // One `Immediate` transaction (via `Store::with_transaction`) spans every check below
+        // and every write that follows.
         //
         // Without it the four checks are plain autocommitted reads, nothing holds a lock across
         // the gap to the `INSERT`, and two concurrent callers both scan, both see no conflict,
@@ -1245,95 +1338,96 @@ impl Store {
         // lock, both scan stale, and one then races the other to upgrade — which SQLite resolves
         // as a forced `SQLITE_BUSY` failure for one side rather than a successful wait, hence
         // `Immediate`, which takes the write lock up front and lets the loser simply wait its
-        // turn.
-        //
-        // `Transaction::new_unchecked` (rather than `Connection::transaction`, which needs
-        // `&mut Connection`) because this method takes `&self`, matching the precedent already
-        // set by `revoke_member_and_bump_epoch` and `revoke_device_and_bump_epoch` above.
+        // turn. See `Store::with_transaction`'s doc comment for why this must stay `Immediate`
+        // and not be weakened to `Deferred` by a future refactor.
         //
         // It also closes the second half of the defect: the share row, its `share_excludes`
         // rows, and the `grants_version` bump were three separate autocommits, so a crash
         // between them could commit a share *without* its exclusion globs — the globs that hide
-        // files. All three now commit together or not at all.
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let existing_count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))?;
-        if existing_count as usize >= self.limits.max_shares {
-            return Err(StoreError::TooManyShares {
-                limit: self.limits.max_shares,
-            });
-        }
-        if excludes.len() > self.limits.max_excludes_per_share {
-            // No share_id yet (not inserted); report against a placeholder — callers already
-            // know which share they're adding.
-            return Err(StoreError::TooManyExcludeGlobs {
-                share: ShareId(0),
-                limit: self.limits.max_excludes_per_share,
-            });
-        }
-
-        // Reject an invalid mount_path outright (same component rules as any other virtual path
-        // — see `VirtualPath::parse`), then check it against every existing share's mount_path
-        // for a collision (equal, ancestor, or descendant — see `StoreError::MountPathCollision`
-        // and `mount_paths_collide`'s doc comment).
-        let new_mount_path = VirtualPath::parse(mount_path)?;
-        for existing in self.list_shares()? {
-            if overlap_check(real_root, &existing.real_root)? {
-                // Neither root is logged — a real filesystem path here is exactly the detail
-                // this crate's tracing policy forbids. `existing_share_id` is a host-local row
-                // id, not a path, and is enough for an operator to look the conflict up via
-                // `list_shares`.
-                let existing_share_id = existing.share_id.0;
-                tracing::warn!(
-                    %existing_share_id,
-                    "add_share refused: new share root overlaps an existing share's real root"
-                );
-                return Err(StoreError::OverlappingShareRoot {
-                    new_root: real_root.to_path_buf(),
-                    existing: existing.share_id,
+        // files. All three now commit together or not at all. `with_transaction` additionally
+        // guarantees (td-c9b9bd follow-up) that every exit from the closure below — including
+        // each early `return Err(...)` — still runs `recover_from_non_autocommit` before this
+        // method returns, so a `ROLLBACK`/`COMMIT` that fails to restore autocommit mode poisons
+        // the connection instead of silently stranding it.
+        self.with_transaction("add_share", TransactionBehavior::Immediate, |_tx| {
+            let existing_count: i64 = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))?;
+            if existing_count as usize >= self.limits.max_shares {
+                return Err(StoreError::TooManyShares {
+                    limit: self.limits.max_shares,
                 });
             }
-            let existing_mount_path = VirtualPath::parse(&existing.mount_path)
-                .expect("mount_path persisted by this store is always a valid VirtualPath");
-            if mount_paths_collide(&new_mount_path, &existing_mount_path) {
-                // `mount_path` is a virtual path — never logged, same reasoning as above.
-                let existing_share_id = existing.share_id.0;
-                tracing::warn!(
-                    %existing_share_id,
-                    "add_share refused: new mount_path collides with an existing share's \
-                     mount_path"
-                );
-                return Err(StoreError::MountPathCollision {
-                    new_mount_path: mount_path.to_string(),
-                    existing: existing.share_id,
+            if excludes.len() > self.limits.max_excludes_per_share {
+                // No share_id yet (not inserted); report against a placeholder — callers already
+                // know which share they're adding.
+                return Err(StoreError::TooManyExcludeGlobs {
+                    share: ShareId(0),
+                    limit: self.limits.max_excludes_per_share,
                 });
             }
-        }
 
-        self.conn.execute(
-            "INSERT INTO shares (name, mount_path, real_root, read_only, allow_upload, show_hidden, created) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                name,
-                mount_path,
-                real_root.to_string_lossy(),
-                flags.read_only as i64,
-                flags.allow_upload as i64,
-                flags.show_hidden as i64,
-                created as i64,
-            ],
-        )?;
-        let share_id = ShareId(self.conn.last_insert_rowid() as u64);
-        for glob in excludes {
+            // Reject an invalid mount_path outright (same component rules as any other virtual
+            // path — see `VirtualPath::parse`), then check it against every existing share's
+            // mount_path for a collision (equal, ancestor, or descendant — see
+            // `StoreError::MountPathCollision` and `mount_paths_collide`'s doc comment).
+            let new_mount_path = VirtualPath::parse(mount_path)?;
+            for existing in self.list_shares()? {
+                if overlap_check(real_root, &existing.real_root)? {
+                    // Neither root is logged — a real filesystem path here is exactly the detail
+                    // this crate's tracing policy forbids. `existing_share_id` is a host-local
+                    // row id, not a path, and is enough for an operator to look the conflict up
+                    // via `list_shares`.
+                    let existing_share_id = existing.share_id.0;
+                    tracing::warn!(
+                        %existing_share_id,
+                        "add_share refused: new share root overlaps an existing share's real root"
+                    );
+                    return Err(StoreError::OverlappingShareRoot {
+                        new_root: real_root.to_path_buf(),
+                        existing: existing.share_id,
+                    });
+                }
+                let existing_mount_path = VirtualPath::parse(&existing.mount_path)
+                    .expect("mount_path persisted by this store is always a valid VirtualPath");
+                if mount_paths_collide(&new_mount_path, &existing_mount_path) {
+                    // `mount_path` is a virtual path — never logged, same reasoning as above.
+                    let existing_share_id = existing.share_id.0;
+                    tracing::warn!(
+                        %existing_share_id,
+                        "add_share refused: new mount_path collides with an existing share's \
+                         mount_path"
+                    );
+                    return Err(StoreError::MountPathCollision {
+                        new_mount_path: mount_path.to_string(),
+                        existing: existing.share_id,
+                    });
+                }
+            }
+
             self.conn.execute(
-                "INSERT INTO share_excludes (share_id, glob) VALUES (?1, ?2)",
-                params![share_id.0 as i64, glob],
+                "INSERT INTO shares (name, mount_path, real_root, read_only, allow_upload, show_hidden, created) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    name,
+                    mount_path,
+                    real_root.to_string_lossy(),
+                    flags.read_only as i64,
+                    flags.allow_upload as i64,
+                    flags.show_hidden as i64,
+                    created as i64,
+                ],
             )?;
-        }
-        self.bump_grants_version()?;
-        tx.commit()?;
-        Ok(share_id)
+            let share_id = ShareId(self.conn.last_insert_rowid() as u64);
+            for glob in excludes {
+                self.conn.execute(
+                    "INSERT INTO share_excludes (share_id, glob) VALUES (?1, ?2)",
+                    params![share_id.0 as i64, glob],
+                )?;
+            }
+            self.bump_grants_version()?;
+            Ok(share_id)
+        })
     }
 
     pub fn get_share(&self, share_id: ShareId) -> Result<Option<Share>, StoreError> {
@@ -1427,33 +1521,34 @@ impl Store {
 
     pub fn add_share_exclude(&self, share_id: ShareId, glob: &str) -> Result<(), StoreError> {
         self.check_not_poisoned()?;
-        // Same `Immediate` transaction discipline as `add_share` above, for the same reason and
-        // the same defect: the count check and the `INSERT` are otherwise separate autocommits,
-        // so two concurrent callers each adding a *distinct* glob both read a stale count under
-        // the cap and both insert, carrying the share past `max_excludes_per_share`.
-        // `INSERT OR IGNORE` does not cover this — it suppresses a duplicate glob, not a
-        // concurrent distinct one, and no SQL constraint can express "at most N rows per
-        // share_id". The `grants_version` bump joins the same transaction so the count and the
-        // version it advertises cannot disagree.
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let current: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM share_excludes WHERE share_id = ?1",
-            params![share_id.0 as i64],
-            |r| r.get(0),
-        )?;
-        if current as usize >= self.limits.max_excludes_per_share {
-            return Err(StoreError::TooManyExcludeGlobs {
-                share: share_id,
-                limit: self.limits.max_excludes_per_share,
-            });
-        }
-        self.conn.execute(
-            "INSERT OR IGNORE INTO share_excludes (share_id, glob) VALUES (?1, ?2)",
-            params![share_id.0 as i64, glob],
-        )?;
-        self.bump_grants_version()?;
-        tx.commit()?;
-        Ok(())
+        // Same `Immediate` transaction discipline as `add_share` above (via
+        // `Store::with_transaction` — see its doc comment for why this must stay `Immediate`),
+        // for the same reason and the same defect: the count check and the `INSERT` are
+        // otherwise separate autocommits, so two concurrent callers each adding a *distinct*
+        // glob both read a stale count under the cap and both insert, carrying the share past
+        // `max_excludes_per_share`. `INSERT OR IGNORE` does not cover this — it suppresses a
+        // duplicate glob, not a concurrent distinct one, and no SQL constraint can express "at
+        // most N rows per share_id". The `grants_version` bump joins the same transaction so the
+        // count and the version it advertises cannot disagree.
+        self.with_transaction("add_share_exclude", TransactionBehavior::Immediate, |_tx| {
+            let current: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM share_excludes WHERE share_id = ?1",
+                params![share_id.0 as i64],
+                |r| r.get(0),
+            )?;
+            if current as usize >= self.limits.max_excludes_per_share {
+                return Err(StoreError::TooManyExcludeGlobs {
+                    share: share_id,
+                    limit: self.limits.max_excludes_per_share,
+                });
+            }
+            self.conn.execute(
+                "INSERT OR IGNORE INTO share_excludes (share_id, glob) VALUES (?1, ?2)",
+                params![share_id.0 as i64, glob],
+            )?;
+            self.bump_grants_version()?;
+            Ok(())
+        })
     }
 
     /// DESIGN.md §A4b: "no overlapping roots ... re-checked at host start" — pairwise-checks
@@ -1704,10 +1799,11 @@ impl Store {
 
     /// Upserts `uploaded_files`'s row for `(share_id, subpath)` to `bytes`, attributed to
     /// `member_id`, and applies the resulting deltas to both counter caches — all inside one
-    /// `Immediate` transaction, following the same discipline (and for the same reason) as
-    /// [`Store::add_share`]/[`Store::add_share_exclude`]'s doc comments: without a shared
-    /// transaction, the read-then-write gap between finding the old row and writing the new one
-    /// would let a concurrent caller observe or apply a half-updated state.
+    /// `Immediate` transaction (via [`Store::with_transaction`]), following the same discipline
+    /// (and for the same reason) as [`Store::add_share`]/[`Store::add_share_exclude`]'s doc
+    /// comments: without a shared transaction, the read-then-write gap between finding the old
+    /// row and writing the new one would let a concurrent caller observe or apply a
+    /// half-updated state.
     ///
     /// Three cases, by what (if anything) already occupied this `(share_id, subpath)`:
     /// - **No existing row**: both counters simply grow by `bytes`.
@@ -1739,54 +1835,53 @@ impl Store {
         bytes: u64,
     ) -> Result<(), StoreError> {
         self.check_not_poisoned()?;
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        self.with_transaction("record_upload", TransactionBehavior::Immediate, |_tx| {
+            let fold_subpath = confine::fold_key(subpath);
 
-        let fold_subpath = confine::fold_key(subpath);
+            let existing: Option<(i64, i64)> = self
+                .conn
+                .query_row(
+                    "SELECT member_id, bytes FROM uploaded_files WHERE share_id = ?1 AND fold_subpath = ?2",
+                    params![share_id.0 as i64, fold_subpath],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
 
-        let existing: Option<(i64, i64)> = self
-            .conn
-            .query_row(
-                "SELECT member_id, bytes FROM uploaded_files WHERE share_id = ?1 AND fold_subpath = ?2",
-                params![share_id.0 as i64, fold_subpath],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-
-        let new_bytes = bytes as i64;
-        match existing {
-            Some((old_member_id, old_bytes)) => {
-                let share_delta = new_bytes - old_bytes;
-                self.adjust_share_upload_bytes(share_id, share_delta)?;
-                if old_member_id == member_id.0 as i64 {
-                    self.adjust_member_upload_bytes(member_id, share_delta)?;
-                } else {
-                    self.adjust_member_upload_bytes(MemberId(old_member_id as u64), -old_bytes)?;
+            let new_bytes = bytes as i64;
+            match existing {
+                Some((old_member_id, old_bytes)) => {
+                    let share_delta = new_bytes - old_bytes;
+                    self.adjust_share_upload_bytes(share_id, share_delta)?;
+                    if old_member_id == member_id.0 as i64 {
+                        self.adjust_member_upload_bytes(member_id, share_delta)?;
+                    } else {
+                        self.adjust_member_upload_bytes(MemberId(old_member_id as u64), -old_bytes)?;
+                        self.adjust_member_upload_bytes(member_id, new_bytes)?;
+                    }
+                }
+                None => {
+                    self.adjust_share_upload_bytes(share_id, new_bytes)?;
                     self.adjust_member_upload_bytes(member_id, new_bytes)?;
                 }
             }
-            None => {
-                self.adjust_share_upload_bytes(share_id, new_bytes)?;
-                self.adjust_member_upload_bytes(member_id, new_bytes)?;
-            }
-        }
 
-        self.conn.execute(
-            "INSERT INTO uploaded_files (share_id, member_id, subpath, fold_subpath, bytes) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(share_id, fold_subpath) \
-             DO UPDATE SET subpath = excluded.subpath, member_id = excluded.member_id, \
-                            bytes = excluded.bytes",
-            params![
-                share_id.0 as i64,
-                member_id.0 as i64,
-                subpath,
-                fold_subpath,
-                new_bytes
-            ],
-        )?;
+            self.conn.execute(
+                "INSERT INTO uploaded_files (share_id, member_id, subpath, fold_subpath, bytes) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(share_id, fold_subpath) \
+                 DO UPDATE SET subpath = excluded.subpath, member_id = excluded.member_id, \
+                                bytes = excluded.bytes",
+                params![
+                    share_id.0 as i64,
+                    member_id.0 as i64,
+                    subpath,
+                    fold_subpath,
+                    new_bytes
+                ],
+            )?;
 
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Removes every `uploaded_files` row at `subpath` itself **or** anywhere beneath it (a
@@ -1841,45 +1936,51 @@ impl Store {
         subpath: &str,
     ) -> Result<Vec<(MemberId, u64)>, StoreError> {
         self.check_not_poisoned()?;
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        self.with_transaction(
+            "remove_uploads_under",
+            TransactionBehavior::Immediate,
+            |_tx| {
+                let fold_subpath = confine::fold_key(subpath);
+                let prefix = format!("{fold_subpath}/");
 
-        let fold_subpath = confine::fold_key(subpath);
-        let prefix = format!("{fold_subpath}/");
+                let mut stmt = self.conn.prepare(
+                    "SELECT member_id, bytes FROM uploaded_files \
+                     WHERE share_id = ?1 AND (fold_subpath = ?2 OR substr(fold_subpath, 1, length(?3)) = ?3)",
+                )?;
+                let matches: Vec<(i64, i64)> = stmt
+                    .query_map(params![share_id.0 as i64, fold_subpath, prefix], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?
+                    .collect::<Result<_, _>>()?;
+                drop(stmt);
 
-        let mut stmt = self.conn.prepare(
-            "SELECT member_id, bytes FROM uploaded_files \
-             WHERE share_id = ?1 AND (fold_subpath = ?2 OR substr(fold_subpath, 1, length(?3)) = ?3)",
-        )?;
-        let matches: Vec<(i64, i64)> = stmt
-            .query_map(params![share_id.0 as i64, fold_subpath, prefix], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
-            .collect::<Result<_, _>>()?;
-        drop(stmt);
+                if matches.is_empty() {
+                    // Nothing to remove; `with_transaction`'s single commit at the end still
+                    // runs on this early return, but that's a no-op (equivalent to rollback here,
+                    // since nothing was written) — same reasoning as
+                    // `revoke_member_and_bump_epoch`'s no-op branch — so the "no match => no
+                    // writes at all" contract still holds exactly.
+                    return Ok(Vec::new());
+                }
 
-        if matches.is_empty() {
-            // Nothing to remove; `tx` drops here without a commit, rolling back (there is nothing
-            // to roll back, but this keeps the "no match => no writes at all" contract exact).
-            return Ok(Vec::new());
-        }
+                self.conn.execute(
+                    "DELETE FROM uploaded_files \
+                     WHERE share_id = ?1 AND (fold_subpath = ?2 OR substr(fold_subpath, 1, length(?3)) = ?3)",
+                    params![share_id.0 as i64, fold_subpath, prefix],
+                )?;
 
-        self.conn.execute(
-            "DELETE FROM uploaded_files \
-             WHERE share_id = ?1 AND (fold_subpath = ?2 OR substr(fold_subpath, 1, length(?3)) = ?3)",
-            params![share_id.0 as i64, fold_subpath, prefix],
-        )?;
+                let total_bytes: i64 = matches.iter().map(|(_, bytes)| bytes).sum();
+                self.adjust_share_upload_bytes(share_id, -total_bytes)?;
 
-        let total_bytes: i64 = matches.iter().map(|(_, bytes)| bytes).sum();
-        self.adjust_share_upload_bytes(share_id, -total_bytes)?;
+                let mut removed = Vec::with_capacity(matches.len());
+                for (member_id, bytes) in matches {
+                    self.adjust_member_upload_bytes(MemberId(member_id as u64), -bytes)?;
+                    removed.push((MemberId(member_id as u64), bytes as u64));
+                }
 
-        let mut removed = Vec::with_capacity(matches.len());
-        for (member_id, bytes) in matches {
-            self.adjust_member_upload_bytes(MemberId(member_id as u64), -bytes)?;
-            removed.push((MemberId(member_id as u64), bytes as u64));
-        }
-
-        tx.commit()?;
-        Ok(removed)
+                Ok(removed)
+            },
+        )
     }
 
     /// Removes exactly the `uploaded_files` row for `(share_id, fold_key(subpath))` — never a
@@ -1919,36 +2020,37 @@ impl Store {
         subpath: &str,
     ) -> Result<Option<(MemberId, u64)>, StoreError> {
         self.check_not_poisoned()?;
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        self.with_transaction("remove_upload_row", TransactionBehavior::Immediate, |_tx| {
+            let fold_subpath = confine::fold_key(subpath);
 
-        let fold_subpath = confine::fold_key(subpath);
+            let row: Option<(i64, i64)> = self
+                .conn
+                .query_row(
+                    "SELECT member_id, bytes FROM uploaded_files \
+                     WHERE share_id = ?1 AND fold_subpath = ?2",
+                    params![share_id.0 as i64, fold_subpath],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
 
-        let row: Option<(i64, i64)> = self
-            .conn
-            .query_row(
-                "SELECT member_id, bytes FROM uploaded_files \
-                 WHERE share_id = ?1 AND fold_subpath = ?2",
+            let Some((member_id, bytes)) = row else {
+                // Nothing to remove; `with_transaction`'s single commit at the end still runs on
+                // this early return, but that's a no-op (equivalent to rollback here, since
+                // nothing was written), so the "no match => no writes at all" contract still
+                // holds exactly.
+                return Ok(None);
+            };
+
+            self.conn.execute(
+                "DELETE FROM uploaded_files WHERE share_id = ?1 AND fold_subpath = ?2",
                 params![share_id.0 as i64, fold_subpath],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+            )?;
 
-        let Some((member_id, bytes)) = row else {
-            // Nothing to remove; `tx` drops here without a commit, rolling back (there is nothing
-            // to roll back, but this keeps the "no match => no writes at all" contract exact).
-            return Ok(None);
-        };
+            self.adjust_share_upload_bytes(share_id, -bytes)?;
+            self.adjust_member_upload_bytes(MemberId(member_id as u64), -bytes)?;
 
-        self.conn.execute(
-            "DELETE FROM uploaded_files WHERE share_id = ?1 AND fold_subpath = ?2",
-            params![share_id.0 as i64, fold_subpath],
-        )?;
-
-        self.adjust_share_upload_bytes(share_id, -bytes)?;
-        self.adjust_member_upload_bytes(MemberId(member_id as u64), -bytes)?;
-
-        tx.commit()?;
-        Ok(Some((MemberId(member_id as u64), bytes as u64)))
+            Ok(Some((MemberId(member_id as u64), bytes as u64)))
+        })
     }
 
     /// Recomputes both `member_upload_bytes` and `share_upload_bytes` from `uploaded_files` —
@@ -1963,28 +2065,31 @@ impl Store {
     /// counter would be left at its last (now-stale) value instead of correctly reconciling to 0.
     pub fn reconcile_upload_counters(&self) -> Result<(), StoreError> {
         self.check_not_poisoned()?;
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        self.with_transaction(
+            "reconcile_upload_counters",
+            TransactionBehavior::Immediate,
+            |_tx| {
+                self.conn
+                    .execute("UPDATE member_upload_bytes SET bytes = 0", [])?;
+                self.conn
+                    .execute("UPDATE share_upload_bytes SET bytes = 0", [])?;
 
-        self.conn
-            .execute("UPDATE member_upload_bytes SET bytes = 0", [])?;
-        self.conn
-            .execute("UPDATE share_upload_bytes SET bytes = 0", [])?;
+                self.conn.execute(
+                    "INSERT INTO member_upload_bytes (member_id, bytes) \
+                     SELECT member_id, SUM(bytes) FROM uploaded_files GROUP BY member_id \
+                     ON CONFLICT(member_id) DO UPDATE SET bytes = excluded.bytes",
+                    [],
+                )?;
+                self.conn.execute(
+                    "INSERT INTO share_upload_bytes (share_id, bytes) \
+                     SELECT share_id, SUM(bytes) FROM uploaded_files GROUP BY share_id \
+                     ON CONFLICT(share_id) DO UPDATE SET bytes = excluded.bytes",
+                    [],
+                )?;
 
-        self.conn.execute(
-            "INSERT INTO member_upload_bytes (member_id, bytes) \
-             SELECT member_id, SUM(bytes) FROM uploaded_files GROUP BY member_id \
-             ON CONFLICT(member_id) DO UPDATE SET bytes = excluded.bytes",
-            [],
-        )?;
-        self.conn.execute(
-            "INSERT INTO share_upload_bytes (share_id, bytes) \
-             SELECT share_id, SUM(bytes) FROM uploaded_files GROUP BY share_id \
-             ON CONFLICT(share_id) DO UPDATE SET bytes = excluded.bytes",
-            [],
-        )?;
-
-        tx.commit()?;
-        Ok(())
+                Ok(())
+            },
+        )
     }
 
     /// Every `uploaded_files` row for `share_id` (td-2db67d): the bounded worklist
@@ -2049,24 +2154,40 @@ impl Store {
         now: u64,
     ) -> Result<IssuedCapRecord, StoreError> {
         self.check_not_poisoned()?;
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO invite_nonces (nonce, member_id, issued_cap, redeemed_at) \
-             VALUES (?1, ?2, ?3, ?4) ON CONFLICT (nonce) DO NOTHING",
-            params![nonce, member_id.0 as i64, issued_cap, now as i64],
-        )?;
-        let (stored_member_id, stored_cap, stored_redeemed_at): (i64, Vec<u8>, i64) = tx
-            .query_row(
-                "SELECT member_id, issued_cap, redeemed_at FROM invite_nonces WHERE nonce = ?1",
-                params![nonce],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        // Bespoke, not `Store::with_transaction`: this method is the one write path in this file
+        // that takes `&mut self`, specifically so it can use `Connection::transaction()` (the
+        // only `Transaction` constructor requiring `&mut Connection`) rather than
+        // `unchecked_transaction`/`Transaction::new_unchecked` — see the "Uses `unchecked_
+        // transaction`..." discussion moved to `Store::with_transaction`'s doc comment for why
+        // every *other* transaction site in this file stays `&self` instead. Because it cannot
+        // use `with_transaction` (which is `&self`-only), it is wired by hand to the identical
+        // guarantee (td-c9b9bd follow-up): the inner closure owns the `Transaction` and is fully
+        // resolved — committed, or dropped via `?` (attempting its own `ROLLBACK`) — before
+        // `recover_from_non_autocommit` runs, exactly like `with_transaction`'s own closure, so a
+        // failed commit or an early `?` return here still gets a recovery attempt instead of
+        // silently stranding the connection.
+        let result = (|| {
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "INSERT INTO invite_nonces (nonce, member_id, issued_cap, redeemed_at) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (nonce) DO NOTHING",
+                params![nonce, member_id.0 as i64, issued_cap, now as i64],
             )?;
-        tx.commit()?;
-        Ok(IssuedCapRecord {
-            member_id: MemberId(stored_member_id as u64),
-            issued_cap: stored_cap,
-            redeemed_at: stored_redeemed_at as u64,
-        })
+            let (stored_member_id, stored_cap, stored_redeemed_at): (i64, Vec<u8>, i64) = tx
+                .query_row(
+                    "SELECT member_id, issued_cap, redeemed_at FROM invite_nonces WHERE nonce = ?1",
+                    params![nonce],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+            tx.commit()?;
+            Ok(IssuedCapRecord {
+                member_id: MemberId(stored_member_id as u64),
+                issued_cap: stored_cap,
+                redeemed_at: stored_redeemed_at as u64,
+            })
+        })();
+        recover_from_non_autocommit(&self.conn, &self.poisoned, "burn_invite_nonce");
+        result
     }
 }
 
@@ -2124,6 +2245,63 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Shared recovery/poison decision, extracted from `Audit::append` (td-c9b9bd) so both this
+/// crate's transaction-opening surfaces can call the identical logic instead of duplicating it:
+/// [`Audit::append`]'s three failure branches (a failed `BEGIN`, a failed `ROLLBACK` after a
+/// failed append, and a failed `COMMIT` after a successful one, each via
+/// [`crate::audit::Audit`]'s thin delegating wrapper of the same name), every `&self` write method
+/// in this file via [`Store::with_transaction`], and [`Store::burn_invite_nonce`]'s bespoke manual
+/// wiring (see that method's doc comment for why it cannot use `with_transaction`). `context` is a
+/// short human-readable description of which call site invoked this, for the log lines only.
+///
+/// Keys the decision on `Connection::is_autocommit()` — the direct, current-state observable
+/// of "is this connection stuck inside a transaction" — rather than on whether the `ROLLBACK`/
+/// `COMMIT`/`BEGIN` that triggered this call itself returned `Err`: those are different facts (a
+/// statement can fail while SQLite still ends the transaction as a side effect, e.g. a
+/// deferred foreign-key violation at `COMMIT` time auto-rollbacks and leaves autocommit mode
+/// true despite `COMMIT` reporting an error).
+///
+/// 1. If already back in autocommit mode, there is nothing to recover from: return.
+/// 2. Otherwise, retry `ROLLBACK` once — a single deterministic recovery attempt, so one
+///    transient failure does not permanently brick every future write through this
+///    connection.
+/// 3. If that retry restores autocommit mode, log it and return — still not poisoned.
+/// 4. If the connection is still not in autocommit mode after the retry, poison it (`poisoned`,
+///    the flag every caller above passes a reference to — see [`Store::poisoned`]'s doc comment
+///    for the recovery contract) and log an `error!` naming that decision.
+pub(crate) fn recover_from_non_autocommit(
+    conn: &rusqlite::Connection,
+    poisoned: &std::sync::atomic::AtomicBool,
+    context: &'static str,
+) {
+    if conn.is_autocommit() {
+        return;
+    }
+    tracing::warn!(
+        context,
+        "connection not in autocommit mode after {context}; retrying ROLLBACK once before \
+         considering this connection poisoned"
+    );
+    let retry_result = conn.execute_batch("ROLLBACK");
+    if conn.is_autocommit() {
+        tracing::info!(
+            context,
+            ?retry_result,
+            "recovery ROLLBACK restored autocommit mode; connection is not poisoned"
+        );
+        return;
+    }
+    poisoned.store(true, Ordering::SeqCst);
+    tracing::error!(
+        context,
+        ?retry_result,
+        "connection still not in autocommit mode after a retried ROLLBACK; poisoning it — \
+         every subsequent write sharing this connection will be refused with \
+         AuditError::ConnectionPoisoned/StoreError::ConnectionPoisoned until the owning Store \
+         is dropped and a fresh one is opened against the same file"
+    );
 }
 
 /// The same `UPDATE ... RETURNING` shape as [`Store::bump_cap_epoch`], run against an in-progress
@@ -3675,7 +3853,8 @@ mod tests {
     /// autocommit statements would still pass this particular assertion (SQLite still serializes
     /// each individual commit), which is stated here rather than left implied: this test's real
     /// coverage stops at "A is not caching", and the torn-pair test below is the one that fails
-    /// when the `unchecked_transaction` is removed.
+    /// when `member_and_cap_epoch`'s transaction (today, its `Store::with_transaction` call) is
+    /// removed.
     #[test]
     fn member_and_cap_epoch_observes_a_fully_committed_revoke_from_another_connection_atomically() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3743,8 +3922,8 @@ mod tests {
     /// with the `cap_epoch` this call returns for the `Member` this call returns, so a pair
     /// straddling a revoke either mints a live capability for a member the owner just revoked
     /// (fail-open) or stamps a still-valid member with an epoch the host will reject on sight
-    /// (fail-closed, but still wrong). Removing the `unchecked_transaction`/`commit` pair from
-    /// `member_and_cap_epoch` makes this test fail with the pair `(Revoked, epoch_before)`: B's
+    /// (fail-closed, but still wrong). Removing `member_and_cap_epoch`'s transaction (today, its
+    /// `Store::with_transaction` call) makes this test fail with the pair `(Revoked, epoch_before)`: B's
     /// revoke lands after `cap_epoch` has already been read (so the epoch this call returns is
     /// still the pre-bump value) but before the `devices` read that follows (so the member this
     /// call returns already reads back `Revoked`). That is the fail-closed half of the straddle —
@@ -4624,6 +4803,213 @@ mod tests {
         assert_eq!(
             after,
             crate::algebra::AccessDecision::Granted(Perms::BROWSE | Perms::DOWNLOAD)
+        );
+    }
+
+    // ---- Poisoning (td-c9b9bd follow-up): a `Store`-opened transaction that fails to end
+    // cleanly must poison the connection, not merely return an error to its immediate caller ----
+    //
+    // The seam: `Connection::authorizer` (rusqlite `hooks` feature, dev-dependency only — see
+    // `Cargo.toml`'s comment) fires at statement *prepare* time and can `Deny` any statement,
+    // including the specific write a `Store` method's own transaction needs, and the bare
+    // `ROLLBACK` a denied statement's `?` triggers via the dropped `Transaction`'s own `Drop`
+    // impl. This is the same technique `crate::audit::tests` already uses for the identical
+    // mechanism on the `Audit::append` side — see that module's tests for the sqlite3.c
+    // verification this relies on (`SQLITE_TRANSACTION`'s literal `"ROLLBACK"`/`"COMMIT"` op
+    // strings). A denied statement never runs at all, so this is a genuine reproduction of "the
+    // connection never left its transaction" — not a simulation of one.
+
+    #[test]
+    fn store_transaction_poisons_when_rollback_cannot_restore_autocommit() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        store.activate_member(member_id).expect("activate_member");
+
+        // Deny the `UPDATE members` that `revoke_member_and_bump_epoch` needs (forcing its
+        // closure into an early `Err` return) and deny every ROLLBACK — the one `Transaction`'s
+        // own `Drop` attempts when `with_transaction`'s inner closure unwinds, AND the single
+        // retry `recover_from_non_autocommit` makes afterward — so the connection can never
+        // leave the transaction its `BEGIN` opened.
+        store
+            .connection()
+            .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Update {
+                    table_name: "members",
+                    ..
+                } => Authorization::Deny,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }));
+
+        let err = store.revoke_member_and_bump_epoch(member_id).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "the original failure (denied UPDATE) must be what's returned, not a \
+             poisoning-related error: {err:?}"
+        );
+
+        store
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+        assert!(
+            !store.connection().is_autocommit(),
+            "both ROLLBACK attempts were denied, so SQLite itself must still report this \
+             connection as inside a transaction"
+        );
+        assert!(
+            store.is_poisoned(),
+            "both the drop-triggered ROLLBACK and its single retry were denied, so the \
+             connection never left its transaction and must be poisoned — this is the exact \
+             defect this test was written to catch: before `Store::with_transaction` existed, \
+             nothing on this path ever called `recover_from_non_autocommit`, so this connection \
+             was silently left stranded, unpoisoned, and reporting success on every subsequent \
+             write instead"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_store_refuses_a_subsequent_write_instead_of_reporting_success() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        store.activate_member(member_id).expect("activate_member");
+
+        store
+            .connection()
+            .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Update {
+                    table_name: "members",
+                    ..
+                } => Authorization::Deny,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }));
+
+        let _ = store.revoke_member_and_bump_epoch(member_id).unwrap_err();
+
+        store
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        assert!(store.is_poisoned());
+
+        // The confirmed defect this test pins shut: before this fix, `bump_cap_epoch` on a
+        // stranded-but-never-poisoned connection returned `Ok(1)` while silently executing
+        // inside the still-open transaction the failed revoke above left behind — reporting
+        // success for a write that was never actually durable. Once poisoned, it must instead
+        // refuse outright, fast, before ever touching the database.
+        let err = store.bump_cap_epoch().unwrap_err();
+        assert!(matches!(err, StoreError::ConnectionPoisoned));
+    }
+
+    #[test]
+    fn a_recoverable_store_transaction_failure_does_not_poison() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        store.activate_member(member_id).expect("activate_member");
+
+        // Deny only the UPDATE; ROLLBACK is allowed, so the dropped `Transaction`'s own rollback
+        // attempt (triggered when the closure's `?` unwinds) actually succeeds and restores
+        // autocommit mode on its own, before `recover_from_non_autocommit` even has anything
+        // left to do. This pins that the fix does not over-poison on an ordinary, cleanly-
+        // recovered statement failure.
+        store
+            .connection()
+            .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Update {
+                    table_name: "members",
+                    ..
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }));
+
+        let err = store.revoke_member_and_bump_epoch(member_id).unwrap_err();
+        assert!(matches!(err, StoreError::Sqlite(_)));
+
+        store
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+        assert!(
+            !store.is_poisoned(),
+            "an ordinary statement failure with a working ROLLBACK must not poison the \
+             connection"
+        );
+        // Not just the flag — a genuinely usable store afterward, not one that merely reports
+        // itself unpoisoned while secretly still broken.
+        store
+            .bump_cap_epoch()
+            .expect("a ROLLBACK-recovered store must accept further writes normally");
+    }
+
+    #[test]
+    fn burn_invite_nonce_poisons_when_rollback_cannot_restore_autocommit() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        // Same shape as `store_transaction_poisons_when_rollback_cannot_restore_autocommit`
+        // above, but through `burn_invite_nonce`'s bespoke `&mut self`/`self.conn.transaction()`
+        // wiring (it cannot use `Store::with_transaction`, which is `&self`-only — see its own
+        // doc comment) — this is what proves that hand-wired recovery call actually runs, not
+        // only `with_transaction`'s.
+        let mut store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+
+        // Deny the `INSERT` `burn_invite_nonce` needs (forcing it into its failure/rollback
+        // branch) and deny every ROLLBACK — the one triggered by the dropped `Transaction`, AND
+        // the single retry the hand-wired `recover_from_non_autocommit` call makes afterward.
+        store
+            .connection()
+            .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Insert {
+                    table_name: "invite_nonces",
+                } => Authorization::Deny,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }));
+
+        let err = store
+            .burn_invite_nonce(b"nonce-1", member_id, b"cap-bytes", 100)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "the original failure (denied INSERT) must be what's returned, not a \
+             poisoning-related error: {err:?}"
+        );
+
+        store
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+        assert!(
+            !store.connection().is_autocommit(),
+            "both ROLLBACK attempts were denied, so SQLite itself must still report this \
+             connection as inside a transaction"
+        );
+        assert!(
+            store.is_poisoned(),
+            "burn_invite_nonce's hand-wired recovery call must poison the store on an \
+             unrecoverable strand, exactly like `Store::with_transaction` does for every other \
+             write method — this is the manual-wiring counterpart of \
+             `store_transaction_poisons_when_rollback_cannot_restore_autocommit` above"
         );
     }
 }

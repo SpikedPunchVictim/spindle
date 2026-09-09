@@ -342,7 +342,16 @@ impl<'a> Audit<'a> {
         if self.poisoned.load(Ordering::SeqCst) {
             return Err(AuditError::ConnectionPoisoned);
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        if let Err(begin_error) = self.conn.execute_batch("BEGIN IMMEDIATE") {
+            // A failed `BEGIN` (e.g. "cannot start a transaction within a transaction") means
+            // this connection was *already* stranded before this call — by an earlier failed
+            // `ROLLBACK`/`COMMIT` this method's own recovery somehow didn't reach, or by a `Store`
+            // write method sharing this connection. Until this fix, this branch didn't exist at
+            // all: `?` returned immediately with no recovery attempt, so a connection that reached
+            // `append` already stranded (but not yet poisoned) could sit that way indefinitely.
+            self.recover_from_non_autocommit("a failed BEGIN");
+            return Err(AuditError::Sqlite(begin_error));
+        }
         match self.append_inner(entry) {
             Ok(record) => match self.conn.execute_batch("COMMIT") {
                 Ok(()) => Ok(record),
@@ -389,54 +398,14 @@ impl<'a> Audit<'a> {
         }
     }
 
-    /// Shared recovery/poison decision for [`Audit::append`]'s two failure branches (a failed
-    /// `ROLLBACK` after a failed append, and a failed `COMMIT` after a successful one). `context`
-    /// is a short human-readable description of which branch called this, for the log lines only.
-    ///
-    /// Keys the decision on `Connection::is_autocommit()` — the direct, current-state observable
-    /// of "is this connection stuck inside a transaction" — rather than on whether the `ROLLBACK`/
-    /// `COMMIT` that triggered this call itself returned `Err`: those are different facts (a
-    /// statement can fail while SQLite still ends the transaction as a side effect, e.g. a
-    /// deferred foreign-key violation at `COMMIT` time auto-rollbacks and leaves autocommit mode
-    /// true despite `COMMIT` reporting an error).
-    ///
-    /// 1. If already back in autocommit mode, there is nothing to recover from: return.
-    /// 2. Otherwise, retry `ROLLBACK` once — a single deterministic recovery attempt, so one
-    ///    transient failure does not permanently brick every future write through this
-    ///    connection.
-    /// 3. If that retry restores autocommit mode, log it and return — still not poisoned.
-    /// 4. If the connection is still not in autocommit mode after the retry, poison it
-    ///    (`Store`'s `poisoned` field, via the reference this `Audit` borrows — see
-    ///    [`crate::store::Store::poisoned`]'s doc comment for the recovery contract) and log an
-    ///    `error!` naming that decision.
-    ///
+    /// Thin delegation to [`crate::store::recover_from_non_autocommit`] — see that free
+    /// function's doc comment for the full mechanism and recovery contract (extracted there,
+    /// rather than kept here, so `Store`'s own `&self` write methods can share the identical
+    /// recovery logic via `Store::with_transaction` instead of duplicating it). `context` is a
+    /// short human-readable description of which of [`Audit::append`]'s failure branches called
+    /// this, for the log lines only.
     fn recover_from_non_autocommit(&self, context: &'static str) {
-        if self.conn.is_autocommit() {
-            return;
-        }
-        tracing::warn!(
-            context,
-            "connection not in autocommit mode after {context}; retrying ROLLBACK once before \
-             considering this connection poisoned"
-        );
-        let retry_result = self.conn.execute_batch("ROLLBACK");
-        if self.conn.is_autocommit() {
-            tracing::info!(
-                context,
-                ?retry_result,
-                "recovery ROLLBACK restored autocommit mode; connection is not poisoned"
-            );
-            return;
-        }
-        self.poisoned.store(true, Ordering::SeqCst);
-        tracing::error!(
-            context,
-            ?retry_result,
-            "connection still not in autocommit mode after a retried ROLLBACK; poisoning it — \
-             every subsequent write sharing this connection will be refused with \
-             AuditError::ConnectionPoisoned/StoreError::ConnectionPoisoned until the owning Store \
-             is dropped and a fresh one is opened against the same file"
-        );
+        crate::store::recover_from_non_autocommit(self.conn, self.poisoned, context);
     }
 
     fn append_inner(&self, entry: AuditEntry) -> Result<AuditRecord, AuditError> {
