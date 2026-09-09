@@ -46,6 +46,7 @@ pub mod identity;
 
 mod base32;
 
+pub use artifacts::checked_verifying_key;
 pub use envelope::{
     derive_bootstrap_key, derive_session_key, direction_byte, open, seal, EnvelopeError,
     OpenParams, SealParams, SessionKey,

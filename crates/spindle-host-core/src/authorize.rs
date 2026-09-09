@@ -638,12 +638,13 @@ impl<L: DeviceLookup> HostConnectAuthorizer<L> {
 /// A fixed, valid Ed25519 verifying key / X25519 public key pair, computed once, that
 /// [`equalize_denial_work`] recomputes a `device_fp` against on every pre-crypto `Deny`.
 ///
-/// Only the sign half needs to be a genuinely valid curve point: `VerifyingKey::from_bytes` is a
-/// point decompression that can fail for a byte string that does not encode a valid Ed25519 point,
-/// and it is exactly that decompression — not a scalar multiplication, which the real `Allow` path
+/// Only the sign half needs to be a genuinely valid curve point: `checked_verifying_key` (td-b8c68a;
+/// `VerifyingKey::from_bytes` plus the RFC 8032 §5.1.3 canonicality pre-check) is a point
+/// decompression that can fail for a byte string that does not encode a canonical, valid Ed25519
+/// point, and it is exactly that check — not a scalar multiplication, which the real `Allow` path
 /// never performs either — that [`equalize_denial_work`] must redo per call to match the real
 /// path's cost. Deriving `sign_bytes` here, once, via `SigningKey::from_bytes(&[0xA5; 32])
-/// .verifying_key().to_bytes()` guarantees a point `VerifyingKey::from_bytes` can always
+/// .verifying_key().to_bytes()` guarantees a point `checked_verifying_key` can always
 /// successfully decompress, without paying that derivation cost on every denied connect.
 ///
 /// `agree_bytes` has no such constraint: X25519 public keys are unvalidated (any 32 bytes decode),
@@ -786,7 +787,7 @@ fn equalize_denial_work() {
     // into the one crash-shaped seam in an otherwise all-`Deny` path. Logging loudly and returning
     // is strictly better: the connect is still denied, just without this call's timing
     // equalization.
-    let Ok(sign_pk) = VerifyingKey::from_bytes(&sign_bytes) else {
+    let Some(sign_pk) = spindle_core::checked_verifying_key(&sign_bytes) else {
         // See EQUALIZATION_DUMMY_KEY_INVALID_LOGGED's doc comment: any peer can reach this branch
         // at will simply by causing a pre-crypto denial, so this must log at most once per
         // process, not once per request.
@@ -905,9 +906,10 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
         // `deny_with_equalized_work()` was flagged as "over-equalized" (a failed decompression is
         // already cheaper than a real `Allow`, so equalizing it further supposedly widens rather
         // than closes the gap). That finding is wrong; recorded here so a future reviewer does not
-        // re-raise it. Let D = the cost of `VerifyingKey::from_bytes`'s point decompression, H =
-        // the cost of the `device_fp_of` rehash (combined with an `Allow`'s later work), and Df =
-        // the (smaller) cost of a decompression that fails fast. A real `Allow` pays D+H. Without
+        // re-raise it. Let D = the cost of `checked_verifying_key`'s point decompression (td-b8c68a:
+        // the RFC 8032 canonicality pre-check plus `VerifyingKey::from_bytes`), H = the cost of the
+        // `device_fp_of` rehash (combined with an `Allow`'s later work), and Df = the (smaller)
+        // cost of a decompression that fails fast. A real `Allow` pays D+H. Without
         // equalization, a failed-decompression `Deny` pays only Df — off from `Allow` by the full
         // D+H, a large gap. WITH equalization (`deny_with_equalized_work` redoes a successful
         // decompression + rehash against the fixed dummy key), this `Deny` pays Df+D+H — off from
@@ -917,7 +919,7 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
         // `DeviceKeyError::BindingMismatch`'s `Deny` stays PLAIN — never routed through
         // `deny_with_equalized_work()` — and that is deliberate, not a missed spot: every
         // `Unverifiable` case above denies *before* performing the real
-        // `VerifyingKey::from_bytes`/`X25519PublicKey::from`/`device_fp_of` work an `Allow` also
+        // `checked_verifying_key`/`X25519PublicKey::from`/`device_fp_of` work an `Allow` also
         // does, so equalizing them against a dummy recompute closes a real faster-than-`Allow`
         // gap. A binding mismatch has already paid that exact cost for real (both key parses, the
         // rehash itself) before reaching here — there is no gap left to close. Adding a second,
@@ -2245,16 +2247,24 @@ mod tests {
     }
 
     /// Without this, a bad `EQUALIZATION_DUMMY_KEYS` constant would make `equalize_denial_work`
-    /// silently do LESS work than the real `Allow` path (a failed `VerifyingKey::from_bytes` short-
+    /// silently do LESS work than the real `Allow` path (a failed `checked_verifying_key` short-
     /// circuits before the `device_fp_of` rehash it exists to redo), quietly reopening the timing
     /// gap it exists to close -- and nothing else in this suite would catch that, since every other
     /// test here observes only `ConnectDecision`, never the equalization's internal cost.
+    ///
+    /// td-b8c68a: asserts against `checked_verifying_key` specifically, not bare
+    /// `VerifyingKey::from_bytes` -- the real `Allow` path (via `checked_device_keys`) and
+    /// `equalize_denial_work` both now call `checked_verifying_key`, so this constant must pass
+    /// the RFC 8032 canonicality pre-check too, not merely decompress. It is a real derived key
+    /// (`SigningKey::from_bytes(&[0xA5; 32]).verifying_key()`), so it should -- this test proves
+    /// that rather than assuming it.
     #[test]
     fn the_equalization_dummy_key_parses_as_a_valid_ed25519_point() {
         let (sign_bytes, _agree_bytes) = *EQUALIZATION_DUMMY_KEYS;
         assert!(
-            VerifyingKey::from_bytes(&sign_bytes).is_ok(),
-            "EQUALIZATION_DUMMY_KEYS's sign half must decompress as a valid Ed25519 point"
+            spindle_core::checked_verifying_key(&sign_bytes).is_some(),
+            "EQUALIZATION_DUMMY_KEYS's sign half must pass checked_verifying_key (decompress as a \
+             canonically-encoded, valid Ed25519 point)"
         );
     }
 
@@ -2310,7 +2320,7 @@ mod tests {
             equalization_calls(),
             0,
             "an Allow must never call equalize_denial_work() -- the Allow path already performs \
-             the real VerifyingKey::from_bytes/X25519PublicKey::from/device_fp_of work that \
+             the real checked_verifying_key/X25519PublicKey::from/device_fp_of work that \
              function exists to imitate for a Deny, so running the dummy work on top of the real \
              work would be pure waste and would make Allow measurably slower than the denials it \
              is supposed to be indistinguishable from."
@@ -2452,7 +2462,7 @@ mod tests {
             0,
             "a BindingMismatch denial must never call equalize_denial_work() -- a binding \
              mismatch is only reached after checked_device_keys has already paid the real \
-             VerifyingKey::from_bytes/X25519PublicKey::from/device_fp_of cost that \
+             checked_verifying_key/X25519PublicKey::from/device_fp_of cost that \
              equalize_denial_work exists to imitate, so equalizing it too would not close any \
              gap: it would make this Deny measurably SLOWER than an Allow reaches the same point, \
              manufacturing a new timing asymmetry pointing the other way. A nonzero count here \
@@ -2500,7 +2510,7 @@ mod tests {
             1,
             "an Unverifiable denial must call equalize_denial_work() exactly once -- this denial \
              fires at checked_device_keys's very first check, before any of the real \
-             VerifyingKey::from_bytes/X25519PublicKey::from/device_fp_of work an Allow performs, \
+             checked_verifying_key/X25519PublicKey::from/device_fp_of work an Allow performs, \
              so without equalize_denial_work it would be measurably FASTER than a live member's \
              device reaches the same point -- exactly the pre-crypto timing gap \
              deny_with_equalized_work exists to close. A count of 0 here means the \

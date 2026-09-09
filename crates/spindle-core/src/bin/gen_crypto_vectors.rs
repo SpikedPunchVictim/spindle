@@ -190,6 +190,19 @@ fn signed_vectors_dir() -> PathBuf {
         .join("signed")
 }
 
+/// The repo-root `vectors/` directory itself (parent of [`signed_vectors_dir`]) — where
+/// `key-validity.json` lives, alongside `spindle-proto`'s own top-level vector files, rather than
+/// under `vectors/signed/`: it carries no real signature (there is nothing to sign — it is a table
+/// of raw key bytes and expected accept/reject verdicts), so it does not belong with the
+/// real-signature vectors `signed_vectors_dir` holds.
+fn vectors_dir() -> PathBuf {
+    // crates/spindle-core -> repo root -> vectors
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("vectors")
+}
+
 // ================================================================================================
 // TEST-ONLY fixed seeds. Never derived from OsRng; never reused outside this generator.
 // ================================================================================================
@@ -230,6 +243,7 @@ fn main() {
     write_vector_file(&dir, "admission-token.json", admission_token_vectors());
     write_vector_file(&dir, "admin-command.json", admin_command_vectors());
     write_vector_file(&dir, "envelope.json", envelope_vectors());
+    write_vector_file(&vectors_dir(), "key-validity.json", key_validity_vectors());
 }
 
 fn case(
@@ -1151,5 +1165,128 @@ fn envelope_vectors() -> Json {
         ("bootstrap_key_hex", Json::hex(bootstrap_key.as_bytes())),
         ("cases", Json::Arr(vec![valid_case, tampered_case])),
         ("offer_case", offer_case),
+    ])
+}
+
+// ---- key validity (td-b8c68a) ----
+//
+// Cross-language contract for Ed25519 point-canonicality parity, and for the deliberate
+// non-divergence on X25519: `spindle_core::checked_verifying_key` (Rust) and
+// `@spindle/crypto`'s `requireEd25519PublicKey` (TS, `ed25519.Point.fromBytes`) must agree on
+// every `"ed25519"` case; every `"x25519"` case is expected to ACCEPT on both languages, pinning
+// `x25519_dalek::PublicKey::from`'s (and TS's mirrored) infallibility as intentional, not an
+// oversight.
+
+const KEY_VALIDITY_ED25519_VALID_SEED: [u8; 32] = [0x99; 32]; // TEST-ONLY
+
+fn key_validity_case(
+    name: &'static str,
+    description: &'static str,
+    curve: &'static str,
+    key: &[u8; 32],
+    expected_accept: bool,
+) -> Json {
+    Json::Obj(vec![
+        ("name", Json::Str(name.into())),
+        ("description", Json::Str(description.into())),
+        ("curve", Json::Str(curve.into())),
+        ("key_hex", Json::hex(key)),
+        (
+            "expected",
+            Json::Str(if expected_accept { "accept" } else { "reject" }.into()),
+        ),
+    ])
+}
+
+fn key_validity_vectors() -> Json {
+    // Case 1: 32 bytes, canonical range, but not a valid compressed Ed25519 point at all (the
+    // same byte pattern `spindle-host-core::device_keys`'s own test already relies on).
+    let mut not_a_point = [0u8; 32];
+    not_a_point[31] = 0xa9;
+    assert!(
+        spindle_core::checked_verifying_key(&not_a_point).is_none(),
+        "sanity: not_a_point must be rejected"
+    );
+
+    // Case 2: [0xff; 32] -- the non-canonical encoding of y = 18 (p + 18 reduces to 2^255 - 1
+    // once the sign bit is masked off, which is exactly what these bytes represent). Bare
+    // `ed25519_dalek::VerifyingKey::from_bytes` ACCEPTS this (measured, td-b8c68a); after this
+    // ticket's fix, `checked_verifying_key` REJECTS it -- the one case this vector exists to pin.
+    let non_canonical = [0xffu8; 32];
+    assert!(
+        spindle_core::checked_verifying_key(&non_canonical).is_none(),
+        "sanity: non_canonical must be rejected by checked_verifying_key"
+    );
+
+    // Case 3: a real, freshly-derived Ed25519 verifying key -- always canonically encoded.
+    let valid_key = SigningKey::from_bytes(&KEY_VALIDITY_ED25519_VALID_SEED)
+        .verifying_key()
+        .to_bytes();
+    assert!(
+        spindle_core::checked_verifying_key(&valid_key).is_some(),
+        "sanity: a genuinely derived key must be accepted"
+    );
+
+    // Case 4: X25519 low-order point, u = 1. `x25519_dalek::PublicKey::from` is infallible by
+    // construction (any 32 bytes are accepted as a Montgomery u-coordinate candidate, low-order
+    // points included) -- this case pins that this is deliberate on both sides of the Rust/TS
+    // boundary, not an oversight left over from before this ticket's Ed25519 fix.
+    let mut x25519_low_order = [0u8; 32];
+    x25519_low_order[0] = 1;
+    let _ = X25519PublicKey::from(x25519_low_order); // infallible; the construction is the proof.
+
+    Json::Obj(vec![
+        (
+            "description",
+            Json::Str(
+                "Ed25519/X25519 public-key validity parity between spindle-core and \
+                 @spindle/crypto (td-b8c68a). Rust's checked_verifying_key and TS's \
+                 requireEd25519PublicKey must agree on every \"ed25519\" case; every \"x25519\" \
+                 case is expected to ACCEPT on both sides (X25519 public keys are deliberately \
+                 unvalidated beyond length -- see spindle_core::checked_verifying_key's doc \
+                 comment)."
+                    .into(),
+            ),
+        ),
+        (
+            "cases",
+            Json::Arr(vec![
+                key_validity_case(
+                    "ed25519_not_a_curve_point",
+                    "32 bytes, canonical range, but does not decompress to any Ed25519 curve \
+                     point.",
+                    "ed25519",
+                    &not_a_point,
+                    false,
+                ),
+                key_validity_case(
+                    "ed25519_non_canonical_y_eq_18",
+                    "[0xff; 32]: the non-canonical encoding of y = 18 (p + 18, reduced mod \
+                     2^255). Bare VerifyingKey::from_bytes accepts this; checked_verifying_key \
+                     (and noble's ed25519.Point.fromBytes) reject it -- the divergence td-b8c68a \
+                     closes.",
+                    "ed25519",
+                    &non_canonical,
+                    false,
+                ),
+                key_validity_case(
+                    "ed25519_valid_derived_key",
+                    "A genuinely derived Ed25519 verifying key -- always canonically encoded.",
+                    "ed25519",
+                    &valid_key,
+                    true,
+                ),
+                key_validity_case(
+                    "x25519_low_order_point_u_eq_1",
+                    "X25519 low-order point (u = 1). Deliberately ACCEPTED on both languages: \
+                     X25519 public keys are unvalidated by design \
+                     (x25519_dalek::PublicKey::from is infallible), and this pins that \
+                     agreement rather than an oversight.",
+                    "x25519",
+                    &x25519_low_order,
+                    true,
+                ),
+            ]),
+        ),
     ])
 }

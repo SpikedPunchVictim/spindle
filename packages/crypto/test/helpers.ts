@@ -23,10 +23,20 @@ import type { CborValue } from "@spindle/proto";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const packageRoot = path.resolve(here, "..");
 export const signedVectorsDir = path.resolve(packageRoot, "..", "..", "vectors", "signed");
+/** The repo-root `vectors/` directory itself (parent of {@link signedVectorsDir}) — where
+ * `key-validity.json` lives; see `gen_crypto_vectors.rs`'s `vectors_dir()` doc comment (Rust side)
+ * for why that file is not under `vectors/signed/`. */
+export const topVectorsDir = path.resolve(packageRoot, "..", "..", "vectors");
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function loadSignedVectorFile(name: string): any {
   const p = path.join(signedVectorsDir, name);
+  return JSON.parse(fs.readFileSync(p, "utf8"));
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function loadTopVectorFile(name: string): any {
+  const p = path.join(topVectorsDir, name);
   return JSON.parse(fs.readFileSync(p, "utf8"));
 }
 

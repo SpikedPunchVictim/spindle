@@ -269,9 +269,26 @@ fn signed_vectors_dir() -> PathBuf {
         .join("signed")
 }
 
+/// The repo-root `vectors/` directory itself (parent of [`signed_vectors_dir`]) — where
+/// `key-validity.json` lives; see `gen_crypto_vectors.rs`'s `vectors_dir()` doc comment for why
+/// that file is not under `vectors/signed/`.
+fn vectors_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("vectors")
+}
+
+fn load_top(filename: &str) -> Json {
+    let path = vectors_dir().join(filename);
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    parse_json(&text)
+}
+
 fn verifying_key_from_hex(j: &Json) -> VerifyingKey {
     let bytes: [u8; 32] = j.hex().try_into().expect("32-byte public key");
-    VerifyingKey::from_bytes(&bytes).expect("valid Ed25519 public key")
+    spindle_core::checked_verifying_key(&bytes)
+        .expect("valid, canonically-encoded Ed25519 public key")
 }
 
 fn fingerprint_from_hex(j: &Json) -> Fingerprint {
@@ -662,4 +679,56 @@ fn seed32(j: &Json) -> [u8; 32] {
 
 fn seed32_pk(j: &Json) -> [u8; 32] {
     j.hex().try_into().expect("32-byte public key")
+}
+
+// ================================================================================================
+// key-validity.json: Ed25519 canonicality / X25519 non-validation cross-language parity (td-b8c68a)
+// ================================================================================================
+
+/// Loads `vectors/key-validity.json` (written by `gen_crypto_vectors.rs`'s `key_validity_vectors`)
+/// and re-checks every case against `spindle_core::checked_verifying_key` (curve `"ed25519"`) or
+/// `x25519_dalek::PublicKey::from` (curve `"x25519"`), independently of the generator's own
+/// in-process `assert!`s — same "don't just trust the writer" discipline as every other test in
+/// this file. `@spindle/crypto`'s `test/vectors.test.ts` reads this same file and must reach the
+/// same verdicts, since this file's whole purpose is being the cross-language contract (DESIGN.md
+/// :1117) for td-b8c68a's Rust/TS Ed25519 canonicality fix.
+#[test]
+fn key_validity_vectors_agree_with_checked_verifying_key() {
+    let doc = load_top("key-validity.json");
+    for case in doc.get("cases").as_arr() {
+        let name = case.get("name").as_str();
+        let curve = case.get("curve").as_str();
+        let key_bytes: [u8; 32] = case.get("key_hex").hex().try_into().expect("32-byte key");
+        let expect_accept = match case.get("expected").as_str() {
+            "accept" => true,
+            "reject" => false,
+            other => panic!("case `{name}`: unknown expected verdict `{other}`"),
+        };
+
+        match curve {
+            "ed25519" => {
+                let accepted = spindle_core::checked_verifying_key(&key_bytes).is_some();
+                assert_eq!(
+                    accepted, expect_accept,
+                    "case `{name}`: checked_verifying_key accepted={accepted}, expected \
+                     accept={expect_accept}"
+                );
+            }
+            "x25519" => {
+                // x25519_dalek::PublicKey::from is infallible (any 32 bytes are a valid
+                // Montgomery u-coordinate candidate), so this branch only exists to fail loudly
+                // if a future case's `expected` is ever "reject" for an X25519 key — which would
+                // mean this vector file has drifted from the deliberate agreement it exists to
+                // pin (see key_validity_vectors' doc comment in gen_crypto_vectors.rs).
+                let _ = spindle_core::X25519PublicKey::from(key_bytes);
+                assert!(
+                    expect_accept,
+                    "case `{name}`: an X25519 case expecting `reject` contradicts \
+                     x25519_dalek::PublicKey::from's documented infallibility -- fix the vector, \
+                     not this test"
+                );
+            }
+            other => panic!("case `{name}`: unknown curve `{other}`"),
+        }
+    }
 }

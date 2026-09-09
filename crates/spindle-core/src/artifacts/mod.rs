@@ -117,13 +117,65 @@ pub(crate) fn check_skew(now: u64, ts: u64, max_skew_secs: u64) -> Result<(), Ar
     Ok(())
 }
 
+/// The Ed25519 field prime `p = 2^255 - 19` (RFC 8032 §5.1.3), little-endian, used by
+/// [`checked_verifying_key`] to reject a non-canonical point encoding.
+///
+/// `y = 0x7f...ed...` in the usual big-endian hex form; written here little-endian (byte 0 is the
+/// least-significant byte) to match the encoding `checked_verifying_key` compares against.
+const P_BYTES: [u8; 32] = [
+    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+];
+
+/// Compares two 32-byte little-endian unsigned integers, returning `true` if `a >= b`. Written as
+/// an explicit byte-by-byte comparison (most-significant byte first) rather than bigint/u128
+/// arithmetic — boring and obvious over clever, per this repo's house style.
+fn ge_le_bytes(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    for i in (0..32).rev() {
+        if a[i] != b[i] {
+            return a[i] > b[i];
+        }
+    }
+    true // every byte equal
+}
+
+/// Parses a 32-byte Ed25519 public key encoding, enforcing RFC 8032 §5.1.3's canonical-encoding
+/// rule in addition to `VerifyingKey::from_bytes`'s point-decompression check.
+///
+/// `ed25519_dalek::VerifyingKey::from_bytes` is `CompressedEdwardsY::decompress`, which reads the
+/// low 255 bits of the encoding as a `y`-coordinate and decompresses any `y < 2^255` — it never
+/// checks `y < p`. A `y` in `[p, 2^255)` decodes to the same point as `y - p`, so two distinct byte
+/// strings can name the same public key. td-b8c68a measured this against `@noble/curves`'
+/// `ed25519.Point.fromBytes`, which does enforce `y < p` and rejects those non-canonical
+/// encodings (e.g. `[0xff; 32]`, the non-canonical encoding of `y = 18`); this helper closes that
+/// Rust/TS divergence by rejecting them here too, before decompression ever runs.
+///
+/// X25519 (`agree_pk`) has no equivalent check anywhere in this codebase, and must not gain one:
+/// `x25519_dalek::PublicKey::from` is infallible by design (any 32 bytes are a valid Montgomery
+/// u-coordinate candidate) and TS mirrors that deliberately — see td-b8c68a.
+pub fn checked_verifying_key(bytes: &[u8; 32]) -> Option<ed25519_dalek::VerifyingKey> {
+    // The sign bit (encoding the sign of the x-coordinate) lives in the top bit of the last byte
+    // and plays no part in the canonicality check, which is purely about the magnitude of `y` —
+    // mask it off in a scratch copy, but pass the original `bytes` (sign bit intact) to
+    // `from_bytes` below.
+    let mut y = *bytes;
+    y[31] &= 0x7f;
+
+    if ge_le_bytes(&y, &P_BYTES) {
+        // y >= p: not the canonical encoding of any point. Reject before decompression.
+        return None;
+    }
+
+    ed25519_dalek::VerifyingKey::from_bytes(bytes).ok()
+}
+
 pub(crate) fn parse_verifying_key(
     bytes: &[u8],
 ) -> Result<ed25519_dalek::VerifyingKey, ArtifactError> {
     let arr: [u8; 32] = bytes
         .try_into()
         .map_err(|_| ArtifactError::InvalidPublicKey)?;
-    ed25519_dalek::VerifyingKey::from_bytes(&arr).map_err(|_| ArtifactError::InvalidPublicKey)
+    checked_verifying_key(&arr).ok_or(ArtifactError::InvalidPublicKey)
 }
 
 pub(crate) fn parse_signature(bytes: &[u8]) -> Result<ed25519_dalek::Signature, ArtifactError> {
@@ -131,4 +183,59 @@ pub(crate) fn parse_signature(bytes: &[u8]) -> Result<ed25519_dalek::Signature, 
         .try_into()
         .map_err(|_| ArtifactError::InvalidSignatureEncoding)?;
     Ok(ed25519_dalek::Signature::from_bytes(&arr))
+}
+
+#[cfg(test)]
+mod checked_verifying_key_tests {
+    use super::checked_verifying_key;
+
+    /// td-b8c68a's measured divergence: `[0xff; 32]` is the non-canonical encoding of `y = 18`
+    /// (`p + 18` reduces mod `2^255` to `2^255 - 1`, which is exactly what `[0xff; 32]` with the
+    /// sign bit masked off represents). Bare `VerifyingKey::from_bytes` accepts it (it only checks
+    /// `y < 2^255`); `checked_verifying_key` must reject it (RFC 8032 requires `y < p`), matching
+    /// noble's `ed25519.Point.fromBytes` on the TS side.
+    #[test]
+    fn all_ff_bytes_is_rejected_as_non_canonical() {
+        assert!(
+            checked_verifying_key(&[0xff; 32]).is_none(),
+            "[0xff; 32] is the non-canonical encoding of y = 18 and must be rejected"
+        );
+    }
+
+    /// `[0u8; 31] ++ 0xa9`: 32 bytes, canonical range, but not a valid compressed Ed25519 point at
+    /// all (verified empirically against this workspace's pinned `ed25519-dalek` version, and
+    /// already relied on by `spindle-host-core::device_keys`'s own test of the same byte pattern).
+    /// This must be rejected for failing to decompress, not for canonicality.
+    #[test]
+    fn invalid_curve_point_is_rejected() {
+        let mut bytes = [0u8; 32];
+        bytes[31] = 0xa9;
+        assert!(
+            checked_verifying_key(&bytes).is_none(),
+            "a byte string that does not decompress to any curve point must be rejected"
+        );
+    }
+
+    /// `y = 0` (all-zero bytes) is on-curve and is the canonical encoding of its point (`0 < p`
+    /// trivially), so it must be accepted by both the decompression and the canonicality check.
+    #[test]
+    fn all_zero_bytes_is_accepted() {
+        assert!(
+            checked_verifying_key(&[0u8; 32]).is_some(),
+            "[0u8; 32] is a canonically-encoded, valid Ed25519 point and must be accepted"
+        );
+    }
+
+    /// A real, freshly-derived signing key's public key must always be accepted: signing keys
+    /// always produce canonically-encoded points, so this is what proves the canonicality check
+    /// does not have false positives against ordinary, legitimately-generated keys.
+    #[test]
+    fn a_real_derived_key_is_accepted() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let bytes = signing_key.verifying_key().to_bytes();
+        assert!(
+            checked_verifying_key(&bytes).is_some(),
+            "a genuinely derived verifying key must be accepted"
+        );
+    }
 }

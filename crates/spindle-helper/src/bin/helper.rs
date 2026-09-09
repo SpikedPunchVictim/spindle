@@ -1753,7 +1753,7 @@ fn handle_one(
 
     match decoded {
         DecodedAuthToken::Device(d) => {
-            let Ok(root_pk) = spindle_core::VerifyingKey::from_bytes(&d.root_pk_bytes) else {
+            let Some(root_pk) = spindle_core::checked_verifying_key(&d.root_pk_bytes) else {
                 return Ok(respond_err(authz::UNIFORM_REFUSAL_MESSAGE));
             };
             let Ok(nats_fp) = auth_token::nats_fp_of_nkey(&connect_nkey) else {
@@ -1785,7 +1785,7 @@ fn handle_one(
             }
         }
         DecodedAuthToken::Host(h) => {
-            let Ok(host_root_pk) = spindle_core::VerifyingKey::from_bytes(&h.host_root_pk_bytes)
+            let Some(host_root_pk) = spindle_core::checked_verifying_key(&h.host_root_pk_bytes)
             else {
                 return Ok(respond_err(authz::UNIFORM_REFUSAL_MESSAGE));
             };

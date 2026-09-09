@@ -29,6 +29,8 @@ import {
   QR_V40_M_CAPACITY_BYTES,
 } from "@spindle/proto";
 
+import { ed25519 } from "@noble/curves/ed25519.js";
+
 import { ArtifactError, verifyCapability } from "./artifacts.js";
 import { deviceFpOf, rootFpOf } from "./fingerprint.js";
 
@@ -38,13 +40,28 @@ import { deviceFpOf, rootFpOf } from "./fingerprint.js";
  * it. */
 const ALG_ID_V1 = 1;
 
-/** `pk.length === 32`, thrown as `ArtifactError.invalidPublicKey()` on mismatch — the same
- * length-only check `artifacts.ts`'s `verifyHostDeviceCert` applies to `sign_pk`/`agree_pk` (see
- * that function's doc comment: this package does not separately validate Ed25519/X25519
- * curve-point well-formedness beyond length, leaving malformed-but-right-length bytes to fail
- * whichever signature or key-agreement operation actually uses them). Duplicated here rather than
- * imported because `artifacts.ts` does not export its own copy. */
-function requirePublicKeyLen(pk: Uint8Array): void {
+/** `pk.length === 32` AND `pk` decodes as a canonically-encoded, valid Ed25519 curve point (RFC
+ * 8032 §5.1.3) — the same check `artifacts.ts`'s `requireEd25519PublicKey` applies to Ed25519
+ * fields there. Duplicated here rather than imported because `artifacts.ts` does not export its
+ * own copy (see this module's other duplicated constant, `ALG_ID_V1`, for the same convention).
+ *
+ * td-b8c68a: this host's envelope sign key is Ed25519, so it gets the canonicality check;
+ * `requireX25519PublicKeyLen` below (for `agree_pk`) deliberately does not. */
+function requireEd25519PublicKey(pk: Uint8Array): void {
+  if (pk.length !== 32) throw ArtifactError.invalidPublicKey();
+  try {
+    ed25519.Point.fromBytes(pk);
+  } catch {
+    throw ArtifactError.invalidPublicKey();
+  }
+}
+
+/** `pk.length === 32` — length ONLY, deliberately, mirroring `x25519_dalek::PublicKey::from`'s
+ * infallibility on the Rust side (td-b8c68a). Do NOT add point-validity checking here: X25519
+ * public keys are unvalidated by design on both sides of this boundary — see
+ * `artifacts.ts`'s `requireX25519PublicKeyLen` doc comment and `vectors/key-validity.json`'s
+ * X25519 low-order-point case, which pins this deliberate agreement. */
+function requireX25519PublicKeyLen(pk: Uint8Array): void {
   if (pk.length !== 32) throw ArtifactError.invalidPublicKey();
 }
 
@@ -443,10 +460,10 @@ function cloneCapability(cap: Capability): Capability {
 /** One entry's worth of step 2 in `verifyBootstrapBundle`'s doc comment — pulled out so the loop
  * above can attach the entry's index to whichever `ArtifactError` this produces. */
 async function verifyBundleEntry(entry: BundleEntry, now: bigint): Promise<VerifiedBundleEntry> {
-  // a. sign_pk (Ed25519) / agree_pk (X25519) length checks — same idiom as
-  // `verifyHostDeviceCert`.
-  requirePublicKeyLen(entry.sign_pk);
-  requirePublicKeyLen(entry.agree_pk);
+  // a. sign_pk (Ed25519, canonicality-checked) / agree_pk (X25519, length-only) — same split as
+  // `verifyHostDeviceCert` in artifacts.ts.
+  requireEd25519PublicKey(entry.sign_pk);
+  requireX25519PublicKeyLen(entry.agree_pk);
 
   // b. Derive this host's device fingerprint.
   const hostDeviceFp = await deviceFpOf(ALG_ID_V1, entry.sign_pk, entry.agree_pk);

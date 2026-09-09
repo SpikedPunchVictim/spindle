@@ -84,7 +84,7 @@ pub(crate) fn checked_device_keys(
     let Ok(sign_pk_arr): Result<[u8; 32], _> = sign_pk_bytes.as_slice().try_into() else {
         return Err(DeviceKeyError::Unverifiable);
     };
-    let Ok(sign_pk) = VerifyingKey::from_bytes(&sign_pk_arr) else {
+    let Some(sign_pk) = spindle_core::checked_verifying_key(&sign_pk_arr) else {
         return Err(DeviceKeyError::Unverifiable);
     };
     let Ok(agree_pk_arr): Result<[u8; 32], _> = agree_pk_bytes.as_slice().try_into() else {

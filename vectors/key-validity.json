@@ -1,0 +1,33 @@
+{
+  "description": "Ed25519/X25519 public-key validity parity between spindle-core and @spindle/crypto (td-b8c68a). Rust's checked_verifying_key and TS's requireEd25519PublicKey must agree on every \"ed25519\" case; every \"x25519\" case is expected to ACCEPT on both sides (X25519 public keys are deliberately unvalidated beyond length -- see spindle_core::checked_verifying_key's doc comment).",
+  "cases": [
+    {
+      "name": "ed25519_not_a_curve_point",
+      "description": "32 bytes, canonical range, but does not decompress to any Ed25519 curve point.",
+      "curve": "ed25519",
+      "key_hex": "00000000000000000000000000000000000000000000000000000000000000a9",
+      "expected": "reject"
+    },
+    {
+      "name": "ed25519_non_canonical_y_eq_18",
+      "description": "[0xff; 32]: the non-canonical encoding of y = 18 (p + 18, reduced mod 2^255). Bare VerifyingKey::from_bytes accepts this; checked_verifying_key (and noble's ed25519.Point.fromBytes) reject it -- the divergence td-b8c68a closes.",
+      "curve": "ed25519",
+      "key_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expected": "reject"
+    },
+    {
+      "name": "ed25519_valid_derived_key",
+      "description": "A genuinely derived Ed25519 verifying key -- always canonically encoded.",
+      "curve": "ed25519",
+      "key_hex": "332ebe8d27cb7323b3a401c1c13b5dd64bccc0e10ecda1c2b5d11a03779a85e5",
+      "expected": "accept"
+    },
+    {
+      "name": "x25519_low_order_point_u_eq_1",
+      "description": "X25519 low-order point (u = 1). Deliberately ACCEPTED on both languages: X25519 public keys are unvalidated by design (x25519_dalek::PublicKey::from is infallible), and this pins that agreement rather than an oversight.",
+      "curve": "x25519",
+      "key_hex": "0100000000000000000000000000000000000000000000000000000000000000",
+      "expected": "accept"
+    }
+  ]
+}

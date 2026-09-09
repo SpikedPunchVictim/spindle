@@ -30,6 +30,8 @@ import {
   RevocationRecord,
 } from "@spindle/proto";
 
+import { ed25519 } from "@noble/curves/ed25519.js";
+
 import { type BackendOption, ed25519Verify } from "./backend.js";
 import { deviceFpOf, rootFpOf } from "./fingerprint.js";
 
@@ -153,7 +155,38 @@ function requireSignatureLen(sig: Uint8Array): void {
   if (sig.length !== 64) throw ArtifactError.invalidSignatureEncoding();
 }
 
-function requirePublicKeyLen(pk: Uint8Array): void {
+/** Validates a 32-byte Ed25519 public key: length, AND that it decodes as a canonically-encoded,
+ * valid curve point (RFC 8032 §5.1.3). `ed25519.Point.fromBytes` called with no explicit `zip215`
+ * argument defaults to the strict RFC-8032 decode (`zip215 = false`) and throws on a non-canonical
+ * encoding (e.g. `y >= p`) or a byte string that is not a valid point at all.
+ *
+ * td-b8c68a: this closes a measured Rust/TS divergence. Bare `ed25519_dalek::VerifyingKey::from_bytes`
+ * only performs the point-decompression half of this check — it never rejects a non-canonical `y`
+ * — so the Rust side gained its own equivalent gate, `spindle_core::checked_verifying_key`, this
+ * function's Rust-side twin. Both now reject exactly the same set of encodings.
+ *
+ * Exported (unlike this file's other `require*` helpers) so `test/key-validity.test.ts` can drive
+ * `vectors/key-validity.json`'s cases against the real production check directly, the same way the
+ * Rust twin's test calls the exported `checked_verifying_key` rather than reimplementing its logic
+ * against the raw `ed25519.Point.fromBytes` primitive. */
+export function requireEd25519PublicKey(pk: Uint8Array): void {
+  if (pk.length !== 32) throw ArtifactError.invalidPublicKey();
+  try {
+    ed25519.Point.fromBytes(pk);
+  } catch {
+    throw ArtifactError.invalidPublicKey();
+  }
+}
+
+/** Validates an X25519 public key: length ONLY — deliberately, not a point-validity check.
+ *
+ * `x25519_dalek::PublicKey::from` (the Rust side of this boundary) is infallible by construction:
+ * every 32-byte string is accepted as a Montgomery u-coordinate candidate, including low-order
+ * points. td-b8c68a measured this and confirmed there is no Rust/TS divergence to close here — do
+ * NOT "complete" this into a point-validity check on either side; that would create a split where
+ * none exists today. See `vectors/key-validity.json`'s X25519 low-order-point case, which pins
+ * this deliberate agreement. */
+function requireX25519PublicKeyLen(pk: Uint8Array): void {
   if (pk.length !== 32) throw ArtifactError.invalidPublicKey();
 }
 
@@ -185,13 +218,13 @@ export async function verifyDeviceCertificate(
   opts?: BackendOption,
 ): Promise<void> {
   if (cert.alg_id !== ALG_ID_V1) throw ArtifactError.unsupportedAlgId();
-  requirePublicKeyLen(cert.sign_pk);
-  requirePublicKeyLen(cert.agree_pk);
+  requireEd25519PublicKey(cert.sign_pk);
+  requireX25519PublicKeyLen(cert.agree_pk);
 
   const recomputedDeviceFp = await deviceFpOf(cert.alg_id, cert.sign_pk, cert.agree_pk);
   if (!bytesEqual(recomputedDeviceFp, cert.device_fp)) throw ArtifactError.deviceFingerprintMismatch();
 
-  requirePublicKeyLen(rootPk);
+  requireEd25519PublicKey(rootPk);
   const rootFp = await rootFpOf(rootPk);
   if (!bytesEqual(rootFp, expectedRootFp)) throw ArtifactError.rootFingerprintMismatch();
   await verifySigOrThrow(rootPk, DeviceCertificate.signingInput(cert), cert.sig_root, opts?.backend);
@@ -218,7 +251,7 @@ export async function verifyCapability(cap: Capability, now: bigint, opts?: Back
   checkMinV(cap.v, CAPABILITY_MIN_V);
 
   // 1. host_fp == SHA-256(host_root_pk) — self-consistency of the capability's own fields.
-  requirePublicKeyLen(cap.host_root_pk);
+  requireEd25519PublicKey(cap.host_root_pk);
   const expectedFp = await rootFpOf(cap.host_root_pk);
   if (!bytesEqual(expectedFp, cap.host_fp)) throw ArtifactError.hostFingerprintMismatch();
 
@@ -232,7 +265,7 @@ export async function verifyCapability(cap: Capability, now: bigint, opts?: Back
   await verifyHostOpKeyCert(opCert, cap.host_root_pk, cap.host_fp, now, opts);
 
   // 3. `sig` verifies under the op cert's own operating key.
-  requirePublicKeyLen(opCert.host_op_pk);
+  requireEd25519PublicKey(opCert.host_op_pk);
   await verifySigOrThrow(opCert.host_op_pk, Capability.signingInput(cap), cap.sig, opts?.backend);
 
   checkExp(now, cap.exp);
@@ -247,7 +280,7 @@ export async function verifyHostOpKeyCert(
   now: bigint,
   opts?: BackendOption,
 ): Promise<void> {
-  requirePublicKeyLen(hostRootPk);
+  requireEd25519PublicKey(hostRootPk);
   const rootFp = await rootFpOf(hostRootPk);
   if (!bytesEqual(rootFp, expectedRootFp)) throw ArtifactError.rootFingerprintMismatch();
   await verifySigOrThrow(hostRootPk, HostOpKeyCert.signingInput(cert), cert.sig_host_root, opts?.backend);
@@ -262,7 +295,7 @@ export async function verifyRevocationRecord(
   signerPk: Uint8Array,
   opts?: BackendOption,
 ): Promise<void> {
-  requirePublicKeyLen(signerPk);
+  requireEd25519PublicKey(signerPk);
   await verifySigOrThrow(signerPk, RevocationRecord.signingInput(rec), rec.sig, opts?.backend);
 }
 
@@ -281,7 +314,7 @@ export async function verifyAdmissionToken(
   now: bigint,
   opts?: BackendOption,
 ): Promise<void> {
-  requirePublicKeyLen(operatorPk);
+  requireEd25519PublicKey(operatorPk);
   await verifySigOrThrow(operatorPk, AdmissionToken.signingInput(tok), tok.sig_operator, opts?.backend);
   checkExp(now, tok.exp);
 }
@@ -298,7 +331,7 @@ export async function verifyAdminCommand(
   // (DESIGN.md §A7b: "Unknown `v` ⇒ reject").
   checkMinV(command.v, ADMIN_COMMAND_MIN_V);
 
-  requirePublicKeyLen(operatorPk);
+  requireEd25519PublicKey(operatorPk);
   await verifySigOrThrow(operatorPk, AdminCommand.signingInput(command), command.sig, opts?.backend);
   checkSkew(now, command.ts, ADMIN_COMMAND_CLOCK_SKEW_SECS);
 }
@@ -338,8 +371,8 @@ export async function verifyHostDeviceCert(
   if (cert.alg_id !== ALG_ID_V1) throw ArtifactError.unsupportedAlgId();
 
   // 2. sign_pk / agree_pk parse (length check).
-  requirePublicKeyLen(cert.sign_pk);
-  requirePublicKeyLen(cert.agree_pk);
+  requireEd25519PublicKey(cert.sign_pk);
+  requireX25519PublicKeyLen(cert.agree_pk);
 
   // 3. host_device_fp binding — recompute from the certificate's own preimage.
   const recomputedDeviceFp = await deviceFpOf(cert.alg_id, cert.sign_pk, cert.agree_pk);
@@ -349,7 +382,7 @@ export async function verifyHostDeviceCert(
   if (!bytesEqual(expectedHostFp, cert.host_fp)) throw ArtifactError.hostFingerprintMismatch();
 
   // 5. host_fp is self-consistent with the embedded host_root_pk.
-  requirePublicKeyLen(cert.host_root_pk);
+  requireEd25519PublicKey(cert.host_root_pk);
   const recomputedHostFp = await rootFpOf(cert.host_root_pk);
   if (!bytesEqual(recomputedHostFp, cert.host_fp)) throw ArtifactError.hostFingerprintMismatch();
 
@@ -363,7 +396,7 @@ export async function verifyHostDeviceCert(
   await verifyHostOpKeyCert(opCert, cert.host_root_pk, cert.host_fp, now, opts);
 
   // 7. sig_host_op verifies under the op cert's own certified operating key.
-  requirePublicKeyLen(opCert.host_op_pk);
+  requireEd25519PublicKey(opCert.host_op_pk);
   await verifySigOrThrow(opCert.host_op_pk, HostDeviceCert.signingInput(cert), cert.sig_host_op, opts?.backend);
 
   // 8. exp check.

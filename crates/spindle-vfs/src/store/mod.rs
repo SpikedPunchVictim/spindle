@@ -759,8 +759,8 @@ impl Store {
             .as_slice()
             .try_into()
             .map_err(|_| StoreError::DeviceKeyBindingMismatch { device_fp })?;
-        let sign_pk = spindle_core::VerifyingKey::from_bytes(&sign_pk_arr)
-            .map_err(|_| StoreError::DeviceKeyBindingMismatch { device_fp })?;
+        let sign_pk = spindle_core::checked_verifying_key(&sign_pk_arr)
+            .ok_or(StoreError::DeviceKeyBindingMismatch { device_fp })?;
         let agree_pk_arr: [u8; 32] = keys
             .agree_pk
             .as_slice()
