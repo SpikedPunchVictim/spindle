@@ -284,9 +284,13 @@ pub enum AuditError {
     /// td-c9b9bd: mirrors [`crate::store::StoreError::ConnectionPoisoned`] — see that variant's
     /// doc comment for the full mechanism and recovery contract. `Audit` and `Store` share one
     /// `rusqlite::Connection` and therefore one poison flag ([`crate::store::Store::poisoned`]),
-    /// so once either side poisons it, both refuse further writes. `Audit::append` checks this
-    /// before even issuing `BEGIN IMMEDIATE`, so a caller sees this variant specifically rather
-    /// than whatever raw SQLite error a doomed write would otherwise produce.
+    /// so once either side poisons it, both refuse further writes. Both of this connection's
+    /// writes on the `Audit` side check this before touching the database: `Audit::append` before
+    /// even issuing `BEGIN IMMEDIATE`, and `Audit::sign_head` before signing (see that method's
+    /// doc comment — independent review of td-c9b9bd, defect 1 — for why it opens no transaction
+    /// of its own and so needed this check added separately). Either way, a caller sees this
+    /// variant specifically rather than whatever raw SQLite error a doomed write would otherwise
+    /// produce.
     #[error(
         "audit connection poisoned: a prior ROLLBACK/COMMIT failed to return this connection to \
          autocommit mode, so appends are refused rather than risking a silent, undurable write \
@@ -463,8 +467,34 @@ impl<'a> Audit<'a> {
     /// Signs the current chain head with `signer`, storing `{seq, head_hash, ts, sig}`.
     /// `ts` is caller-supplied (this crate has no wall-clock dependency — see `crate::model`/
     /// `crate::algebra`, which take timestamps as plain parameters throughout). Fails with
-    /// [`AuditError::EmptyChain`] if nothing has been appended yet.
+    /// [`AuditError::EmptyChain`] if nothing has been appended yet, or with
+    /// [`AuditError::ConnectionPoisoned`] if this connection is already poisoned — see the inline
+    /// comment on that check below, and [`Audit::append`]'s doc comment for the full poisoning
+    /// mechanism.
     pub fn sign_head(&self, signer: &dyn HeadSigner, ts: u64) -> Result<SignedHead, AuditError> {
+        // Independent review of td-c9b9bd (defect 1): unlike `append`, this method opens no
+        // transaction of its own — its `INSERT` below runs directly on `self.conn` — so on a
+        // connection already stranded inside another un-ended transaction (see `append`'s doc
+        // comment's "Poisoning" section) it would silently execute inside that stranded
+        // transaction and return `Ok` with a real signature that never becomes durable. That
+        // matters more here than for an ordinary write: per the module doc comment's "Detecting
+        // tampering" section, the signed head is the *only* thing that detects tail truncation of
+        // the audit chain — a signed head that reports success without becoming durable is, after
+        // a crash and reopen, indistinguishable from a truncated chain, defeating the one
+        // mechanism that exists to catch that. Checked here, at the very top of this method and
+        // before `signer.sign` specifically (not merely before the `INSERT`), so a write that
+        // cannot possibly become durable never first spends a signing operation — a `HeadSigner`
+        // implementation is not guaranteed to be cheap (a later slice's production signer may be
+        // backed by hardware, e.g. an HSM or OS keystore).
+        //
+        // Root cause: `618318a`'s census of this connection's write paths claimed "all 26 write
+        // paths" were guarded, but that count was `Store`'s 26 mutators plus `Audit::append` — it
+        // never noticed that `Audit` itself has *two* writes on this shared connection
+        // (`append`'s guarded `INSERT` and this method's, until now unguarded, `INSERT`), because
+        // the census never looked past `Store`'s own type boundary.
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(AuditError::ConnectionPoisoned);
+        }
         let head = self.verify_chain()?;
         if head.seq == 0 {
             return Err(AuditError::EmptyChain);
@@ -1228,6 +1258,136 @@ mod tests {
             reopened.list_members().expect("list_members").is_empty(),
             "no member was ever added in this test; this just confirms the reopened store is \
              otherwise a normal, unpoisoned store"
+        );
+    }
+
+    // ---- Poisoning (independent review of td-c9b9bd, defect 1): `sign_head` must not write on a
+    // poisoned connection ----
+    //
+    // `sign_head` opens no transaction of its own — its `INSERT` runs directly on `self.conn` —
+    // so unlike `append`, before this fix it had no poison check at all: on a connection already
+    // stranded inside another un-ended transaction, it would silently execute inside that
+    // stranded transaction and return `Ok` with a real signature that never becomes durable. Both
+    // tests below poison the connection the identical way
+    // `append_poisons_the_store_when_both_the_rollback_and_its_retry_are_denied` does (deny the
+    // `INSERT` a subsequent `append` needs, and deny every `ROLLBACK`), then exercise `sign_head`
+    // against the now-poisoned connection.
+
+    #[test]
+    fn sign_head_is_refused_on_a_poisoned_connection_and_never_reports_an_undurable_success() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.sqlite3");
+        let store = Store::open(&path).expect("open");
+        let audit = store.audit();
+        audit.append(entry("a")).expect("append a");
+
+        store
+            .connection()
+            .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Insert {
+                    table_name: "audit_log",
+                } => Authorization::Deny,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }));
+        let _ = audit.append(entry("poisoning-append")).unwrap_err();
+        store
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        assert!(
+            store.is_poisoned(),
+            "setup: the connection must be poisoned before exercising sign_head"
+        );
+
+        let signer = TestHeadSigner::from_seed([21; 32]);
+        let err = audit.sign_head(&signer, 999).unwrap_err();
+        assert!(
+            matches!(err, AuditError::ConnectionPoisoned),
+            "sign_head must refuse a poisoned connection instead of reporting a signature that \
+             can never become durable: {err:?}"
+        );
+
+        drop(store); // release the file lock before a second connection opens the same file
+
+        // The meaningful half of this test: prove that, absent this fix, the `Ok` `sign_head`
+        // would have returned really was undurable, not merely that this call happened to return
+        // an error. A second, independent connection to the same file sees no signed_heads row —
+        // the INSERT ran (if at all) inside a transaction that was never committed, and SQLite
+        // discards it when the poisoned connection is dropped.
+        let reopened = Store::open(&path).expect("reopen");
+        let count: i64 = reopened
+            .connection()
+            .query_row("SELECT COUNT(*) FROM signed_heads", [], |r| r.get(0))
+            .expect("count signed_heads rows");
+        assert_eq!(
+            count, 0,
+            "sign_head must not have durably written a signed_heads row while poisoned"
+        );
+    }
+
+    #[test]
+    fn a_signer_is_never_invoked_for_a_write_that_cannot_be_durable() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+        use std::cell::Cell;
+
+        // A `HeadSigner` test double that records whether it was ever asked to sign anything,
+        // wrapping `TestHeadSigner` so it still produces a real, verifiable signature if it *is*
+        // called (nothing here should ever reach that point, but a signer that always errors
+        // would leave open the possibility that `sign_head` short-circuits on the *signature*
+        // being unusable rather than on the poison check specifically).
+        struct RecordingSigner {
+            inner: TestHeadSigner,
+            called: Cell<bool>,
+        }
+
+        impl HeadSigner for RecordingSigner {
+            fn public_key(&self) -> VerifyingKey {
+                self.inner.public_key()
+            }
+            fn sign(&self, digest: &[u8; 32]) -> Vec<u8> {
+                self.called.set(true);
+                self.inner.sign(digest)
+            }
+        }
+
+        let store = Store::open_in_memory().expect("open");
+        let audit = store.audit();
+        audit.append(entry("a")).expect("append a");
+
+        store
+            .connection()
+            .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Insert {
+                    table_name: "audit_log",
+                } => Authorization::Deny,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }));
+        let _ = audit.append(entry("poisoning-append")).unwrap_err();
+        store
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        assert!(store.is_poisoned(), "setup: connection must be poisoned");
+
+        let signer = RecordingSigner {
+            inner: TestHeadSigner::from_seed([22; 32]),
+            called: Cell::new(false),
+        };
+        let err = audit.sign_head(&signer, 123).unwrap_err();
+        assert!(matches!(err, AuditError::ConnectionPoisoned));
+        assert!(
+            !signer.called.get(),
+            "a signer must never be invoked for a write that cannot possibly become durable — \
+             this pins the ordering requirement (the poison check must run before signer.sign): \
+             a check placed after signing would still let this test's outer assertion pass while \
+             quietly wasting a signing operation every time, which is worse for a signer backed \
+             by hardware"
         );
     }
 }

@@ -434,17 +434,33 @@ impl Store {
     /// was never poisoned, because nothing on that path ever called
     /// [`recover_from_non_autocommit`]: every subsequent write then silently executed inside the
     /// stranded transaction and reported success while remaining undurable. `with_transaction`
-    /// closes this by making the call unconditional: it runs [`recover_from_non_autocommit`] after
-    /// `f` returns by *any* path, not only after a successful `commit()`.
+    /// closes this by making the call unconditional: [`recover_from_non_autocommit`] runs after
+    /// `f` returns by any path — including a panic unwinding through it (see below) — not only
+    /// after a successful `commit()`.
     ///
-    /// The inner closure is what makes that guarantee airtight, not an RAII `Drop` ordering trick:
-    /// `f`, and the `Transaction` it borrows, live entirely inside the immediately-invoked closure
-    /// `(|| { ... })()`. By the time that expression finishes — whether `f` returned `Err` and `?`
-    /// unwound out of the closure (dropping the un-committed `Transaction`, which attempts its own
-    /// `ROLLBACK`), or `f` returned `Ok` and this wrapper's own `tx.commit()?` ran — the
-    /// transaction has already been fully resolved one way or the other. Only then does
-    /// [`recover_from_non_autocommit`] run, so it always observes the connection's *final*
-    /// autocommit state for this call, never a mid-resolution one.
+    /// **Recovery on panic (independent review of td-c9b9bd, defect 2)**: an earlier version of
+    /// this wrapper ran `f` inside an immediately-invoked closure `(|| { ... })()` and called
+    /// `recover_from_non_autocommit` on the line immediately after, reasoning that the closure's
+    /// return covered every exit path. That reasoning missed the one exit that isn't a return at
+    /// all: a panic inside `f` (or inside `tx.commit()`) unwinds straight past that following
+    /// line without ever executing it. Measured: with an authorizer denying the write `f` needs
+    /// *and* every `ROLLBACK`, then a `panic!()` inside `f`, the connection was left
+    /// `is_autocommit() == false` and — because `recover_from_non_autocommit` was never
+    /// reached — `is_poisoned() == false` too, so a subsequent write like `bump_cap_epoch`
+    /// reported `Ok(_)` while silently executing inside the still-open transaction: the exact
+    /// report-success-while-undurable signature this whole mechanism exists to close.
+    ///
+    /// The fix wraps `f`'s call (and `tx.commit()`) in [`std::panic::catch_unwind`] instead: the
+    /// `Transaction` is fully resolved — committed, or dropped attempting its own `ROLLBACK` —
+    /// whether that closure returns normally or unwinds past it, so by the time `catch_unwind`
+    /// returns either way, [`recover_from_non_autocommit`] always observes the connection's truly
+    /// final autocommit state. The caught panic is then re-raised via
+    /// [`std::panic::resume_unwind`], so it still propagates to this method's caller unchanged —
+    /// `with_transaction` never swallows a panic, it only makes sure recovery runs before letting
+    /// it continue. `AssertUnwindSafe` is warranted here, not a papering-over: restoring the
+    /// connection's poison/autocommit invariant after an unwind is exactly what this code exists
+    /// to do, so a `&self` borrow crossing the unwind boundary is the intended use, not an
+    /// oversight.
     ///
     /// `context` is a short, static, human-readable label (e.g. `"revoke_member_and_bump_epoch"`)
     /// passed straight through to [`recover_from_non_autocommit`] for its log lines only.
@@ -494,14 +510,17 @@ impl Store {
         f: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         self.check_not_poisoned()?;
-        let result = (|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let tx = Transaction::new_unchecked(&self.conn, behavior)?;
             let value = f(&tx)?;
             tx.commit()?;
             Ok(value)
-        })();
+        }));
         recover_from_non_autocommit(&self.conn, &self.poisoned, context);
-        result
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2161,12 +2180,16 @@ impl Store {
         // transaction`..." discussion moved to `Store::with_transaction`'s doc comment for why
         // every *other* transaction site in this file stays `&self` instead. Because it cannot
         // use `with_transaction` (which is `&self`-only), it is wired by hand to the identical
-        // guarantee (td-c9b9bd follow-up): the inner closure owns the `Transaction` and is fully
-        // resolved — committed, or dropped via `?` (attempting its own `ROLLBACK`) — before
-        // `recover_from_non_autocommit` runs, exactly like `with_transaction`'s own closure, so a
-        // failed commit or an early `?` return here still gets a recovery attempt instead of
-        // silently stranding the connection.
-        let result = (|| {
+        // guarantee via the same `catch_unwind`/`resume_unwind` shape `with_transaction` uses
+        // (td-c9b9bd follow-up, and its independent-review defect-2 panic fix — see that method's
+        // doc comment for the full reasoning): the `Transaction` below is fully resolved —
+        // committed, or dropped attempting its own `ROLLBACK` — whether the closure returns
+        // normally or unwinds past it, so `recover_from_non_autocommit` always observes the
+        // connection's truly final autocommit state, and the caught panic is re-raised unchanged
+        // afterward. With no borrow held across the `catch_unwind` call, `&mut self` and
+        // `Connection::transaction()` work exactly as they did before this fix — nothing about
+        // this method's signature or transaction strategy changes.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let tx = self.conn.transaction()?;
             tx.execute(
                 "INSERT INTO invite_nonces (nonce, member_id, issued_cap, redeemed_at) \
@@ -2185,9 +2208,12 @@ impl Store {
                 issued_cap: stored_cap,
                 redeemed_at: stored_redeemed_at as u64,
             })
-        })();
+        }));
         recover_from_non_autocommit(&self.conn, &self.poisoned, "burn_invite_nonce");
-        result
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 }
 
@@ -2205,6 +2231,23 @@ impl Store {
 ///
 /// It lives in this module, not a separate file, because it needs `self.conn`, which is private to
 /// `Store` and only reachable from code inside `store/mod.rs`.
+#[cfg(test)]
+impl Store {
+    /// Test-only seam (independent review of td-c9b9bd, defect 2): calls
+    /// [`Store::with_transaction`] with a caller-supplied closure, so a test can inject a panic
+    /// mid-transaction without widening `with_transaction` itself (which stays private) or any
+    /// other production signature. See
+    /// `a_panic_inside_a_store_transaction_still_recovers_or_poisons` for the only current use.
+    fn with_transaction_for_test<T>(
+        &self,
+        context: &'static str,
+        behavior: TransactionBehavior,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.with_transaction(context, behavior, f)
+    }
+}
+
 #[cfg(feature = "test-support")]
 impl Store {
     /// Overwrites a device's stored `alg_id` directly, bypassing every invariant `add_device`
@@ -5010,6 +5053,77 @@ mod tests {
              unrecoverable strand, exactly like `Store::with_transaction` does for every other \
              write method — this is the manual-wiring counterpart of \
              `store_transaction_poisons_when_rollback_cannot_restore_autocommit` above"
+        );
+    }
+
+    // ---- Poisoning (independent review of td-c9b9bd, defect 2): a panic mid-transaction must
+    // still recover or poison, not unwind straight past `with_transaction`'s recovery call ----
+
+    #[test]
+    fn a_panic_inside_a_store_transaction_still_recovers_or_poisons() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+        use std::panic::{self, AssertUnwindSafe};
+
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        store.activate_member(member_id).expect("activate_member");
+
+        // Same seam as `store_transaction_poisons_when_rollback_cannot_restore_autocommit`: deny
+        // the `UPDATE members` the closure below attempts, and deny every `ROLLBACK`, so nothing
+        // on this connection can leave the transaction `with_transaction`'s `BEGIN` opened.
+        store
+            .connection()
+            .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Update {
+                    table_name: "members",
+                    ..
+                } => Authorization::Deny,
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }));
+
+        // Silence the default panic hook's stderr dump for this deliberately-triggered panic.
+        let prev_hook = panic::take_hook();
+        panic::set_hook(Box::new(|_| {}));
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            store.with_transaction_for_test("panic-test", TransactionBehavior::Deferred, |tx| {
+                // The denied UPDATE returns `Err`; `.expect` turns that into the panic this test
+                // exercises — mirroring the reviewer's repro (deny the UPDATE, deny ROLLBACK,
+                // panic inside the closure).
+                tx.execute(
+                    "UPDATE members SET status = 'revoked' WHERE member_id = ?1",
+                    params![member_id.0 as i64],
+                )
+                .expect("deliberate panic: UPDATE is denied by this test's authorizer");
+                Ok(())
+            })
+        }));
+        panic::set_hook(prev_hook);
+
+        assert!(
+            result.is_err(),
+            "the panic must propagate out of with_transaction, not be swallowed"
+        );
+
+        store
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+        assert!(
+            store.is_poisoned(),
+            "both the panic-triggered ROLLBACK (attempted by the unwinding Transaction's own \
+             Drop) and recovery's single retry were denied, so the connection never left its \
+             transaction; recovery must still have run on unwind and poisoned it. Before this \
+             fix, `with_transaction` called `recover_from_non_autocommit` only on the line after \
+             its immediately-invoked closure returned, which a panic unwinds straight past — so \
+             this connection was left stranded and *unpoisoned* instead (is_autocommit=false, \
+             is_poisoned=false), and a subsequent write like bump_cap_epoch reported Ok(_) while \
+             remaining undurable — the same report-success-while-undurable signature this whole \
+             mechanism exists to close"
         );
     }
 }
