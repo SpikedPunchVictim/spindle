@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.25) + Execution Plan
+# Spindle — System Design Document (draft v0.9.26) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -73,6 +73,12 @@
 > the signature-verification boundary — the authorizer's pre-verification half charges only the global bucket, a
 > post-verification callback charges the per-`from_fp` bucket and mints the cap — closing both denial modes and the
 > `Allow`/`Deny` mint-timing asymmetry it also surfaced (2026-09-08; td-fc5a30).
+> v0.9.26: §A4c added — revocation convergence by state reconciliation (host connect, `cap_epoch` divergence,
+> periodic jittered reconciliation); a reviewed draft's digest-of-revoked-state trigger is dropped to the Design
+> Reserve pending the still-unmeasured payload-size ceiling; §A5's stale, unscoped `pub registry.revoke` bullet
+> corrected to the scoped `pub registry.revoke.<own>`; new per-host token buckets (for this section's resync
+> subject and for the two already specified in §A5) flagged as specified but unimplemented (user decisions,
+> 2026-09-08).
 
 ---
 
@@ -445,6 +451,152 @@ device or the person), *Groups* (grid Groups × Shares with perm chips; click to
 **"Preview as …"** (see the tree exactly as a member sees it), plain-language explanations ("Alex can download from
 Photos because they're in Family") derived directly from the union model.
 
+## A4c. Revocation convergence: making the helper's store self-healing (→ ADR-003)
+
+**The gap this closes** — A4 states that the helper's durable revocation store is "part of the cut-off path, not a
+backstop": a kicked client reconnects on its own, so KICK alone cuts nobody off, and the cut-off holds only because
+the callout refuses the reconnect. A4 specifies the publish — host bumps epoch, signs a `RevocationRecord`, publishes
+to `registry.revoke.<hfp>` — but says nothing about what happens when that publish never lands.
+
+The full operation is three steps and only the first is durable: (1) the host's store transaction commits (revoked
+status **and** the `cap_epoch` bump, atomically); (2) the `RevocationRecord` is minted in memory; (3) the record is
+published over NATS. A process death, a partition, a dropped message, or a helper replica restart between (1) and
+(3) loses the record permanently. Locally the subject is revoked and the host's per-request enforcement —
+authoritative, per A4 — still denies them, so **no file contents are exposed**. What is lost is the registry-side
+cut-off: no KICK is issued, and the callout keeps admitting the revoked device's capability. The `< 5 s` cut-off
+target (S9) is violated silently.
+
+**Why a lost record does not repair itself** — the helper's ingest is deliberately a **one-way lattice**: it unions
+the record's `revoked` subjects into its set, applies max-wins to the stored epoch, never removes a subject, and
+never rejects a stale epoch (replay is explicitly safe, so a redelivered or operator-replayed record cannot roll
+anything back). Union is what makes a lost record permanent: a *later* revocation record carries only its own
+subjects, so it never re-adds the one that was lost. The max-wins epoch does bound the damage — any later record
+raises `revocation_epoch(host_fp)`, which stales the lost victim's capability and downgrades them from full member
+permissions to connect-only — but that is degradation, not repair. The subject remains absent from the helper's
+revoked set until something republishes it. The same lattice is also what makes repair cheap: **republishing is
+idempotent and order-independent**, so a reconciliation pass cannot corrupt state no matter how often it runs or in
+what order records arrive.
+
+**Decision 1 — convergence by state reconciliation, not a delivery queue [DEFAULT]**
+
+The host **republishes its complete current revoked set** rather than guaranteeing delivery of each individual
+record. The revoked set is small, monotone, and derivable at any time from the host's own store (members with
+`status = revoked`, devices with `revoked = 1`), which is exactly the shape where state reconciliation beats a queue.
+This heals strictly more than a delivery guarantee does: the sender's crash window, but also a helper that lost its
+store, a replica that was down, a dropped message, and a partition. It needs no new table, no migration, no drain
+loop, and no retry policy.
+
+**Rejected: a transactional outbox.** Writing the minted record into an `outbox` table inside the same transaction
+and draining it with a background publisher fixes only the sender's crash window, and costs a schema migration plus
+a publisher task with its own retry and table-growth policy. Held in reserve: if measurement later shows the
+reconciliation payload is too large or too frequent to republish, an outbox becomes the fallback, not the first
+move.
+
+**Decision 2 — what is republished: the revoked set only, never the roster [normative]**
+
+The reconciliation payload is exactly the existing A4/A7b `RevocationRecord` — `{host_fp, epoch, revoked: [...], ts,
+sig_host_op}` — where `revoked` carries the host's complete current revoked set rather than a single revocation's
+subjects. No new artifact type is introduced. It **MUST NOT** carry non-revoked members. A1 and A2 state that
+accounts live only on hosts and that the registry holds none; the helper today holds only revoked fingerprints, an
+epoch, and admission records. Sending the member table would hand the registry the membership roster A2 says it must
+never have. That is a change to the threat model, not an optimization, and it is rejected on those grounds.
+
+**Decision 3 — three triggers**
+
+| Trigger | Detects | Cost |
+|---------|---------|------|
+| host connect | restart after a crash; helper restart; anything missed while the host was offline | one publish per host connect |
+| `cap_epoch` divergence | the helper is provably behind — it missed at least one record | free; already on the wire |
+| periodic reconciliation (jittered) | the gap neither of the other two triggers can cover — see below | one publish per interval, per host |
+
+**(a) On host connect.** After each successful registry connection the host publishes one reconciliation record on
+its existing `registry.revoke.<hfp>` subject. No new permission is required: the callout already grants a host `pub
+registry.revoke.<own>`, scoped to its own fingerprint, per §A5's permission list — and it is exactly that
+scoping that makes this safe. A bare, unscoped `pub registry.revoke` grant would let any host publish a
+reconciliation record into every other host's revocation subject.
+
+**(b) On proven divergence, detected from `cap_epoch` — the free detector.** A capability is host-signed and carries
+the `cap_epoch` at which it was issued, so a cap naming epoch *N* is proof the host reached epoch *N*. If a
+connecting device presents a verified cap whose `cap_epoch` is **greater** than the helper's stored
+`revocation_epoch(host_fp)`, the helper has proof it missed at least one revocation record. This needs no hash, no
+extra round-trip, and no protocol change — the value is already presented at every connect and today is used only
+for the freshness comparison and then discarded.
+
+**(c) Periodic reconciliation, jittered (user decision, 2026-09-08).** The host republishes its complete current
+revoked set on a jittered interval, independent of the other two triggers. The interval itself is left unspecified
+and retunable, but it **MUST** be jittered: an unjittered fixed period would have every host in a fleet republish in
+lockstep, turning what should be a trickle of small, staggered messages into a synchronized storm.
+
+This is the only trigger that fires without depending on either the host reconnecting or some *other* device
+presenting a fresher cap, and closing that gap is not optional — it is precisely the attack case. Trigger (b) fires
+when a device presents a cap whose `cap_epoch` exceeds the helper's stored `revocation_epoch`, but the **revoked**
+device's own capability is stale by definition (it was revoked, so it never received a refresh), so the revoked
+device's own reconnect can never fire trigger (b); only some other, still-current device could, and a quiet fleet
+may never produce one. Trigger (a) fires on host connect, which a host holding a stable, long-lived NATS connection
+never re-fires. So a quiet fleet, plus a long-lived host connection, plus one dropped publish, leaves the revoked
+device admitted indefinitely, with S9's `< 5 s` cut-off silently and permanently violated — periodic reconciliation
+is the only one of the three triggers that repairs that case on its own.
+
+**Held in the Design Reserve: a digest probe.** A reviewed draft of this section paired trigger (a) with a digest of
+the host's revoked state — `H(DOMAIN_REVOKE_DIGEST, host_fp, epoch, sorted(revoked))` — compared against the
+helper's own, to catch "the epochs agree but the set diverged" (a partial write, a restore from a stale backup, a
+replica that drifted). Placed at host connect it bought nothing: trigger (a) already republishes the **full**
+revoked set at that same moment and repairs any divergence unconditionally, so the digest detected a divergence the
+very same message had already fixed. A digest's only genuine use is as a cheap probe for a **frequent** signal —
+i.e. paired with periodic reconciliation (c), where it could confirm agreement without paying for a full republish
+every interval. But at realistic revoked-set sizes — a household host runs on the order of 0–5 revoked devices — the
+full record is already small enough that a digest probe saves nothing; it pays for itself only at large
+revoked-set sizes, which is the same regime as the still-unmeasured payload ceiling (Open items, below). The digest
+is therefore held in the Design Reserve, not built, with an explicit promotion condition: promote it only if the
+payload measurement shows the periodic full republish is too large.
+
+**Decision 4 — reconciliation is never on the connect critical path [normative]**
+
+The callout **MUST** decide every connection from the helper's local durable state alone. It must never block on a
+round-trip to the host. S14 requires the callout to refuse a revoked device *while hosts are offline*, and the
+helper's durable store exists precisely so that question can be answered without the host. Making the decision
+depend on a host round-trip forces a choice between failing open (a revoked device is admitted because its host is
+asleep) and failing closed (nobody reaches a host that is merely offline). Both are worse than the current
+behaviour.
+
+Reconciliation is therefore **asynchronous repair**, never a synchronous lookup. On detecting divergence the helper:
+(1) decides the current connection conservatively from local state — the existing stale-cap downgrade path;
+(2) publishes a resync request, rate-limited (below); (3) applies the host's reconciliation record whenever it
+arrives.
+
+**Subject: `host.<hfp>.revoke-resync`**
+
+The helper needs a way to *ask*. Hosts are already granted `sub host.<own>.>` by the callout, and the helper already
+publishes to `host.<hfp>.presence` under that grant, so the resync request fits the existing pattern with **no new
+permission and no new grant**:
+
+| Subject | Publisher | Subscriber | Notes |
+|---------|-----------|------------|-------|
+| `host.<hfp>.revoke-resync` | broker helper | host `hfp` | asks the host to republish its full revoked set on `registry.revoke.<hfp>`; no reply (the answer arrives on the existing revoke subject); per-host token bucket |
+
+**Rate limiting is required, not optional.** A capability is host-signed and therefore unforgeable, but a genuine
+old capability carrying a high `cap_epoch` can be replayed by a client at will, and each replay would otherwise
+trigger a resync request. The subject therefore needs a **per-host token bucket** — but that is a requirement, not
+an existing facility to lean on. §A5's subject table already specifies a per-host token bucket for
+`registry.revoke.<hfp>` and `registry.devcert.<hfp>`, and **none of the three is implemented**: `spindle-helper` has
+no rate limiter of any kind today — no token-bucket type, no `ratelimit` module anywhere in the crate — so all three
+buckets are an outstanding implementation obligation.
+
+**Open items**
+
+- **Resolved (user decision, 2026-09-08).** Periodic reconciliation is added as trigger (c) above; the digest
+  (formerly trigger (c)) is dropped to the Design Reserve, promotable only if the payload measurement below shows
+  the periodic full republish is too large.
+- **Unmeasured:** the reconciliation payload size ceiling. `deploy/nats/nats-server.conf` sets
+  `max_control_line: 32768` (A10.10), but that governs the CONNECT control line where capabilities ride — **not**
+  published payloads, which fall under `max_payload`, currently unset and therefore nats-server's 1 MB default.
+  That is roughly 30,000 fingerprints on paper, but the number must be measured before it is relied on, not derived
+  on paper. This is now doubly important: it is also the promotion condition for the reserved digest, above.
+- **No owner yet.** `apps/host/` is still a README; nothing exists to run the connect hook or answer a resync
+  request. This section should be specified now and implemented with the host daemon.
+- **Unimplemented:** the per-host token buckets specified for `registry.revoke.<hfp>`, `registry.devcert.<hfp>`, and
+  `host.<hfp>.revoke-resync` (Decision 3 / above) do not exist in any form today and need an owner.
+
 ## A5. Subject and permission model (→ ADR-002 rev)
 
 | Subject | Publisher | Subscriber | Notes |
@@ -453,6 +605,7 @@ Photos because they're in Family") derived directly from the union model.
 | `host.<hfp>.sess.<cfp>.<sid>.c2h` | client `cfp` only | host | trickle ICE + session control |
 | `host.<hfp>.sess.<cfp>.<sid>.h2c` | host | client `cfp` only | trickle ICE + session control |
 | `host.<hfp>.presence` | broker helper (from `$SYS` events) | devices holding a cap for `hfp` | push deltas `{host_fp, state, last_seen}` only |
+| `host.<hfp>.revoke-resync` | broker helper | host `hfp` | asks the host to republish its full revoked set on `registry.revoke.<hfp>`; no reply (the answer arrives on the existing revoke subject); per-host token bucket (A4c) |
 | `helper.presence.get.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply snapshot for the caller's hosts (from the session record for `nfp` — identity = the callout-granted subject token, never the payload; core NATS has no retained messages) |
 | `registry.revoke.<hfp>` | host `hfp` only | broker helper | host-signed revocation/epoch records (durable; helper asserts subject token == record `host_fp`; per-host token bucket) |
 | `registry.devcert.<hfp>` | host `hfp` only | broker helper | host-signed device certificate (durable; helper asserts subject token == the cert's `host_fp`; per-host token bucket) |
@@ -463,8 +616,12 @@ Photos because they're in Family") derived directly from the union model.
 | `_INBOX_<dfp>.>` | host via `allow_responses` after prefix check | owning device | private inbox prefix |
 
 **Permissions issued by callout**
-- Host: `sub host.<own>.>`, `pub host.<own>.sess.*.*.h2c`, `pub registry.revoke`,
-  `allow_responses {max:1, expires:"2m"}`; explicit deny of `_INBOX.>`, `$SYS.>`, `$JS.>`.
+- Host: `sub host.<own>.>`, `pub host.<own>.sess.*.*.h2c`, `pub registry.revoke.<own>`,
+  `allow_responses {max:1, expires:"2m"}`; explicit deny of `_INBOX.>`, `$SYS.>`, `$JS.>`. **[corrected v0.9.26]**
+  the bare `pub registry.revoke` this bullet previously listed contradicted this section's own subject table above
+  (`registry.revoke.<hfp>`, "host `hfp` only"); the scoped form is what the implementation grants
+  (`permissions::host_permissions`) and what makes the subject safe — a bare grant would let any host publish into
+  every other host's revocation subject.
 - Client, for each host `h` in its verified caps: `pub host.<h>.connect`, `pub host.<h>.sess.<own>.*.c2h`,
   `sub host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus `sub _INBOX_<own>.>`,
   `pub helper.presence.get.<own nfp>`, `pub helper.turn.get.<own nfp>`, `pub helper.devcert.get.<own nfp>`,
@@ -1145,6 +1302,84 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.26 (2026-09-08)** — §A4c added: revocation convergence by state reconciliation, closing the gap where a
+  host-side crash, partition, or dropped publish between the store-commit and the NATS-publish loses a
+  `RevocationRecord` permanently and the registry-side cut-off silently never happens (S9's `< 5 s` target violated
+  with no visible failure). The host republishes its complete revoked set rather than guaranteeing delivery of one
+  record; three triggers cover it — host connect, `cap_epoch` divergence (free, already on the wire), and
+  **periodic jittered reconciliation** (user decision, new) — the last because it is the only one of the three that
+  fires without depending on the host reconnecting or another device presenting a fresher cap: a revoked device's
+  own capability is stale by definition, so its own reconnect can never raise `cap_epoch` past what the helper
+  already has, and a quiet fleet plus a long-lived host connection plus one dropped publish otherwise leaves it
+  admitted indefinitely. A companion digest-of-revoked-state trigger from the reviewed draft is **dropped to the
+  Design Reserve** (user decision): as drafted it sat alongside host-connect, which already repairs any divergence
+  unconditionally in the same message, so the digest detected nothing that message hadn't already fixed; it is
+  held, unbuilt, promotable only if the still-unmeasured payload-size ceiling shows periodic full republish is too
+  large. New subject `host.<hfp>.revoke-resync` (§A5) lets the helper ask a host to resync; its per-host token
+  bucket, and the buckets already specified for `registry.revoke.<hfp>` and `registry.devcert.<hfp>`, are flagged
+  as **specified but unimplemented** — `spindle-helper` has no rate limiter of any kind today. Also fixes a
+  pre-existing §A5 self-contradiction (closes part of td-40a2d0): the `Permissions issued by callout` bullet's
+  stale, unscoped `pub registry.revoke` is corrected to the scoped `pub registry.revoke.<own>`, matching §A5's
+  own subject table and the implementation (`permissions::host_permissions`) — the scoping is what makes it safe; a
+  bare grant would let any host publish into every other host's revocation subject.
+- **v0.9.25 (2026-09-08)** — §A5 amended again: S1 measured that the previous entry's expectation does not hold —
+  the NATS permission set does **not** refuse a publish naming another device's inbox as its reply subject. A
+  device holding only `pub host.<h>.connect` published to that subject naming another device's inbox as the reply;
+  no violation was raised and the host received the message with the foreign reply intact. Seven permission shapes
+  were measured against nats-server 2.10, including `allow_responses` and a full-token deny matching the target
+  subject, with zero effect: a publish's permissions are evaluated against the subject only, the reply is tested
+  solely by `isReservedReply` (a structural check for NATS-internal prefixes), and the `Permissions Violation for
+  Publish with Reply` error is not the permission decision its name implies. Nor is a narrower rule writable —
+  NATS wildcards are full-token, so `_INBOX_<other_fp>` cannot be named as a subject class without one explicit
+  deny per fleet member. Both v0.9.24 denial modes are therefore **live, not conditional**, and the global
+  bucket's shared-fate cost is load-bearing rather than paid for a threat the broker already blocked.
+  **Mitigation** (closes td-fc5a30): nothing an unauthenticated peer names may cost a *specific* identity. The
+  connect authorizer's pre-verification half now does the membership lookup and charges only the global bucket; a
+  new post-verification callback charges the per-`from_fp` bucket and mints the member cap. A forged offer never
+  reaches the callback, so an attacker lacking the victim's signing key can neither drain that victim's bucket
+  (mode 1) nor allocate bounded-map entries (mode 2) — both become unreachable rather than merely bounded — and
+  splitting the charge across the verification boundary also closes the `Allow`/`Deny` mint-timing asymmetry the
+  investigation surfaced.
+- **v0.9.24 (2026-09-08)** — §A5's connect limiter amended: the per-`from_fp` token bucket is kept but made
+  **capacity-bounded** and paired with a **global** bucket over the connect endpoint, charged pre-verification,
+  because `from_fp` is unverified at authorize time — the connect authorizer must resolve `sign_pk` before any
+  signature can be checked, so a limiter keyed only on `from_fp` is defeated by rotation (every offer arrives at a
+  fresh, full bucket) and each fabricated `from_fp` allocates bucket state, making the limiter its own
+  memory-exhaustion surface. The per-`from_fp` bucket is kept because it bounds a single *identified* device; the
+  accepted cost is **shared fate** — a flooder draining the global bucket slows legitimate connects too. Timing
+  equalization is stated as **best-effort**, not claimed away: the authorizer performs the same key parse and
+  `device_fp` recompute on a rejected lookup as on an accepted one, but the store-side cost difference between a
+  registry hit and a miss remains, only bounded by the limiters and the uniform silent drop. Two denial modes this
+  shape creates are recorded here rather than left to be discovered in production: (1) an attacker naming a
+  *victim's* `from_fp` drains that victim's bucket and locks the device out for as long as the flood runs — a
+  targeted denial the global bucket cannot see, since a per-`from_fp` refusal short-circuits before it is
+  consulted — gated on an **unproven** expectation that §A5's permission set refuses a publish carrying another
+  device's inbox as its own reply subject; and (2) once the bounded map is full and every tracked bucket is
+  throttled, an untracked device is refused outright, a harder denial than shared fate even while the global
+  bucket has headroom — still the correct failure mode, since the alternative is the unbounded allocation the
+  bound exists to prevent.
+- **v0.9.23 (2026-09-07)** — Bundle entry and member cap sizes are corrected to values measured from a real minted
+  artifact, replacing the v0.9.22 estimates: an entry is **546 B** (was ~530 B) and a cap is **449 B** (was 466
+  B), both measured with a 16-byte cap nonce. The QR host ceiling §A4 states gains a precondition it lacked
+  before: **4** hosts at EC level M and **5** at level L holds only for a short registry endpoint; at the 256-byte
+  `MAX_REGISTRY_LEN` ceiling it drops to **3** and **4**. The same corrected 449 B cap figure also fixes the
+  CONNECT `auth_token` presentation figure in §A4: a full 32-cap token measures **19,751 B**, 40% under the 32 KiB
+  ceiling — not the previously stated 19,106 B/42%.
+- **v0.9.22 (2026-09-06)** — Device bootstrap state bundle specified: `{registry endpoint, [{sign_pk, agree_pk,
+  member_cap}…]}`, transferring state rather than just a signature. The entry drops the derivable `host_fp` and
+  instead names the host's **envelope** keys explicitly, replacing an earlier, ambiguous `host_pk` field that
+  could be read as either the host's root key or the envelope keys a client actually pins; `host_fp` and the
+  host's own `device_fp` are **derived, never carried** — `host_fp = SHA-256(cap.host_root_pk)` (the check
+  `verify_capability` already performs) and `device_fp = device_fp_of(sign_pk, agree_pk)` — so no field of an
+  entry can disagree with another. The bundle is **unsigned** and deliberately absent from §A7b's signed-artifact
+  catalog: its only consumer is the new device, over the same local QR channel that already conveys the root
+  identity itself, so a signature would have no verifier that channel does not already establish, and the one
+  security-bearing value it carries — `member_cap` — is itself an independently verifiable signed artifact. This
+  holds only while the bundle stays on that channel: relaying it over the network, cloud sync, or a file export
+  would make it a signed artifact requiring its own §A7b entry, tag, time rule, and replay rule. The QR's measured
+  host ceiling is stated for the first time: an entry is ~530 B (two 32-byte keys plus a 466 B cap), so a
+  version-40 QR carries **4** hosts at EC level M and **5** at level L against the 32-host presentation cap in
+  §A4; §A4's per-cap size is likewise corrected from an earlier estimate to this measured 466 B value.
 - **v0.9.21 (2026-09-04)** — §A4b edge rules: a fold collision between different *kinds* of entry is refused
   rather than overwritten (user decision). An upload never replaces a colliding directory and `mkdir` never
   replaces a colliding file; both answer `already_exists` and leave the existing entry untouched. `mkdir` onto a
