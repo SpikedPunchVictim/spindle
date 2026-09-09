@@ -93,9 +93,13 @@ export const MEASURED_ENTRY_BYTES = 546;
  * `"TooManyEntries"` are this module's own additions for the two length/count caps `ProtoError` has
  * no variant for.
  *
- * REDACTION DISCIPLINE: neither message ever echoes field *content* — `registry` is a bare NATS
- * endpoint string that must never appear in a log line, so both messages below carry only lengths
- * and counts. */
+ * REDACTION DISCIPLINE: neither `RegistryTooLong`'s nor `TooManyEntries`'s message ever echoes
+ * field *content* — `registry` is a bare NATS endpoint string that must never appear in a log
+ * line, so both carry only lengths and counts. `Proto`, however, can wrap
+ * `ProtoError.UnknownField`, whose `.message` embeds a CBOR map key taken verbatim from the
+ * peer's bytes — for this artifact specifically, potentially a hostile QR code a user scanned,
+ * not a channel that has already authorized the sender. Use `.redacted()`, never `.message`, on
+ * a `BundleWireError` anywhere it reaches a log call — see that method's doc comment. */
 export type BundleWireErrorKind = "Proto" | "RegistryTooLong" | "TooManyEntries";
 
 export class BundleWireError extends Error {
@@ -138,6 +142,21 @@ export class BundleWireError extends Error {
       `bundle has ${actual} entries, exceeding the ${max}-entry cap`,
       { max, actual },
     );
+  }
+
+  /** A log-safe rendering of this error, with every peer-controlled byte replaced by its shape —
+   * mirrors `crates/spindle-proto/src/bootstrap.rs`'s `BundleWireError::redacted()` /
+   * `RedactedBundleWireError` precisely, one layer up from `ProtoError.redacted()`. Only `Proto`
+   * needs rewriting, by delegating to the wrapped `ProtoError`'s own `.redacted()`;
+   * `RegistryTooLong`/`TooManyEntries` already carry only lengths/counts (see this class's doc
+   * comment's "REDACTION DISCIPLINE" note), so they render exactly as `.message` always did.
+   *
+   * Use this, never `.message`/`.toString()`, anywhere a `BundleWireError` reaches a log call. */
+  redacted(): string {
+    if (this.kind === "Proto" && this.protoError !== undefined) {
+      return this.protoError.redacted();
+    }
+    return this.message;
   }
 }
 

@@ -53,7 +53,11 @@ const textEncoder = new TextEncoder();
  * Mirrors Rust's `SignalingError` enum: `kind: "Proto"` wraps every rejection kind `ProtoError`
  * already defines (missing/unknown field, wrong CBOR type, invalid enum discriminant, non-canonical
  * CBOR); `"TooLong"`/`"WrongLength"` are this module's own additions for the two rejection kinds
- * `ProtoError` has no variant for. */
+ * `ProtoError` has no variant for. `TooLong`/`WrongLength` carry only a schema field name plus
+ * lengths — safe to log as-is; `Proto` can wrap `ProtoError.UnknownField`, whose `.message`
+ * embeds a CBOR map key taken verbatim from the peer's bytes. Use `.redacted()`, never
+ * `.message`, anywhere a `SignalingError` reaches a log call — see that method's doc comment,
+ * including a recorded, deliberate divergence from the Rust twin. */
 export type SignalingErrorKind = "Proto" | "TooLong" | "WrongLength";
 
 export class SignalingError extends Error {
@@ -102,6 +106,41 @@ export class SignalingError extends Error {
       `field \`${field}\` is ${actual} bytes long, expected exactly ${expected}`,
       { field, expected, actual },
     );
+  }
+
+  /** A log-safe rendering of this error, with every peer-controlled byte replaced by its shape.
+   * Only `Proto` needs rewriting, by delegating to the wrapped `ProtoError`'s own `.redacted()`;
+   * `TooLong`/`WrongLength` already carry only a schema field name plus lengths (see this class's
+   * doc comment), so they render exactly as `.message` always did.
+   *
+   * Use this, never `.message`/`.toString()`, anywhere a `SignalingError` reaches a log call.
+   *
+   * # A deliberate divergence from the Rust twin — recorded, not an oversight
+   *
+   * `crates/spindle-proto/src/signaling.rs`'s `SignalingError` has **no** `redacted()`/
+   * `RedactedSignalingError` of its own. Its module doc's "Why this type lives here" section (see
+   * `bootstrap.rs`'s own doc comment, which quotes it) explains why: `spindle-net` wraps
+   * `SignalingError` in its own error type one layer up, and redacts *there*
+   * (`spindle-net::quic`'s `RedactedSignalingError`) — because `spindle-net` is where those bytes
+   * actually reach `tracing`. Rust's `spindle-proto` crate is deliberately left without a
+   * redaction affordance for this one type because a better-positioned owner exists one layer up.
+   *
+   * TypeScript has no such layer: there is no `@spindle/net` package, and no other package
+   * wrapping `SignalingError` today. Applying `bootstrap.rs`'s own reasoning for why
+   * `BundleWireError` (which is *also* undefended in Rust's `spindle-proto`... except it isn't —
+   * `BundleWireError` gets its own `redacted()` directly in `bootstrap.rs`, for exactly this
+   * reason: "with no intermediate crate positioned to own the redaction, it has to live at the
+   * point of definition instead, or it would not exist anywhere") leads to the same conclusion
+   * here: with no TS layer positioned to own `SignalingError`'s redaction, it has to live at the
+   * point of definition, or it would not exist anywhere in this package's ecosystem at all. This
+   * method is that affordance. A future session comparing the two twins and finding this class
+   * "redacted in TS but not in Rust" should read this comment as the reason, not conclude someone
+   * forgot to port `RedactedSignalingError` down into `spindle-proto`. */
+  redacted(): string {
+    if (this.kind === "Proto" && this.protoError !== undefined) {
+      return this.protoError.redacted();
+    }
+    return this.message;
   }
 }
 

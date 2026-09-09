@@ -18,8 +18,17 @@
 import { CborError, CborValue, canonicalDecode, canonicalEncode } from "./canonical.js";
 import * as tags from "./tags.js";
 
+const textEncoder = new TextEncoder();
+
 /** Errors produced while converting between wire types and `CborValue`/bytes. Mirrors Rust's
- * `ProtoError` enum: one variant per `kind`. */
+ * `ProtoError` enum: one variant per `kind`.
+ *
+ * REDACTION: `UnknownField`'s `field` is a CBOR map key lifted verbatim from the peer's decoded
+ * bytes — the one piece of peer-supplied content any error in this package carries (every other
+ * kind's `field`/`enumValue`/`cborError` comes from this package's own schema, a numeric
+ * discriminant, or a byte offset). Use `.redacted()`, never `.message`/`.toString()`, anywhere a
+ * `ProtoError` reaches a log call. See `.redacted()`'s own doc comment for the "why no automated
+ * guard" note — this package has no `tracing`-equivalent call sites yet for one to scan. */
 export type ProtoErrorKind =
   | "NotAMap"
   | "MissingField"
@@ -83,6 +92,49 @@ export class ProtoError extends Error {
   }
   static fromCbor(e: CborError): ProtoError {
     return new ProtoError("Cbor", e.message, { cborError: e });
+  }
+
+  /** A log-safe rendering of this error, with every peer-controlled byte replaced by its shape.
+   * Mirrors `crates/spindle-proto/src/artifacts.rs`'s `ProtoError::redacted()` /
+   * `RedactedProtoError`, adapted to this package's idiom: an `Error` subclass with a `kind`
+   * discriminant has no `Display` impl to wrap, so a `redacted(): string` method plays the same
+   * role a wrapper type plays in Rust — a second, deliberately-opt-in rendering, not a
+   * replacement for `.message`.
+   *
+   * Only `UnknownField` is rewritten, to `"unknown field (name withheld: N bytes of
+   * peer-supplied text)"` — every other kind is already content-free (a static template, a
+   * `field` name drawn from this package's own declared schema, a numeric enum discriminant, or
+   * a `CborError` message with no peer bytes in it) and renders exactly as `.message` always did,
+   * so no diagnostic value is lost redacting them. `N` counts UTF-8 bytes (`TextEncoder`), not
+   * UTF-16 code units (`string.length` would undercount any peer key containing a surrogate
+   * pair) — this matches Rust's `name.len()`, which counts `String`'s UTF-8 bytes.
+   *
+   * Use this, never `.message`/`.toString()`, anywhere a `ProtoError` reaches a log call.
+   *
+   * # Why no automated guard mirrors `crates/spindle-core/tests/redaction_guard.rs`
+   *
+   * That guard is a text scan over `tracing::{trace,debug,info,warn,error}!(...)` call sites for
+   * suspicious `%binding`/`?binding` shorthand — it exists because Rust's `tracing` macros are
+   * pervasive across several crates already emitting untruncated identifiers. `@spindle/proto`
+   * (and `@spindle/crypto`, its only consumer today) has no logging call sites at all — a repo
+   * grep for `redacted`/`Redaction` this session found zero mechanism and zero log call sites
+   * outside two doc comments. A guard that scans zero call sites protects nothing and would only
+   * assert "still zero call sites", which the package's own dependency graph (no logging library)
+   * already guarantees far more cheaply than a bespoke scanner would. Deferred, not skipped:
+   * once a TS consumer (a Stage 7+ app, most likely) actually logs one of this package's three
+   * error classes, a guard belongs *there*, modeled on `redaction_guard.rs` but scanning for
+   * `.message`/`.toString()`/template-literal interpolation of a `ProtoError`/`BundleWireError`/
+   * `SignalingError` outside of a `.redacted()` call — not preemptively in this package, which
+   * cannot see how its own errors get logged. Also inherits `redaction_guard.rs`'s own documented
+   * blind spot either way: a binding-name/call-shape scan cannot see through indirection (an
+   * error re-thrown under a new name, or embedded in another type's own `message`), tracked
+   * upstream as td-a196b6. */
+  redacted(): string {
+    if (this.kind === "UnknownField") {
+      const bytes = textEncoder.encode(this.field ?? "").length;
+      return `unknown field (name withheld: ${bytes} bytes of peer-supplied text)`;
+    }
+    return this.message;
   }
 }
 

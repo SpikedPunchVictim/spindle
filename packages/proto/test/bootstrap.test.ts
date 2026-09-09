@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { CAPABILITY_CURRENT_V, CapKind, Capability } from "../src/artifacts.js";
+import { CAPABILITY_CURRENT_V, CapKind, Capability, ProtoError } from "../src/artifacts.js";
 import {
   BUNDLE_ENTRY_FIELDS,
   BUNDLE_FIELDS,
@@ -503,5 +503,33 @@ describe("vectors/bootstrap.json", () => {
       expect(err.protoError?.kind).toBe("Cbor");
       expect(err.protoError?.cborError?.kind).toBe("MapKeyOrder");
     });
+  });
+});
+
+describe("redaction (bootstrap.rs parity)", () => {
+  // Mirrors `bootstrap.rs`'s `redacted_display_withholds_an_unknown_field_name_and_nothing_else`
+  // precisely, one layer up from `artifacts.test.ts`'s `ProtoError.redacted()` coverage: a
+  // `BundleWireError::Proto(ProtoError::UnknownField(..))` carries a CBOR map key taken verbatim
+  // from a peer's bytes — for this artifact specifically, potentially a hostile QR code a user
+  // scanned — so it must never reach a log line unredacted.
+  it("withholds an unknown field name and nothing else", () => {
+    const leaky = BundleWireError.proto(ProtoError.unknownField("secret_key_name"));
+    expect(leaky.message).toContain("secret_key_name");
+
+    const redacted = leaky.redacted();
+    expect(redacted).not.toContain("secret_key_name");
+    // "secret_key_name" is 15 bytes, all ASCII.
+    expect(redacted).toContain("15 bytes");
+  });
+
+  it("leaves every other kind's rendering unchanged", () => {
+    const safeCases: BundleWireError[] = [
+      BundleWireError.proto(ProtoError.invalidEnumValue("kind", 9n)),
+      BundleWireError.registryTooLong(MAX_REGISTRY_LEN, MAX_REGISTRY_LEN + 1),
+      BundleWireError.tooManyEntries(MAX_BUNDLE_ENTRIES, MAX_BUNDLE_ENTRIES + 1),
+    ];
+    for (const safe of safeCases) {
+      expect(safe.redacted()).toBe(safe.message);
+    }
   });
 });

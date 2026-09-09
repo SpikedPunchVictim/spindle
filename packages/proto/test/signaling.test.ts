@@ -504,3 +504,29 @@ describe("constants (signaling.rs parity)", () => {
     expect(Transport.WebRtc).toBe(1);
   });
 });
+
+describe("redaction (deliberate divergence from signaling.rs — see SignalingError.redacted()'s doc comment)", () => {
+  // Rust's `SignalingError` has no `redacted()` of its own — `spindle-net` wraps and redacts one
+  // layer up, since TS has no equivalent layer, `SignalingError.redacted()` exists directly here
+  // instead. This test proves the affordance behaves the same way `ProtoError.redacted()` and
+  // `BundleWireError.redacted()` do.
+  it("withholds an unknown field name and nothing else", () => {
+    const leaky = SignalingError.proto(ProtoError.unknownField("secret_ice_field"));
+    expect(leaky.message).toContain("secret_ice_field");
+
+    const redacted = leaky.redacted();
+    expect(redacted).not.toContain("secret_ice_field");
+    expect(redacted).toContain("16 bytes");
+  });
+
+  it("leaves every other kind's rendering unchanged", () => {
+    const safeCases: SignalingError[] = [
+      SignalingError.proto(ProtoError.invalidEnumValue("transport", 99n)),
+      SignalingError.tooLong("inbox", MAX_INBOX_LEN, MAX_INBOX_LEN + 1),
+      SignalingError.wrongLength("cert_fp", CERT_FP_LEN, CERT_FP_LEN - 1),
+    ];
+    for (const safe of safeCases) {
+      expect(safe.redacted()).toBe(safe.message);
+    }
+  });
+});
