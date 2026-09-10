@@ -57,12 +57,13 @@ use spindle_proto::canonical::CborValue;
 /// nonce (32 bytes) — see `spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES`'s doc comment for
 /// that per-cap figure this token-level measurement is 32 of, plus a device cert and session
 /// attestation on top. **This nonce length is now pinned, not assumed**: a test in
-/// `spindle-host-core` (`default_member_cap_nonce_is_exactly_fingerprint_len_bytes`) asserts the
-/// production issuer's nonce is exactly `FINGERPRINT_LEN` bytes, and `realistic_member_cap` below
-/// builds its nonce from that same named constant — so a future change to the production nonce
-/// length turns that test red, rather than leaving this constant to drift out from under it
-/// silently again (previously 13,571 B / 18,095 B / 55.2%, measured against a 16-byte nonce no
-/// production issuer ever emitted — td-331c11). Pinned by
+/// `spindle-host-core` (`production_issuer_mints_caps_at_exactly_measured_member_cap_bytes`) mints
+/// a capability through the production `RootKeyCapIssuer` and asserts its encoded length equals
+/// `MEASURED_MEMBER_CAP_BYTES`, and `realistic_member_cap` below builds its nonce from the same
+/// `FINGERPRINT_LEN` constant — so a change to the production nonce length turns that test red,
+/// rather than leaving this constant to drift out from under it silently again (previously
+/// 13,571 B / 18,095 B / 55.2%, measured against a 16-byte nonce no production issuer ever
+/// emitted — td-331c11). Pinned by
 /// `keeps_measured_32_cap_token_bytes_honest` below, which mints the envelope through
 /// `encode_device_token` — the same builder every other test in this module uses.
 #[cfg(test)]
@@ -458,9 +459,9 @@ mod tests {
     /// timestamp like the rest of this module's tests use understates every timestamp field by a
     /// byte, which is exactly the bug this measurement exists to catch) and for why the nonce
     /// length is the named constant `spindle_core::FINGERPRINT_LEN` rather than a bare literal
-    /// (td-331c11: that constant is what `spindle-host-core::authorize::default_member_cap_nonce`
-    /// — the only `nonce_fn` any production `CapIssuer` installs — actually produces, and a test
-    /// in that crate pins the two together).
+    /// (td-331c11: that constant is the nonce width the production `RootKeyCapIssuer` actually
+    /// emits, and a test in `spindle-host-core` pins the two together by minting through that
+    /// issuer and asserting the encoded capability length).
     fn realistic_member_cap(
         host_seed: u8,
         op_seed: u8,
@@ -557,9 +558,11 @@ mod tests {
         // percentage-range assertion here could never independently fail (it would only ever
         // restate the assertion above in different units), so td-331c11 deleted the dead ±range
         // check that used to sit here (see MEASURED_32_CAP_TOKEN_CBOR_BYTES's doc comment for the
-        // percentage itself). What IS worth asserting independently is the actual functional
-        // requirement DESIGN.md §A4/A10.10 raised `max_control_line` for in the first place: that
-        // a full 32-cap token really does fit under the raised ceiling.
+        // percentage itself). What replaced it asserts the actual functional requirement DESIGN.md
+        // §A4/A10.10 raised `max_control_line` for in the first place — that a full 32-cap token
+        // really does fit under the raised ceiling. Note it cannot fire independently either while
+        // the exact-byte assertion above it holds; it is executable documentation of the
+        // requirement, kept deliberately, not a second independent guard (td-331c11).
         assert!(
             b64_len < NATS_MAX_CONTROL_LINE_BYTES,
             "32-cap token ({b64_len} B) must fit under nats-server's raised \

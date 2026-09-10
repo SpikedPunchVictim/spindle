@@ -180,7 +180,7 @@
     },
     {
       "name": "four_entry_bundle_qr_v40_ec_level_m_ceiling",
-      "description": "Four hosts — DESIGN.md :328-329's stated EC-level-M ceiling (\"a version-40 QR carries 4 hosts at EC level M and 5 at level L\"). Pins the encoding at exactly the host count spindle-core's QR fit check is measured against for that EC level. NOTE: this vector's byte size is NOT a capacity measurement — spindle-proto has no crypto dependency, so its embedded caps are short dummy byte patterns, not a real embedded op_cert (143 B on its own). The real measured figure, with genuine caps, is 2060 B for four entries against EC-M's 2331 B budget (see MEASURED_ENTRY_BYTES).",
+      "description": "Four hosts — DESIGN.md :328-329's stated EC-level-M ceiling (\"a version-40 QR carries 4 hosts at EC level M and 5 at level L\"). Pins the encoding at exactly the host count spindle-core's QR fit check is measured against for that EC level. NOTE: this vector's byte size is NOT a capacity measurement — spindle-proto has no crypto dependency, so its embedded caps are short dummy byte patterns, not a real embedded op_cert (143 B on its own). The real measured figure, with genuine caps and a short (21-byte) registry endpoint, is 2128 B for four entries against EC-M's 2331 B budget (see MEASURED_ENTRY_BYTES).",
       "decoded": {
         "type": "map",
         "value": [

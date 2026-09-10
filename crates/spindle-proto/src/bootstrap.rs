@@ -93,14 +93,15 @@ pub const QR_V40_M_CAPACITY_BYTES: usize = 2331;
 /// MEASURED 2026-09-10, not estimated: a member cap encodes to 424 B canonical (of which 143 B
 /// is the embedded `op_cert`), plus two 32-byte keys — 521 B per entry. Measured with realistic
 /// Unix-seconds timestamps (~1.757e9) and a **32-byte** cap nonce — `FINGERPRINT_LEN`, matching
-/// what `spindle-host-core::authorize::default_member_cap_nonce` (the only `nonce_fn` any
-/// production `CapIssuer` installs) actually produces. **This is now pinned, not assumed**:
-/// `spindle-host-core`'s `default_member_cap_nonce_is_exactly_fingerprint_len_bytes` test asserts
-/// that function's output length directly, so a future change to the production nonce length
-/// turns that test red — this constant can no longer drift out from under the issuer silently the
-/// way it did before td-331c11 (previously 504 B / 407 B cap, measured against a 16-byte nonce no
-/// production issuer ever emitted). This figure last moved for a structural reason (not the nonce)
-/// when v0.9.31 (td-583db5) dropped `HostOpKeyCert.nats_fp` — a new `HostSessionAttestation`
+/// what the production `RootKeyCapIssuer` actually emits. **This is now pinned, not assumed**:
+/// `spindle-host-core`'s `production_issuer_mints_caps_at_exactly_measured_member_cap_bytes` test
+/// mints a capability through that issuer and asserts its encoded length equals
+/// `MEASURED_MEMBER_CAP_BYTES`, the 424 B half of this entry's arithmetic — so a change to the
+/// production nonce length turns that test red, and this constant can no longer drift out from
+/// under the issuer silently the way it did before td-331c11 (previously 504 B / 407 B cap,
+/// measured against a 16-byte nonce no production issuer ever emitted). This figure last moved
+/// for a structural reason (not the nonce) when v0.9.31 (td-583db5) dropped
+/// `HostOpKeyCert.nats_fp` — a new `HostSessionAttestation`
 /// artifact took over the per-connect NATS binding instead — which shrank the embedded `op_cert`
 /// from 185 B to 143 B and, with it, every figure below (previously: 449 B cap, 185 B op_cert,
 /// 546 B entry, all still on the stale 16-byte-nonce basis). DESIGN.md :328-329 derives from this

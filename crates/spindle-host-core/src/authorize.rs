@@ -2808,36 +2808,75 @@ mod tests {
     // constant is valid, so `equalize_denial_work` always performs the same SHAPE of work an
     // `Allow` does, which is what this module can actually guarantee deterministically.
 
-    // ---- td-331c11: the production member-cap nonce length is pinned, not assumed ----
+    // ---- td-331c11: the production issuer's own output is pinned, not an assumption about it ----
 
-    /// Every measured-size figure downstream of a member `Capability` (`MEASURED_MEMBER_CAP_BYTES`,
-    /// `MEASURED_ENTRY_BYTES`, `MEASURED_32_CAP_TOKEN_{CBOR,B64}_BYTES` and every host count derived
-    /// from them) assumes a specific nonce length for the value [`default_member_cap_nonce`]
-    /// produces — the only `nonce_fn` [`RootKeyCapIssuer::new`] installs, since `with_nonce_fn`
-    /// (above) has no non-test/non-doc caller anywhere in this workspace. Before td-331c11 that
-    /// assumption (16 bytes) was never checked against this function; it silently drifted out of
-    /// sync when `default_member_cap_nonce` was written to return a full `Fingerprint`
-    /// (`FINGERPRINT_LEN` = 32 bytes, `crates/spindle-core/src/fingerprint.rs:14`).
+    /// A [`RootKeyCapIssuer`] built exactly as production builds it — [`RootKeyCapIssuer::new`],
+    /// which installs [`default_member_cap_nonce`] — with only the wall clock pinned so the
+    /// measurement below is reproducible. Deliberately does NOT call
+    /// [`RootKeyCapIssuer::with_nonce_fn`]: the nonce this issuer emits is the thing under test.
     ///
-    /// This test is the pin: it asserts the production nonce is exactly `FINGERPRINT_LEN` bytes.
-    /// The measurement fixtures in `spindle-core`/`spindle-helper` build their nonces from that
-    /// same named constant (imported from `spindle_core::FINGERPRINT_LEN`) rather than a bare
-    /// literal, so the two ends are linked by name: change what `default_member_cap_nonce`
-    /// returns (e.g. truncate it, or key it off something other than `Fingerprint::of_parts`) and
-    /// THIS test goes red immediately, before any byte-count constant has a chance to drift out
-    /// from under it again.
+    /// Unlike [`test_cap_issuer`], the embedded `HostOpKeyCert` carries realistic Unix-seconds
+    /// timestamps rather than `ts = 0` / `exp = u64::MAX / 2`. CBOR encodes integers in the
+    /// shortest form that fits, so those placeholders encode to different widths than real
+    /// timestamps do, and the op_cert is embedded in every capability — only realistic values
+    /// reproduce the reference measurement. Mirrors `spindle-core`'s own `realistic_test_host`
+    /// and `spindle-helper`'s `realistic_member_cap` fixtures.
+    fn realistic_cap_issuer(now: u64) -> RootKeyCapIssuer {
+        const NINETY_DAYS: u64 = 90 * 86_400;
+        let root = RootKey::from_seed([0x90; 32]);
+        let op_signing = SigningKey::from_bytes(&[0x91; 32]);
+        let op_cert =
+            issue_host_op_key_cert(&root, &op_signing.verifying_key(), now, now + NINETY_DAYS);
+        RootKeyCapIssuer::new(root.public_key(), op_cert, op_signing).with_now_fn(move || now)
+    }
+
+    /// Every measured-size figure downstream of a member `Capability` —
+    /// `MEASURED_MEMBER_CAP_BYTES`, `MEASURED_ENTRY_BYTES`,
+    /// `MEASURED_32_CAP_TOKEN_{CBOR,B64}_BYTES`, the QR host counts derived from them, and
+    /// DESIGN.md §A4/§A5's published numbers — is a measurement of what the
+    /// production issuer actually emits. Before td-331c11 nothing compared any of it against that
+    /// issuer: the assumed cap nonce was 16 bytes while [`default_member_cap_nonce`] returns a full
+    /// `Fingerprint` (`FINGERPRINT_LEN` = 32 bytes, `crates/spindle-core/src/fingerprint.rs:14`),
+    /// and every published figure was wrong by 17 bytes per capability.
+    ///
+    /// td-331c11's first attempt at a pin asserted the length of `default_member_cap_nonce`'s
+    /// return value directly. That was not enough, and the way it failed is worth recording:
+    /// rewiring [`RootKeyCapIssuer::new`]'s `nonce_fn` to wrap that same function in a truncating
+    /// closure reintroduced the original 16-byte defect with the whole suite still green. A test of
+    /// the function only pins the function; the constants depend on the *issuer*.
+    ///
+    /// So this test mints through [`RootKeyCapIssuer`] itself, built by the production constructor,
+    /// and pins the encoded byte count end-to-end against the shared constant. It goes red for a
+    /// truncated nonce, for a rewired `nonce_fn`, and for any other drift in a capability's encoded
+    /// width — and because it pins the *shared* constant, the cheapest way to make it green again
+    /// is to edit `MEASURED_MEMBER_CAP_BYTES`, which immediately reddens the `spindle-core` and
+    /// `spindle-helper` measurement tests that pin the same constant. All three must move together
+    /// or none of them can.
     #[test]
-    fn default_member_cap_nonce_is_exactly_fingerprint_len_bytes() {
-        let subject = Fingerprint::of_parts(&[b"pin-check-subject"]);
-        let nonce = default_member_cap_nonce(subject, 1_757_000_000);
+    fn production_issuer_mints_caps_at_exactly_measured_member_cap_bytes() {
+        let cap = realistic_cap_issuer(1_755_907_200)
+            .issue_member_cap(Fingerprint::of_parts(&[b"pin-check-subject"]), 7)
+            .expect("RootKeyCapIssuer mints a member cap");
+
+        let measured = cap.to_canonical_bytes().len();
         assert_eq!(
-            nonce.len(),
+            measured,
+            spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES,
+            "a capability minted by the PRODUCTION issuer encoded to {measured} B, but \
+             MEASURED_MEMBER_CAP_BYTES is {} B -- every downstream size figure \
+             (MEASURED_ENTRY_BYTES, MEASURED_32_CAP_TOKEN_{{CBOR,B64}}_BYTES, the QR host counts, \
+             and DESIGN.md's own numbers) is built on this measurement. If the change is genuine, \
+             every measurement fixture, every MEASURED_* constant and DESIGN.md must be \
+             re-measured and updated together (td-331c11). Nonce length is {} B (expected {}); a \
+             difference there is the most likely cause",
+            spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES,
+            cap.nonce.len(),
+            spindle_core::FINGERPRINT_LEN
+        );
+        assert_eq!(
+            cap.nonce.len(),
             spindle_core::FINGERPRINT_LEN,
-            "default_member_cap_nonce (the only nonce_fn RootKeyCapIssuer::new installs) must \
-             produce exactly FINGERPRINT_LEN bytes -- every MEASURED_* size constant in \
-             spindle-proto/spindle-helper is built on this assumption; if it genuinely changed, \
-             every measurement fixture and constant must be re-measured and updated together \
-             (td-331c11)"
+            "the production issuer's nonce must be exactly FINGERPRINT_LEN bytes (td-331c11)"
         );
     }
 }

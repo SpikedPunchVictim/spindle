@@ -396,14 +396,17 @@ pub const CAPABILITY_CURRENT_V: u8 = 1;
 /// [`crate::bootstrap::MEASURED_ENTRY_BYTES`]'s doc comment for that half of the arithmetic and
 /// why it moved when v0.9.31 (td-583db5) dropped `HostOpKeyCert.nats_fp`). Measured with a
 /// realistic Unix-seconds `ts`/`exp` (~1.76e9 — a 5-byte CBOR uint, wider than a small placeholder
-/// value) and a **32-byte** cap nonce — `FINGERPRINT_LEN`, matching what
-/// `spindle-host-core::authorize::default_member_cap_nonce` (the only `nonce_fn` any production
-/// `CapIssuer` installs) actually produces. Previously measured at 407 B against a 16-byte
-/// nonce that no issuer in this workspace ever emits (td-331c11); that assumption is now pinned
-/// by `spindle-host-core`'s `default_member_cap_nonce_is_exactly_fingerprint_len_bytes` test, so
-/// a future change to the production nonce length turns that test red instead of leaving this
-/// constant to drift silently again. The nonce length is what makes this figure move, the same as
-/// `MEASURED_ENTRY_BYTES`. `spindle-core::artifacts::capability`'s
+/// value) and a **32-byte** cap nonce — `FINGERPRINT_LEN`, matching what the production
+/// `RootKeyCapIssuer` actually emits. Previously measured at 407 B against a 16-byte nonce that no
+/// issuer in this workspace ever emits (td-331c11); this constant is now pinned against that
+/// issuer directly by `spindle-host-core`'s
+/// `production_issuer_mints_caps_at_exactly_measured_member_cap_bytes` test, which mints a
+/// capability through `RootKeyCapIssuer` and asserts its encoded length equals this value — so a
+/// change to the production nonce length, or to any other field width, turns that test red instead
+/// of leaving this constant to drift silently again. An earlier attempt pinned only the length
+/// returned by `default_member_cap_nonce`, which left the issuer free to wrap that function and
+/// reintroduce the defect with the suite green. The nonce length is what makes this figure move,
+/// the same as `MEASURED_ENTRY_BYTES`. `spindle-core::artifacts::capability`'s
 /// `keeps_measured_member_cap_bytes_honest` test pins this against a freshly minted capability
 /// (equality, not tolerance — the measurement is fully deterministic); this constant itself is
 /// DOCUMENTATION only — nothing in this crate consults it at runtime (see A9c boundary rule 3:

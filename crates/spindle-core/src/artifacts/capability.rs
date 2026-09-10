@@ -129,12 +129,13 @@ mod tests {
 
     /// Shared by every behavioral test in this module (nonce length is irrelevant to any of
     /// them) AND by `keeps_measured_member_cap_bytes_honest` below, which is why the nonce here
-    /// is `FINGERPRINT_LEN` bytes, not an arbitrary literal: `FINGERPRINT_LEN` is the same named
-    /// constant `default_member_cap_nonce`'s pin test
-    /// (`spindle-host-core::authorize::default_member_cap_nonce_is_exactly_fingerprint_len_bytes`)
-    /// checks the production issuer against (td-331c11) — so a future change to the production
-    /// nonce length turns that pin test red rather than leaving this fixture's byte count to
-    /// silently drift out of sync with reality again.
+    /// is `FINGERPRINT_LEN` bytes, not an arbitrary literal: it is the same named constant the
+    /// production issuer's own pin test in `spindle-host-core`
+    /// (`authorize::tests::production_issuer_mints_caps_at_exactly_measured_member_cap_bytes`)
+    /// finds when it mints a capability through `RootKeyCapIssuer` and asserts its encoded length
+    /// against `MEASURED_MEMBER_CAP_BYTES` (td-331c11) — so a change to the production nonce
+    /// length turns that pin test red rather than leaving this fixture's byte count to silently
+    /// drift out of sync with reality again.
     fn issue(
         host: &TestHost,
         kind: CapKind,

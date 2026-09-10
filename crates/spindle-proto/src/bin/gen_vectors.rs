@@ -1593,8 +1593,9 @@ fn bootstrap_vectors() -> Json {
              host count spindle-core's QR fit check is measured against for that EC level. NOTE: \
              this vector's byte size is NOT a capacity measurement — spindle-proto has no crypto \
              dependency, so its embedded caps are short dummy byte patterns, not a real embedded \
-             op_cert (143 B on its own). The real measured figure, with genuine caps, is 2060 B \
-             for four entries against EC-M's 2331 B budget (see MEASURED_ENTRY_BYTES).",
+             op_cert (143 B on its own). The real measured figure, with genuine caps and a short \
+             (21-byte) registry endpoint, is 2128 B for four entries against EC-M's 2331 B budget \
+             (see MEASURED_ENTRY_BYTES).",
             DeviceBootstrapBundle {
                 v: BUNDLE_CURRENT_V,
                 registry: "nats://registry.example:4222".to_string(),

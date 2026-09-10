@@ -78,10 +78,12 @@ cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp
   useless without the device key). **Renewal path (no lockout)**: a cap that is expired or stale-epoch but
   signature-valid still earns **connect-only** NATS permissions (same as an invite); the host verifies the device
   over the E2E channel and re-issues the current cap in the reply. Only *revoked* subjects are refused outright.
-- **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (~330 B each, chain-carrying, v0.9.5,
-  base64url). nats-server's default `max_control_line` is 4 KiB, so the registry sets it to **32 KiB** (see Open
-  items, A10.10 — full config detail in ADR-002) and clients present **only the caps for hosts they will use this
-  session** (pinned/open hosts), max **32** per connection (see Open items, A10.5). S12 measures.
+- **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (**424 B each, measured** —
+  chain-carrying, v0.9.5, base64url; the earlier ~330 B was an estimate from before any cap had been measured
+  against the production issuer, corrected in td-331c11). nats-server's default `max_control_line` is 4 KiB, so the
+  registry sets it to **32 KiB** (see Open items, A10.10 — full config detail in ADR-002) and clients present
+  **only the caps for hosts they will use this session** (pinned/open hosts), max **32** per connection (see Open
+  items, A10.5). A full 32-cap CONNECT token measures **18,820 B**, **57%** of that ceiling (td-331c11).
 
 ### NATS authentication = Auth Callout for every connection
 

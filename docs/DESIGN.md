@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.33) + Execution Plan
+# Spindle — System Design Document (draft v0.9.34) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -131,8 +131,11 @@
 > production issuer emits — cap **424 B** (was 407), 32-cap token **18,820 B** / **57%** (was
 > 18,095 / 55%), bundle entry **521 B** (was 504) — and the QR host ceiling at the 256-byte
 > `MAX_REGISTRY_LEN` drops to **3** at EC level M (was 4), a claim that had been derived by
-> arithmetic rather than measured and would have failed to encode. The nonce basis is now pinned
-> to the issuer by test (td-331c11).
+> arithmetic rather than measured and would have failed to encode.
+> v0.9.34: no figure changes; v0.9.33's claim to have pinned the nonce basis "to the issuer" was
+> itself unpinned — it tested one nonce *function*, leaving the issuer free to wrap it. The pin
+> now mints through the production `RootKeyCapIssuer` and asserts the encoded capability size
+> against the shared `MEASURED_MEMBER_CAP_BYTES` (td-331c11).
 
 ---
 
@@ -433,13 +436,16 @@ cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp
   (a 5-byte CBOR uint, worth 1 byte per field over a toy value) and the **32-byte** cap nonce the
   production issuer actually emits. **[amended v0.9.33]** Every figure in this section before
   v0.9.33 — 407 B, 449 B, 466 B, 18,095 B — was measured against a **16-byte** cap nonce that no
-  issuer in the system has ever produced: `default_member_cap_nonce` returns a `Fingerprint`, and
-  it is the only `nonce_fn` `RootKeyCapIssuer` installs. The document had already been bitten by
-  this once — the 466 B figure was itself corrected as "a mis-measurement from a differing cap
-  nonce length" — and still did not pin the basis, so the error recurred at every subsequent
-  re-measurement. It is pinned now: a test asserts the production nonce is exactly
-  `FINGERPRINT_LEN`, and every measurement fixture derives its nonce from that constant rather
-  than a literal (td-331c11). S12
+  issuer in the system has ever produced; `default_member_cap_nonce` returns a `Fingerprint`. The
+  document had already been bitten by this once — the 466 B figure was itself corrected as "a
+  mis-measurement from a differing cap nonce length" — and still did not pin the basis, so the
+  error recurred at every subsequent re-measurement. **[amended v0.9.34]** It is pinned now, at
+  the issuer rather than at any one nonce function: a test mints a capability through the
+  production `RootKeyCapIssuer` and asserts its encoded length equals the shared
+  `MEASURED_MEMBER_CAP_BYTES`, which the `spindle-core` and `spindle-helper` measurement fixtures
+  pin as well — so the figures cannot be brought back to green one at a time. v0.9.33 claimed this
+  was pinned when only the nonce function was: wrapping that function in a truncating closure at
+  the issuer's wiring reproduced the original defect with the whole suite green (td-331c11). S12
   measures.
 
 **NATS authentication = Auth Callout for every connection**
@@ -1690,6 +1696,25 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.34 (2026-09-10)** — Corrects v0.9.33's pin, not its figures: every measured size in §A4
+  stands unchanged. v0.9.33 asserted the basis was "pinned to the issuer by test." It was not. The
+  test asserted the return length of `default_member_cap_nonce`, a function, and justified that as
+  sufficient with a parenthetical — "the only `nonce_fn` `RootKeyCapIssuer::new` installs" — which
+  was an unchecked assumption stated as fact inside the test whose purpose was to remove unchecked
+  assumptions. Independent review broke it and the break was reproduced here: rewiring the
+  issuer's `nonce_fn` to wrap that same function in a truncating closure reintroduces the original
+  16-byte defect with `cargo test --workspace` still reporting 869 passed / 0 failed. The pin now
+  mints a capability through the production `RootKeyCapIssuer` — the constructor that installs the
+  real nonce source, with realistic op-cert timestamps so the encoding is comparable — and asserts
+  its canonical encoded length equals `MEASURED_MEMBER_CAP_BYTES`. That is a strict superset: it
+  reddens for a truncated nonce, for a rewired `nonce_fn`, and for any other drift in a
+  capability's encoded width. It also closes the escape hatch a length-equality pin leaves open,
+  since the cheapest way to make it green after a genuine change is to edit the shared constant,
+  which immediately reddens the `spindle-core` and `spindle-helper` fixtures pinning the same
+  constant — all three move together or none can. The general lesson, recorded because this is the
+  second time the document has been bitten by this exact basis: pinning a *value* is not pinning
+  its *basis*, and a test that asserts one of its own premises in a comment has not tested that
+  premise (td-331c11).
 - **v0.9.33 (2026-09-10)** — Corrects every measured size figure in §A4 to the cap nonce the system
   actually produces. `default_member_cap_nonce` (`crates/spindle-host-core/src/authorize.rs:405`)
   returns a 32-byte `Fingerprint`, it is the only `nonce_fn` `RootKeyCapIssuer` installs, and
@@ -1705,13 +1730,14 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
   produced the underlying error; all four QR counts are now measured directly and bounded on both
   sides. The document had already been bitten by nonce length once — v0.9.23's 466 B was corrected as
   "a mis-measurement from a differing cap nonce length" — and pinned nothing, so the error returned at
-  the next re-measurement. It is pinned now: a test asserts the production nonce is exactly
-  `FINGERPRINT_LEN` and names the constants that must be re-measured if it ever changes, and every
-  measurement fixture derives its nonce from that constant instead of a literal. Tolerances on all
-  four size assertions are tightened from ±2 B / ±66 B to equality, since each mints from hardcoded
-  inputs and reads no clock; a percentage band that could never fire independently of the assertion
-  above it is replaced by a real one — that the token fits under `max_control_line`, the functional
-  requirement the 32 KiB raise exists to satisfy (td-331c11).
+  the next re-measurement. This entry originally claimed the basis was pinned; it was not — see
+  v0.9.34, which corrects both the claim and the test behind it. **[corrected v0.9.34]**
+  Tolerances on all four size assertions are tightened from ±2 B / ±66 B to equality, since each
+  mints from hardcoded inputs and reads no clock; a percentage band that could never fire
+  independently of the assertion above it is replaced by an assertion that the token fits under
+  `max_control_line` — the functional requirement the 32 KiB raise exists to satisfy, and
+  executable documentation of it, though it cannot fire independently either while the exact byte
+  count above it holds (td-331c11).
 - **v0.9.32 (2026-09-10)** — Two gaps closed: cold-clock diagnostics (td-e8b79f, A10.42) and host
   key custody (td-ef5744, A10.41). §A7b gains a stated time-rule discipline: the catalog's time
   rules split by *when* an artifact is minted, not by which side mints it — an artifact issued ahead

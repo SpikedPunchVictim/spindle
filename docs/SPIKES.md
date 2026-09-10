@@ -482,8 +482,11 @@ cost at 5k connects/min.
 
 **Method sketch**:
 - Construct a real CONNECT payload holding the maximum allowed 32 host caps (§A10.5) plus a device
-  certificate, using the actual compact-CBOR cap encoding (~200 B each per §A4) and confirm the
-  serialized size fits under the 32 KiB `max_control_line` set in §A10.10.
+  certificate, using the actual compact-CBOR cap encoding (**424 B each, measured** per §A4 — this
+  sketch previously said ~200 B, an estimate from before any cap was measured) and confirm the
+  serialized size fits under the 32 KiB `max_control_line` set in §A10.10. Note this has since been
+  measured directly in `spindle-helper`'s `keeps_measured_32_cap_token_bytes_honest`: 18,820 B, 57%
+  of the ceiling (td-331c11).
 - Load-test the Auth Callout responder at a sustained 5,000 connects/minute and record p99 latency
   for the callout step alone.
 - Separately verify the per-IP connection/rate limiter in front of NATS actually blocks a flood

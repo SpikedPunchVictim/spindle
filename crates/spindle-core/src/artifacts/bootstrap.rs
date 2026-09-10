@@ -648,10 +648,10 @@ mod tests {
     /// is safe to measure against [`MEASURED_ENTRY_BYTES`]. `cap_epoch = 7` (still small enough
     /// to encode in 1 byte either way — realism here is about matching the spec's example, not
     /// about byte width) is a stylistic choice; the cap's nonce is `FINGERPRINT_LEN` bytes because
-    /// that is what `spindle-host-core::authorize::default_member_cap_nonce` — the only `nonce_fn`
-    /// any production `CapIssuer` installs — actually produces (td-331c11 pins that length via a
-    /// test in `spindle-host-core`, so this fixture derives from the same named constant rather
-    /// than a bare literal).
+    /// that is the nonce width the production `RootKeyCapIssuer` actually emits (td-331c11 pins it
+    /// with a test in `spindle-host-core` that mints through that issuer and asserts the encoded
+    /// capability length, so this fixture derives from the same named constant rather than a bare
+    /// literal).
     fn realistic_entry(host_seed: u8, envelope_seed: u8, now: u64) -> BundleEntry {
         const NINETY_DAYS: u64 = 90 * 86_400;
         const TWENTY_ONE_DAYS: u64 = 21 * 86_400;
