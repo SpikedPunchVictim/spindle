@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.31) + Execution Plan
+# Spindle — System Design Document (draft v0.9.32) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -119,6 +119,14 @@
 > chain embedded in every member capability — ignored the field entirely. Domain-separating the two
 > roles restores symmetry with the device path, makes the binding a required verifier argument in
 > both languages, and **returns the host nkey to per-session** (td-583db5; bears on td-ef5744).
+> v0.9.32: §A7b states its time-rule discipline explicitly (`exp` = minted ahead of use, `ts` =
+> minted at use, permanent = revocation) and §A7 gains a two-step cold-clock diagnostic — an
+> always-on local bound check against a capability's already-verified `HostOpKeyCert.ts`, plus an
+> optional operator-configured HTTPS time source, diagnostic-only in both cases (A10.42; closes
+> td-e8b79f). §A4's host principal gains the custody mechanism it never specified: the host root
+> seed, never the derived keypair, generated on first run, held behind a `HostKeyStore` seam (OS
+> keychain desktop / `0600` seed file headless), recoverable via a one-time phrase (A10.41; bears
+> on td-ef5744).
 
 ---
 
@@ -329,7 +337,28 @@ signer, result).
   CONNECT time by the **operating** key rather than the root. Because that key is warm by design (it
   already signs capabilities), the host's nkey is **per-session again**, as A3 always intended — the
   v0.9.29 constraint fixing it long-lived was an artifact of putting the binding in a root-signed
-  certificate, not a property the design wanted.
+  certificate, not a property the design wanted. **[added v0.9.32, A10.41]** Custody of this root
+  key is now specified end to end. The custody layer generates 32 bytes from the OS CSPRNG and
+  persists **that seed**, never the derived keypair: private scalars are never readable back out
+  of the key type (`DeviceKey`, `crates/spindle-core/src/identity.rs:161`, has no serialization
+  path and is deliberately not `Clone`; only `generate()` and the currently test-only
+  `from_seeds()` construct one). This decision promotes seed-construction to a supported path and
+  adds no export accessor. A `HostKeyStore` trait gives desktop and headless custody one seam:
+  desktop/Tauri stores the seed in the OS keychain, matching A9c's boundary rule; headless/server
+  stores it in a seed file, since a headless daemon has no Secret Service without a session D-Bus
+  and an unlocked keyring — and headless is exactly where such a daemon runs. (This equips
+  `HostKeyStore` for whichever shape `spindle-hostd` ends up taking; it does not reopen A10.26's
+  headless/NAS deferral.) The seed file's mode is normative: `0600`, parent directory `0700`. If
+  either is found wider at startup the host **refuses to start**, naming the path and the mode
+  found — it MUST NOT silently correct the mode, since a silent fix conceals that the seed may
+  already have been read. The seed is presented once, at first run, as a recovery phrase;
+  re-entering it restores the host identity after loss or reinstall, closing the gap A12 #35 and
+  Part C2's "Host key loss/reinstall undesigned" row both pointed at A4/A10.13 without a
+  mechanism. The phrase is itself a compromise surface, stated plainly: whoever holds it holds the
+  host. **Accepted residual risk:** the headless store is plaintext at rest behind filesystem ACLs
+  only — a backup snapshot, a synced folder, or a container image layer containing that file
+  discloses the seed. An encrypted-at-rest store is designed but not built; hardware-backed
+  custody (TPM, Secure Enclave) is out of scope for v1.
 - *Member* = a host-local record binding a `root_fp` (and its accepted device chain) to host-local state (A4b).
 
 **Two credentials per device**
@@ -1054,6 +1083,32 @@ at ±2 min, a device whose clock is further off than that **cannot complete a CO
 and the failure is indistinguishable from revocation or a stolen bundle. The UI warns on large
 skew. [Prior text claimed the helper returned server time in the callout reply and clients
 computed an offset; that mechanism was never implementable from the client side.]
+**Cold-clock diagnostics [added v0.9.32]**: a client refused for skew today cannot tell that
+refusal from revocation or a stolen bundle — both surface as the same uniform message. Two
+diagnostics, checked in this order, close that gap without weakening anything above. (1) **Local
+bound check (always).** Before minting a `SessionAttestation`, a client compares its clock against
+bounds it has already verified, not against anything new on the wire. Every `Capability` embeds
+its `op_cert` (`spindle-proto/src/artifacts.rs:412`), and `HostOpKeyCert` carries `ts`
+(`artifacts.rs:949`) — a signed lower bound on true time, since a certificate cannot have been
+issued before it was signed. If local time is earlier than `max(op_cert.ts)` across the held
+bundle, the clock is **provably** behind and the client reports the delta. If local time is past
+`exp` for every capability held, the client reports the ambiguous case honestly: the clock may be
+ahead, **or** every membership genuinely expired — `Capability` itself carries only `exp`, never
+`ts`, so this direction cannot be resolved locally. The check costs nothing: no network round
+trip, and it trusts nothing it did not already verify. Its resolution is stated honestly, too: it
+catches a device with no working notion of real time, not one merely off by three minutes — the
+case that actually trips the ±2 min window — since it is only as tight as the age of the
+credentials on hand. (2) **Configured out-of-band time source (optional).** An operator MAY
+configure an HTTPS endpoint whose `Date` response header the client compares against its own
+clock for a precise offset. This is a **new configured endpoint**, not the bootstrap bundle's
+`registry` field, which names a NATS endpoint, not a URL (`spindle-proto/src/bootstrap.rs:74`). In
+a browser the endpoint MUST send `Access-Control-Expose-Headers: Date`, or the header is invisible
+cross-origin. Spindle MUST NOT ship a default third-party time host: contacting one on every
+connect would disclose a device's existence to an outside party. **This offset is diagnostic
+only.** It MUST NOT be fed into signing time, `exp` checks, or revocation checks — a time source is
+not an authenticated channel, and folding it into validity checks would let a network attacker who
+shifts a client's perceived time turn a safe refusal into an acceptance of an expired or revoked
+artifact. A refusal is a safe failure; an acceptance is not.
 **Public-key encoding validity [added v0.9.28]**: an **Ed25519** public key MUST be the *canonical*
 encoding of its point (RFC 8032 §5.1.3), and a verifier MUST reject one that is not. Two rules, both
 required: the encoded `y` is `< p` (`p = 2^255 − 19`), and when the decompressed `x` is 0 the sign bit
@@ -1094,6 +1149,15 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 | Host device cert | `spindle-host-dev-cert-v1` | host op key | `exp` 90 d | n/a (rotation) |
 | Session attestation | `spindle-sess-attest-v1` | device identity key | `ts` ±2 min (client's own out-of-band clock, §A7) | n/a — inert without the nkey secret it names, whose possession the callout proves separately; MUST be minted fresh per connect attempt (incl. reconnect) and MUST NOT be persisted (§A3) **[added v0.9.30]** |
 | Host session attestation | `spindle-host-sess-attest-v1` | host **operating** key | `ts` ±2 min (client's own out-of-band clock, §A7) | n/a — inert without the nkey secret it names, whose possession the callout proves separately; minted fresh per connect attempt **[added v0.9.31]** |
+
+**Time-rule discipline [added v0.9.32]**: the table's time rules split by *when* an artifact is
+minted, not by *which side* mints it. An artifact issued ahead of use — signed once and presented
+many times — carries `exp` and is checked for expiry alone; an artifact minted at the moment of
+use — signed fresh on every presentation — carries `ts` and is checked at ±2 min; a revocation
+record carries neither and is permanent. Both sides of a CONNECT hold artifacts of the first class
+and mint one of the second, so their clock requirements are identical: an accurate-to-2-minutes
+clock is required to **mint** a credential, never to **hold** one. Every new artifact MUST state which of
+the three classes it belongs to.
 
 Root keys sign two artifact types (`spindle-dev-cert-v2`, `spindle-self-rev-v1`); device identity
 keys likewise sign two (`spindle-env-v1`, `spindle-sess-attest-v1`); and **[amended v0.9.31]** the
@@ -1323,7 +1387,8 @@ spindle/
 ```
 
 **Boundary rules (enforced, not aspirational)**
-1. **Key custody**: private key material exists only in Rust (`keyring`/OS keystore) or non-extractable WebCrypto.
+1. **Key custody**: private key material exists only in Rust (`keyring`/OS keystore, or — headless
+   host only, A10.41 — a permission-checked seed file) or non-extractable WebCrypto.
    Tauri frontends receive fingerprints and display state over IPC — never keys, seeds, or caps. The IPC command
    list is enumerated in ADR-009 and is the host/client attack surface review target.
 2. **Engine substitution**: `apps/client/ui` and `apps/web` import **only** `@spindle/engine-api` (lint-enforced);
@@ -1408,6 +1473,8 @@ Docker is explicitly not the primary dev environment.
 | 38 | Public-key encoding validity | **DECIDED 2026-09-08:** tighten Rust to RFC 8032 §5.1.3 canonical rather than loosen TypeScript. Ed25519 encodings must be canonical (`y < p`, and sign bit 0 when `x = 0`); X25519 stays unvalidated beyond length on **both** sides, mirroring `x25519-dalek`'s infallible `PublicKey::from`. Forced by measurement, not review: the ticket asserted Rust validated X25519 — it does not (`impl From<[u8; 32]> for PublicKey` is infallible), so adding the "missing" TypeScript check would have *created* a split; and `ed25519-dalek`'s `VerifyingKey::from_bytes` is only `CompressedEdwardsY::decompress`, which accepts `y ≥ p` where `@noble/curves` rejects it. Rejected: loosening TS to dalek's semantics (hand-rolled curve code in a package designed to delegate primitives); leaving the split documented (ships a known consensus fork). Verifiers implement the rule as a decompress/re-compress **round trip**, which subsumes both clauses by construction — the first attempt enumerated them and shipped only one. Parity proven over 4128 inputs, zero mismatches (§A7). |
 | 39 | Binding a NATS session to a device | **DECIDED 2026-09-09:** implement A3's `sig_device(nats_fp, ts)` as a first-class A7b artifact (`spindle-sess-attest-v1`), and **delete** the device certificate's now-redundant `nats_fp` (`spindle-dev-cert-v1` → `spindle-dev-cert-v2`). A3 named both mechanisms and the implementation had neither, making `{root_pk, device_cert, caps}` a bearer token — found by reading, then proven live (td-0bcab4). Rejected: enforcing `device_cert.nats_fp` instead (one comparison, no wire change, but a new nkey would then need a newly root-signed certificate, killing A3's "rotated per session" and forcing the person's root warm every connect); requiring both (more surface, no property the attestation lacks); retaining the field as documented-inert (an unenforced binding field in a signed artifact is exactly what caused this defect, and the removal is free today — nothing persists a device certificate server- or host-side, so there is no migration, only regenerated vectors and the TS twin; the cost only grows later). Deleting `nats_fp` is not a loss of connect material: `nats_fp = hash(nats_pk)` is a fingerprint of a *public* key, the nkey seed lives client-side (A3: OS keychain / IndexedDB), and the callout derives the session fingerprint from the nkey NATS itself presents on CONNECT. The attestation needs no replay rule: it is inert without the nkey secret it names, and the nkey signature over the server nonce independently proves possession of that secret. **[added v0.9.30]** A fourth alternative — `sig_device(nonce || nats_fp)`, challenge-response over the same server nonce the session nkey already signs in the same instant — would have removed the clock dependence and made a captured attestation permanently unreplayable. It was rejected on **measured** grounds: it is buildable natively (`async-nats` `with_auth_callback` is async and receives the nonce) but **not in the browser**. The NATS JS `Authenticator` is `(nonce?: string) => Auth`, invoked synchronously inside the `Connect` constructor and spread onto the CONNECT with no `await` anywhere in the path; `crypto.subtle.sign` on a non-extractable key is async. Making it work would require A3's identity key to become **extractable** so a synchronous Ed25519 implementation could sign — directly defeating the storage-exfiltration resistance that motivates non-extractable WebCrypto in the first place. The alternative loses on security, not ergonomics. |
 | 40 | Domain-separating the host op-key cert | **DECIDED 2026-09-10 (user decision):** split `HostOpKeyCert`'s two roles into two artifacts. The cert **drops `nats_fp`** (`spindle-host-cert-v1` → `v2`) and becomes the issuance chain only; the per-connect binding becomes `HostSessionAttestation {nats_fp, ts, sig_op}` (`spindle-host-sess-attest-v1`), signed by the **operating** key. A10.39 fixed the device half but left the host half one level weaker: `verify_host_op_key_cert` never read `nats_fp`, so the binding lived in a single manual comparison at one call site whose own comment noted no other caller performed it — while the device path made the expected `nats_fp` a *required argument* the verifier cannot skip. The codebase had already recognised the split in a comment rather than a type: the test fixtures built capability-issuance op certs with a **dummy** `nats_fp`, documented as "an issuance-time cert, not the one the host presents on its own CONNECT". A binding field filled with a deliberately meaningless value because its consuming context ignores it is the A10.39 shape. Migration cost is zero *today* — every `issue_host_op_key_cert` call site is a test module, fixture, spike, or vector generator, because host enrollment is unshipped (td-539ffa, td-ef5744) — the same argument A10.39 used to delete rather than document-as-inert. **Consequence:** the host nkey returns to **per-session**. v0.9.29 fixed it long-lived only because the binding sat in a root-signed certificate and §A4 keeps the host root cold; the operating key is warm by design, so a fresh nkey gets a fresh attestation without ever waking the root. This retires the long-lived host nkey seed as a durable credential and changes what td-ef5744 (host key custody) must decide. Rejected: keeping one artifact and making `expected_nats_fp` a required argument of `verify_host_op_key_cert` (the issuance-chain caller has no session to name, so it would have to pass a dummy — re-creating the fixture's tell in the API itself); documenting the field as inert (A10.39's rejected option, for its reasons). The host attack is now closed **by construction**, not merely by a comparison. A member holding a capability has `host_root_pk` and the `op_cert`, but never the operating *private* key -- so it cannot forge a valid `HostSessionAttestation` for any nkey, its own included. Under the old design that member held working attack material outright. |
+| 41 | Host key custody | **DECIDED 2026-09-10 (user decision):** generate the host root key on first run from the OS CSPRNG and persist the 32-byte seed, never the derived keypair (`DeviceKey`, `crates/spindle-core/src/identity.rs:161`, has no serialization path and is deliberately not `Clone`; seed-construction via `from_seeds`, previously test-only, is promoted to a supported path with no new export accessor); present the seed once, at first run, as a recovery phrase — the out-of-band path that restores host identity after loss or reinstall. A `HostKeyStore` trait provides the seam: desktop/Tauri custody stores the seed in the OS keychain; headless/server custody stores it in a seed file, `0600` with a `0700` parent directory, and the host **refuses to start** if either is found wider — naming the path and the mode, rather than silently correcting it, since a silent fix would conceal that the seed may already have been read. Rejected: *provisioning-only*, an operator ceremony before every host can start — hostile to the single-tray-app shape A10.26 already decided; *generation-only, no recovery* — leaves the host-key-loss gap (A12 #35) this decision exists to close; *keychain everywhere*, A4 read literally — makes the headless server case unsupported by construction, since a daemon has no Secret Service without a session D-Bus and an unlocked keyring; *encrypted file everywhere* (passphrase + KDF) — one seam, identical on both platforms, genuinely attractive, but a daemon needs the passphrase at every start, so it either prompts (unusable as a service) or stashes it, which is circular, and it adds a KDF + AEAD dependency for a property the OS keychain already supplies on the desktop half — held as a designed-but-unbuilt fallback; *plain `0600` file everywhere* — simplest, but would require amending A4 to weaken it rather than to describe it; *an export accessor on the key type* — would create the first path for private key bytes to leave `DeviceKey`, permanently widening the secret's blast radius, and buys nothing the custody layer does not already hold via the seed. This removes the stated blocker for `spindle-hostd` regaining a binary target: its own doc comment names host-identity custody not existing anywhere in the workspace as the reason it ships none (`crates/spindle-hostd/src/lib.rs:16-37`). Accepted residual risk: the headless store is plaintext at rest behind filesystem ACLs only — a backup snapshot, a synced folder, or a container image layer containing that file discloses the seed; an encrypted-at-rest store is designed but not built. Hardware-backed custody (TPM, Secure Enclave) is out of scope for v1. Bears on td-ef5744. |
+| 42 | Cold-clock diagnostics | **DECIDED 2026-09-10:** before minting a `SessionAttestation`, a client always runs a local bound check against the signed `ts` lower bound every `HostOpKeyCert` in its bundle already carries (`spindle-proto/src/artifacts.rs:949`) — provable-behind when local time precedes it, honestly ambiguous when every held capability's `exp` has passed, since `Capability` carries no `ts` to disambiguate that direction. An operator MAY additionally configure an HTTPS endpoint whose `Date` header gives a precise offset. Both are diagnostic only: neither MUST be fed into signing time, `exp` checks, or revocation checks — a time source is not an authenticated channel, and folding one into validity checks would turn a safe refusal into an acceptance of an expired or revoked artifact. Rejected: *in-band offset from the helper* — already disproved in v0.9.30, since the callout reply never reaches the client, refusals are uniform, and NATS `INFO` carries no time field; *a default third-party time host* — discloses a device's existence to an outside party on every connect; *widening the ±2 min window* — weakens the time bound without fixing the cold-bootstrap case, reopening ground already decided (td-e8b79f); *challenge-response over the server nonce* — rejected on measured grounds in A10.39, since the browser NATS `Authenticator` runs synchronously while `crypto.subtle.sign` on a non-extractable key is async, which would force the identity key to become extractable. Closes td-e8b79f. |
 
 ## A11. Alternatives considered
 
@@ -1607,6 +1674,41 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.32 (2026-09-10)** — Two gaps closed: cold-clock diagnostics (td-e8b79f, A10.42) and host
+  key custody (td-ef5744, A10.41). §A7b gains a stated time-rule discipline: the catalog's time
+  rules split by *when* an artifact is minted, not by which side mints it — an artifact issued ahead
+  of use carries `exp` and is checked for expiry alone, one minted at the moment of use carries `ts`
+  and is checked at ±2 min, and a revocation record carries neither and is permanent; both sides of
+  a CONNECT hold artifacts of the first class and mint one of the second, so their clock
+  requirements are identical — an accurate clock is required to **mint** a credential, never to
+  **hold** one. Two independent adversarial reviews had reported a device/host clock asymmetry,
+  citing that `verify_host_op_key_cert` carries no skew check; that was true while `HostOpKeyCert`
+  carried the per-connect NATS binding, but v0.9.31 (td-583db5) moved that binding to
+  `HostSessionAttestation`, which does check ±120 s — the asymmetry was already gone and only
+  undocumented, which is why it was re-derived from the code twice. §A7's clock-skew paragraph gains
+  the diagnostic path that follows from stating the rule: a client refused for skew today cannot
+  tell that from revocation or a stolen bundle, since both surface as the same uniform message. A
+  local, always-on bound check compares the client's clock against the signed `ts` lower bound every
+  `HostOpKeyCert` already carries (`spindle-proto/src/artifacts.rs:949`) — provable when the clock
+  is behind, honestly ambiguous when every held capability's `exp` has passed, since `Capability`
+  itself carries no `ts` to resolve that direction (`spindle-proto/src/artifacts.rs:412`). An
+  optional operator-configured HTTPS `Date` source (a new configured endpoint, not the bootstrap
+  bundle's NATS `registry` field, `spindle-proto/src/bootstrap.rs:74`) adds a precise offset. Both
+  are diagnostic only, normatively: neither may be fed into signing time, `exp`, or revocation
+  checks. §A4's host principal gains the custody mechanism its identity-root sentence never
+  specified: the custody layer generates 32 bytes from the OS CSPRNG and persists that seed, never
+  the derived keypair — `DeviceKey` (`crates/spindle-core/src/identity.rs:161`) has no serialization
+  path and is deliberately not `Clone`, so seed-construction (`from_seeds`, previously test-only) is
+  promoted to a supported path with no new export accessor. A `HostKeyStore` trait gives
+  desktop/Tauri and headless/server one seam — OS keychain on desktop, a `0600` seed file (`0700`
+  parent) on headless — and the host refuses to start, naming the path and mode, rather than
+  silently correcting a wider permission it finds. The seed doubles as a one-time recovery phrase,
+  closing the gap the traceability table logs as "Host key loss/reinstall undesigned" and A12 #35's
+  availability edge, both of which had pointed at A4/A10.13 without a mechanism; the phrase is
+  stated plainly as its own compromise surface, and the headless store's plaintext-at-rest exposure
+  is recorded as an accepted residual risk pending an unbuilt encrypted-at-rest design. This removes
+  the stated blocker for `spindle-hostd` regaining a binary target
+  (`crates/spindle-hostd/src/lib.rs:16-37`).
 - **v0.9.31 (2026-09-10)** — Closes the host half of td-0bcab4's last open acceptance item (td-583db5).
   `HostOpKeyCert` is domain-separated: it **drops `nats_fp`** (`spindle-host-cert-v1` → `v2`) and
   becomes the issuance chain only, while the per-connect binding becomes a new eleventh A7b artifact,
