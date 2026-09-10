@@ -9,12 +9,13 @@
 //! |---|---|
 //! | [`DeviceCertificate`](spindle_proto::artifacts::DeviceCertificate) | identity root |
 //! | [`Capability`](spindle_proto::artifacts::Capability) | host operating key, chained to the host root via an embedded `op_cert` (decision A10.30; `host_fp` is root-derived, self-verifying) |
-//! | [`HostOpKeyCert`](spindle_proto::artifacts::HostOpKeyCert) | host root |
+//! | [`HostOpKeyCert`](spindle_proto::artifacts::HostOpKeyCert) | host root (issuance chain only, embedded in every `Capability`/`HostDeviceCert` — carries no per-connect binding since v0.9.31/td-583db5; see [`HostSessionAttestation`](spindle_proto::artifacts::HostSessionAttestation) below) |
 //! | [`HostDeviceCert`](spindle_proto::artifacts::HostDeviceCert) | host operating key, chained to the host root via an embedded `op_cert` (decision A10.35; self-verifying like `Capability`, but `verify_host_device_cert` additionally *requires* a pinned `host_fp` argument) |
 //! | [`RevocationRecord`](spindle_proto::artifacts::RevocationRecord) | host op key or identity root |
 //! | [`AdmissionToken`](spindle_proto::artifacts::AdmissionToken) | operator admission key |
 //! | [`AdminCommand`](spindle_proto::artifacts::AdminCommand) | operator admission key (`verify_admin_command` also takes the operator identity it binds to — `expected_signer_fp` — as a required argument, td-0bcab4) |
 //! | [`SessionAttestation`](spindle_proto::artifacts::SessionAttestation) | device identity key (`verify_session_attestation` likewise takes the value it binds — the connecting session's `nats_fp` — as a required argument rather than checking only a signature, td-0bcab4) |
+//! | [`HostSessionAttestation`](spindle_proto::artifacts::HostSessionAttestation) | host operating key (`verify_host_session_attestation` likewise requires the connecting session's `nats_fp` as an argument, td-583db5 — the host-side mirror of `SessionAttestation`, added v0.9.31 to give `HostOpKeyCert`'s per-connect binding the same required-argument shape) |
 //!
 //! This crate never reads a system clock: every time check takes a caller-supplied `now: u64`
 //! (Unix seconds), consistent with DESIGN.md §A7 ("clients compute an offset" from helper server
@@ -37,6 +38,7 @@ mod capability;
 mod device_cert;
 mod host_device_cert;
 mod host_op_key_cert;
+mod host_session_attest;
 mod revocation;
 mod session_attest;
 
@@ -50,6 +52,10 @@ pub use capability::{issue_capability, verify_capability};
 pub use device_cert::{issue_device_certificate, verify_device_certificate};
 pub use host_device_cert::{issue_host_device_cert, verify_host_device_cert};
 pub use host_op_key_cert::{issue_host_op_key_cert, verify_host_op_key_cert};
+pub use host_session_attest::{
+    issue_host_session_attestation, verify_host_session_attestation,
+    HOST_SESSION_ATTESTATION_CLOCK_SKEW_SECS,
+};
 pub use revocation::{is_newer_epoch, issue_revocation_record, verify_revocation_record};
 pub use session_attest::{
     issue_session_attestation, verify_session_attestation, SESSION_ATTESTATION_CLOCK_SKEW_SECS,
@@ -105,6 +111,19 @@ pub enum ArtifactError {
     /// the check ran and the byte comparison failed, not because the check was skipped.
     #[error("session attestation does not name the connecting session key")]
     SessionKeyMismatch,
+    /// [`host_session_attest::verify_host_session_attestation`] (td-583db5, DESIGN.md §A4 step 3,
+    /// v0.9.31): the attestation names a different session key than the one presenting it.
+    /// `HostOpKeyCert` used to carry a `nats_fp` field for exactly this purpose, but the only place
+    /// that field was ever compared against the connecting session was a single manual byte
+    /// comparison in `spindle-helper`'s `authz::decide_host_connect` — whose own comment noted that
+    /// no other caller did the same check. That is one level less protected than the device path
+    /// above (`SessionKeyMismatch`): there the binding is a required argument no caller can omit,
+    /// where here the binding was one helper function's discipline away from being skipped
+    /// entirely. `HostSessionAttestation` gives the host path the same required-argument shape, so
+    /// this error can only fire because the check ran and the byte comparison failed, not because
+    /// the check was skipped.
+    #[error("host session attestation does not name the connecting session key")]
+    HostSessionKeyMismatch,
     /// [`admin_command::verify_admin_command`] (td-0bcab4's exact API shape, one artifact over):
     /// `command.signer_fp` — carried inside the *signed* preimage — does not match the
     /// `expected_signer_fp` the caller supplied for the `operator_pk` it is verifying against.

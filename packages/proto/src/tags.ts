@@ -27,8 +27,12 @@ export const DEVICE_CERT_V2: Uint8Array = encoder.encode("spindle-dev-cert-v2");
 export const REVOCATION_V1: Uint8Array = encoder.encode("spindle-rev-v1");
 /** `AdminCommand` (A3b/A7b) — signed by the operator admission key. */
 export const ADMIN_COMMAND_V1: Uint8Array = encoder.encode("spindle-adm-cmd-v1");
-/** `HostOpKeyCert` (A4) — signed by the host root. */
-export const HOST_OP_KEY_CERT_V1: Uint8Array = encoder.encode("spindle-host-cert-v1");
+/** `HostOpKeyCert` (A4) — signed by the host root. Bumped to v2 in v0.9.31: this artifact carries
+ * no `v` field, so per DESIGN.md §A7b the domain tag *is* the version discriminant, and v0.9.31
+ * removed `nats_fp` from the certificate — a wire-visible change — which is expressed here as
+ * `spindle-host-cert-v1` -> `spindle-host-cert-v2` rather than as a field-level version
+ * (td-583db5). The removed binding moved to the new `HOST_SESSION_ATTESTATION_V1`. */
+export const HOST_OP_KEY_CERT_V2: Uint8Array = encoder.encode("spindle-host-cert-v2");
 /** `HostDeviceCert` (A4/A10.35) — signed by the host operating key. */
 export const HOST_DEVICE_CERT_V1: Uint8Array = encoder.encode("spindle-host-dev-cert-v1");
 /** `SessionAttestation` (A4/A7b, added v0.9.29) — signed by the device identity key. Device
@@ -37,6 +41,14 @@ export const HOST_DEVICE_CERT_V1: Uint8Array = encoder.encode("spindle-host-dev-
  * same connection, so this tag is the only thing preventing cross-artifact signature confusion
  * between them (DESIGN.md §A7b). */
 export const SESSION_ATTESTATION_V1: Uint8Array = encoder.encode("spindle-sess-attest-v1");
+/** `HostSessionAttestation` (A4/A7b, added v0.9.31, td-583db5) — signed by the host **operating**
+ * key. That key now signs three artifact types — `Capability` (`spindle-cap-v1`),
+ * `RevocationRecord` (`spindle-rev-v1`), and `HostSessionAttestation`
+ * (`spindle-host-sess-attest-v1`) — so this tag is what prevents cross-artifact signature
+ * confusion between them (DESIGN.md §A7b). */
+export const HOST_SESSION_ATTESTATION_V1: Uint8Array = encoder.encode(
+  "spindle-host-sess-attest-v1",
+);
 
 /**
  * Concatenates a domain tag with a byte string — `tag || bytes`. No hashing, no signing: this

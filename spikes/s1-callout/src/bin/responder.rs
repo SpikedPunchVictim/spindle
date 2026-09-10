@@ -424,6 +424,7 @@ fn handle_one(
             let presented = HostConnectPresented {
                 host_root_pk,
                 host_op_cert: h.host_op_cert,
+                session_attest: h.session_attest,
                 admission_token: h.admission_token,
                 nats_fp,
             };

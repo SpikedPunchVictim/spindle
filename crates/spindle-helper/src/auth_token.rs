@@ -14,29 +14,37 @@
 //! device connection: { "kind": "device", "root_pk": bytes32, "device_cert": bytes,
 //!                       "session_attest": bytes, "caps": [bytes, ...] }
 //! host connection:   { "kind": "host", "host_root_pk": bytes32, "host_op_cert": bytes,
-//!                       "admission_token": bytes (present only if a token accompanies this connect) }
+//!                       "session_attest": bytes, "admission_token": bytes (present only if a
+//!                       token accompanies this connect) }
 //! ```
-//! Each of `device_cert`/`session_attest`/`host_op_cert`/`caps[i]`/`admission_token` is the
-//! artifact's own `to_canonical_bytes()` output re-embedded as a CBOR byte string; the whole
-//! envelope is canonical-CBOR-encoded, then base64url (no padding), matching DESIGN.md's
+//! Each of `device_cert`/`session_attest` (both arms)/`host_op_cert`/`caps[i]`/`admission_token`
+//! is the artifact's own `to_canonical_bytes()` output re-embedded as a CBOR byte string; the
+//! whole envelope is canonical-CBOR-encoded, then base64url (no padding), matching DESIGN.md's
 //! presentation rule. The **encode/builder** side of this envelope (`fixtures::device_auth_token`/
 //! `fixtures::host_auth_token`) stays test-fixture-only in the spike crate — nothing but test
 //! harnesses need to *build* one; the responder only ever needs to *decode* one.
 //!
-//! `session_attest` (added v0.9.29, td-0bcab4 §A4 step 2) is **required**, unlike
-//! `admission_token` on the host arm above. It carries the [`SessionAttestation`] that binds this
-//! device's identity key to the connecting session nkey (DESIGN.md §A3/§A4 step 2) — the fix for
-//! the bearer-token defect where `{root_pk, device_cert, caps}` alone authorized a connection from
-//! *any* nkey. Making it optional here would silently reinstate exactly that property for any
-//! client that simply omitted the field: an "optional-but-checked-if-present" decode would still
-//! let an old or stripped-down bundle through as a bearer token. `admission_token` is optional
-//! because a host's *second and later* connections legitimately have none (DESIGN.md §A3b: an
-//! already-admitted host connects on its cert alone) — there is no equivalent legitimate case here.
+//! `session_attest` (device arm added v0.9.29, td-0bcab4 §A4 step 2; host arm added v0.9.31,
+//! td-583db5) is **required** on both arms, unlike `admission_token` on the host arm above. On the
+//! device side it carries a [`SessionAttestation`] binding the device's identity key to the
+//! connecting session nkey (DESIGN.md §A3/§A4 step 2); on the host side it carries a
+//! [`HostSessionAttestation`] binding the host's operating key to the connecting session nkey —
+//! the per-connect binding that td-583db5 split out of `HostOpKeyCert` once that certificate's own
+//! `nats_fp` field turned out to be enforced by exactly one manual comparison at one call site
+//! (the td-0bcab4 defect class). Both are the fix for the same bearer-token defect: without them,
+//! `{root_pk, device_cert, caps}` / `{host_root_pk, host_op_cert}` alone authorized a connection
+//! from *any* nkey. Making either field optional here would silently reinstate that property for
+//! any client that simply omitted it: an "optional-but-checked-if-present" decode would still let
+//! an old or stripped-down bundle through as a bearer token. `admission_token` is optional because
+//! a host's *second and later* connections legitimately have none (DESIGN.md §A3b: an
+//! already-admitted host connects on its cert alone) — there is no equivalent legitimate case for
+//! either `session_attest`.
 
 use base64::Engine;
 use spindle_core::Fingerprint;
 use spindle_proto::artifacts::{
-    AdmissionToken, Capability, DeviceCertificate, HostOpKeyCert, SessionAttestation,
+    AdmissionToken, Capability, DeviceCertificate, HostOpKeyCert, HostSessionAttestation,
+    SessionAttestation,
 };
 use spindle_proto::canonical::CborValue;
 
@@ -76,6 +84,11 @@ pub struct DecodedDeviceAuthToken {
 pub struct DecodedHostAuthToken {
     pub host_root_pk_bytes: [u8; 32],
     pub host_op_cert: HostOpKeyCert,
+    /// v0.9.31 (td-583db5): the host operating key's attestation binding this bundle to the
+    /// connecting session nkey — the per-connect twin of `DecodedDeviceAuthToken::session_attest`.
+    /// Required — see the module docs' note on why this field, unlike `admission_token` below, has
+    /// no "absent" case.
+    pub session_attest: HostSessionAttestation,
     pub admission_token: Option<AdmissionToken>,
 }
 
@@ -151,6 +164,14 @@ pub fn decode_auth_token(token: &str) -> Result<DecodedAuthToken, AuthTokenError
                 .ok_or(AuthTokenError::MissingField("host_op_cert"))?;
             let host_op_cert = HostOpKeyCert::from_canonical_bytes(host_op_cert_bytes)
                 .map_err(|e| AuthTokenError::BadArtifact("host_op_cert", format!("{e:?}")))?;
+            // Required, not optional — see the module docs' note on `session_attest`. A missing
+            // field here fails the whole decode via `?`, exactly like `host_op_cert` above; there
+            // is deliberately no `None`-on-absent branch the way `admission_token` gets below.
+            let session_attest_bytes = cbor_map_get(map, "session_attest")
+                .and_then(|v| v.as_bytes())
+                .ok_or(AuthTokenError::MissingField("session_attest"))?;
+            let session_attest = HostSessionAttestation::from_canonical_bytes(session_attest_bytes)
+                .map_err(|e| AuthTokenError::BadArtifact("session_attest", format!("{e:?}")))?;
             let admission_token = match cbor_map_get(map, "admission_token") {
                 Some(v) => {
                     let b = v
@@ -165,6 +186,7 @@ pub fn decode_auth_token(token: &str) -> Result<DecodedAuthToken, AuthTokenError
             Ok(DecodedAuthToken::Host(DecodedHostAuthToken {
                 host_root_pk_bytes,
                 host_op_cert,
+                session_attest,
                 admission_token,
             }))
         }
@@ -184,7 +206,7 @@ mod tests {
     use super::*;
     use spindle_core::artifacts::{
         issue_capability, issue_device_certificate, issue_host_op_key_cert,
-        issue_session_attestation,
+        issue_host_session_attestation, issue_session_attestation,
     };
     use spindle_core::identity::{DeviceKey, RootKey};
     use spindle_proto::artifacts::CapKind;
@@ -224,9 +246,12 @@ mod tests {
         b64url(&spindle_proto::canonical_encode(&env))
     }
 
+    /// `session_attest` is `Option` here purely so `rejects_a_host_token_missing_session_attest`
+    /// can build an envelope that omits the field entirely — every other caller passes `Some(..)`.
     fn encode_host_token(
         host_root_pk_bytes: &[u8; 32],
         host_op_cert: &HostOpKeyCert,
+        session_attest: Option<&HostSessionAttestation>,
         admission_token: Option<&AdmissionToken>,
     ) -> String {
         let mut entries = vec![
@@ -240,6 +265,12 @@ mod tests {
                 CborValue::bytes(host_op_cert.to_canonical_bytes()),
             ),
         ];
+        if let Some(attest) = session_attest {
+            entries.push((
+                "session_attest",
+                CborValue::bytes(attest.to_canonical_bytes()),
+            ));
+        }
         if let Some(tok) = admission_token {
             entries.push((
                 "admission_token",
@@ -289,13 +320,7 @@ mod tests {
         let attest = issue_session_attestation(&device, nats_fp, 0);
         let host_root = RootKey::from_seed([0x21; 32]);
         let op_signer = spindle_core::SigningKey::from_bytes(&[0x22; 32]);
-        let op_cert = issue_host_op_key_cert(
-            &host_root,
-            &op_signer.verifying_key(),
-            Fingerprint::of_parts(&[b"op-cert"]),
-            0,
-            u64::MAX,
-        );
+        let op_cert = issue_host_op_key_cert(&host_root, &op_signer.verifying_key(), 0, u64::MAX);
         let cap = issue_capability(
             &host_root.public_key(),
             &op_cert,
@@ -345,20 +370,40 @@ mod tests {
     fn decodes_a_host_token_with_no_admission_token() {
         let host_root = RootKey::from_seed([0x31; 32]);
         let op_signer = spindle_core::SigningKey::from_bytes(&[0x32; 32]);
-        let cert = issue_host_op_key_cert(
-            &host_root,
-            &op_signer.verifying_key(),
-            Fingerprint::of_parts(&[b"host-nats"]),
-            0,
-            2_000_000,
+        let cert = issue_host_op_key_cert(&host_root, &op_signer.verifying_key(), 0, 2_000_000);
+        let nats_fp = Fingerprint::of_parts(&[b"host-nats"]);
+        let attest = issue_host_session_attestation(&op_signer, nats_fp, 0);
+        let token = encode_host_token(
+            &host_root.public_key().to_bytes(),
+            &cert,
+            Some(&attest),
+            None,
         );
-        let token = encode_host_token(&host_root.public_key().to_bytes(), &cert, None);
 
         let decoded = decode_auth_token(&token).expect("decode succeeds");
         let DecodedAuthToken::Host(h) = decoded else {
             panic!("expected a host payload");
         };
         assert!(h.admission_token.is_none());
+    }
+
+    /// td-583db5: `session_attest` is required, not optional, on the host arm (see the module
+    /// docs' note above), mirroring `rejects_a_device_token_missing_session_attest`. A host token
+    /// that omits it entirely must fail to decode rather than decode successfully with some
+    /// placeholder/absent value — an optional field here would silently reinstate the
+    /// bearer-token property this fix exists to close.
+    #[test]
+    fn rejects_a_host_token_missing_session_attest() {
+        let host_root = RootKey::from_seed([0x51; 32]);
+        let op_signer = spindle_core::SigningKey::from_bytes(&[0x52; 32]);
+        let cert = issue_host_op_key_cert(&host_root, &op_signer.verifying_key(), 0, 2_000_000);
+        let token = encode_host_token(&host_root.public_key().to_bytes(), &cert, None, None);
+
+        let err = decode_auth_token(&token).unwrap_err();
+        assert!(
+            matches!(err, AuthTokenError::MissingField("session_attest")),
+            "expected MissingField(\"session_attest\"), got {err:?}"
+        );
     }
 
     #[test]

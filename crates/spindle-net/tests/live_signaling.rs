@@ -126,7 +126,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use spindle_core::artifacts::issue_revocation_record;
+use spindle_core::artifacts::{issue_host_session_attestation, issue_revocation_record};
 use spindle_core::identity::DeviceKey;
 use spindle_core::{Fingerprint, SigningKey, VerifyingKey};
 use spindle_net::framing::{read_frame, write_frame};
@@ -135,7 +135,7 @@ use spindle_net::signaling::{
     ConnectAuthorizer, ConnectDecision, ConnectOptions, HostIdentity, HostOptions, SessionHandler,
     SignalingClient, SignalingHost, VerifiedDecision,
 };
-use spindle_proto::artifacts::Capability;
+use spindle_proto::artifacts::{Capability, HostOpKeyCert};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
 // The callout bootstrap fixtures (`fixtures::*`), the live-stack connection helpers
@@ -1109,69 +1109,166 @@ async fn live_revocation_kicks_and_then_refuses_the_devices_reconnect_within_the
     );
 }
 
-/// Security regression for td-0bcab4: `spindle_helper::authz::decide_host_connect` verifies a
-/// `HostOpKeyCert` chains to `host_root_pk` and has not expired
-/// (`spindle_core::artifacts::verify_host_op_key_cert`), but never compares the cert's own
-/// `nats_fp` field against the nkey the connection actually authenticated with. This test pins
-/// the invariant that must hold instead: a host op cert authorizes ONLY the nkey named in its own
-/// `nats_fp` field, never whichever nkey happens to present it.
+/// Security regression for td-583db5 (v0.9.31). Before this change, `HostOpKeyCert` carried its
+/// own `nats_fp` field, and `decide_host_connect` bound a host's operating-key certificate to one
+/// NATS session with exactly one manual byte comparison against that field — the same defect
+/// class as td-0bcab4 on the device side. td-583db5 removed the field entirely: `HostOpKeyCert` is
+/// now the issuance chain only (root key -> operating key, DESIGN.md:306's "spindle-host-cert-v2"),
+/// and the per-connect binding of an operating key to one session moved to a new, separate
+/// artifact, [`spindle_core::artifacts::HostSessionAttestation`] (`{nats_fp, ts, sig_op}`), signed
+/// by the host's **operating** key — mirroring the device side's `SessionAttestation`/td-0bcab4
+/// exactly, on purpose (see `decide_host_connect`'s own doc comments).
 ///
-/// The attack material here is not contrived. Every member `Capability` this host issues embeds
-/// exactly this shape of cert (`host_root_pk` + `op_cert`, DESIGN.md:306) —
-/// [`HostRootIdentity::capability_op_cert`] builds it with a dummy, never-used `nats_fp` and
-/// `exp: u64::MAX`, because `verify_capability` never inspects a capability's embedded
-/// `op_cert.nats_fp`. Any member this host has ever admitted already holds one of these certs
-/// today. If `decide_host_connect` also skips the `nats_fp` check, that same cert lets the member
-/// CONNECT to NATS *as the host itself*.
+/// `decide_host_connect` (`crates/spindle-helper/src/authz.rs`) enforces the new binding with two
+/// checks, in order: a cheap pre-check (`presented.nats_fp.matches(&presented.session_attest.
+/// nats_fp)`, a plain byte comparison, before any crypto), and the authoritative check —
+/// `verify_host_session_attestation(&presented.session_attest, &host_op_pk, &presented.nats_fp,
+/// now)` — run only after `verify_host_op_key_cert` has already proven `host_op_pk` genuinely
+/// comes from a certificate chaining to the pinned `host_root_pk`.
 ///
-/// The positive control below is what makes a refusal meaningful: it proves the live stack
-/// genuinely admits this host identity at all, so the attack's refusal afterward can only mean
-/// the `nats_fp` binding is enforced — not that the stack is unreachable or this host was never
-/// admitted in the first place.
+/// This test pins the invariant the redesign exists to prove, at the real attacker's power level:
+/// a member holding nothing but a genuine `Capability` from this host — `host_root_pk` and the
+/// capability's own embedded `op_cert` (which contains `host_op_pk`) — **cannot forge any valid
+/// `HostSessionAttestation` at all**, for its own connecting nkey or anyone else's, because doing
+/// so requires the host's operating **private** key, which a `Capability` never contains. Unlike
+/// the old td-0bcab4 defect (a missing comparison), this attack is closed by construction: there
+/// is no signature a mere capability holder can produce that `verify_host_session_attestation`
+/// will ever accept. Attack 1 below demonstrates exactly that — it is the attack a genuine
+/// external attacker can actually mount, and it is refused only by the authoritative check, since
+/// the forged attestation's `nats_fp` is deliberately set to match the attacker's own connecting
+/// fingerprint (so the cheap pre-check alone cannot be credited with the refusal). Attack 2
+/// exercises the cheap pre-check in isolation, using an artifact strictly beyond what a real
+/// capability holder could ever obtain — see its own comment for why that is honestly disclosed
+/// rather than oversold as a realistic attack.
+///
+/// The positive control below is what makes either refusal meaningful: it proves the live stack
+/// genuinely admits this host identity at all, so a refusal in an attack afterward can only mean
+/// the binding is enforced — not that the stack is unreachable or this host was never admitted in
+/// the first place.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live stack required: run `docker compose -f deploy/docker-compose.yml up -d` first, \
             then `cargo test -p spindle-net --test live_signaling -- --ignored --nocapture`. \
             When run, an unreachable stack fails loudly — this test never skips."]
-async fn live_capability_op_cert_must_not_authorize_a_host_connect() {
+async fn live_a_member_cap_holder_must_not_authorize_a_host_connect() {
     let url = nats_url();
     assert_stack_rejects_anonymous(&url).await;
 
     // A host identity not used by any other test in this file.
-    let host = HostRootIdentity::new([0x91; 32], [0x92; 32]);
+    let host = HostRootIdentity::new([0x71; 32], [0x72; 32]);
+    let exp = fixtures::now() + 3600;
 
     // ---- positive control: this host identity is genuinely admitted by the live stack ----------
-    // Connects for real, the normal way (`connect_host`, the host's own op-key cert bound to its
-    // own session nkey's nats_fp). This proves the stack admits `host` at all, so a refusal in the
-    // attack below can only mean the nats_fp binding is enforced — not that the stack is broken or
-    // this host is unadmitted.
-    let exp = fixtures::now() + 3600;
+    // Connects for real, the normal way (`connect_host`, whose session attestation is genuinely
+    // bound to the session nkey it names). This proves the live stack admits this exact host
+    // identity, so a refusal in either attack below can only mean the session-attestation binding
+    // is enforced — not that the stack is unreachable or this host was never admitted at all.
     let (host_nats, _host_events) = connect_host(&url, &host, exp).await;
     drop(host_nats);
 
-    // ---- the attack: an unrelated attacker nkey, authenticated with the host's never-expiring,
-    // dummy-nats_fp capability-issuance cert instead of a real op-key cert bound to itself --------
-    let cap_cert = host.capability_op_cert();
-    let token = fixtures::host_auth_token(&host.root.public_key().to_bytes(), &cap_cert);
-    let attacker = nkeys::KeyPair::new_user();
+    // ---- attack material a real member cap holder actually possesses ---------------------------
+    // A genuine member `Capability` this host would issue to any admitted device — the exact
+    // artifact a member holds after being admitted, nothing contrived. Its `host_root_pk` and
+    // `op_cert` fields are the entirety of what a capability hands a member about the host's
+    // identity; there is no `host_op_signing` (the operating *private* key) anywhere in this
+    // bundle or reachable from it.
+    let member_cap: Capability = host.member_capability(
+        Fingerprint::of_parts(&[b"live_signaling:member_cap_attack:attacker-subject"]),
+        exp,
+        vec![0xC7],
+    );
+    let host_root_pk_bytes = host.root.public_key().to_bytes();
+    // Decoded out of the capability's own bytes, deliberately, rather than calling
+    // `host.capability_op_cert()` directly — the point being tested is that this cert is exactly
+    // the material a member legitimately holds inside a capability it was handed, not test-fixture
+    // convenience. (It is byte-identical to `host.capability_op_cert()`'s output either way:
+    // `HostRootIdentity::member_capability` builds the capability from precisely that cert.)
+    let op_cert_from_cap: HostOpKeyCert = HostOpKeyCert::from_canonical_bytes(&member_cap.op_cert)
+        .expect("a genuine capability's embedded op_cert must decode");
+
+    // =============================================================================================
+    // Attack 1 (the real one): the member forges its OWN attestation, over its OWN connecting nkey.
+    // =============================================================================================
+    // This is the attack a genuine external attacker — someone who has only ever seen their own
+    // capability — can actually mount. They generate a fresh nkey to connect with, and a fresh
+    // Ed25519 keypair to sign with (nothing here is the host's real operating key — that key is
+    // never available to a capability holder). The forged attestation names the attacker's OWN
+    // connecting `nats_fp`, so the cheap pre-check (a pure byte comparison, no crypto) PASSES: the
+    // bundle is fully self-consistent on its face. The only thing standing between this bundle and
+    // full host impersonation is the authoritative check, which must reject it because `sig_op`
+    // does not verify under the `host_op_pk` the (genuine, root-chained) certificate certifies.
+    let attacker_session = nkeys::KeyPair::new_user();
+    let attacker_nats_fp = fixtures::nats_fp_of_nkey(&attacker_session.public_key());
+    let attacker_signing_key = SigningKey::from_bytes(&[0xEE; 32]); // the attacker's own key, not the host's
+    let forged_attest =
+        issue_host_session_attestation(&attacker_signing_key, attacker_nats_fp, fixtures::now());
+    let forged_token =
+        fixtures::host_auth_token(&host_root_pk_bytes, &op_cert_from_cap, &forged_attest);
     let (opts, _events) = base_opts();
-    let result = opts
-        .nkey(attacker.seed().expect("attacker nkey seed"))
-        .token(token)
+    let forged_result = opts
+        .nkey(attacker_session.seed().expect("attacker nkey seed"))
+        .token(forged_token)
         .connect(&url)
         .await;
 
     let host_fp = host.host_fp;
     assert!(
-        result.is_err(),
-        "an attacker's own, unrelated nkey CONNECTed to the live stack using this host's \
-         capability-embedded op cert (never expires, bound to a dummy nats_fp belonging to no \
-         real session) and the stack ADMITTED it. Every member `Capability` this host issues \
-         embeds exactly this cert (`host_root_pk` + `op_cert`, DESIGN.md:306) — since \
-         `decide_host_connect` never checks that cert's `nats_fp` against the connecting nkey, \
-         any member who decodes its own capability can authenticate to NATS *as the host itself*, \
-         gaining `sub host.{host_fp}.>`, `pub host.{host_fp}.sess.*.*.h2c`, and `pub \
-         registry.revoke.{host_fp}` (permissions::host_permissions). This is td-0bcab4; it must \
-         be reported as a genuine finding, not papered over by weakening this assertion."
+        forged_result.is_err(),
+        "a member holding nothing but its own genuine Capability from this host — decoding \
+         host_root_pk and op_cert straight out of that capability's own bytes, exactly what any \
+         admitted member already holds — CONNECTed to the live stack presenting a \
+         HostSessionAttestation it forged itself (signed with a key of its own choosing, naming \
+         its own connecting nats_fp), and the stack ADMITTED it. This bundle is fully \
+         self-consistent: the op_cert is genuine and chains to the pinned host root, and the \
+         attestation names the connecting nkey, so the CHEAP PRE-CHECK in decide_host_connect \
+         passes. Only the authoritative check (verify_host_session_attestation against the \
+         cert-certified host_op_pk) can catch this, because sig_op was never produced by the \
+         host's real operating key. If this connect succeeds, ANY member who decodes its own \
+         capability can authenticate to NATS *as the host itself*, gaining `sub host.{host_fp}.>`, \
+         `pub host.{host_fp}.sess.*.*.h2c`, and `pub registry.revoke.{host_fp}` \
+         (permissions::host_permissions). This is a genuine finding for td-583db5's replacement \
+         binding and must be reported as such — never papered over by weakening this assertion."
+    );
+
+    // =============================================================================================
+    // Attack 2: replay a genuinely host-signed attestation naming a DIFFERENT session, from a
+    // third, unrelated nkey. This exercises only the cheap pre-check.
+    // =============================================================================================
+    // Honesty about the threat model: NO real capability holder could ever produce or obtain the
+    // artifact this attack presents — minting it requires `host.op_signing`, the host's own
+    // operating *private* key, which a `Capability` never contains and which Attack 1 above never
+    // had access to either. This grants the adversary strictly MORE power than reality (a stolen
+    // or leaked genuine attestation for some other session, rather than anything forgeable from
+    // capability material alone) purely to prove the binding still holds even then — it is not a
+    // realistic attack in its own right, and must not be read as one.
+    let other_session_nats_fp =
+        Fingerprint::of_parts(&[b"live_signaling:member_cap_attack:attack2-other-session"]);
+    let genuine_but_misnamed_attest =
+        host.session_attestation(other_session_nats_fp, fixtures::now());
+    let real_op_cert = host.op_key_cert(fixtures::now(), exp);
+    let replay_token = fixtures::host_auth_token(
+        &host_root_pk_bytes,
+        &real_op_cert,
+        &genuine_but_misnamed_attest,
+    );
+    let unrelated_session = nkeys::KeyPair::new_user();
+    let (opts2, _events2) = base_opts();
+    let replay_result = opts2
+        .nkey(unrelated_session.seed().expect("unrelated nkey seed"))
+        .token(replay_token)
+        .connect(&url)
+        .await;
+
+    assert!(
+        replay_result.is_err(),
+        "a THIRD, unrelated nkey CONNECTed to the live stack presenting this host's genuine \
+         op-key cert alongside a genuinely host-op-signed HostSessionAttestation minted for a \
+         DIFFERENT session's nats_fp, and the stack ADMITTED it. The attestation's sig_op is \
+         valid under the real host_op_pk, so only the CHEAP PRE-CHECK (byte comparison of \
+         presented.nats_fp against session_attest.nats_fp) stands between this bundle and \
+         admission — if that comparison is missing or bypassed, any party who ever obtains one \
+         host-signed attestation could ride it onto an entirely different NATS session as this \
+         host. This must be reported as a genuine finding, not papered over by weakening this \
+         assertion."
     );
 }
 

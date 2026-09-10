@@ -1,0 +1,28 @@
+{
+  "artifact": "HostSessionAttestation",
+  "domain_tag": "spindle-host-sess-attest-v1",
+  "cases": [
+    {
+      "name": "freshly_issued",
+      "description": "Host session attestation binding the host operating key to one freshly-established NATS session key (td-583db5): sig_op(nats_fp, ts).",
+      "decoded": {
+        "nats_fp": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+        "ts": 1755907200,
+        "sig_op": "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2"
+      },
+      "canonical_cbor_hex": "a36274731a68a90480667369675f6f705840d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2676e6174735f66705820d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+      "signing_input_hex": "7370696e646c652d686f73742d736573732d6174746573742d7631a26274731a68a90480676e6174735f66705820d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1"
+    },
+    {
+      "name": "different_session_nkey",
+      "description": "A second attestation, same host, naming a different nats_fp: this artifact's whole purpose is being minted fresh per session (unlike HostOpKeyCert, which persists across many sessions), so two attestations from the same host legitimately differ only in which session key they name and when.",
+      "decoded": {
+        "nats_fp": "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
+        "ts": 1755907260,
+        "sig_op": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+      },
+      "canonical_cbor_hex": "a36274731a68a904bc667369675f6f705840d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4676e6174735f66705820d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
+      "signing_input_hex": "7370696e646c652d686f73742d736573732d6174746573742d7631a26274731a68a904bc676e6174735f66705820d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3"
+    }
+  ]
+}

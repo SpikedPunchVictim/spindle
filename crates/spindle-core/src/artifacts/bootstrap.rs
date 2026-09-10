@@ -138,7 +138,7 @@ pub enum BundleError {
 /// [`spindle_proto::bootstrap::MEASURED_ENTRY_BYTES`].** That constant is documentation for
 /// DESIGN.md :328-329's "4 hosts at EC level M, 5 at level L" figures only — it is not a lower
 /// bound this function is allowed to trust. A future artifact (e.g. a larger op-cert chain, or a
-/// second cap embedded per entry) could grow a single entry's encoding well past 546 B; measuring
+/// second cap embedded per entry) could grow a single entry's encoding well past 504 B; measuring
 /// the real bytes here means such a change is caught by this check automatically, rather than
 /// silently producing a bundle that fails to scan once printed.
 ///
@@ -405,13 +405,7 @@ mod tests {
     fn test_host(root_seed: [u8; 32], op_seed: [u8; 32], op_cert_exp: u64) -> TestHost {
         let root = RootKey::from_seed(root_seed);
         let op_signer = SigningKey::from_bytes(&op_seed);
-        let op_cert = issue_host_op_key_cert(
-            &root,
-            &op_signer.verifying_key(),
-            Fingerprint::of_parts(&[b"bootstrap-test:nats"]),
-            0,
-            op_cert_exp,
-        );
+        let op_cert = issue_host_op_key_cert(&root, &op_signer.verifying_key(), 0, op_cert_exp);
         TestHost {
             root,
             op_signer,
@@ -564,7 +558,7 @@ mod tests {
         // returning `Ok(bundle)` regardless of encoded size) would make this test fail, since it
         // would never see `TooLargeForQr` at all.
         //
-        // Real entries measure ~546 B each (see `keeps_measured_entry_bytes_honest` below); the
+        // Real entries measure ~504 B each (see `keeps_measured_entry_bytes_honest` below); the
         // EC-M budget is 2331 B. 6 real entries safely exceed it regardless of small per-entry
         // size drift, while staying well under MAX_BUNDLE_ENTRIES (32).
         let entries: Vec<BundleEntry> = (0u8..6)
@@ -636,13 +630,7 @@ mod tests {
     ) -> TestHost {
         let root = RootKey::from_seed(root_seed);
         let op_signer = SigningKey::from_bytes(&op_seed);
-        let op_cert = issue_host_op_key_cert(
-            &root,
-            &op_signer.verifying_key(),
-            Fingerprint::of_parts(&[b"bootstrap-test:nats"]),
-            ts,
-            op_cert_exp,
-        );
+        let op_cert = issue_host_op_key_cert(&root, &op_signer.verifying_key(), ts, op_cert_exp);
         TestHost {
             root,
             op_signer,
@@ -697,7 +685,7 @@ mod tests {
         // Minted with realistic values (see `realistic_entry`'s doc comment): now =
         // 1_757_000_000, a 90-day op-cert exp, a 21-day cap exp, cap_epoch = 7, a 16-byte nonce.
         // Tolerance chosen from an actual measurement, not invented: this test module's real
-        // entry measures 546 B, exactly MEASURED_ENTRY_BYTES — +/-2 B leaves room for a single
+        // entry measures 504 B, exactly MEASURED_ENTRY_BYTES — +/-2 B leaves room for a single
         // field crossing a CBOR shortest-form boundary (e.g. a timestamp ticking past a
         // power-of-two-scaled threshold between now and whenever this test next runs) without
         // being so loose it would fail to flag a genuine future drift (e.g. a larger op_cert
@@ -717,7 +705,7 @@ mod tests {
     #[test]
     fn qr_ceiling_matches_the_documented_host_counts() {
         // This is what actually protects DESIGN.md :328-329's documented claim ("4 hosts at EC
-        // level M, 5 at level L, with a short registry endpoint; 3 and 4 at MAX_REGISTRY_LEN") —
+        // level M, 5 at level L, with a short registry endpoint; 4 and 5 at MAX_REGISTRY_LEN") —
         // MEASURED_ENTRY_BYTES alone only documents the arithmetic that produced those numbers;
         // it does not prove them, since it is never consulted by the real fit check. This test
         // builds real bundles of real entries and checks their real encoded size against the QR
@@ -764,13 +752,34 @@ mod tests {
              ({QR_V40_L_CAPACITY_BYTES} B)"
         );
 
-        // At MAX_REGISTRY_LEN, 4 real entries no longer fit EC-M.
+        // At MAX_REGISTRY_LEN, EC level M: 4 real entries fit, 5 do not — the same host count as
+        // the short-registry case above (previously 3/4 before v0.9.31/td-583db5 shrank
+        // HostOpKeyCert by dropping nats_fp; see MEASURED_ENTRY_BYTES's doc comment).
         let long_registry = "r".repeat(spindle_proto::bootstrap::MAX_REGISTRY_LEN);
         let four_long_registry = bundle_of(&long_registry, 4).to_canonical_bytes().len();
         assert!(
-            four_long_registry > QR_V40_M_CAPACITY_BYTES,
-            "4 real entries with a MAX_REGISTRY_LEN registry ({four_long_registry} B) must NOT \
+            four_long_registry <= QR_V40_M_CAPACITY_BYTES,
+            "4 real entries with a MAX_REGISTRY_LEN registry ({four_long_registry} B) must fit \
+             the EC-M budget ({QR_V40_M_CAPACITY_BYTES} B)"
+        );
+        let five_long_registry = bundle_of(&long_registry, 5).to_canonical_bytes().len();
+        assert!(
+            five_long_registry > QR_V40_M_CAPACITY_BYTES,
+            "5 real entries with a MAX_REGISTRY_LEN registry ({five_long_registry} B) must NOT \
              fit the EC-M budget ({QR_V40_M_CAPACITY_BYTES} B)"
+        );
+
+        // At MAX_REGISTRY_LEN, EC level L: 5 real entries fit, 6 do not.
+        assert!(
+            five_long_registry <= QR_V40_L_CAPACITY_BYTES,
+            "5 real entries with a MAX_REGISTRY_LEN registry ({five_long_registry} B) must fit \
+             the EC-L budget ({QR_V40_L_CAPACITY_BYTES} B)"
+        );
+        let six_long_registry = bundle_of(&long_registry, 6).to_canonical_bytes().len();
+        assert!(
+            six_long_registry > QR_V40_L_CAPACITY_BYTES,
+            "6 real entries with a MAX_REGISTRY_LEN registry ({six_long_registry} B) must NOT \
+             fit the EC-L budget ({QR_V40_L_CAPACITY_BYTES} B)"
         );
     }
 

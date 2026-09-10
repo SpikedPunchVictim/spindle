@@ -29,6 +29,7 @@ export {
   RevocationRecord,
   AdminCommand,
   HostOpKeyCert,
+  HostSessionAttestation,
   HostDeviceCert,
   CAPABILITY_MIN_V,
   CAPABILITY_CURRENT_V,

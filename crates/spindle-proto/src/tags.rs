@@ -25,8 +25,12 @@ pub const DEVICE_CERT_V2: &[u8] = b"spindle-dev-cert-v2";
 pub const REVOCATION_V1: &[u8] = b"spindle-rev-v1";
 /// `AdminCommand` (A3b/A7b) — signed by the operator admission key.
 pub const ADMIN_COMMAND_V1: &[u8] = b"spindle-adm-cmd-v1";
-/// `HostOpKeyCert` (A4) — signed by the host root.
-pub const HOST_OP_KEY_CERT_V1: &[u8] = b"spindle-host-cert-v1";
+/// `HostOpKeyCert` (A4) — signed by the host root. Bumped to v2 in v0.9.31: this artifact carries
+/// no `v` field, so per DESIGN.md §A7b the domain tag *is* the version discriminant, and v0.9.31
+/// removed `nats_fp` from the certificate — a wire-visible change — which is expressed here as
+/// `spindle-host-cert-v1` → `spindle-host-cert-v2` rather than as a field-level version (td-583db5).
+/// The removed binding moved to the new [`HOST_SESSION_ATTESTATION_V1`].
+pub const HOST_OP_KEY_CERT_V2: &[u8] = b"spindle-host-cert-v2";
 /// `HostDeviceCert` (A4/A10.35) — signed by the host operating key.
 pub const HOST_DEVICE_CERT_V1: &[u8] = b"spindle-host-dev-cert-v1";
 /// `SessionAttestation` (A4/A7b, added v0.9.29) — signed by the device identity key. Device
@@ -35,6 +39,12 @@ pub const HOST_DEVICE_CERT_V1: &[u8] = b"spindle-host-dev-cert-v1";
 /// same connection, so this tag is the only thing preventing cross-artifact signature confusion
 /// between them (DESIGN.md §A7b).
 pub const SESSION_ATTESTATION_V1: &[u8] = b"spindle-sess-attest-v1";
+/// `HostSessionAttestation` (A4/A7b, added v0.9.31, td-583db5) — signed by the host **operating**
+/// key. That key now signs three artifact types — `Capability` (`spindle-cap-v1`),
+/// `RevocationRecord` (`spindle-rev-v1`), and `HostSessionAttestation`
+/// (`spindle-host-sess-attest-v1`) — so this tag is what prevents cross-artifact signature
+/// confusion between them (DESIGN.md §A7b).
+pub const HOST_SESSION_ATTESTATION_V1: &[u8] = b"spindle-host-sess-attest-v1";
 
 /// Concatenates a domain tag with a byte string — `tag || bytes`. No hashing, no signing: this
 /// crate only assembles the exact byte sequence that `spindle-core` will later sign or verify.
@@ -61,7 +71,7 @@ mod tests {
     }
 
     #[test]
-    fn all_nine_tags_distinct() {
+    fn all_ten_tags_distinct() {
         let tags = [
             ENVELOPE_V1,
             CAPABILITY_V1,
@@ -69,9 +79,10 @@ mod tests {
             DEVICE_CERT_V2,
             REVOCATION_V1,
             ADMIN_COMMAND_V1,
-            HOST_OP_KEY_CERT_V1,
+            HOST_OP_KEY_CERT_V2,
             HOST_DEVICE_CERT_V1,
             SESSION_ATTESTATION_V1,
+            HOST_SESSION_ATTESTATION_V1,
         ];
         for i in 0..tags.len() {
             for j in 0..tags.len() {

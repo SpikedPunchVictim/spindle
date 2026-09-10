@@ -1112,13 +1112,7 @@ mod tests {
     fn test_cap_issuer(root_seed: [u8; 32], op_seed: [u8; 32], now: u64) -> RootKeyCapIssuer {
         let root = RootKey::from_seed(root_seed);
         let op_signing = SigningKey::from_bytes(&op_seed);
-        let op_cert = issue_host_op_key_cert(
-            &root,
-            &op_signing.verifying_key(),
-            Fingerprint::of_parts(&[b"authorize-test:nats"]),
-            0,
-            u64::MAX / 2,
-        );
+        let op_cert = issue_host_op_key_cert(&root, &op_signing.verifying_key(), 0, u64::MAX / 2);
         RootKeyCapIssuer::new(root.public_key(), op_cert, op_signing).with_now_fn(move || now)
     }
 

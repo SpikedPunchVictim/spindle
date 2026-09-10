@@ -22,6 +22,7 @@ import {
   DeviceCertificate,
   HostDeviceCert,
   HostOpKeyCert,
+  HostSessionAttestation,
   RevocationRecord,
   SessionAttestation,
 } from "@spindle/proto";
@@ -35,6 +36,7 @@ import {
   verifyDeviceCertificate,
   verifyHostDeviceCert,
   verifyHostOpKeyCert,
+  verifyHostSessionAttestation,
   verifyRevocationRecord,
   verifySessionAttestation,
 } from "../src/artifacts.js";
@@ -49,6 +51,7 @@ import {
   parseDeviceCertificate,
   parseHostDeviceCert,
   parseHostOpKeyCert,
+  parseHostSessionAttestation,
   parseRevocationRecord,
   parseSessionAttestation,
 } from "./helpers.js";
@@ -553,6 +556,46 @@ describe("session-attestation.json", () => {
     await expectArtifactError(
       () => verifySessionAttestation(att, deviceSignPk, wrongNatsFp, att.ts),
       "SessionKeyMismatch",
+    );
+  });
+});
+
+describe("host-session-attestation.json", () => {
+  const doc = loadSignedVectorFile("host-session-attestation.json");
+  const hostOpPk = hexToBytes(doc.signer.public_key_hex);
+
+  for (const c of doc.cases) {
+    it(`${c.name}: signing input matches`, () => {
+      const att = parseHostSessionAttestation(c.decoded);
+      expect(bytesToHex(HostSessionAttestation.signingInput(att))).toBe(c.signing_input_hex);
+    });
+
+    it(`${c.name}: verifyHostSessionAttestation(now=ts) is ${c.signature_valid ? "ok" : "BadSignature"}`, async () => {
+      const att = parseHostSessionAttestation(c.decoded);
+      if (c.signature_valid) {
+        await expect(
+          verifyHostSessionAttestation(att, hostOpPk, att.nats_fp, att.ts),
+        ).resolves.toBeUndefined();
+      } else {
+        await expectArtifactError(
+          () => verifyHostSessionAttestation(att, hostOpPk, att.nats_fp, att.ts),
+          "BadSignature",
+        );
+      }
+    });
+  }
+
+  // ---- td-0bcab4 binding check: a well-signed attestation naming a different session key must
+  // never verify, even against its own genuine signer (mirrors session-attestation.test.ts's
+  // hand-fixture coverage of the same check, here run against the golden `valid` vector). ----
+  it("rejects the valid case's own attestation when expectedNatsFp names a different session key", async () => {
+    const valid = doc.cases.find((c: { name: string }) => c.name === "valid");
+    const att = parseHostSessionAttestation(valid.decoded);
+    const wrongNatsFp = new Uint8Array(att.nats_fp);
+    wrongNatsFp[0] ^= 0xff;
+    await expectArtifactError(
+      () => verifyHostSessionAttestation(att, hostOpPk, wrongNatsFp, att.ts),
+      "HostSessionKeyMismatch",
     );
   });
 });

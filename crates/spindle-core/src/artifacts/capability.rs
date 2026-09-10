@@ -118,13 +118,7 @@ mod tests {
     fn test_host(root_seed: [u8; 32], op_seed: [u8; 32], op_cert_exp: u64) -> TestHost {
         let root = RootKey::from_seed(root_seed);
         let op_signer = SigningKey::from_bytes(&op_seed);
-        let op_cert = issue_host_op_key_cert(
-            &root,
-            &op_signer.verifying_key(),
-            Fingerprint::of_parts(&[b"capability-test:nats"]),
-            0,
-            op_cert_exp,
-        );
+        let op_cert = issue_host_op_key_cert(&root, &op_signer.verifying_key(), 0, op_cert_exp);
         TestHost {
             root,
             op_signer,

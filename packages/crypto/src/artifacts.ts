@@ -14,6 +14,7 @@
 // | AdmissionToken | operator admission key |
 // | AdminCommand | operator admission key (`verifyAdminCommand` also takes the operator identity it binds to — `expectedSignerFp` — as a required argument, td-0bcab4) |
 // | SessionAttestation | device identity key (`verifySessionAttestation` likewise takes the value it binds — the connecting session's `nats_fp` — as a required argument rather than checking only a signature, td-0bcab4) |
+// | HostSessionAttestation | host operating key (`verifyHostSessionAttestation` likewise requires the connecting session's `nats_fp` as an argument, td-583db5 — the host-side mirror of `SessionAttestation`, added v0.9.31 to give `HostOpKeyCert`'s per-connect binding the same required-argument shape; `HostOpKeyCert` itself is issuance-chain only as of v0.9.31) |
 //
 // This module never reads a system clock: every time check takes a caller-supplied `now: bigint`
 // (Unix seconds), consistent with DESIGN.md §A7 ("clients compute an offset" from helper server
@@ -28,6 +29,7 @@ import {
   DeviceCertificate,
   HostDeviceCert,
   HostOpKeyCert,
+  HostSessionAttestation,
   RevocationRecord,
   SessionAttestation,
 } from "@spindle/proto";
@@ -47,6 +49,10 @@ export const ADMIN_COMMAND_CLOCK_SKEW_SECS = 120n;
 /** A7b time rule for `SessionAttestation`: `ts` ±2 min against helper server time. */
 export const SESSION_ATTESTATION_CLOCK_SKEW_SECS = 120n;
 
+/** A7b time rule for `HostSessionAttestation`: `ts` ±2 min against helper server time, the same
+ * window as its device-side twin, `SESSION_ATTESTATION_CLOCK_SKEW_SECS`. */
+export const HOST_SESSION_ATTESTATION_CLOCK_SKEW_SECS = 120n;
+
 /** Errors from verifying any A7b signed artifact in this module (DESIGN.md §A7b). Every `verify*`
  * function fails closed on the first check it fails — never silently. Mirrors `spindle-core`'s
  * `ArtifactError` enum. */
@@ -63,6 +69,7 @@ export type ArtifactErrorKind =
   | "UnsupportedAlgId"
   | "VersionTooLow"
   | "SessionKeyMismatch"
+  | "HostSessionKeyMismatch"
   | "SignerFingerprintMismatch";
 
 export class ArtifactError extends Error {
@@ -133,6 +140,12 @@ export class ArtifactError extends Error {
     return new ArtifactError(
       "SessionKeyMismatch",
       "session attestation does not name the connecting session key",
+    );
+  }
+  static hostSessionKeyMismatch(): ArtifactError {
+    return new ArtifactError(
+      "HostSessionKeyMismatch",
+      "host session attestation does not name the connecting session key",
     );
   }
   static signerFingerprintMismatch(): ArtifactError {
@@ -533,6 +546,66 @@ export async function verifySessionAttestation(
     deviceSignPk,
     SessionAttestation.signingInput(attestation),
     attestation.sig_device,
+    opts?.backend,
+  );
+}
+
+/** Verifies a host session attestation: `sig_op(nats_fp, ts)` (DESIGN.md §A4 step 3, §A7b, added
+ * v0.9.31, td-583db5) — the per-connect binding by which a host's **operating** key authorizes
+ * exactly one NATS session nkey. The host-side mirror of `verifySessionAttestation` above: A7b
+ * properties: signer = the host operating key (`hostOpPk`, the same key certified in the host's
+ * own `HostOpKeyCert.host_op_pk`); time rule = `ts` checked ±2 min against the caller-supplied
+ * `now` (`HOST_SESSION_ATTESTATION_CLOCK_SKEW_SECS`); replay rule = n/a — the artifact is inert
+ * without the nkey secret it names, whose possession the callout proves separately via the
+ * server-nonce signature. There is no `exp` field on this artifact; the `ts` skew window is its
+ * sole time bound.
+ *
+ * **`expectedNatsFp` is a required argument, deliberately and non-negotiably.** This artifact
+ * exists because of td-583db5: the field it replaces, `HostOpKeyCert.nats_fp`, *was* compared
+ * against the connecting session, but by exactly one manual comparison at exactly one call site
+ * (`spindle-helper`'s `authz::decide_host_connect`), whose own comment noted that no other caller
+ * did the same check — one level less protected than the device path above, where the binding is
+ * a required argument no caller can omit rather than one function's discipline. A
+ * `verifyHostSessionAttestation` that resolved for a well-signed attestation naming somebody
+ * else's session key would be strictly worse than that one manual comparison, not merely no
+ * better. There is no valid caller that wants the signature checked without the binding, so this
+ * API does not offer one.
+ *
+ * Checks run cheap-structural-before-crypto (§A6), in this order:
+ * 1. `expectedNatsFp` matches `attestation.nats_fp` — the binding check td-583db5 exists for, run
+ *    first because it is both the cheapest possible rejection and the one this function exists to
+ *    enforce. Both sides must be exactly 32 bytes (`fingerprintsMatch`, not bare `bytesEqual`):
+ *    `bytesEqual([], [])` is vacuously `true`, so an unguarded comparison would let a well-signed
+ *    attestation naming an empty `nats_fp` "verify" against a caller that (by bug or omission)
+ *    also passes an empty `expectedNatsFp` — the binding check running and passing having bound
+ *    nothing. Rust's `expected_nats_fp: &Fingerprint` gets this for free from the `Fingerprint`
+ *    newtype (always exactly 32 bytes); this length check is what gives the TS twin the same
+ *    guarantee — a required-argument API shape does not survive the language boundary on its own.
+ * 2. Clock skew: `|now - attestation.ts| <= 2 min`, via the same `checkSkew` idiom
+ *    `verifySessionAttestation` uses.
+ * 3. `hostOpPk` parses as a valid Ed25519 public key, and `sig_op` verifies over
+ *    `HostSessionAttestation.signingInput(attestation)`. */
+export async function verifyHostSessionAttestation(
+  attestation: HostSessionAttestation,
+  hostOpPk: Uint8Array,
+  expectedNatsFp: Uint8Array,
+  now: bigint,
+  opts?: BackendOption,
+): Promise<void> {
+  // 1. nats_fp binding — the check this artifact exists for (td-583db5). Must run before any
+  // crypto work, per §A6, and before the skew check too: naming the wrong session key is a
+  // structural mismatch, cheaper to reject than either the timestamp or the signature.
+  if (!fingerprintsMatch(expectedNatsFp, attestation.nats_fp)) throw ArtifactError.hostSessionKeyMismatch();
+
+  // 2. Clock skew.
+  checkSkew(now, attestation.ts, HOST_SESSION_ATTESTATION_CLOCK_SKEW_SECS);
+
+  // 3. Signature, under the host's own operating key.
+  requireEd25519PublicKey(hostOpPk);
+  await verifySigOrThrow(
+    hostOpPk,
+    HostSessionAttestation.signingInput(attestation),
+    attestation.sig_op,
     opts?.backend,
   );
 }

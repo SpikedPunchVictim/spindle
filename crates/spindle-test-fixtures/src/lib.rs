@@ -27,12 +27,13 @@ pub mod fixtures {
     use base64::Engine as _;
     use spindle_core::artifacts::{
         issue_capability, issue_device_certificate, issue_host_op_key_cert,
-        issue_session_attestation,
+        issue_host_session_attestation, issue_session_attestation,
     };
     use spindle_core::identity::{DeviceKey, RootKey};
     use spindle_core::{Fingerprint, SigningKey};
     use spindle_proto::artifacts::{
-        CapKind, Capability, DeviceCertificate, HostOpKeyCert, SessionAttestation,
+        CapKind, Capability, DeviceCertificate, HostOpKeyCert, HostSessionAttestation,
+        SessionAttestation,
     };
     use spindle_proto::canonical::CborValue;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -136,37 +137,33 @@ pub mod fixtures {
             }
         }
 
-        pub fn op_key_cert(&self, nats_fp: Fingerprint, ts: u64, exp: u64) -> HostOpKeyCert {
-            issue_host_op_key_cert(
-                &self.root,
-                &self.op_signing.verifying_key(),
-                nats_fp,
-                ts,
-                exp,
-            )
+        pub fn op_key_cert(&self, ts: u64, exp: u64) -> HostOpKeyCert {
+            issue_host_op_key_cert(&self.root, &self.op_signing.verifying_key(), ts, exp)
+        }
+
+        /// The §A4-step-3 artifact (v0.9.31, td-583db5) that binds this host's **operating** key
+        /// to one connecting session nkey's `nats_fp`. This is the host-side mirror of
+        /// [`DeviceIdentity::session_attestation`]: `HostOpKeyCert` is the issuance chain only
+        /// (no session binding at all), and a caller mints one of these per session, over that
+        /// session's own `nats_fp`, and presents it alongside the op-key cert.
+        pub fn session_attestation(&self, nats_fp: Fingerprint, ts: u64) -> HostSessionAttestation {
+            issue_host_session_attestation(&self.op_signing, nats_fp, ts)
         }
 
         /// The `op_cert` a capability embeds (decision A10.30 — a capability chains root ->
-        /// operating key -> capability). Built fresh per call with a dummy `nats_fp` and a
-        /// never-expiring `exp`: this is an issuance-time cert, not the one the host presents on
-        /// its own CONNECT.
+        /// operating key -> capability). Built fresh per call with a never-expiring `exp`: this is
+        /// an issuance-time cert, not the one the host presents on its own CONNECT.
         ///
         /// `pub` (rather than private, as this started) so a live test can build a real
         /// `spindle_host_core::RootKeyCapIssuer` from this same fixture (td-c74122 slice D):
         /// `RootKeyCapIssuer::new` needs exactly this op cert, this struct's own `root.public_key()`,
-        /// and its already-`pub` `op_signing` field — `verify_capability` never inspects an op
-        /// cert's `nats_fp` (it only checks that the cert decodes, chains to `host_root_pk`, and
-        /// has not expired — see `spindle_core::artifacts::capability::verify_capability`), so the
-        /// same dummy-`nats_fp` cert [`Self::member_capability`] already builds for itself is
-        /// exactly the right thing for an issuer to use too, not a distinct fixture-only shape.
+        /// and its already-`pub` `op_signing` field. `HostOpKeyCert` no longer carries a `nats_fp`
+        /// at all (td-583db5 moved the per-connect NATS binding to `HostSessionAttestation`), so
+        /// there is no dummy session-binding value to explain here any more: the issuance chain and
+        /// the session a host actually presents on are two different artifacts now, not one cert
+        /// pressed into both roles.
         pub fn capability_op_cert(&self) -> HostOpKeyCert {
-            issue_host_op_key_cert(
-                &self.root,
-                &self.op_signing.verifying_key(),
-                Fingerprint::of_parts(&[b"spindle-net:live_signaling:capability-op-cert"]),
-                0,
-                u64::MAX,
-            )
+            issue_host_op_key_cert(&self.root, &self.op_signing.verifying_key(), 0, u64::MAX)
         }
 
         /// A `member` capability for `subject` (a device's `root_fp`) — what earns a client
@@ -230,7 +227,15 @@ pub mod fixtures {
     /// The host CONNECT `auth_token`, byte-compatible with
     /// `spindle_helper::auth_token::decode_auth_token`'s `kind: "host"` arm. No admission token:
     /// the composed stack runs `ADMISSION_MODE=open`.
-    pub fn host_auth_token(host_root_pk_bytes: &[u8; 32], host_op_cert: &HostOpKeyCert) -> String {
+    ///
+    /// `session_attest` (added v0.9.31, td-583db5 §A4 step 3) is required — see
+    /// `spindle_helper::auth_token`'s module doc for why this field, unlike `admission_token`, has
+    /// no "absent" case.
+    pub fn host_auth_token(
+        host_root_pk_bytes: &[u8; 32],
+        host_op_cert: &HostOpKeyCert,
+        session_attest: &HostSessionAttestation,
+    ) -> String {
         let env = CborValue::map(vec![
             ("kind", CborValue::text("host")),
             (
@@ -240,6 +245,10 @@ pub mod fixtures {
             (
                 "host_op_cert",
                 CborValue::bytes(host_op_cert.to_canonical_bytes()),
+            ),
+            (
+                "session_attest",
+                CborValue::bytes(session_attest.to_canonical_bytes()),
             ),
         ]);
         b64url(&spindle_proto::canonical_encode(&env))
@@ -332,7 +341,9 @@ pub async fn connect_device(
 }
 
 /// Connects a host to the live stack through the real Auth Callout (operating-key certificate,
-/// `ADMISSION_MODE=open`, so no admission token).
+/// a [`spindle_proto::artifacts::HostSessionAttestation`] binding that key's `nats_fp` to the
+/// host's own operating key (§A4 step 3, td-583db5), `ADMISSION_MODE=open`, so no admission
+/// token).
 pub async fn connect_host(
     url: &str,
     host: &HostRootIdentity,
@@ -340,8 +351,11 @@ pub async fn connect_host(
 ) -> (async_nats::Client, EventLog) {
     let session = nkeys::KeyPair::new_user();
     let nats_fp = fixtures::nats_fp_of_nkey(&session.public_key());
-    let cert = host.op_key_cert(nats_fp, fixtures::now(), exp);
-    let token = fixtures::host_auth_token(&host.root.public_key().to_bytes(), &cert);
+    let ts = fixtures::now();
+    let cert = host.op_key_cert(ts, exp);
+    let session_attest = host.session_attestation(nats_fp, ts);
+    let token =
+        fixtures::host_auth_token(&host.root.public_key().to_bytes(), &cert, &session_attest);
     let (opts, events) = base_opts();
     let client = opts
         .nkey(session.seed().expect("session nkey seed"))

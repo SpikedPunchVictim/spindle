@@ -31,7 +31,8 @@
 use spindle_core::artifacts::ArtifactError;
 use spindle_core::{root_fp_of, Fingerprint, VerifyingKey};
 use spindle_proto::artifacts::{
-    AdmissionToken, CapKind, Capability, DeviceCertificate, HostOpKeyCert, SessionAttestation,
+    AdmissionToken, CapKind, Capability, DeviceCertificate, HostOpKeyCert, HostSessionAttestation,
+    SessionAttestation,
 };
 
 use crate::permissions::{self, Limits, SubjectPermissions};
@@ -104,16 +105,16 @@ pub enum RefusalReason {
     /// [`spindle_core::artifacts::verify_session_attestation`] (or the cheap pre-check in
     /// [`decide_device_connect`]) can fail: a mismatched `nats_fp`, a `ts` outside the skew
     /// window, or a bad `sig_device`. This mirrors [`RefusalReason::BadDeviceCertificate`] and
-    /// [`RefusalReason::BadHostSignature`] above/below — not [`RefusalReason::HostCertificateSessionMismatch`],
-    /// which *is* split from `BadHostSignature` because it is a distinct check at a distinct point
-    /// (a cheap field comparison, run before the crypto). Here, both call sites (cheap pre-check
-    /// and authoritative verification) test the *same* fact — does this session_attest bind to
-    /// this session — so collapsing them to one reason isn't losing information a caller needs;
-    /// it's declining to hand a would-be attacker a way to distinguish "wrong session key" from
-    /// "bad signature" from a refused connection, when every `Refused` variant collapses to the
-    /// same [`UNIFORM_REFUSAL_MESSAGE`] on the wire anyway (§A5 uniform silent drops) — the
-    /// distinction would only ever be observable through timing or side channels this module's
-    /// ordering discipline already exists to close off.
+    /// [`RefusalReason::BadHostSignature`] above/below, and — since v0.9.31/td-583db5 —
+    /// [`RefusalReason::BadHostSessionAttestation`] too: the host path is now structurally
+    /// symmetric with this one, a cheap pre-check and an authoritative verification that both test
+    /// the *same* fact (does this session_attest bind to this session), collapsed to a single
+    /// reason for the identical rationale given there. Collapsing either pair to one reason isn't
+    /// losing information a caller needs; it's declining to hand a would-be attacker a way to
+    /// distinguish "wrong session key" from "bad signature" from a refused connection, when every
+    /// `Refused` variant collapses to the same [`UNIFORM_REFUSAL_MESSAGE`] on the wire anyway (§A5
+    /// uniform silent drops) — the distinction would only ever be observable through timing or
+    /// side channels this module's ordering discipline already exists to close off.
     #[error("device session attestation is missing, malformed, or names a different session key")]
     BadSessionAttestation,
     #[error("no presented capability's subject matches the presenting identity root")]
@@ -126,8 +127,18 @@ pub enum RefusalReason {
     BadCapabilitySignature,
     #[error("host operating-key certificate expired")]
     HostCertificateExpired,
-    #[error("host operating-key certificate is bound to a different session key")]
-    HostCertificateSessionMismatch,
+    /// v0.9.31 (td-583db5). A **single** reason covers every way
+    /// [`spindle_core::artifacts::verify_host_session_attestation`] (or the cheap pre-check in
+    /// [`decide_host_connect`]) can fail: a mismatched `nats_fp`, a `ts` outside the skew window,
+    /// or a bad `sig_op`. This mirrors [`RefusalReason::BadSessionAttestation`] above — the two
+    /// paths are symmetric: both call sites (cheap pre-check and authoritative verification) test
+    /// the *same* fact — does this session_attest bind to this session — so collapsing them to one
+    /// reason isn't losing information a caller needs; it's declining to hand a would-be attacker
+    /// a way to distinguish "wrong session key" from "bad signature" from a refused connection,
+    /// when every `Refused` variant collapses to the same [`UNIFORM_REFUSAL_MESSAGE`] on the wire
+    /// anyway (§A5 uniform silent drops).
+    #[error("host session attestation is missing, malformed, or names a different session key")]
+    BadHostSessionAttestation,
     #[error("host operating-key certificate signature invalid")]
     BadHostSignature,
     #[error("admission mode is invite-only and no admission token was presented")]
@@ -568,6 +579,14 @@ pub fn decide_device_connect(
 pub struct HostConnectPresented {
     pub host_root_pk: VerifyingKey,
     pub host_op_cert: HostOpKeyCert,
+    /// v0.9.31 (td-583db5): `sig_op(nats_fp, ts)`, proving the host's own **operating** key — not
+    /// just whichever nkey happens to be presenting — authorized this session. `HostOpKeyCert`
+    /// used to carry its own `nats_fp` field for this purpose, but that field was enforced by
+    /// exactly one manual comparison at one call site (the td-0bcab4 defect class); td-583db5
+    /// domain-separates the issuance chain (`HostOpKeyCert`, no `nats_fp`) from this per-connect
+    /// binding, mirroring [`DeviceConnectPresented::session_attest`]. See
+    /// [`decide_host_connect`]'s two check sites for how this is enforced.
+    pub session_attest: HostSessionAttestation,
     /// Present only on a host's first connection under `invite` admission mode.
     pub admission_token: Option<AdmissionToken>,
     pub nats_fp: Fingerprint,
@@ -592,18 +611,19 @@ pub fn decide_host_connect(
         return AuthzDecision::Refused(RefusalReason::HostCertificateExpired);
     }
 
-    // The cert's own `nats_fp` is the *entire* mechanism binding a root-signed host cert to one
-    // NATS session (DESIGN.md:286 "signs its operating key (sig_host_root(host_op_pk, nats_fp,
-    // ts))"; DESIGN.md:349 "a host connection presents sig_host_root(host_op_pk, nats_fp, ts)").
-    // `verify_host_op_key_cert` below checks chain-to-root, signature and `exp` — it does not
-    // compare `nats_fp` against the session that is actually presenting, and no other caller does
-    // either. Without this comparison, the never-expiring op cert embedded in every member
-    // `Capability` (DESIGN.md:306) authorizes a CONNECT from any nkey at all: `verify_nkey_sig`
-    // only proves possession of whichever nkey is presenting, not that it is the one the cert was
-    // issued for (td-0bcab4). This belongs among the cheap checks, not the crypto below — it's a
-    // byte comparison, and the file orders cheap-before-crypto (see the ordering tests below).
-    if !presented.nats_fp.matches(&presented.host_op_cert.nats_fp) {
-        return AuthzDecision::Refused(RefusalReason::HostCertificateSessionMismatch);
+    // A cheap early rejection, not the authoritative check — that's the authoritative check below,
+    // after `verify_host_op_key_cert` succeeds. This is a byte comparison against the
+    // caller-supplied `nats_fp` (derived from whichever nkey is presenting, before any crypto has
+    // run), so a stolen `{host_root_pk, host_op_cert, session_attest}` bundle replayed from an
+    // attacker's own nkey gets refused here rather than costing the callout two Ed25519
+    // verifications (`verify_nkey_sig` plus `verify_host_session_attestation`) first (DESIGN.md
+    // §A12 #24; see the module docs' "Ordering" section and this file's `Cell`-counter ordering
+    // tests). It is deliberately redundant with the authoritative check: a self-consistent forged
+    // bundle could in principle carry a `session_attest.nats_fp` that matches `presented.nats_fp`
+    // while everything else is garbage, so this alone proves nothing — only that the cheap case
+    // can be dismissed without paying for crypto.
+    if !presented.nats_fp.matches(&presented.session_attest.nats_fp) {
+        return AuthzDecision::Refused(RefusalReason::BadHostSessionAttestation);
     }
 
     // 2. Cheap hash.
@@ -645,6 +665,33 @@ pub fn decide_host_connect(
     .is_err()
     {
         return AuthzDecision::Refused(RefusalReason::BadHostSignature);
+    }
+
+    // The authoritative session-binding check (v0.9.31, td-583db5) — and it must sit exactly
+    // here, after `verify_host_op_key_cert` has succeeded and before any admission/quota work is
+    // trusted. `presented.host_op_cert.host_op_pk` is only trustworthy once the certificate
+    // carrying it has been verified against the pinned host root above: verifying
+    // `session_attest` against an *unverified* cert's `host_op_pk` would let an attacker present a
+    // self-made cert naming their own key and satisfy the attestation with a signature they
+    // produced themselves — checking a signature against a key the attacker chose proves nothing.
+    // The cheap comparison above is not a substitute for this: it only ever inspects field bytes,
+    // never a signature.
+    let Ok(host_op_pk_bytes) = <[u8; 32]>::try_from(presented.host_op_cert.host_op_pk.as_slice())
+    else {
+        return AuthzDecision::Refused(RefusalReason::BadHostSessionAttestation);
+    };
+    let Some(host_op_pk) = spindle_core::checked_verifying_key(&host_op_pk_bytes) else {
+        return AuthzDecision::Refused(RefusalReason::BadHostSessionAttestation);
+    };
+    if spindle_core::artifacts::verify_host_session_attestation(
+        &presented.session_attest,
+        &host_op_pk,
+        &presented.nats_fp,
+        now,
+    )
+    .is_err()
+    {
+        return AuthzDecision::Refused(RefusalReason::BadHostSessionAttestation);
     }
 
     let quota_profile = match outcome {
@@ -699,7 +746,7 @@ mod tests {
     use super::*;
     use spindle_core::artifacts::{
         issue_admission_token, issue_capability, issue_device_certificate, issue_host_op_key_cert,
-        issue_session_attestation,
+        issue_host_session_attestation, issue_session_attestation,
     };
     use spindle_core::identity::{DeviceKey, RootKey};
     use spindle_core::SigningKey;
@@ -844,13 +891,7 @@ mod tests {
     fn test_host(root_seed: [u8; 32], op_seed: [u8; 32]) -> TestHost {
         let root = RootKey::from_seed(root_seed);
         let op_signer = SigningKey::from_bytes(&op_seed);
-        let op_cert = issue_host_op_key_cert(
-            &root,
-            &op_signer.verifying_key(),
-            fp(b"authz-test:op-cert-nats"),
-            0,
-            u64::MAX,
-        );
+        let op_cert = issue_host_op_key_cert(&root, &op_signer.verifying_key(), 0, u64::MAX);
         let host_fp = root.root_fp();
         TestHost {
             root,
@@ -1281,7 +1322,7 @@ mod tests {
     /// Mirrors `host_op_cert_session_mismatch_is_refused_before_any_signature_work` — the cheap
     /// pre-check (i) in `decide_device_connect` must refuse a mismatched `session_attest.nats_fp`
     /// without ever calling `verify_nkey_sig`, exactly like the host half's ordering test proves
-    /// for `HostCertificateSessionMismatch` (DESIGN.md §A12 #24; see the module docs' "Ordering"
+    /// for `BadHostSessionAttestation` (DESIGN.md §A12 #24; see the module docs' "Ordering"
     /// section).
     #[test]
     fn device_session_mismatch_is_refused_before_any_signature_work() {
@@ -1324,25 +1365,43 @@ mod tests {
 
     // ---- decide_host_connect --------------------------------------------------------------
 
-    /// `session_fp` is the `nats_fp` the returned cert is issued for — callers must present the
-    /// same fingerprint in `HostConnectPresented.nats_fp` (td-0bcab4: `decide_host_connect` now
-    /// enforces that the two match).
-    fn host_setup(session_fp: Fingerprint) -> (RootKey, SigningKey, HostOpKeyCert, Fingerprint) {
+    /// `session_fp` is the `nats_fp` the returned [`HostSessionAttestation`] is issued for —
+    /// callers must present that same fingerprint in `HostConnectPresented.nats_fp` (v0.9.31,
+    /// td-583db5: `decide_host_connect` enforces that the two match). Mirrors `device_setup`
+    /// above, and exists for the identical reason: `HostOpKeyCert` no longer carries a `nats_fp`
+    /// of its own to (mis)match against — the binding now lives entirely in the attestation this
+    /// helper builds separately.
+    fn host_setup(
+        session_fp: Fingerprint,
+    ) -> (
+        RootKey,
+        SigningKey,
+        HostOpKeyCert,
+        HostSessionAttestation,
+        Fingerprint,
+    ) {
         let host_root = RootKey::from_seed([0x51; 32]);
         let op_signing = SigningKey::from_bytes(&[0x52; 32]);
         let op_pk = op_signing.verifying_key();
-        let cert = issue_host_op_key_cert(&host_root, &op_pk, session_fp, 1_000, 2_000_000);
+        let cert = issue_host_op_key_cert(&host_root, &op_pk, 1_000, 2_000_000);
+        // ts=1_500 matches every caller's `now` argument to `decide_host_connect` below — the
+        // attestation's own clock-skew window (±120s, `HOST_SESSION_ATTESTATION_CLOCK_SKEW_SECS`)
+        // is a property of `verify_host_session_attestation` itself (already covered by that
+        // function's own unit tests in spindle-core), not something this file's tests need to
+        // re-prove.
+        let session_attest = issue_host_session_attestation(&op_signing, session_fp, 1_500);
         let host_fp = host_root.root_fp();
-        (host_root, op_signing, cert, host_fp)
+        (host_root, op_signing, cert, session_attest, host_fp)
     }
 
     #[test]
     fn host_with_valid_cert_but_no_admission_record_in_invite_mode_is_refused() {
         let session_fp = fp(b"host-session");
-        let (host_root, _op, cert, _hfp) = host_setup(session_fp);
+        let (host_root, _op, cert, attest, _hfp) = host_setup(session_fp);
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
+            session_attest: attest,
             admission_token: None,
             nats_fp: session_fp,
         };
@@ -1360,10 +1419,11 @@ mod tests {
     #[test]
     fn host_admission_closed_refuses_new_hosts_but_not_existing_ones() {
         let session_fp = fp(b"host-session");
-        let (host_root, _op, cert, host_fp) = host_setup(session_fp);
+        let (host_root, _op, cert, attest, host_fp) = host_setup(session_fp);
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert.clone(),
+            session_attest: attest.clone(),
             admission_token: None,
             nats_fp: session_fp,
         };
@@ -1391,6 +1451,7 @@ mod tests {
         let presented2 = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
+            session_attest: attest,
             admission_token: None,
             nats_fp: session_fp,
         };
@@ -1404,10 +1465,11 @@ mod tests {
     #[test]
     fn host_admission_open_mode_cert_alone_suffices() {
         let session_fp = fp(b"host-session");
-        let (host_root, _op, cert, _hfp) = host_setup(session_fp);
+        let (host_root, _op, cert, attest, _hfp) = host_setup(session_fp);
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
+            session_attest: attest,
             admission_token: None,
             nats_fp: session_fp,
         };
@@ -1422,10 +1484,11 @@ mod tests {
     #[test]
     fn host_admission_closed_refuses_before_any_signature_work() {
         let session_fp = fp(b"host-session");
-        let (host_root, _op, cert, _hfp) = host_setup(session_fp);
+        let (host_root, _op, cert, attest, _hfp) = host_setup(session_fp);
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
+            session_attest: attest,
             admission_token: None,
             nats_fp: session_fp,
         };
@@ -1454,7 +1517,7 @@ mod tests {
     #[test]
     fn host_with_valid_admission_token_is_authorized_and_token_burned_exactly_once() {
         let session_fp = fp(b"host-session");
-        let (host_root, _op, cert, host_fp) = host_setup(session_fp);
+        let (host_root, _op, cert, attest, host_fp) = host_setup(session_fp);
         let operator = SigningKey::from_bytes(&[0x61; 32]);
         let token = issue_admission_token(
             &operator,
@@ -1472,6 +1535,7 @@ mod tests {
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert.clone(),
+            session_attest: attest.clone(),
             admission_token: Some(token.clone()),
             nats_fp: session_fp,
         };
@@ -1494,6 +1558,7 @@ mod tests {
         let presented_again = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
+            session_attest: attest,
             admission_token: Some(token),
             nats_fp: session_fp,
         };
@@ -1552,10 +1617,11 @@ mod tests {
     #[test]
     fn host_cert_expired_is_refused() {
         let session_fp = fp(b"host-session");
-        let (host_root, _op, cert, _hfp) = host_setup(session_fp);
+        let (host_root, _op, cert, attest, _hfp) = host_setup(session_fp);
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
+            session_attest: attest,
             admission_token: None,
             nats_fp: session_fp,
         };
@@ -1567,21 +1633,25 @@ mod tests {
         );
     }
 
-    /// td-0bcab4, live-reproduced by
-    /// `live_capability_op_cert_must_not_authorize_a_host_connect`
-    /// (crates/spindle-net/tests/live_signaling.rs): a host op-key cert's own `nats_fp` is the
-    /// entire mechanism binding a root-signed cert to one NATS session (DESIGN.md:286, :349). A
-    /// cert issued for one session fingerprint, presented alongside a *different* session's
-    /// fingerprint, must be refused — even for an already-admitted host, so the refusal cannot be
-    /// attributed to admission rather than the session binding.
+    /// v0.9.31/td-583db5, the host-side twin of
+    /// `device_bundle_presented_from_a_different_nkey_is_refused`:
+    /// `HostSessionAttestation.nats_fp` is now the entire mechanism binding a root-signed host
+    /// cert's operating key to one NATS session (DESIGN.md v0.9.31, §A4 step 3).
+    /// An attestation issued for one session fingerprint, presented alongside a *different*
+    /// session's fingerprint, must be refused — even for an already-admitted host, so the refusal
+    /// cannot be attributed to admission rather than the session binding. (Previously this was
+    /// `HostOpKeyCert`'s own `nats_fp` field and `RefusalReason::HostCertificateSessionMismatch`;
+    /// td-583db5 moved the binding into `HostSessionAttestation` and this refusal into
+    /// `RefusalReason::BadHostSessionAttestation` — see that variant's doc comment.)
     #[test]
-    fn host_op_cert_bound_to_a_different_nkey_is_refused() {
+    fn host_session_attestation_for_a_different_nkey_is_refused() {
         let issued_for = fp(b"host-session");
-        let (host_root, _op, cert, host_fp) = host_setup(issued_for);
+        let (host_root, _op, cert, attest, host_fp) = host_setup(issued_for);
         let presented_fp = fp(b"host-session-attacker");
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
+            session_attest: attest,
             admission_token: None,
             nats_fp: presented_fp,
         };
@@ -1598,18 +1668,23 @@ mod tests {
         let decision = decide_host_connect(&presented, || true, 1_500, &mut view, 0);
         assert_eq!(
             decision,
-            AuthzDecision::Refused(RefusalReason::HostCertificateSessionMismatch)
+            AuthzDecision::Refused(RefusalReason::BadHostSessionAttestation)
         );
     }
 
+    /// Mirrors `device_session_mismatch_is_refused_before_any_signature_work` — the cheap
+    /// pre-check in `decide_host_connect` must refuse a mismatched `session_attest.nats_fp`
+    /// without ever calling `verify_nkey_sig`, for `BadHostSessionAttestation` (DESIGN.md §A12
+    /// #24; see the module docs' "Ordering" section).
     #[test]
     fn host_op_cert_session_mismatch_is_refused_before_any_signature_work() {
         let issued_for = fp(b"host-session");
-        let (host_root, _op, cert, host_fp) = host_setup(issued_for);
+        let (host_root, _op, cert, attest, host_fp) = host_setup(issued_for);
         let presented_fp = fp(b"host-session-attacker");
         let presented = HostConnectPresented {
             host_root_pk: host_root.public_key(),
             host_op_cert: cert,
+            session_attest: attest,
             admission_token: None,
             nats_fp: presented_fp,
         };
@@ -1636,13 +1711,56 @@ mod tests {
         );
         assert_eq!(
             decision,
-            AuthzDecision::Refused(RefusalReason::HostCertificateSessionMismatch)
+            AuthzDecision::Refused(RefusalReason::BadHostSessionAttestation)
         );
         assert_eq!(
             nkey_calls.get(),
             0,
             "the nkey signature must never be checked when the session-mismatch check already \
              refuses"
+        );
+    }
+
+    /// This is the test that would fail if someone later "optimized away" the Ed25519 verification
+    /// in the authoritative check and kept only the cheap `nats_fp` comparison above it: the
+    /// attestation here *does* name the connecting session key, so the cheap check alone would
+    /// wave it through. The signature, however, was produced by a different operating key than the
+    /// one `host_op_cert` (and its `host_op_pk`) actually names — so only the authoritative check
+    /// in `decide_host_connect`, which verifies `sig_op` under the certificate's own (now
+    /// cert-verified) `host_op_pk`, can catch this. Mirrors
+    /// `device_session_attestation_with_wrong_device_signature_is_refused`.
+    #[test]
+    fn host_session_attestation_with_wrong_op_key_signature_is_refused() {
+        let session_fp = fp(b"host-session");
+        let (host_root, _op, cert, _genuine_attest, host_fp) = host_setup(session_fp);
+        // A different operating key signs an attestation naming the *correct* nats_fp — the
+        // binding field matches, but the signature does not belong to the key the certificate
+        // names.
+        let attacker_op = SigningKey::from_bytes(&[0x99; 32]);
+        // ts=1_500 matches `now` below so this test fails on the signature check specifically,
+        // not incidentally on clock skew.
+        let forged_attest = issue_host_session_attestation(&attacker_op, session_fp, 1_500);
+        let presented = HostConnectPresented {
+            host_root_pk: host_root.public_key(),
+            host_op_cert: cert,
+            session_attest: forged_attest,
+            admission_token: None,
+            nats_fp: session_fp,
+        };
+        let mut view = MockView::default();
+        view.records.insert(
+            host_fp,
+            AdmissionRecord {
+                host_fp,
+                label: "workshop-nas".to_string(),
+                admitted_at: 500,
+                quota_profile: "default".to_string(),
+            },
+        );
+        let decision = decide_host_connect(&presented, || true, 1_500, &mut view, 0);
+        assert_eq!(
+            decision,
+            AuthzDecision::Refused(RefusalReason::BadHostSessionAttestation)
         );
     }
 
@@ -1692,7 +1810,7 @@ mod tests {
             BadNkeySignature,
             BadCapabilitySignature,
             HostCertificateExpired,
-            HostCertificateSessionMismatch,
+            BadHostSessionAttestation,
             BadHostSignature,
             NoAdmissionRecord,
             AdmissionClosed,

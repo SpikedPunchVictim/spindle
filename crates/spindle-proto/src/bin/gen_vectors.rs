@@ -13,7 +13,7 @@
 
 use spindle_proto::artifacts::{
     AdminCommand, AdmissionToken, CapKind, Capability, DeviceCertificate, Envelope, HostDeviceCert,
-    HostOpKeyCert, RevocationRecord, SessionAttestation,
+    HostOpKeyCert, HostSessionAttestation, RevocationRecord, SessionAttestation,
 };
 use spindle_proto::bootstrap::{
     BundleEntry, DeviceBootstrapBundle, BUNDLE_CURRENT_V, MAX_REGISTRY_LEN,
@@ -260,6 +260,11 @@ fn main() {
     );
     write_vector_file(
         &vectors_dir,
+        "host-session-attestation.json",
+        host_session_attestation_vectors(),
+    );
+    write_vector_file(
+        &vectors_dir,
         "host-device-cert.json",
         host_device_cert_vectors(),
     );
@@ -379,7 +384,6 @@ fn capability_vectors() -> Json {
     // the same current op cert for every capability it issues.
     let dummy_op_cert = HostOpKeyCert {
         host_op_pk: rep(0x21, 32),
-        nats_fp: rep(0x22, 32),
         ts: 1_755_907_200,
         exp: 1_763_683_200, // ts + 90 days
         sig_host_root: rep(0x23, 64),
@@ -733,14 +737,12 @@ fn admin_command_vectors() -> Json {
 fn host_op_key_cert_vectors() -> Json {
     let c1 = HostOpKeyCert {
         host_op_pk: rep(0xa1, 32),
-        nats_fp: rep(0xa2, 32),
         ts: 1_755_907_200,
         exp: 1_763_683_200, // ts + 90 days
         sig_host_root: rep(0xa3, 64),
     };
     let c2 = HostOpKeyCert {
         host_op_pk: rep(0xa4, 32), // rotated operating key
-        nats_fp: rep(0xa2, 32),    // same nats_fp across rotation
         ts: 1_763_683_200,
         exp: 1_771_459_200,
         sig_host_root: rep(0xa5, 64),
@@ -749,7 +751,6 @@ fn host_op_key_cert_vectors() -> Json {
     fn decoded(c: &HostOpKeyCert) -> Json {
         Json::Obj(vec![
             ("host_op_pk", Json::hex(&c.host_op_pk)),
-            ("nats_fp", Json::hex(&c.nats_fp)),
             ("ts", Json::UInt(c.ts)),
             ("exp", Json::UInt(c.exp)),
             ("sig_host_root", Json::hex(&c.sig_host_root)),
@@ -766,13 +767,68 @@ fn host_op_key_cert_vectors() -> Json {
         ),
         case(
             "rotated",
-            "Operating-key rotation: new host_op_pk, same nats_fp, exp window rolled forward.",
+            "Operating-key rotation: new host_op_pk, exp window rolled forward. The per-connect \
+             NATS binding this cert used to carry (`nats_fp`) is now the separate \
+             HostSessionAttestation artifact, minted fresh per session rather than rotated \
+             alongside the operating key.",
             decoded(&c2),
             &c2.to_canonical_bytes(),
             &c2.signing_input(),
         ),
     ];
-    artifact_file("HostOpKeyCert", tags::HOST_OP_KEY_CERT_V1, cases)
+    artifact_file("HostOpKeyCert", tags::HOST_OP_KEY_CERT_V2, cases)
+}
+
+// ---- HostSessionAttestation ----
+
+fn host_session_attestation_vectors() -> Json {
+    // sig_op here is structural filler, not a real Ed25519 signature — this crate has no crypto
+    // dependency (A9c boundary rule 3) and cannot produce one. Real-signature validity vectors
+    // for this artifact are `spindle-core`'s `gen-crypto-vectors` job (see module docs).
+    let a1 = HostSessionAttestation {
+        nats_fp: rep(0xd1, 32),
+        ts: 1_755_907_200,
+        sig_op: rep(0xd2, 64),
+    };
+    let a2 = HostSessionAttestation {
+        nats_fp: rep(0xd3, 32), // a different session nkey than a1's
+        ts: 1_755_907_260,
+        sig_op: rep(0xd4, 64),
+    };
+
+    fn decoded(a: &HostSessionAttestation) -> Json {
+        Json::Obj(vec![
+            ("nats_fp", Json::hex(&a.nats_fp)),
+            ("ts", Json::UInt(a.ts)),
+            ("sig_op", Json::hex(&a.sig_op)),
+        ])
+    }
+
+    let cases = vec![
+        case(
+            "freshly_issued",
+            "Host session attestation binding the host operating key to one freshly-established \
+             NATS session key (td-583db5): sig_op(nats_fp, ts).",
+            decoded(&a1),
+            &a1.to_canonical_bytes(),
+            &a1.signing_input(),
+        ),
+        case(
+            "different_session_nkey",
+            "A second attestation, same host, naming a different nats_fp: this artifact's whole \
+             purpose is being minted fresh per session (unlike HostOpKeyCert, which persists \
+             across many sessions), so two attestations from the same host legitimately differ \
+             only in which session key they name and when.",
+            decoded(&a2),
+            &a2.to_canonical_bytes(),
+            &a2.signing_input(),
+        ),
+    ];
+    artifact_file(
+        "HostSessionAttestation",
+        tags::HOST_SESSION_ATTESTATION_V1,
+        cases,
+    )
 }
 
 // ---- HostDeviceCert ----
@@ -784,7 +840,6 @@ fn host_device_cert_vectors() -> Json {
     // `sig*` field in this file uses, not a valid signature (see module docs).
     let dummy_op_cert = HostOpKeyCert {
         host_op_pk: rep(0xb1, 32),
-        nats_fp: rep(0xb2, 32),
         ts: 1_755_907_200,
         exp: 1_763_683_200, // ts + 90 days
         sig_host_root: rep(0xb3, 64),
@@ -1538,7 +1593,7 @@ fn bootstrap_vectors() -> Json {
              host count spindle-core's QR fit check is measured against for that EC level. NOTE: \
              this vector's byte size is NOT a capacity measurement — spindle-proto has no crypto \
              dependency, so its embedded caps are short dummy byte patterns, not a real embedded \
-             op_cert (185 B on its own). The real measured figure, with genuine caps, is 2228 B \
+             op_cert (143 B on its own). The real measured figure, with genuine caps, is 2060 B \
              for four entries against EC-M's 2331 B budget (see MEASURED_ENTRY_BYTES).",
             DeviceBootstrapBundle {
                 v: BUNDLE_CURRENT_V,

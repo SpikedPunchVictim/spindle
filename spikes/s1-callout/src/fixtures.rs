@@ -12,15 +12,18 @@
 //! device connection: { "kind": "device", "root_pk": bytes32, "device_cert": bytes,
 //!                       "session_attest": bytes, "caps": [bytes, ...] }
 //! host connection:   { "kind": "host", "host_root_pk": bytes32, "host_op_cert": bytes,
+//!                       "session_attest": bytes,
 //!                       "admission_token": bytes (present only if a token accompanies this connect) }
 //! ```
-//! `device_cert`/`session_attest`/`host_op_cert`/`caps[i]`/`admission_token` are each the
-//! artifact's own `to_canonical_bytes()` output re-embedded as a CBOR byte string — this only
+//! `device_cert`/`session_attest` (both arms)/`host_op_cert`/`caps[i]`/`admission_token` are each
+//! the artifact's own `to_canonical_bytes()` output re-embedded as a CBOR byte string — this only
 //! needs to be symmetric with itself (encoder and decoder live in this same crate), not
 //! compatible with any other wire format, though it happens to match
 //! `spindle_helper::auth_token`'s later, graduated envelope field-for-field. The whole envelope is
 //! canonical-CBOR-encoded, then base64url (no padding) for the CONNECT `auth_token` string,
-//! matching DESIGN.md's presentation rule.
+//! matching DESIGN.md's presentation rule. The host arm's `session_attest` (added v0.9.31,
+//! td-583db5) carries a `HostSessionAttestation` — the host-side mirror of the device arm's
+//! `SessionAttestation` — binding the host's operating key to the connecting session nkey.
 //!
 //! **[amended v0.9.29, td-0bcab4]**: this module used to note here that there was no separate
 //! "session-nkey attestation" artifact in this envelope, and that `verify_nkey_sig` — the real
@@ -40,12 +43,14 @@
 use base64::Engine;
 use nkeys::KeyPair;
 use spindle_core::artifacts::{
-    issue_capability, issue_device_certificate, issue_host_op_key_cert, issue_session_attestation,
+    issue_capability, issue_device_certificate, issue_host_op_key_cert,
+    issue_host_session_attestation, issue_session_attestation,
 };
 use spindle_core::identity::{DeviceKey, RootKey};
 use spindle_core::{root_fp_of, Fingerprint};
 use spindle_proto::artifacts::{
-    AdmissionToken, CapKind, Capability, DeviceCertificate, HostOpKeyCert, SessionAttestation,
+    AdmissionToken, CapKind, Capability, DeviceCertificate, HostOpKeyCert, HostSessionAttestation,
+    SessionAttestation,
 };
 use spindle_proto::canonical::CborValue;
 
@@ -142,36 +147,40 @@ pub fn new_host_identity(root_seed: [u8; 32], op_seed: [u8; 32]) -> HostIdentity
     }
 }
 
-pub fn host_op_key_cert(
-    identity: &HostIdentity,
-    nats_fp: Fingerprint,
-    ts: u64,
-    exp: u64,
-) -> HostOpKeyCert {
+pub fn host_op_key_cert(identity: &HostIdentity, ts: u64, exp: u64) -> HostOpKeyCert {
     issue_host_op_key_cert(
         &identity.root,
         &identity.op_signing.verifying_key(),
-        nats_fp,
         ts,
         exp,
     )
 }
 
+/// Issues the `HostSessionAttestation` (`sig_op(nats_fp, ts)`, DESIGN.md §A4 step 3/§A7b, added
+/// v0.9.31, td-583db5) binding `identity`'s **operating** key to `nats_fp` at `ts` — the
+/// per-connect proof that this connecting nkey was actually authorized by the host's operating
+/// key, not merely possessed by whoever is presenting it. Host-side mirror of
+/// [`session_attestation`] above.
+pub fn host_session_attestation(
+    identity: &HostIdentity,
+    nats_fp: Fingerprint,
+    ts: u64,
+) -> HostSessionAttestation {
+    issue_host_session_attestation(&identity.op_signing, nats_fp, ts)
+}
+
 /// The `op_cert` a test capability embeds (A10.30: `issue_capability` now needs the host root's
 /// certification of its operating key, not just the operating key itself). Built fresh per call
-/// with a dummy nats_fp/exp — this is a capability-issuance-time cert, not the (separately built,
-/// via [`host_op_key_cert`]) cert a host presents on its own NATS CONNECT — so it does not need
-/// to share that cert's `nats_fp`/`ts`/`exp`. `exp = u64::MAX` so it never itself expires within
-/// this suite's timescales, isolating capability-level exp/signature checks from the op cert's
-/// own freshness.
+/// with a never-expiring `exp` — this is a capability-issuance-time cert, not the (separately
+/// built, via [`host_op_key_cert`]) cert a host presents on its own NATS CONNECT. `HostOpKeyCert`
+/// no longer carries a `nats_fp` at all (td-583db5 moved the per-connect NATS binding to
+/// `HostSessionAttestation`), so there is no dummy session-binding value to explain here any
+/// more — the issuance chain and the session a host actually presents on are two different
+/// artifacts now, not one cert pressed into both roles. `exp = u64::MAX` so it never itself
+/// expires within this suite's timescales, isolating capability-level exp/signature checks from
+/// the op cert's own freshness.
 fn capability_op_cert(host: &HostIdentity) -> HostOpKeyCert {
-    issue_host_op_key_cert(
-        &host.root,
-        &host.op_signing.verifying_key(),
-        Fingerprint::of_parts(&[b"spike-s1-callout:capability-op-cert"]),
-        0,
-        u64::MAX,
-    )
+    issue_host_op_key_cert(&host.root, &host.op_signing.verifying_key(), 0, u64::MAX)
 }
 
 /// Issues a `member` capability for `subject` (a device's `root_fp`), signed by the host's
@@ -247,10 +256,17 @@ pub fn device_auth_token(
     b64url(&spindle_proto::canonical_encode(&env))
 }
 
-/// Builds the base64url canonical-CBOR `auth_token` for a host CONNECT.
+/// Builds the base64url canonical-CBOR `auth_token` for a host CONNECT. `session_attest` is
+/// required (td-583db5) — every caller must build one, matching the connecting session's own
+/// `nats_fp`, via [`host_session_attestation`]. Emitted as `session_attest.to_canonical_bytes()`
+/// under the `"session_attest"` key, byte-compatible with
+/// `spindle_helper::auth_token::decode_auth_token`. `admission_token` stays optional (§A3b: an
+/// already-admitted host's later connects carry none) — unlike `session_attest`, there is a
+/// legitimate case for omitting it.
 pub fn host_auth_token(
     host_root_pk_bytes: &[u8; 32],
     host_op_cert: &HostOpKeyCert,
+    session_attest: &HostSessionAttestation,
     admission_token: Option<&AdmissionToken>,
 ) -> String {
     let mut entries = vec![
@@ -262,6 +278,10 @@ pub fn host_auth_token(
         (
             "host_op_cert",
             CborValue::bytes(host_op_cert.to_canonical_bytes()),
+        ),
+        (
+            "session_attest",
+            CborValue::bytes(session_attest.to_canonical_bytes()),
         ),
     ];
     if let Some(tok) = admission_token {
@@ -300,6 +320,9 @@ pub struct DecodedDevicePayload {
 pub struct DecodedHostPayload {
     pub host_root_pk_bytes: [u8; 32],
     pub host_op_cert: HostOpKeyCert,
+    /// v0.9.31 (td-583db5): the host operating key's attestation binding this bundle to the
+    /// connecting session nkey — required, decoded unconditionally below.
+    pub session_attest: HostSessionAttestation,
     pub admission_token: Option<AdmissionToken>,
 }
 
@@ -376,6 +399,14 @@ pub fn decode_auth_token(token: &str) -> anyhow::Result<DecodedPayload> {
                 .ok_or_else(|| anyhow::anyhow!("missing host_op_cert"))?;
             let host_op_cert = HostOpKeyCert::from_canonical_bytes(host_op_cert_bytes)
                 .map_err(|e| anyhow::anyhow!("bad host_op_cert: {e}"))?;
+            // Required, not optional (td-583db5) — a missing `session_attest` fails the whole
+            // decode via `?`, exactly like `host_op_cert` above. Making this optional would
+            // silently reinstate the bearer-token defect for any client that simply omitted it.
+            let session_attest_bytes = get("session_attest")
+                .and_then(|v| v.as_bytes())
+                .ok_or_else(|| anyhow::anyhow!("missing session_attest"))?;
+            let session_attest = HostSessionAttestation::from_canonical_bytes(session_attest_bytes)
+                .map_err(|e| anyhow::anyhow!("bad session_attest: {e}"))?;
             let admission_token = match get("admission_token") {
                 Some(v) => {
                     let bytes = v
@@ -391,6 +422,7 @@ pub fn decode_auth_token(token: &str) -> anyhow::Result<DecodedPayload> {
             Ok(DecodedPayload::Host(DecodedHostPayload {
                 host_root_pk_bytes,
                 host_op_cert,
+                session_attest,
                 admission_token,
             }))
         }

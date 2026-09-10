@@ -90,18 +90,23 @@ pub const QR_V40_L_CAPACITY_BYTES: usize = 2953;
 /// constant, not measured.
 pub const QR_V40_M_CAPACITY_BYTES: usize = 2331;
 
-/// MEASURED 2026-09-07, not estimated: a member cap encodes to 449 B canonical (of which 185 B
-/// is the embedded `op_cert`), plus two 32-byte keys — 546 B per entry. Measured with realistic
+/// MEASURED 2026-09-10, not estimated: a member cap encodes to 407 B canonical (of which 143 B
+/// is the embedded `op_cert`), plus two 32-byte keys — 504 B per entry. Measured with realistic
 /// Unix-seconds timestamps (~1.757e9) and a 16-byte cap nonce. The cap nonce length is what
 /// makes this figure move — nothing in DESIGN.md pins it — which is why an earlier measurement
-/// recorded 466 B for the cap. DESIGN.md :328-329 derives from this that a version-40 QR carries
-/// 4 hosts at EC level M and 5 at level L with a short registry endpoint; at the 256-byte
-/// [`MAX_REGISTRY_LEN`] ceiling it is 3 and 4. Measured whole-bundle sizes: with a 21-byte
-/// registry, n=4 encodes to 2228 B (fits M's 2331) and n=5 to 2774 B (fits L's 2953 but not M);
-/// with a 256-byte registry, n=4 is 2465 B and does not fit M. This constant is DOCUMENTATION for
-/// those figures only: `spindle-core`'s QR fit check measures the real canonical encoding of
-/// each candidate bundle instead of trusting this estimate.
-pub const MEASURED_ENTRY_BYTES: usize = 546;
+/// recorded 466 B for the cap. This figure last moved when v0.9.31 (td-583db5) dropped
+/// `HostOpKeyCert.nats_fp` — a new `HostSessionAttestation` artifact took over the per-connect
+/// NATS binding instead — which shrank the embedded `op_cert` from 185 B to 143 B and, with it,
+/// every figure below (previously: 449 B cap, 185 B op_cert, 546 B entry). DESIGN.md :328-329
+/// derives from this that a version-40 QR carries 4 hosts at EC level M and 5 at level L with a
+/// short registry endpoint; at the 256-byte [`MAX_REGISTRY_LEN`] ceiling it is now *also* 4 and 5
+/// (previously 3 and 4, before the `op_cert` shrink above). Measured whole-bundle sizes: with a
+/// 21-byte registry, n=4 encodes to 2060 B (fits M's 2331) and n=5 to 2564 B (fits L's 2953 but
+/// not M); with a 256-byte registry, n=4 is 2297 B (fits M) and n=5 is 2801 B (fits L's 2953 but
+/// not M). This constant is DOCUMENTATION for those figures only: `spindle-core`'s QR fit check
+/// measures the real canonical encoding of each candidate bundle instead of trusting this
+/// estimate.
+pub const MEASURED_ENTRY_BYTES: usize = 504;
 
 /// Errors produced while converting between the bootstrap bundle wire types and
 /// [`CborValue`]/bytes. [`BundleWireError::Proto`] reuses every rejection kind [`ProtoError`]

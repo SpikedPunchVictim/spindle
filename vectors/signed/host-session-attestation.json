@@ -1,0 +1,40 @@
+{
+  "artifact": "HostSessionAttestation",
+  "domain_tag": "spindle-host-sess-attest-v1",
+  "signer": {
+    "role": "host_operating_key",
+    "seed": {
+      "label": "TEST-ONLY",
+      "seed_hex": "0606060606060606060606060606060606060606060606060606060606060606"
+    },
+    "public_key_hex": "8a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17"
+  },
+  "cases": [
+    {
+      "name": "valid",
+      "description": "Host session attestation binding the host operating key to one freshly-established NATS session key (td-583db5): sig_op(nats_fp, ts).",
+      "decoded": {
+        "nats_fp": "7a0c69db054d9fe74656a481c5b6d3ce0e38ca136bf89d91e537a9feb661253a",
+        "ts": 1755907200,
+        "sig_op": "71f425c49d88db62a6c7c667a707468c8f5aa5b6fcba0247147a80f51e4535171da1895bf8c56c3d8da58af24bd3f7ad718042eb88c9fb51a64671ff5f9a0b03"
+      },
+      "canonical_cbor_hex": "a36274731a68a90480667369675f6f70584071f425c49d88db62a6c7c667a707468c8f5aa5b6fcba0247147a80f51e4535171da1895bf8c56c3d8da58af24bd3f7ad718042eb88c9fb51a64671ff5f9a0b03676e6174735f667058207a0c69db054d9fe74656a481c5b6d3ce0e38ca136bf89d91e537a9feb661253a",
+      "signing_input_hex": "7370696e646c652d686f73742d736573732d6174746573742d7631a26274731a68a90480676e6174735f667058207a0c69db054d9fe74656a481c5b6d3ce0e38ca136bf89d91e537a9feb661253a",
+      "signature_hex": "71f425c49d88db62a6c7c667a707468c8f5aa5b6fcba0247147a80f51e4535171da1895bf8c56c3d8da58af24bd3f7ad718042eb88c9fb51a64671ff5f9a0b03",
+      "signature_valid": true
+    },
+    {
+      "name": "tampered_signature_last_byte",
+      "description": "sig_op's last byte flipped; verify_host_session_attestation must reject with BadSignature.",
+      "decoded": {
+        "nats_fp": "7a0c69db054d9fe74656a481c5b6d3ce0e38ca136bf89d91e537a9feb661253a",
+        "ts": 1755907200,
+        "sig_op": "71f425c49d88db62a6c7c667a707468c8f5aa5b6fcba0247147a80f51e4535171da1895bf8c56c3d8da58af24bd3f7ad718042eb88c9fb51a64671ff5f9a0bfc"
+      },
+      "canonical_cbor_hex": "a36274731a68a90480667369675f6f70584071f425c49d88db62a6c7c667a707468c8f5aa5b6fcba0247147a80f51e4535171da1895bf8c56c3d8da58af24bd3f7ad718042eb88c9fb51a64671ff5f9a0bfc676e6174735f667058207a0c69db054d9fe74656a481c5b6d3ce0e38ca136bf89d91e537a9feb661253a",
+      "signing_input_hex": "7370696e646c652d686f73742d736573732d6174746573742d7631a26274731a68a90480676e6174735f667058207a0c69db054d9fe74656a481c5b6d3ce0e38ca136bf89d91e537a9feb661253a",
+      "signature_hex": "71f425c49d88db62a6c7c667a707468c8f5aa5b6fcba0247147a80f51e4535171da1895bf8c56c3d8da58af24bd3f7ad718042eb88c9fb51a64671ff5f9a0bfc",
+      "signature_valid": false
+    }
+  ]
+}

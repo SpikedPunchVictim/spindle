@@ -737,9 +737,10 @@ async fn main() -> anyhow::Result<ExitCode> {
     let host_nats_client = {
         let session = KeyPair::new_user();
         let nats_fp = fixtures::nats_fp_of_nkey(&session.public_key())?;
-        let cert = fixtures::host_op_key_cert(&host_identity, nats_fp, now(), exp);
+        let cert = fixtures::host_op_key_cert(&host_identity, now(), exp);
+        let session_attest = fixtures::host_session_attestation(&host_identity, nats_fp, now());
         let root_pk_bytes = host_identity.root.public_key().to_bytes();
-        let token = fixtures::host_auth_token(&root_pk_bytes, &cert, None);
+        let token = fixtures::host_auth_token(&root_pk_bytes, &cert, &session_attest, None);
         async_nats::ConnectOptions::new()
             .nkey(session.seed()?)
             .token(token)

@@ -12,14 +12,14 @@
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use spindle_core::artifacts::{
     verify_admin_command, verify_admission_token, verify_capability, verify_device_certificate,
-    verify_host_device_cert, verify_host_op_key_cert, verify_revocation_record,
-    verify_session_attestation,
+    verify_host_device_cert, verify_host_op_key_cert, verify_host_session_attestation,
+    verify_revocation_record, verify_session_attestation, ArtifactError,
 };
 use spindle_core::envelope::{open, OpenParams};
 use spindle_core::{root_fp_of, Fingerprint};
 use spindle_proto::artifacts::{
     AdminCommand, AdmissionToken, Capability, DeviceCertificate, Envelope, HostDeviceCert,
-    HostOpKeyCert, RevocationRecord, SessionAttestation,
+    HostOpKeyCert, HostSessionAttestation, RevocationRecord, SessionAttestation,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -384,7 +384,6 @@ fn host_op_key_cert_vectors_verify() {
     for case in doc.get("cases").as_arr() {
         let cert = HostOpKeyCert {
             host_op_pk: case.get("decoded").get("host_op_pk").hex(),
-            nats_fp: case.get("decoded").get("nats_fp").hex(),
             ts: case.get("decoded").get("ts").as_u64(),
             exp: case.get("decoded").get("exp").as_u64(),
             sig_host_root: case.get("decoded").get("sig_host_root").hex(),
@@ -399,6 +398,71 @@ fn host_op_key_cert_vectors_verify() {
         let result = verify_host_op_key_cert(&cert, &root_pk, &root_fp, now);
         assert_eq!(result.is_ok(), case.get("signature_valid").as_bool());
     }
+}
+
+// ================================================================================================
+// HostSessionAttestation: signer key supplied out of band (the host's operating key here);
+// expected_nats_fp is read per-case from the case's own `decoded.nats_fp` — this artifact's
+// `nats_fp` field IS the value `verify_host_session_attestation` requires the caller to already
+// expect, so there is no separate top-level field for it (unlike `signer`, which is the same key
+// across every case). Host-side mirror of `session_attestation_vectors_verify` above (td-583db5,
+// DESIGN.md v0.9.31).
+// ================================================================================================
+
+#[test]
+fn host_session_attestation_vectors_verify() {
+    let doc = load("host-session-attestation.json");
+    let host_op_pk = verifying_key_from_hex(doc.get("signer").get("public_key_hex"));
+
+    for case in doc.get("cases").as_arr() {
+        let att = HostSessionAttestation {
+            nats_fp: case.get("decoded").get("nats_fp").hex(),
+            ts: case.get("decoded").get("ts").as_u64(),
+            sig_op: case.get("decoded").get("sig_op").hex(),
+        };
+        assert_eq!(
+            att.to_canonical_bytes(),
+            case.get("canonical_cbor_hex").hex()
+        );
+        assert_eq!(att.signing_input(), case.get("signing_input_hex").hex());
+
+        let expected_nats_fp = fingerprint_from_hex(case.get("decoded").get("nats_fp"));
+        let now = case.get("decoded").get("ts").as_u64();
+        let result = verify_host_session_attestation(&att, &host_op_pk, &expected_nats_fp, now);
+        assert_eq!(
+            result.is_ok(),
+            case.get("signature_valid").as_bool(),
+            "case `{}`",
+            case.get("name").as_str()
+        );
+    }
+
+    // td-583db5 binding check: `session_attestation_vectors_verify` above has no equivalent of
+    // this (its vector file carries only a `tampered_signature_last_byte` negative case, not a
+    // mismatched-binding one) — added here for the host artifact specifically because
+    // `verify_host_session_attestation` exists to enforce exactly this check, and the unit tests in
+    // `host_session_attest.rs` covering it exercise freshly-issued attestations, not the real bytes
+    // this generator wrote to disk. A well-signed `valid` attestation, checked against an
+    // `expected_nats_fp` that has been tampered by one flipped byte, must be rejected with
+    // `HostSessionKeyMismatch`, not silently accepted.
+    let valid_case = doc
+        .get("cases")
+        .as_arr()
+        .iter()
+        .find(|c| c.get("name").as_str() == "valid")
+        .expect("a `valid` case must exist");
+    let att = HostSessionAttestation {
+        nats_fp: valid_case.get("decoded").get("nats_fp").hex(),
+        ts: valid_case.get("decoded").get("ts").as_u64(),
+        sig_op: valid_case.get("decoded").get("sig_op").hex(),
+    };
+    let now = valid_case.get("decoded").get("ts").as_u64();
+    let mut wrong_nats_fp_bytes = valid_case.get("decoded").get("nats_fp").hex();
+    let last = wrong_nats_fp_bytes.len() - 1;
+    wrong_nats_fp_bytes[last] ^= 0xff;
+    let wrong_nats_fp = Fingerprint::from_slice(&wrong_nats_fp_bytes).expect("32-byte fingerprint");
+    let err = verify_host_session_attestation(&att, &host_op_pk, &wrong_nats_fp, now).unwrap_err();
+    assert_eq!(err, ArtifactError::HostSessionKeyMismatch);
 }
 
 // ================================================================================================

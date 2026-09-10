@@ -36,6 +36,7 @@ export type { ArtifactErrorKind } from "./artifacts.js";
 export {
   ADMIN_COMMAND_CLOCK_SKEW_SECS,
   ArtifactError,
+  HOST_SESSION_ATTESTATION_CLOCK_SKEW_SECS,
   isNewerEpoch,
   SESSION_ATTESTATION_CLOCK_SKEW_SECS,
   verifyAdminCommand,
@@ -44,6 +45,7 @@ export {
   verifyDeviceCertificate,
   verifyHostDeviceCert,
   verifyHostOpKeyCert,
+  verifyHostSessionAttestation,
   verifyRevocationRecord,
   verifySessionAttestation,
 } from "./artifacts.js";

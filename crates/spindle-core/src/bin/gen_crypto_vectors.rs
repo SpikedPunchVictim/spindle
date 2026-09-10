@@ -16,10 +16,11 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use spindle_core::artifacts::{
     issue_admin_command, issue_admission_token, issue_capability, issue_device_certificate,
-    issue_host_device_cert, issue_host_op_key_cert, issue_revocation_record,
-    issue_session_attestation, verify_admin_command, verify_admission_token, verify_capability,
-    verify_device_certificate, verify_host_device_cert, verify_host_op_key_cert,
-    verify_revocation_record, verify_session_attestation,
+    issue_host_device_cert, issue_host_op_key_cert, issue_host_session_attestation,
+    issue_revocation_record, issue_session_attestation, verify_admin_command,
+    verify_admission_token, verify_capability, verify_device_certificate, verify_host_device_cert,
+    verify_host_op_key_cert, verify_host_session_attestation, verify_revocation_record,
+    verify_session_attestation,
 };
 use spindle_core::envelope::{
     derive_bootstrap_key, derive_session_key, open, seal, OpenParams, SealParams,
@@ -244,6 +245,11 @@ fn main() {
     );
     write_vector_file(&dir, "capability.json", capability_vectors());
     write_vector_file(&dir, "host-op-key-cert.json", host_op_key_cert_vectors());
+    write_vector_file(
+        &dir,
+        "host-session-attestation.json",
+        host_session_attestation_vectors(),
+    );
     write_vector_file(&dir, "host-device-cert.json", host_device_cert_vectors());
     write_vector_file(&dir, "revocation-record.json", revocation_record_vectors());
     write_vector_file(&dir, "admission-token.json", admission_token_vectors());
@@ -452,7 +458,6 @@ fn capability_vectors() -> Json {
     let op_cert = issue_host_op_key_cert(
         &host_root,
         &host_op.verifying_key(),
-        Fingerprint::of_parts(&[b"gen-crypto-vectors:capability:op-cert-nats"]),
         op_cert_ts,
         op_cert_exp,
     );
@@ -546,11 +551,10 @@ fn capability_vectors() -> Json {
 fn host_op_key_cert_vectors() -> Json {
     let host_root = RootKey::from_seed(HOST_ROOT_SEED);
     let host_op_pk = SigningKey::from_bytes(&HOST_OP_SEED).verifying_key();
-    let nats_fp = Fingerprint::of_parts(&[b"gen-crypto-vectors:host-op-key-cert:nats"]);
     let ts = 1_755_907_200;
     let exp = 1_763_683_200; // ts + 90 days
 
-    let cert = issue_host_op_key_cert(&host_root, &host_op_pk, nats_fp, ts, exp);
+    let cert = issue_host_op_key_cert(&host_root, &host_op_pk, ts, exp);
     assert!(
         verify_host_op_key_cert(&cert, &host_root.public_key(), &host_root.root_fp(), ts).is_ok()
     );
@@ -558,7 +562,6 @@ fn host_op_key_cert_vectors() -> Json {
     fn decoded(c: &spindle_proto::artifacts::HostOpKeyCert) -> Json {
         Json::Obj(vec![
             ("host_op_pk", Json::hex(&c.host_op_pk)),
-            ("nats_fp", Json::hex(&c.nats_fp)),
             ("ts", Json::UInt(c.ts)),
             ("exp", Json::UInt(c.exp)),
             ("sig_host_root", Json::hex(&c.sig_host_root)),
@@ -595,7 +598,7 @@ fn host_op_key_cert_vectors() -> Json {
 
     artifact_file(
         "HostOpKeyCert",
-        spindle_proto::tags::HOST_OP_KEY_CERT_V1,
+        spindle_proto::tags::HOST_OP_KEY_CERT_V2,
         Json::Obj(vec![
             ("role", Json::Str("host_root".into())),
             ("seed", seed_field("TEST-ONLY", &HOST_ROOT_SEED)),
@@ -604,6 +607,75 @@ fn host_op_key_cert_vectors() -> Json {
                 Json::hex(host_root.public_key().as_bytes()),
             ),
             ("root_fp_hex", Json::hex(&host_root.root_fp().to_vec())),
+        ]),
+        cases,
+    )
+}
+
+// ---- HostSessionAttestation ----
+
+/// td-583db5 (v0.9.31): the host-side mirror of `session_attestation_vectors` above. Reuses
+/// `HOST_OP_SEED` — the same operating key `host_op_key_cert_vectors`'s, `capability_vectors`'s,
+/// and `host_device_cert_vectors`'s `HostOpKeyCert` all certify — so all of this generator's
+/// host-artifact vector files describe one consistent host end to end. Signed by the host
+/// **operating** key, not the root: `HostOpKeyCert` no longer carries `nats_fp` at all (see
+/// `host_op_key_cert_vectors`'s doc comment) — this artifact is the per-connect binding that
+/// replaces it.
+fn host_session_attestation_vectors() -> Json {
+    let host_op = SigningKey::from_bytes(&HOST_OP_SEED);
+    let nats_fp = Fingerprint::of_parts(&[b"gen-crypto-vectors:host-session-attestation:nats"]);
+    let ts = 1_755_907_200;
+
+    let att = issue_host_session_attestation(&host_op, nats_fp, ts);
+    assert!(verify_host_session_attestation(&att, &host_op.verifying_key(), &nats_fp, ts).is_ok());
+
+    fn decoded(a: &spindle_proto::artifacts::HostSessionAttestation) -> Json {
+        Json::Obj(vec![
+            ("nats_fp", Json::hex(&a.nats_fp)),
+            ("ts", Json::UInt(a.ts)),
+            ("sig_op", Json::hex(&a.sig_op)),
+        ])
+    }
+
+    let mut tampered = att.clone();
+    tampered.sig_op = flip_last_byte(&att.sig_op);
+    assert!(
+        verify_host_session_attestation(&tampered, &host_op.verifying_key(), &nats_fp, ts).is_err()
+    );
+
+    let cases = vec![
+        case(
+            "valid",
+            "Host session attestation binding the host operating key to one freshly-established \
+             NATS session key (td-583db5): sig_op(nats_fp, ts).",
+            decoded(&att),
+            &att.to_canonical_bytes(),
+            &att.signing_input(),
+            &att.sig_op,
+            true,
+        ),
+        case(
+            "tampered_signature_last_byte",
+            "sig_op's last byte flipped; verify_host_session_attestation must reject with \
+             BadSignature.",
+            decoded(&tampered),
+            &tampered.to_canonical_bytes(),
+            &tampered.signing_input(),
+            &tampered.sig_op,
+            false,
+        ),
+    ];
+
+    artifact_file(
+        "HostSessionAttestation",
+        spindle_proto::tags::HOST_SESSION_ATTESTATION_V1,
+        Json::Obj(vec![
+            ("role", Json::Str("host_operating_key".into())),
+            ("seed", seed_field("TEST-ONLY", &HOST_OP_SEED)),
+            (
+                "public_key_hex",
+                Json::hex(host_op.verifying_key().as_bytes()),
+            ),
         ]),
         cases,
     )
@@ -624,7 +696,6 @@ fn host_device_cert_vectors() -> Json {
     let op_cert = issue_host_op_key_cert(
         &host_root,
         &host_op.verifying_key(),
-        Fingerprint::of_parts(&[b"gen-crypto-vectors:host-device-cert:op-cert-nats"]),
         op_cert_ts,
         op_cert_exp,
     );

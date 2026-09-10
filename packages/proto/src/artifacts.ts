@@ -897,22 +897,36 @@ export const AdminCommand = {
 // HostOpKeyCert (A4)
 // ============================================================================================
 
-/** `HostOpKeyCert { host_op_pk, nats_fp, ts, exp, sig_host_root }` (DESIGN.md §A4). */
+/** `HostOpKeyCert { host_op_pk, ts, exp, sig_host_root }` (DESIGN.md §A4, as amended v0.9.31,
+ * td-583db5).
+ *
+ * This is the issuance chain only: it is embedded (as opaque canonical bytes) in every
+ * `Capability` (A10.30) and every `HostDeviceCert`, and `verifyCapability` chains it to the host
+ * root — it never reads any per-connect binding. That embedding is the entire reason a `nats_fp`
+ * field here was a defect waiting to happen (td-0bcab4's binding-field class): a field that most
+ * consumers ignore.
+ *
+ * **Why no `nats_fp` [amended v0.9.31]**: this certificate used to carry `nats_fp` and have it
+ * checked against the connecting NATS nkey at the callout, conflating two unrelated roles —
+ * issuance-chain member and per-connect credential — in one artifact. v0.9.31 domain-separated
+ * them: the host's per-connect NATS binding is now the separate `HostSessionAttestation`
+ * artifact, signed online by the host operating key, the exact host-side mirror of the
+ * device-side `SessionAttestation` (added v0.9.29 for the identical reason). A `nats_fp` field
+ * here would again duplicate (or, on a bug, contradict) that binding rather than serve any need
+ * of its own. */
 export interface HostOpKeyCert {
   host_op_pk: Uint8Array;
-  nats_fp: Uint8Array;
   ts: bigint;
   exp: bigint;
   sig_host_root: Uint8Array;
 }
 
-const HOST_OP_KEY_CERT_FIELDS = ["host_op_pk", "nats_fp", "ts", "exp", "sig_host_root"] as const;
+const HOST_OP_KEY_CERT_FIELDS = ["host_op_pk", "ts", "exp", "sig_host_root"] as const;
 
 export const HostOpKeyCert = {
   unsignedEntries(cert: HostOpKeyCert): Array<[string, CborValue]> {
     return [
       ["host_op_pk", CborValue.bytes(cert.host_op_pk)],
-      ["nats_fp", CborValue.bytes(cert.nats_fp)],
       ["ts", CborValue.uint(cert.ts)],
       ["exp", CborValue.uint(cert.exp)],
     ];
@@ -937,7 +951,6 @@ export const HostOpKeyCert = {
     m.denyUnknownFields(HOST_OP_KEY_CERT_FIELDS);
     return {
       host_op_pk: m.bytes("host_op_pk"),
-      nats_fp: m.bytes("nats_fp"),
       ts: m.u64("ts"),
       exp: m.u64("exp"),
       sig_host_root: m.bytes("sig_host_root"),
@@ -948,11 +961,91 @@ export const HostOpKeyCert = {
     return HostOpKeyCert.fromCbor(decodeCanonicalOrThrow(bytes));
   },
 
-  /** `"spindle-host-cert-v1" || canonical(self minus sig_host_root)` (A7b). */
+  /** `"spindle-host-cert-v2" || canonical(self minus sig_host_root)` (A7b). */
   signingInput(cert: HostOpKeyCert): Uint8Array {
     return tags.signingInput(
-      tags.HOST_OP_KEY_CERT_V1,
+      tags.HOST_OP_KEY_CERT_V2,
       canonicalEncode(HostOpKeyCert.unsignedCbor(cert)),
+    );
+  },
+};
+
+// ============================================================================================
+// HostSessionAttestation (A4/A7b, added v0.9.31, td-583db5)
+// ============================================================================================
+
+/** `HostSessionAttestation { nats_fp, ts, sig_op }` (DESIGN.md §A4/§A7b, added v0.9.31,
+ * td-583db5).
+ *
+ * `sig_op(nats_fp, ts)` — the per-connect attestation by which the host's **operating** key
+ * authorizes one NATS session nkey. It is the exact host-side mirror of the device-side
+ * `SessionAttestation` (added v0.9.29 for the same reason): a binding field folded into a
+ * long-lived issuance certificate is a known defect class here (td-0bcab4), so the host's
+ * per-connect NATS binding is minted fresh, per session, as its own artifact rather than living
+ * inside `HostOpKeyCert`.
+ *
+ * **Why the operating key, not the root**: A4 keeps the host root cold — it never signs online.
+ * The operating key is warm by design, since it already signs `Capability` at issuance time;
+ * signing this attestation at CONNECT time asks nothing new of it.
+ *
+ * A7b time rule: `ts` is checked ±2 minutes against the helper server's clock. Replay rule: n/a —
+ * this artifact is inert without the nkey secret it names, whose possession the callout proves
+ * separately via the server-nonce signature.
+ *
+ * No `v` field (the domain tag, `spindle-host-sess-attest-v1`, is the version discriminant) and
+ * no `exp` (the `ts` skew window is the sole time bound).
+ *
+ * This package carries bytes only and performs no verification — that is `@spindle/crypto`'s job
+ * (A9c boundary rule 3). */
+export interface HostSessionAttestation {
+  nats_fp: Uint8Array;
+  ts: bigint;
+  sig_op: Uint8Array;
+}
+
+const HOST_SESSION_ATTESTATION_FIELDS = ["nats_fp", "ts", "sig_op"] as const;
+
+export const HostSessionAttestation = {
+  unsignedEntries(att: HostSessionAttestation): Array<[string, CborValue]> {
+    return [
+      ["nats_fp", CborValue.bytes(att.nats_fp)],
+      ["ts", CborValue.uint(att.ts)],
+    ];
+  },
+
+  unsignedCbor(att: HostSessionAttestation): CborValue {
+    return CborValue.map(HostSessionAttestation.unsignedEntries(att));
+  },
+
+  toCbor(att: HostSessionAttestation): CborValue {
+    const entries = HostSessionAttestation.unsignedEntries(att);
+    entries.push(["sig_op", CborValue.bytes(att.sig_op)]);
+    return CborValue.map(entries);
+  },
+
+  toCanonicalBytes(att: HostSessionAttestation): Uint8Array {
+    return canonicalEncode(HostSessionAttestation.toCbor(att));
+  },
+
+  fromCbor(v: CborValue): HostSessionAttestation {
+    const m = new MapReader(v);
+    m.denyUnknownFields(HOST_SESSION_ATTESTATION_FIELDS);
+    return {
+      nats_fp: m.bytes("nats_fp"),
+      ts: m.u64("ts"),
+      sig_op: m.bytes("sig_op"),
+    };
+  },
+
+  fromCanonicalBytes(bytes: Uint8Array): HostSessionAttestation {
+    return HostSessionAttestation.fromCbor(decodeCanonicalOrThrow(bytes));
+  },
+
+  /** `"spindle-host-sess-attest-v1" || canonical(self minus sig_op)` (A7b). */
+  signingInput(att: HostSessionAttestation): Uint8Array {
+    return tags.signingInput(
+      tags.HOST_SESSION_ATTESTATION_V1,
+      canonicalEncode(HostSessionAttestation.unsignedCbor(att)),
     );
   },
 };
@@ -979,10 +1072,10 @@ export const HostOpKeyCert = {
  *
  * **Why no `nats_fp` field**: neither device-shaped certificate carries `nats_fp` any more. A
  * person/device's NATS session binding is the separate `SessionAttestation` artifact (added
- * v0.9.29); the host's NATS connection is authenticated by its own `HostOpKeyCert`, which carries
- * the host's `nats_fp` and — since v0.9.29 — is checked against the connecting nkey at the
- * callout. This artifact is purely the §A7 envelope identity, so a `nats_fp` here would duplicate
- * (or, on a bug, contradict) the op cert's binding rather than serve any need of its own.
+ * v0.9.29); the host's NATS connection is authenticated by its own `HostSessionAttestation`
+ * (added v0.9.31), signed online by the host operating key and checked against the connecting
+ * nkey at the callout. This artifact is purely the §A7 envelope identity, so a `nats_fp` here
+ * would duplicate (or, on a bug, contradict) that binding rather than serve any need of its own.
  *
  * **[A10.34 preimage discipline, mirrored from `DeviceCertificate`]**: `alg_id`/`sign_pk`/
  * `agree_pk` are the exact preimage `host_device_fp` commits to
