@@ -138,7 +138,7 @@ pub enum BundleError {
 /// [`spindle_proto::bootstrap::MEASURED_ENTRY_BYTES`].** That constant is documentation for
 /// DESIGN.md :328-329's "4 hosts at EC level M, 5 at level L" figures only — it is not a lower
 /// bound this function is allowed to trust. A future artifact (e.g. a larger op-cert chain, or a
-/// second cap embedded per entry) could grow a single entry's encoding well past 504 B; measuring
+/// second cap embedded per entry) could grow a single entry's encoding well past 521 B; measuring
 /// the real bytes here means such a change is caught by this check automatically, rather than
 /// silently producing a bundle that fails to scan once printed.
 ///
@@ -389,6 +389,7 @@ fn verify_bundle_entry(
 mod tests {
     use super::*;
     use crate::artifacts::{issue_capability, issue_host_op_key_cert};
+    use crate::fingerprint::FINGERPRINT_LEN;
     use crate::identity::{DeviceKey, RootKey};
     use ed25519_dalek::SigningKey;
     use spindle_proto::artifacts::{CapKind, HostOpKeyCert};
@@ -558,7 +559,7 @@ mod tests {
         // returning `Ok(bundle)` regardless of encoded size) would make this test fail, since it
         // would never see `TooLargeForQr` at all.
         //
-        // Real entries measure ~504 B each (see `keeps_measured_entry_bytes_honest` below); the
+        // Real entries measure ~521 B each (see `keeps_measured_entry_bytes_honest` below); the
         // EC-M budget is 2331 B. 6 real entries safely exceed it regardless of small per-entry
         // size drift, while staying well under MAX_BUNDLE_ENTRIES (32).
         let entries: Vec<BundleEntry> = (0u8..6)
@@ -646,7 +647,11 @@ mod tests {
     /// `1_757_000_000` costs 5 bytes (1-byte header + 4-byte argument). Only this helper's output
     /// is safe to measure against [`MEASURED_ENTRY_BYTES`]. `cap_epoch = 7` (still small enough
     /// to encode in 1 byte either way — realism here is about matching the spec's example, not
-    /// about byte width) and the cap's 16-byte nonce match this bundle's spec (td-0f4fb6).
+    /// about byte width) is a stylistic choice; the cap's nonce is `FINGERPRINT_LEN` bytes because
+    /// that is what `spindle-host-core::authorize::default_member_cap_nonce` — the only `nonce_fn`
+    /// any production `CapIssuer` installs — actually produces (td-331c11 pins that length via a
+    /// test in `spindle-host-core`, so this fixture derives from the same named constant rather
+    /// than a bare literal).
     fn realistic_entry(host_seed: u8, envelope_seed: u8, now: u64) -> BundleEntry {
         const NINETY_DAYS: u64 = 90 * 86_400;
         const TWENTY_ONE_DAYS: u64 = 21 * 86_400;
@@ -664,7 +669,7 @@ mod tests {
             host.root.root_fp(),
             7, // cap_epoch
             now + TWENTY_ONE_DAYS,
-            vec![0xAA; 16], // 16-byte nonce, matching MEASURED_ENTRY_BYTES's own assumption
+            vec![0xAA; FINGERPRINT_LEN], // matches default_member_cap_nonce's actual length
         );
         let envelope = host_envelope(envelope_seed);
         BundleEntry {
@@ -679,33 +684,36 @@ mod tests {
         // DESIGN.md :328-329's host-count figures (4 hosts at EC level M, 5 at level L, with a
         // short registry endpoint) are derived from MEASURED_ENTRY_BYTES. A genuine drift in a
         // real entry's encoded size means DESIGN.md and this constant must be updated together.
-        // This figure assumes a 16-byte cap nonce — see MEASURED_ENTRY_BYTES's own doc comment
-        // for why the nonce length, specifically, is what makes it move.
+        // This figure assumes a FINGERPRINT_LEN-byte cap nonce — see MEASURED_ENTRY_BYTES's own
+        // doc comment for why the nonce length, specifically, is what makes it move, and
+        // `realistic_entry`'s doc comment for why that length is a named constant now (td-331c11),
+        // not a bare literal.
         //
         // Minted with realistic values (see `realistic_entry`'s doc comment): now =
-        // 1_757_000_000, a 90-day op-cert exp, a 21-day cap exp, cap_epoch = 7, a 16-byte nonce.
-        // Tolerance chosen from an actual measurement, not invented: this test module's real
-        // entry measures 504 B, exactly MEASURED_ENTRY_BYTES — +/-2 B leaves room for a single
-        // field crossing a CBOR shortest-form boundary (e.g. a timestamp ticking past a
-        // power-of-two-scaled threshold between now and whenever this test next runs) without
-        // being so loose it would fail to flag a genuine future drift (e.g. a larger op_cert
-        // chain).
+        // 1_757_000_000, a 90-day op-cert exp, a 21-day cap exp, cap_epoch = 7, a
+        // FINGERPRINT_LEN-byte nonce. Every input is a hardcoded constant — nothing here reads a
+        // wall clock — so the encoded length reproduces bit-for-bit on every run. td-331c11
+        // tightened this from a +/-2 B tolerance (left over from when this figure was believed to
+        // vary run-to-run) to an equality assertion for that reason.
         let now = 1_757_000_000u64;
         let entry = realistic_entry(0x90, 0x91, now);
         let measured = entry.to_canonical_bytes().len();
-        let tolerance = 2usize;
-        assert!(
-            measured.abs_diff(MEASURED_ENTRY_BYTES) <= tolerance,
-            "entry encoded to {measured} B, expected within {tolerance} B of \
-             MEASURED_ENTRY_BYTES ({MEASURED_ENTRY_BYTES} B) — update DESIGN.md :328-329's host \
+        assert_eq!(
+            measured, MEASURED_ENTRY_BYTES,
+            "entry encoded to {measured} B, expected exactly MEASURED_ENTRY_BYTES \
+             ({MEASURED_ENTRY_BYTES} B) — this measurement is fully deterministic, so any \
+             difference is a genuine drift: update DESIGN.md :328-329's host \
              counts and MEASURED_ENTRY_BYTES together if this genuinely drifted"
         );
     }
 
     #[test]
     fn qr_ceiling_matches_the_documented_host_counts() {
-        // This is what actually protects DESIGN.md :328-329's documented claim ("4 hosts at EC
-        // level M, 5 at level L, with a short registry endpoint; 4 and 5 at MAX_REGISTRY_LEN") —
+        // This is what actually protects DESIGN.md :328-329's documented claim — as re-measured
+        // by td-331c11 against the production FINGERPRINT_LEN cap nonce: 4 hosts at EC level M
+        // and 5 at level L with a short registry endpoint; at the 256-byte MAX_REGISTRY_LEN
+        // ceiling, 3 at EC level M (DOWN from the previously documented 4 — that number was
+        // measured against a 16-byte nonce no production issuer ever emits) and 5 at level L.
         // MEASURED_ENTRY_BYTES alone only documents the arithmetic that produced those numbers;
         // it does not prove them, since it is never consulted by the real fit check. This test
         // builds real bundles of real entries and checks their real encoded size against the QR
@@ -752,24 +760,30 @@ mod tests {
              ({QR_V40_L_CAPACITY_BYTES} B)"
         );
 
-        // At MAX_REGISTRY_LEN, EC level M: 4 real entries fit, 5 do not — the same host count as
-        // the short-registry case above (previously 3/4 before v0.9.31/td-583db5 shrank
-        // HostOpKeyCert by dropping nats_fp; see MEASURED_ENTRY_BYTES's doc comment).
+        // At MAX_REGISTRY_LEN (256 B), EC level M: MEASURED TRUTH is 3 real entries fit, 4 do
+        // not — DOWN from 4 (td-331c11: with the production FINGERPRINT_LEN nonce, 4 entries
+        // measure 2365 B, over EC-M's 2331 B budget; DESIGN.md :328-329's previous claim of 4
+        // was measured against a 16-byte nonce no production issuer ever emits). Measured: n=3 is
+        // 1844 B (fits 2331), n=4 is 2365 B (does not).
         let long_registry = "r".repeat(spindle_proto::bootstrap::MAX_REGISTRY_LEN);
-        let four_long_registry = bundle_of(&long_registry, 4).to_canonical_bytes().len();
+        let three_long_registry = bundle_of(&long_registry, 3).to_canonical_bytes().len();
         assert!(
-            four_long_registry <= QR_V40_M_CAPACITY_BYTES,
-            "4 real entries with a MAX_REGISTRY_LEN registry ({four_long_registry} B) must fit \
+            three_long_registry <= QR_V40_M_CAPACITY_BYTES,
+            "3 real entries with a MAX_REGISTRY_LEN registry ({three_long_registry} B) must fit \
              the EC-M budget ({QR_V40_M_CAPACITY_BYTES} B)"
         );
-        let five_long_registry = bundle_of(&long_registry, 5).to_canonical_bytes().len();
+        let four_long_registry = bundle_of(&long_registry, 4).to_canonical_bytes().len();
         assert!(
-            five_long_registry > QR_V40_M_CAPACITY_BYTES,
-            "5 real entries with a MAX_REGISTRY_LEN registry ({five_long_registry} B) must NOT \
-             fit the EC-M budget ({QR_V40_M_CAPACITY_BYTES} B)"
+            four_long_registry > QR_V40_M_CAPACITY_BYTES,
+            "4 real entries with a MAX_REGISTRY_LEN registry ({four_long_registry} B) must NOT \
+             fit the EC-M budget ({QR_V40_M_CAPACITY_BYTES} B) — this is the td-331c11 defect: \
+             DESIGN.md previously claimed 4 hosts fit here, measured against a 16-byte nonce no \
+             production issuer emits"
         );
 
-        // At MAX_REGISTRY_LEN, EC level L: 5 real entries fit, 6 do not.
+        // At MAX_REGISTRY_LEN, EC level L: 5 real entries fit, 6 do not — unchanged from the
+        // short-registry case (measured: n=5 is 2886 B, fits L's 2953; n=6 is 3407 B, does not).
+        let five_long_registry = bundle_of(&long_registry, 5).to_canonical_bytes().len();
         assert!(
             five_long_registry <= QR_V40_L_CAPACITY_BYTES,
             "5 real entries with a MAX_REGISTRY_LEN registry ({five_long_registry} B) must fit \

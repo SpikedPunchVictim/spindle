@@ -2807,4 +2807,37 @@ mod tests {
     // as_a_valid_ed25519_point` above is the meaningful thing to test instead: that the dummy
     // constant is valid, so `equalize_denial_work` always performs the same SHAPE of work an
     // `Allow` does, which is what this module can actually guarantee deterministically.
+
+    // ---- td-331c11: the production member-cap nonce length is pinned, not assumed ----
+
+    /// Every measured-size figure downstream of a member `Capability` (`MEASURED_MEMBER_CAP_BYTES`,
+    /// `MEASURED_ENTRY_BYTES`, `MEASURED_32_CAP_TOKEN_{CBOR,B64}_BYTES` and every host count derived
+    /// from them) assumes a specific nonce length for the value [`default_member_cap_nonce`]
+    /// produces — the only `nonce_fn` [`RootKeyCapIssuer::new`] installs, since `with_nonce_fn`
+    /// (above) has no non-test/non-doc caller anywhere in this workspace. Before td-331c11 that
+    /// assumption (16 bytes) was never checked against this function; it silently drifted out of
+    /// sync when `default_member_cap_nonce` was written to return a full `Fingerprint`
+    /// (`FINGERPRINT_LEN` = 32 bytes, `crates/spindle-core/src/fingerprint.rs:14`).
+    ///
+    /// This test is the pin: it asserts the production nonce is exactly `FINGERPRINT_LEN` bytes.
+    /// The measurement fixtures in `spindle-core`/`spindle-helper` build their nonces from that
+    /// same named constant (imported from `spindle_core::FINGERPRINT_LEN`) rather than a bare
+    /// literal, so the two ends are linked by name: change what `default_member_cap_nonce`
+    /// returns (e.g. truncate it, or key it off something other than `Fingerprint::of_parts`) and
+    /// THIS test goes red immediately, before any byte-count constant has a chance to drift out
+    /// from under it again.
+    #[test]
+    fn default_member_cap_nonce_is_exactly_fingerprint_len_bytes() {
+        let subject = Fingerprint::of_parts(&[b"pin-check-subject"]);
+        let nonce = default_member_cap_nonce(subject, 1_757_000_000);
+        assert_eq!(
+            nonce.len(),
+            spindle_core::FINGERPRINT_LEN,
+            "default_member_cap_nonce (the only nonce_fn RootKeyCapIssuer::new installs) must \
+             produce exactly FINGERPRINT_LEN bytes -- every MEASURED_* size constant in \
+             spindle-proto/spindle-helper is built on this assumption; if it genuinely changed, \
+             every measurement fixture and constant must be re-measured and updated together \
+             (td-331c11)"
+        );
+    }
 }

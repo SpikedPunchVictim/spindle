@@ -90,23 +90,31 @@ pub const QR_V40_L_CAPACITY_BYTES: usize = 2953;
 /// constant, not measured.
 pub const QR_V40_M_CAPACITY_BYTES: usize = 2331;
 
-/// MEASURED 2026-09-10, not estimated: a member cap encodes to 407 B canonical (of which 143 B
-/// is the embedded `op_cert`), plus two 32-byte keys — 504 B per entry. Measured with realistic
-/// Unix-seconds timestamps (~1.757e9) and a 16-byte cap nonce. The cap nonce length is what
-/// makes this figure move — nothing in DESIGN.md pins it — which is why an earlier measurement
-/// recorded 466 B for the cap. This figure last moved when v0.9.31 (td-583db5) dropped
-/// `HostOpKeyCert.nats_fp` — a new `HostSessionAttestation` artifact took over the per-connect
-/// NATS binding instead — which shrank the embedded `op_cert` from 185 B to 143 B and, with it,
-/// every figure below (previously: 449 B cap, 185 B op_cert, 546 B entry). DESIGN.md :328-329
-/// derives from this that a version-40 QR carries 4 hosts at EC level M and 5 at level L with a
-/// short registry endpoint; at the 256-byte [`MAX_REGISTRY_LEN`] ceiling it is now *also* 4 and 5
-/// (previously 3 and 4, before the `op_cert` shrink above). Measured whole-bundle sizes: with a
-/// 21-byte registry, n=4 encodes to 2060 B (fits M's 2331) and n=5 to 2564 B (fits L's 2953 but
-/// not M); with a 256-byte registry, n=4 is 2297 B (fits M) and n=5 is 2801 B (fits L's 2953 but
-/// not M). This constant is DOCUMENTATION for those figures only: `spindle-core`'s QR fit check
-/// measures the real canonical encoding of each candidate bundle instead of trusting this
+/// MEASURED 2026-09-10, not estimated: a member cap encodes to 424 B canonical (of which 143 B
+/// is the embedded `op_cert`), plus two 32-byte keys — 521 B per entry. Measured with realistic
+/// Unix-seconds timestamps (~1.757e9) and a **32-byte** cap nonce — `FINGERPRINT_LEN`, matching
+/// what `spindle-host-core::authorize::default_member_cap_nonce` (the only `nonce_fn` any
+/// production `CapIssuer` installs) actually produces. **This is now pinned, not assumed**:
+/// `spindle-host-core`'s `default_member_cap_nonce_is_exactly_fingerprint_len_bytes` test asserts
+/// that function's output length directly, so a future change to the production nonce length
+/// turns that test red — this constant can no longer drift out from under the issuer silently the
+/// way it did before td-331c11 (previously 504 B / 407 B cap, measured against a 16-byte nonce no
+/// production issuer ever emitted). This figure last moved for a structural reason (not the nonce)
+/// when v0.9.31 (td-583db5) dropped `HostOpKeyCert.nats_fp` — a new `HostSessionAttestation`
+/// artifact took over the per-connect NATS binding instead — which shrank the embedded `op_cert`
+/// from 185 B to 143 B and, with it, every figure below (previously: 449 B cap, 185 B op_cert,
+/// 546 B entry, all still on the stale 16-byte-nonce basis). DESIGN.md :328-329 derives from this
+/// (re-measured against the pinned 32-byte nonce, td-331c11) that a version-40 QR carries 4 hosts
+/// at EC level M and 5 at level L with a short registry endpoint; at the 256-byte
+/// [`MAX_REGISTRY_LEN`] ceiling it is now **3** at EC level M (DOWN from a previously documented
+/// 4 — that number was measured against the stale 16-byte nonce) and 5 at level L. Measured
+/// whole-bundle sizes: with a 21-byte registry, n=4 encodes to 2128 B (fits M's 2331) and n=5 to
+/// 2649 B (fits L's 2953 but not M); with a 256-byte registry, n=3 is 1844 B (fits M), n=4 is
+/// 2365 B (does NOT fit M's 2331 — the defect td-331c11 fixes), and n=5 is 2886 B (fits L's 2953
+/// but not M). This constant is DOCUMENTATION for those figures only: `spindle-core`'s QR fit
+/// check measures the real canonical encoding of each candidate bundle instead of trusting this
 /// estimate.
-pub const MEASURED_ENTRY_BYTES: usize = 504;
+pub const MEASURED_ENTRY_BYTES: usize = 521;
 
 /// Errors produced while converting between the bootstrap bundle wire types and
 /// [`CborValue`]/bytes. [`BundleWireError::Proto`] reuses every rejection kind [`ProtoError`]

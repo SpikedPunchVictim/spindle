@@ -49,22 +49,29 @@ use spindle_proto::artifacts::{
 use spindle_proto::canonical::CborValue;
 
 /// MEASURED 2026-09-10, not estimated: DESIGN.md §A4/§A5's "A full 32-cap CONNECT token measures
-/// **18,095 B**, **55%** of the 32 KiB ceiling" — the base64url length of a device's CONNECT
+/// **18,820 B**, **57.4%** of the 32 KiB ceiling" — the base64url length of a device's CONNECT
 /// `auth_token` envelope (this module's device-connection shape, above) carrying a
 /// `DeviceCertificate`, a `SessionAttestation`, and 32 member `Capability`s. Measured with
 /// realistic Unix-seconds `ts`/`exp` throughout (~1.76e9 — a 5-byte CBOR uint, 1 byte per field
-/// wider than a toy value like `ts: 0`/`exp: 2_000_000`) and each cap's 16-byte nonce — see
-/// `spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES`'s doc comment for that per-cap figure
-/// this token-level measurement is 32 of, plus a device cert and session attestation on top.
-/// Pinned by `keeps_measured_32_cap_token_bytes_honest` below, which mints the envelope through
+/// wider than a toy value like `ts: 0`/`exp: 2_000_000`) and each cap's **`FINGERPRINT_LEN`**-byte
+/// nonce (32 bytes) — see `spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES`'s doc comment for
+/// that per-cap figure this token-level measurement is 32 of, plus a device cert and session
+/// attestation on top. **This nonce length is now pinned, not assumed**: a test in
+/// `spindle-host-core` (`default_member_cap_nonce_is_exactly_fingerprint_len_bytes`) asserts the
+/// production issuer's nonce is exactly `FINGERPRINT_LEN` bytes, and `realistic_member_cap` below
+/// builds its nonce from that same named constant — so a future change to the production nonce
+/// length turns that test red, rather than leaving this constant to drift out from under it
+/// silently again (previously 13,571 B / 18,095 B / 55.2%, measured against a 16-byte nonce no
+/// production issuer ever emitted — td-331c11). Pinned by
+/// `keeps_measured_32_cap_token_bytes_honest` below, which mints the envelope through
 /// `encode_device_token` — the same builder every other test in this module uses.
 #[cfg(test)]
-const MEASURED_32_CAP_TOKEN_CBOR_BYTES: usize = 13_571;
+const MEASURED_32_CAP_TOKEN_CBOR_BYTES: usize = 14_115;
 /// The base64url (no padding) encoding of [`MEASURED_32_CAP_TOKEN_CBOR_BYTES`] — the length that
 /// actually counts against nats-server's `max_control_line`, since DESIGN.md §A4 presents the
 /// token base64url-encoded on the wire, not as raw CBOR.
 #[cfg(test)]
-const MEASURED_32_CAP_TOKEN_B64_BYTES: usize = 18_095;
+const MEASURED_32_CAP_TOKEN_B64_BYTES: usize = 18_820;
 /// nats-server's default `max_control_line` is 4 KiB; DESIGN.md §A4/A10.10 says the registry
 /// raises this ceiling to 32 KiB specifically so a full 32-cap CONNECT bundle fits.
 #[cfg(test)]
@@ -231,6 +238,7 @@ mod tests {
         issue_host_session_attestation, issue_session_attestation,
     };
     use spindle_core::identity::{DeviceKey, RootKey};
+    use spindle_core::FINGERPRINT_LEN;
     use spindle_proto::artifacts::CapKind;
 
     fn b64url(bytes: &[u8]) -> String {
@@ -445,10 +453,14 @@ mod tests {
     // ---- MEASURED_32_CAP_TOKEN_*_BYTES stays honest ----
 
     /// Builds one member [`Capability`] chained to its own freshly minted host, with realistic
-    /// Unix-seconds timestamps throughout and a 16-byte nonce — see
+    /// Unix-seconds timestamps throughout and a `FINGERPRINT_LEN`-byte nonce — see
     /// [`MEASURED_32_CAP_TOKEN_CBOR_BYTES`]'s doc comment for why realism matters here (a toy
     /// timestamp like the rest of this module's tests use understates every timestamp field by a
-    /// byte, which is exactly the bug this measurement exists to catch).
+    /// byte, which is exactly the bug this measurement exists to catch) and for why the nonce
+    /// length is the named constant `spindle_core::FINGERPRINT_LEN` rather than a bare literal
+    /// (td-331c11: that constant is what `spindle-host-core::authorize::default_member_cap_nonce`
+    /// — the only `nonce_fn` any production `CapIssuer` installs — actually produces, and a test
+    /// in that crate pins the two together).
     fn realistic_member_cap(
         host_seed: u8,
         op_seed: u8,
@@ -473,25 +485,25 @@ mod tests {
             subject,
             7, // cap_epoch, matching DESIGN.md's own example
             now + TWENTY_ONE_DAYS,
-            vec![0xAA; 16], // 16-byte nonce
+            vec![0xAA; FINGERPRINT_LEN], // matches default_member_cap_nonce's actual length
         )
     }
 
     #[test]
     fn keeps_measured_32_cap_token_bytes_honest() {
-        // DESIGN.md §A4/§A5's "A full 32-cap CONNECT token measures 18,095 B, 55% of the 32 KiB
-        // ceiling" is pinned here against a real envelope: a device certificate, a session
-        // attestation, and 32 member caps, each minted with realistic Unix-seconds timestamps and
-        // a 16-byte cap nonce (see MEASURED_32_CAP_TOKEN_CBOR_BYTES's doc comment for why realism
-        // matters — a toy `ts`/`exp` understates every timestamp field by a CBOR byte, and an
-        // envelope missing device_cert or session_attest undercounts the whole thing).
+        // DESIGN.md §A4/§A5's 32-cap CONNECT token figures are pinned here against a real
+        // envelope: a device certificate, a session attestation, and 32 member caps, each minted
+        // with realistic Unix-seconds timestamps and a `FINGERPRINT_LEN`-byte cap nonce (see
+        // MEASURED_32_CAP_TOKEN_CBOR_BYTES's doc comment for why realism matters — a toy
+        // `ts`/`exp` understates every timestamp field by a CBOR byte, and an envelope missing
+        // device_cert or session_attest undercounts the whole thing — and `realistic_member_cap`'s
+        // doc comment for why the nonce length is that named constant, not a bare literal).
         //
-        // Tolerance: +/-2 B per cap-bearing field (33 signature-bearing artifacts: 1 device cert,
-        // 1 session attestation, 32 caps) for the same reason `keeps_measured_entry_bytes_honest`
-        // and `keeps_measured_member_cap_bytes_honest` use +/-2 B each — a timestamp ticking past
-        // a CBOR shortest-form width boundary between now and whenever this test next runs. Scaled
-        // up (rather than reused as a flat +/-2) because 32 independent artifacts each carry their
-        // own independently-drifting timestamp fields.
+        // Every input this test mints with (`now`, every seed byte, the nonce) is a hardcoded
+        // constant — nothing here reads a wall clock — so the encoded length reproduces
+        // bit-for-bit on every run. td-331c11 tightened this from a scaled +/-2 B-per-artifact
+        // tolerance (left over from when this figure was believed to vary run-to-run) to equality
+        // assertions for that reason.
         let now = 1_755_907_200u64; // matches DESIGN.md's own reference measurement
         let root = RootKey::from_seed([0xE0; 32]);
         let device = DeviceKey::from_seeds([0xE1; 32], [0xE2; 32]);
@@ -525,31 +537,34 @@ mod tests {
             .expect("valid base64url")
             .len();
 
-        let tolerance = 2 * 33; // 33 independently-timestamped signed artifacts, +/-2 B each
-        assert!(
-            cbor_len.abs_diff(MEASURED_32_CAP_TOKEN_CBOR_BYTES) <= tolerance,
-            "32-cap token's raw canonical CBOR encoded to {cbor_len} B, expected within \
-             {tolerance} B of MEASURED_32_CAP_TOKEN_CBOR_BYTES ({MEASURED_32_CAP_TOKEN_CBOR_BYTES} \
-             B) — update DESIGN.md §A4/§A5's 32-cap token figures and these constants together if \
-             this genuinely drifted"
+        assert_eq!(
+            cbor_len, MEASURED_32_CAP_TOKEN_CBOR_BYTES,
+            "32-cap token's raw canonical CBOR encoded to {cbor_len} B, expected exactly \
+             MEASURED_32_CAP_TOKEN_CBOR_BYTES ({MEASURED_32_CAP_TOKEN_CBOR_BYTES} B) — this \
+             measurement is fully deterministic, so any difference is a genuine drift: update \
+             DESIGN.md §A4/§A5's 32-cap token figures and these constants together"
         );
-        assert!(
-            b64_len.abs_diff(MEASURED_32_CAP_TOKEN_B64_BYTES) <= tolerance,
-            "32-cap token's base64url encoding is {b64_len} B, expected within {tolerance} B of \
-             MEASURED_32_CAP_TOKEN_B64_BYTES ({MEASURED_32_CAP_TOKEN_B64_BYTES} B) — update \
-             DESIGN.md §A4/§A5's 32-cap token figures and these constants together if this \
-             genuinely drifted"
+        assert_eq!(
+            b64_len, MEASURED_32_CAP_TOKEN_B64_BYTES,
+            "32-cap token's base64url encoding is {b64_len} B, expected exactly \
+             MEASURED_32_CAP_TOKEN_B64_BYTES ({MEASURED_32_CAP_TOKEN_B64_BYTES} B) — this \
+             measurement is fully deterministic, so any difference is a genuine drift: update \
+             DESIGN.md §A4/§A5's 32-cap token figures and these constants together"
         );
 
-        // DESIGN.md rounds this to "55%"; the reference measurement it supersedes-from records
-        // 55.2%. Assert against the actual measured bytes, not the rounded prose figure, with
-        // enough slack to absorb the tolerance bands above.
-        let pct = b64_len as f64 / NATS_MAX_CONTROL_LINE_BYTES as f64 * 100.0;
+        // The "share of the 32 KiB ceiling" prose figure (DESIGN.md §A4/§A5: 18,820 / 32,768 =
+        // 57.4%) is a pure function of b64_len, already pinned exactly above — a separate
+        // percentage-range assertion here could never independently fail (it would only ever
+        // restate the assertion above in different units), so td-331c11 deleted the dead ±range
+        // check that used to sit here (see MEASURED_32_CAP_TOKEN_CBOR_BYTES's doc comment for the
+        // percentage itself). What IS worth asserting independently is the actual functional
+        // requirement DESIGN.md §A4/A10.10 raised `max_control_line` for in the first place: that
+        // a full 32-cap token really does fit under the raised ceiling.
         assert!(
-            (54.0..=57.0).contains(&pct),
-            "32-cap token is {pct:.1}% of the {NATS_MAX_CONTROL_LINE_BYTES}-byte max_control_line \
-             ceiling, expected roughly 55% — update DESIGN.md §A4/§A5's percentage figure if this \
-             genuinely drifted"
+            b64_len < NATS_MAX_CONTROL_LINE_BYTES,
+            "32-cap token ({b64_len} B) must fit under nats-server's raised \
+             {NATS_MAX_CONTROL_LINE_BYTES}-byte max_control_line ceiling (DESIGN.md §A4/A10.10) — \
+             this is the actual requirement the ceiling raise exists to satisfy"
         );
     }
 

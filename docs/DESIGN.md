@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.32) + Execution Plan
+# Spindle — System Design Document (draft v0.9.33) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -127,6 +127,12 @@
 > seed, never the derived keypair, generated on first run, held behind a `HostKeyStore` seam (OS
 > keychain desktop / `0600` seed file headless), recoverable via a one-time phrase (A10.41; bears
 > on td-ef5744).
+> v0.9.33: every measured size figure in §A4 is corrected to the **32-byte** cap nonce the
+> production issuer emits — cap **424 B** (was 407), 32-cap token **18,820 B** / **57%** (was
+> 18,095 / 55%), bundle entry **521 B** (was 504) — and the QR host ceiling at the 256-byte
+> `MAX_REGISTRY_LEN` drops to **3** at EC level M (was 4), a claim that had been derived by
+> arithmetic rather than measured and would have failed to encode. The nonce basis is now pinned
+> to the issuer by test (td-331c11).
 
 ---
 
@@ -417,18 +423,23 @@ cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp
   useless without the device key). **Renewal path (no lockout)**: a cap that is expired or stale-epoch but
   signature-valid still earns **connect-only** NATS permissions (same as an invite); the host verifies the device
   over the E2E channel and re-issues the current cap in the reply. Only *revoked* subjects are refused outright.
-- **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (**407 B each, measured** [**[amended v0.9.31]** re-measured after
-  `HostOpKeyCert.nats_fp` was removed — 449 B at v0.9.23 with a 16-byte cap nonce; the earlier
-  466 B was itself a mis-measurement from a differing cap nonce length], chain-carrying,
-  v0.9.5, base64url). nats-server's default `max_control_line` is 4 KiB, so the registry sets it to **32 KiB**
+- **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (**424 B each, measured**
+  **[amended v0.9.33]**, chain-carrying, v0.9.5, base64url). nats-server's default `max_control_line`
+  is 4 KiB, so the registry sets it to **32 KiB**
   (A10.10) and clients present **only the caps for hosts they will use this session** (pinned/open hosts), max **32**
-  per connection (A10.5). A full 32-cap CONNECT token measures **18,095 B**, **55%** of the 32 KiB ceiling
-  **[amended v0.9.31]**. Measured over the full envelope a real device presents — device
+  per connection (A10.5). A full 32-cap CONNECT token measures **18,820 B**, **57%** of the 32 KiB ceiling
+  **[amended v0.9.33]**. Measured over the full envelope a real device presents — device
   certificate, session attestation and 32 member caps, realistic wall-clock timestamps
-  (a 5-byte CBOR uint, worth 1 byte per field over a toy value) and a 16-byte cap nonce.
-  The superseded 19,751 B predates v0.9.30's `session_attest` field and could not be
-  reproduced under the current envelope, so this figure supersedes it outright rather
-  than adjusting it by the per-cap delta. S12
+  (a 5-byte CBOR uint, worth 1 byte per field over a toy value) and the **32-byte** cap nonce the
+  production issuer actually emits. **[amended v0.9.33]** Every figure in this section before
+  v0.9.33 — 407 B, 449 B, 466 B, 18,095 B — was measured against a **16-byte** cap nonce that no
+  issuer in the system has ever produced: `default_member_cap_nonce` returns a `Fingerprint`, and
+  it is the only `nonce_fn` `RootKeyCapIssuer` installs. The document had already been bitten by
+  this once — the 466 B figure was itself corrected as "a mis-measurement from a differing cap
+  nonce length" — and still did not pin the basis, so the error recurred at every subsequent
+  re-measurement. It is pinned now: a test asserts the production nonce is exactly
+  `FINGERPRINT_LEN`, and every measurement fixture derives its nonce from that constant rather
+  than a literal (td-331c11). S12
   measures.
 
 **NATS authentication = Auth Callout for every connection**
@@ -476,11 +487,16 @@ QR channel that conveys the root identity itself, so a signature would have no v
 already establish, and the one security-bearing value inside it — `member_cap` — is an independently verifiable
 signed artifact. **This holds only while the bundle stays on that channel**: relaying it over the network, cloud
 sync, or a file export makes it a signed artifact requiring a §A7b entry with its own tag, time rule, and replay
-rule. **QR ceiling**: an entry is ~504 B (two 32-byte keys plus a 407-byte cap, measured with a 16-byte cap
-nonce), so a version-40 QR carries **4** hosts at EC level M and **5** at level L with a
-short registry endpoint — and, **[amended v0.9.31]** since removing `HostOpKeyCert.nats_fp`
-shrank each entry by 42 B, **4** and **5** at the 256-byte `MAX_REGISTRY_LEN` ceiling too
-(previously 3 and 4) — against the 32-host presentation cap in §A4. Bundle
+rule. **QR ceiling**: an entry is ~521 B (two 32-byte keys plus a 424-byte cap) **[amended v0.9.33]**,
+so a version-40 QR carries **4** hosts at EC level M and **5** at level L with a
+short registry endpoint, and **3** at EC level M and **5** at level L at the 256-byte
+`MAX_REGISTRY_LEN` ceiling — against the 32-host presentation cap in §A4. **[amended v0.9.33]**
+All four counts are measured directly, each bounded on both sides (n fits, n+1 does not); the
+previous claim of **4** at the ceiling was arithmetic, adjusted from an earlier figure by a
+per-entry delta rather than re-measured, and it was wrong: four real entries with a
+`MAX_REGISTRY_LEN` registry encode to 2365 B against EC-M's 2331 B budget, so a bundle built to
+that claim would have failed to encode. The short-registry counts were re-measured too and are
+unchanged. Bundle
 construction fails loudly when the host list does not fit, naming the hosts left out, and the owner re-invites the new
 device to the remainder; multi-frame QR is held in reserve, unbuilt, pending evidence that a real host list needs it.
 All hosts accept the new device automatically (they pinned `root_fp`) and notify the owner ("Alex added *iPhone*"). Any
@@ -1674,6 +1690,28 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.33 (2026-09-10)** — Corrects every measured size figure in §A4 to the cap nonce the system
+  actually produces. `default_member_cap_nonce` (`crates/spindle-host-core/src/authorize.rs:405`)
+  returns a 32-byte `Fingerprint`, it is the only `nonce_fn` `RootKeyCapIssuer` installs, and
+  `with_nonce_fn` has no callers — yet every figure the document has ever stated was measured
+  against a 16-byte nonce, and every fixture in the repository hardcoded that same 16, so the tests
+  agreed with each other and with the document while all of them disagreed with the code. Re-measured:
+  a member capability is **424 B** (was 407), a full 32-cap CONNECT token **18,820 B** and **57%** of
+  the 32 KiB ceiling (was 18,095 B and 55%), and a bootstrap bundle entry **521 B** (was 504). The
+  consequential correction is the QR ceiling: at the 256-byte `MAX_REGISTRY_LEN` a version-40 code
+  carries **3** hosts at EC level M, not 4 — four real entries encode to 2365 B against a 2331 B
+  budget, so the previous claim would have failed to encode. That claim had been derived by adjusting
+  an earlier figure by a per-entry delta rather than re-measured, which is the same habit that
+  produced the underlying error; all four QR counts are now measured directly and bounded on both
+  sides. The document had already been bitten by nonce length once — v0.9.23's 466 B was corrected as
+  "a mis-measurement from a differing cap nonce length" — and pinned nothing, so the error returned at
+  the next re-measurement. It is pinned now: a test asserts the production nonce is exactly
+  `FINGERPRINT_LEN` and names the constants that must be re-measured if it ever changes, and every
+  measurement fixture derives its nonce from that constant instead of a literal. Tolerances on all
+  four size assertions are tightened from ±2 B / ±66 B to equality, since each mints from hardcoded
+  inputs and reads no clock; a percentage band that could never fire independently of the assertion
+  above it is replaced by a real one — that the token fits under `max_control_line`, the functional
+  requirement the 32 KiB raise exists to satisfy (td-331c11).
 - **v0.9.32 (2026-09-10)** — Two gaps closed: cold-clock diagnostics (td-e8b79f, A10.42) and host
   key custody (td-ef5744, A10.41). §A7b gains a stated time-rule discipline: the catalog's time
   rules split by *when* an artifact is minted, not by which side mints it — an artifact issued ahead

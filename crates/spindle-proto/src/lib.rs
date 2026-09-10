@@ -69,7 +69,7 @@ pub mod vfs_rpc;
 pub use artifacts::{
     AdminCommand, AdmissionToken, CapKind, Capability, DeviceCertificate, Envelope, HostOpKeyCert,
     ProtoError, RevocationRecord, ADMIN_COMMAND_CURRENT_V, ADMIN_COMMAND_MIN_V,
-    CAPABILITY_CURRENT_V, CAPABILITY_MIN_V,
+    CAPABILITY_CURRENT_V, CAPABILITY_MIN_V, MEASURED_MEMBER_CAP_BYTES,
 };
 pub use bootstrap::{
     BundleEntry, BundleWireError, DeviceBootstrapBundle, RedactedBundleWireError, BUNDLE_CURRENT_V,

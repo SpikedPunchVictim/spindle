@@ -104,6 +104,7 @@ pub fn verify_capability(cap: &Capability, now: u64) -> Result<(), ArtifactError
 mod tests {
     use super::*;
     use crate::artifacts::issue_host_op_key_cert;
+    use crate::fingerprint::FINGERPRINT_LEN;
     use crate::identity::RootKey;
 
     /// A full test host: identity root + operating key + the root's certificate for that
@@ -126,6 +127,14 @@ mod tests {
         }
     }
 
+    /// Shared by every behavioral test in this module (nonce length is irrelevant to any of
+    /// them) AND by `keeps_measured_member_cap_bytes_honest` below, which is why the nonce here
+    /// is `FINGERPRINT_LEN` bytes, not an arbitrary literal: `FINGERPRINT_LEN` is the same named
+    /// constant `default_member_cap_nonce`'s pin test
+    /// (`spindle-host-core::authorize::default_member_cap_nonce_is_exactly_fingerprint_len_bytes`)
+    /// checks the production issuer against (td-331c11) — so a future change to the production
+    /// nonce length turns that pin test red rather than leaving this fixture's byte count to
+    /// silently drift out of sync with reality again.
     fn issue(
         host: &TestHost,
         kind: CapKind,
@@ -141,7 +150,7 @@ mod tests {
             subject,
             epoch,
             exp,
-            vec![0xAA; 16],
+            vec![0xAA; FINGERPRINT_LEN],
         )
     }
 
@@ -330,19 +339,20 @@ mod tests {
 
     #[test]
     fn keeps_measured_member_cap_bytes_honest() {
-        // DESIGN.md §A4/§A5's "**407 B each, measured**" (the per-member-capability figure the
+        // DESIGN.md §A4/§A5's "**424 B each, measured**" (the per-member-capability figure the
         // 32-cap CONNECT token figure in `auth_token.rs` builds on) is pinned by
         // `spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES`. A genuine drift in a real cap's
         // encoded size means DESIGN.md and that constant must be updated together.
         //
         // Minted with realistic values, matching the reference measurement this test reproduces:
         // ts = 1_755_907_200, a 90-day op-cert exp (1_763_683_200), cap_epoch = 7, a 21-day cap
-        // exp, and a 16-byte nonce — the same nonce length `MEASURED_ENTRY_BYTES`'s own doc
-        // comment flags as what makes this figure move. Tolerance chosen the same way
-        // `keeps_measured_entry_bytes_honest` (this crate's `bootstrap` module) chooses its own:
-        // +/-2 B leaves room for a single field crossing a CBOR shortest-form boundary between now
-        // and whenever this test next runs, without being so loose it would fail to flag a
-        // genuine future drift (e.g. a larger op_cert chain).
+        // exp, and a FINGERPRINT_LEN-byte nonce (see `issue`'s own doc comment — td-331c11 pins
+        // that length to `default_member_cap_nonce`'s actual output via a test in
+        // spindle-host-core, rather than a bare literal here). Every input this test mints with
+        // is a hardcoded constant (`ts`/`op_cert_exp`/the nonce/the subject) — nothing here reads
+        // a wall clock, so the encoded length reproduces bit-for-bit on every run. td-331c11
+        // tightened this from a +/-2 B tolerance (left over from when this figure was believed to
+        // vary run-to-run) to an equality assertion for that reason.
         const TWENTY_ONE_DAYS: u64 = 21 * 86_400;
         let ts = 1_755_907_200u64;
         let op_cert_exp = 1_763_683_200u64; // ts + 90 days
@@ -355,12 +365,13 @@ mod tests {
             ts + TWENTY_ONE_DAYS,
         );
         let measured = cap.to_canonical_bytes().len();
-        let tolerance = 2usize;
-        assert!(
-            measured.abs_diff(spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES) <= tolerance,
-            "capability encoded to {measured} B, expected within {tolerance} B of \
-             MEASURED_MEMBER_CAP_BYTES ({} B) — update DESIGN.md §A4/§A5's \"407 B each\" figure \
-             and MEASURED_MEMBER_CAP_BYTES together if this genuinely drifted",
+        assert_eq!(
+            measured,
+            spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES,
+            "capability encoded to {measured} B, expected exactly MEASURED_MEMBER_CAP_BYTES \
+             ({} B) — this measurement is fully deterministic (fixed ts/exp/nonce/subject, no \
+             wall clock), so any difference is a genuine drift: update DESIGN.md §A4/§A5's \"424 \
+             B each\" figure and MEASURED_MEMBER_CAP_BYTES together",
             spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES
         );
     }
