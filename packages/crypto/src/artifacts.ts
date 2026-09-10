@@ -441,7 +441,10 @@ export async function verifyAdminCommand(
  * 2. `sign_pk` parses as Ed25519; `agree_pk` is exactly 32 bytes.
  * 3. `host_device_fp` recomputed from `(alg_id, sign_pk, agree_pk)` matches the certificate's own
  *    field (§A7b clarification 6's binding discipline, mirrored from `DeviceCertificate`/A10.34).
- * 4. `host_fp` matches the caller's pinned `expectedHostFp`.
+ * 4. `host_fp` matches the caller's pinned `expectedHostFp`. Both sides must be exactly 32 bytes
+ *    (`fingerprintsMatch`, not bare `bytesEqual`): `bytesEqual([], [])` is vacuously `true`, so an
+ *    unguarded comparison would let a well-formed certificate naming an empty `host_fp` "verify"
+ *    against a caller that (by bug or omission) also passes an empty `expectedHostFp`.
  * 5. `host_fp == SHA-256(host_root_pk)` — self-consistency of the certificate's own fields (the
  *    same check `verifyCapability`'s step 1 performs).
  * 6. The embedded `op_cert` decodes as a `HostOpKeyCert` and chains to `host_root_pk` (including
@@ -466,7 +469,11 @@ export async function verifyHostDeviceCert(
   if (!bytesEqual(recomputedDeviceFp, cert.host_device_fp)) throw ArtifactError.deviceFingerprintMismatch();
 
   // 4. host_fp matches the caller's pinned expectation (required parameter — see doc comment).
-  if (!bytesEqual(expectedHostFp, cert.host_fp)) throw ArtifactError.hostFingerprintMismatch();
+  // Both sides must be exactly 32 bytes (`fingerprintsMatch`, not bare `bytesEqual`): `bytesEqual`
+  // is vacuously `true` on two empty inputs, so an unguarded comparison would let a well-formed
+  // certificate naming an empty `host_fp` "verify" against a caller that (by bug or omission) also
+  // passes an empty `expectedHostFp`.
+  if (!fingerprintsMatch(expectedHostFp, cert.host_fp)) throw ArtifactError.hostFingerprintMismatch();
 
   // 5. host_fp is self-consistent with the embedded host_root_pk.
   requireEd25519PublicKey(cert.host_root_pk);

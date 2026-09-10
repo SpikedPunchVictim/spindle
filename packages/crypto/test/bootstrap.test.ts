@@ -49,7 +49,6 @@ async function testHost(
   const opPk = await ed25519PublicKeyFromSeed(opSeed);
   const unsigned: HostOpKeyCert = {
     host_op_pk: opPk,
-    nats_fp: new Uint8Array(32).fill(0xee),
     ts: 0n,
     exp: opCertExp,
     sig_host_root: new Uint8Array(64),

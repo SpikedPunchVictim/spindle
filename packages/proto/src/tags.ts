@@ -42,10 +42,10 @@ export const HOST_DEVICE_CERT_V1: Uint8Array = encoder.encode("spindle-host-dev-
  * between them (DESIGN.md §A7b). */
 export const SESSION_ATTESTATION_V1: Uint8Array = encoder.encode("spindle-sess-attest-v1");
 /** `HostSessionAttestation` (A4/A7b, added v0.9.31, td-583db5) — signed by the host **operating**
- * key. That key now signs three artifact types — `Capability` (`spindle-cap-v1`),
- * `RevocationRecord` (`spindle-rev-v1`), and `HostSessionAttestation`
- * (`spindle-host-sess-attest-v1`) — so this tag is what prevents cross-artifact signature
- * confusion between them (DESIGN.md §A7b). */
+ * key. That key now signs four artifact types — `Capability` (`spindle-cap-v1`),
+ * `RevocationRecord` (`spindle-rev-v1`), `HostDeviceCert` (`spindle-host-dev-cert-v1`), and
+ * `HostSessionAttestation` (`spindle-host-sess-attest-v1`) — so this tag is what prevents
+ * cross-artifact signature confusion between them (DESIGN.md §A7b). */
 export const HOST_SESSION_ATTESTATION_V1: Uint8Array = encoder.encode(
   "spindle-host-sess-attest-v1",
 );

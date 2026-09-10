@@ -669,13 +669,35 @@ pub fn decide_host_connect(
 
     // The authoritative session-binding check (v0.9.31, td-583db5) — and it must sit exactly
     // here, after `verify_host_op_key_cert` has succeeded and before any admission/quota work is
-    // trusted. `presented.host_op_cert.host_op_pk` is only trustworthy once the certificate
-    // carrying it has been verified against the pinned host root above: verifying
-    // `session_attest` against an *unverified* cert's `host_op_pk` would let an attacker present a
-    // self-made cert naming their own key and satisfy the attestation with a signature they
-    // produced themselves — checking a signature against a key the attacker chose proves nothing.
-    // The cheap comparison above is not a substitute for this: it only ever inspects field bytes,
-    // never a signature.
+    // trusted. Both checks are unconditional and sequential, so it is not the ordering alone that
+    // stands between an attacker and a grant: `verify_host_op_key_cert` independently refuses an
+    // attacker-supplied op cert (an attacker presenting the victim's `host_root_pk` with their own
+    // `op_cert`/attestation is refused there with `BadHostSignature`, since they cannot produce
+    // `sig_host_root`). Ordering is load-bearing for a different reason — DESIGN.md §A12 #24's
+    // cheap-before-expensive cost discipline, so an attacker who can't sign anything real is
+    // turned away before this crate spends a second Ed25519 verification on them — and the
+    // placement here is still correct as defense in depth: the grant below is gated on
+    // `verify_host_op_key_cert` having succeeded on this same path, not merely on it having run
+    // earlier.
+    //
+    // Note what `verify_host_op_key_cert` succeeding does and does not prove. `host_fp` (line
+    // ~630) is `root_fp_of(&presented.host_root_pk)`, and that same value is passed to
+    // `verify_host_op_key_cert` as `expected_root_fp`; its first check, `root_fp_of(host_root_pk)
+    // != *expected_root_fp`, is therefore a tautology on this call path — it is not what pins
+    // `host_root_pk` to a known host. The actual pin is the durable-store lookup,
+    // `view.admission_record(&host_fp)`, above (step 3): an admitted host's `host_root_pk` is the
+    // one recorded at admission time. In `AdmissionMode::Open` there is no record and so no pin —
+    // any caller can mint a fresh `host_root_pk` — but the grant produced below is scoped to the
+    // presenter's own `host_fp` via `permissions::host_permissions(host_fp)`, so a self-made
+    // identity can claim only its own subjects, never a victim's (DESIGN.md §A3b's intent). What
+    // `verify_host_op_key_cert` does prove is that `host_op_pk` was actually certified by whichever
+    // key `host_root_pk` names — i.e. it is safe to use `host_op_pk` as the verifying key below.
+    // Verifying `session_attest` against an *unverified* cert's `host_op_pk` would let an attacker
+    // present a self-made cert naming their own key and satisfy the attestation with a signature
+    // they produced themselves — checking a signature against a key the attacker chose proves
+    // nothing — so this check belongs after cert verification regardless of the cost-ordering
+    // argument above. The cheap comparison in step 1 is not a substitute for any of this: it only
+    // ever inspects field bytes, never a signature.
     let Ok(host_op_pk_bytes) = <[u8; 32]>::try_from(presented.host_op_cert.host_op_pk.as_slice())
     else {
         return AuthzDecision::Refused(RefusalReason::BadHostSessionAttestation);

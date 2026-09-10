@@ -40,10 +40,10 @@ pub const HOST_DEVICE_CERT_V1: &[u8] = b"spindle-host-dev-cert-v1";
 /// between them (DESIGN.md §A7b).
 pub const SESSION_ATTESTATION_V1: &[u8] = b"spindle-sess-attest-v1";
 /// `HostSessionAttestation` (A4/A7b, added v0.9.31, td-583db5) — signed by the host **operating**
-/// key. That key now signs three artifact types — `Capability` (`spindle-cap-v1`),
-/// `RevocationRecord` (`spindle-rev-v1`), and `HostSessionAttestation`
-/// (`spindle-host-sess-attest-v1`) — so this tag is what prevents cross-artifact signature
-/// confusion between them (DESIGN.md §A7b).
+/// key. That key now signs four artifact types — `Capability` (`spindle-cap-v1`),
+/// `RevocationRecord` (`spindle-rev-v1`), `HostDeviceCert` (`spindle-host-dev-cert-v1`), and
+/// `HostSessionAttestation` (`spindle-host-sess-attest-v1`) — so this tag is what prevents
+/// cross-artifact signature confusion between them (DESIGN.md §A7b).
 pub const HOST_SESSION_ATTESTATION_V1: &[u8] = b"spindle-host-sess-attest-v1";
 
 /// Concatenates a domain tag with a byte string — `tag || bytes`. No hashing, no signing: this
@@ -70,8 +70,16 @@ mod tests {
         assert_eq!(out, vec![b't', b'a', b'g', 1, 2, 3]);
     }
 
+    // `signing_input` is `tag || canonical_bytes` with no length prefix and no delimiter between
+    // the two (see the fn doc above), so pairwise distinctness of the tags is not the property
+    // that actually prevents cross-artifact preimage collision: if one tag were a byte-prefix of
+    // another, a `canonical_bytes` for the shorter-tagged artifact could be chosen so that
+    // `short_tag || bytes` reassembles, byte-for-byte, into `long_tag || bytes'` for some
+    // `bytes'` — a signature over one artifact's preimage would then verify as a signature over
+    // the other's. Prefix-freeness is what rules this out, and it subsumes plain distinctness:
+    // two equal tags are trivially prefixes of each other.
     #[test]
-    fn all_ten_tags_distinct() {
+    fn all_ten_tags_are_prefix_free() {
         let tags = [
             ENVELOPE_V1,
             CAPABILITY_V1,
@@ -87,7 +95,12 @@ mod tests {
         for i in 0..tags.len() {
             for j in 0..tags.len() {
                 if i != j {
-                    assert_ne!(tags[i], tags[j], "tags at {i} and {j} collide");
+                    assert!(
+                        !tags[j].starts_with(tags[i]),
+                        "tag at {i} ({:?}) is a byte-prefix of tag at {j} ({:?})",
+                        tags[i],
+                        tags[j]
+                    );
                 }
             }
         }

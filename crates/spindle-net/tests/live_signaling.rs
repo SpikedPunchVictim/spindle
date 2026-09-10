@@ -1231,7 +1231,10 @@ async fn live_a_member_cap_holder_must_not_authorize_a_host_connect() {
 
     // =============================================================================================
     // Attack 2: replay a genuinely host-signed attestation naming a DIFFERENT session, from a
-    // third, unrelated nkey. This exercises only the cheap pre-check.
+    // third, unrelated nkey. This exercises the nats_fp binding, which is enforced twice: the
+    // cheap pre-check in decide_host_connect, and independently as the first step inside
+    // verify_host_session_attestation itself (`expected_nats_fp.matches(&attestation.nats_fp)`,
+    // which returns HostSessionKeyMismatch before the signature is even looked at).
     // =============================================================================================
     // Honesty about the threat model: NO real capability holder could ever produce or obtain the
     // artifact this attack presents — minting it requires `host.op_signing`, the host's own
@@ -1263,12 +1266,17 @@ async fn live_a_member_cap_holder_must_not_authorize_a_host_connect() {
         "a THIRD, unrelated nkey CONNECTed to the live stack presenting this host's genuine \
          op-key cert alongside a genuinely host-op-signed HostSessionAttestation minted for a \
          DIFFERENT session's nats_fp, and the stack ADMITTED it. The attestation's sig_op is \
-         valid under the real host_op_pk, so only the CHEAP PRE-CHECK (byte comparison of \
-         presented.nats_fp against session_attest.nats_fp) stands between this bundle and \
-         admission — if that comparison is missing or bypassed, any party who ever obtains one \
-         host-signed attestation could ride it onto an entirely different NATS session as this \
-         host. This must be reported as a genuine finding, not papered over by weakening this \
-         assertion."
+         valid under the real host_op_pk, so this bundle is refused twice over: the cheap \
+         pre-check in decide_host_connect (byte comparison of presented.nats_fp against \
+         session_attest.nats_fp) rejects it before any crypto runs, and even if that comparison \
+         were missing or bypassed, verify_host_session_attestation's own first step — \
+         `expected_nats_fp.matches(&attestation.nats_fp)` — refuses it again with \
+         HostSessionKeyMismatch before it ever checks sig_op. Both checks compare the same two \
+         fingerprints, so this replay tests that the binding holds, not that either check alone \
+         is the last line of defense; if this connect ever succeeded it would mean BOTH \
+         comparisons were missing or bypassed, and any party who ever obtains one host-signed \
+         attestation could ride it onto an entirely different NATS session as this host. This \
+         must be reported as a genuine finding, not papered over by weakening this assertion."
     );
 }
 

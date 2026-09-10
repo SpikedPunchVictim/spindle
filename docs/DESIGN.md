@@ -1097,7 +1097,8 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 
 Root keys sign two artifact types (`spindle-dev-cert-v2`, `spindle-self-rev-v1`); device identity
 keys likewise sign two (`spindle-env-v1`, `spindle-sess-attest-v1`); and **[amended v0.9.31]** the
-host operating key signs three (`spindle-cap-v1`, `spindle-rev-v1`, `spindle-host-sess-attest-v1`)
+host operating key signs four (`spindle-cap-v1`, `spindle-rev-v1`, `spindle-host-dev-cert-v1`,
+`spindle-host-sess-attest-v1`)
 — the distinct tags prevent cross-artifact signature confusion. The device pair matters most: an envelope signature and a session attestation are both
 produced online by the same key on the same connection, so the tag is the only thing standing between them.
 Host and helper both use helper server time for `exp`/`nbf` checks (single
