@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.34) + Execution Plan
+# Spindle — System Design Document (draft v0.9.35) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -136,6 +136,10 @@
 > itself unpinned — it tested one nonce *function*, leaving the issuer free to wrap it. The pin
 > now mints through the production `RootKeyCapIssuer` and asserts the encoded capability size
 > against the shared `MEASURED_MEMBER_CAP_BYTES` (td-331c11).
+> v0.9.35: no figure changes; v0.9.34's own two claims about that pin — that three measurement
+> tests move together, and that it catches any encoded-width drift — were themselves unchecked and
+> both false. Rather than soften them, the coupling and the clock guard they described were built,
+> and each is now verified by perturbation (td-331c11).
 
 ---
 
@@ -442,10 +446,16 @@ cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp
   error recurred at every subsequent re-measurement. **[amended v0.9.34]** It is pinned now, at
   the issuer rather than at any one nonce function: a test mints a capability through the
   production `RootKeyCapIssuer` and asserts its encoded length equals the shared
-  `MEASURED_MEMBER_CAP_BYTES`, which the `spindle-core` and `spindle-helper` measurement fixtures
-  pin as well — so the figures cannot be brought back to green one at a time. v0.9.33 claimed this
-  was pinned when only the nonce function was: wrapping that function in a truncating closure at
-  the issuer's wiring reproduced the original defect with the whole suite green (td-331c11). S12
+  `MEASURED_MEMBER_CAP_BYTES`. v0.9.33 claimed this was pinned when only the nonce function was:
+  wrapping that function in a truncating closure at the issuer's wiring reproduced the original
+  defect with the whole suite green. **[amended v0.9.35]** Two further claims v0.9.34 made about
+  that pin were themselves unchecked. `spindle-helper` did not in fact pin the shared constant —
+  it pinned its own literals, and stayed green when `MEASURED_MEMBER_CAP_BYTES` was perturbed — so
+  it now asserts `32 * MEASURED_MEMBER_CAP_BYTES + envelope` instead, and the perturbation reddens
+  all three measurement tests. And the pin cannot see a change to the production clock, because its
+  fixture injects one; a separate test bounds `wall_clock_now_secs` to the `[2^16, 2^32)` band the
+  measurements assume, since a seconds-to-milliseconds change would widen every timestamp field by
+  a CBOR byte unnoticed (td-331c11). S12
   measures.
 
 **NATS authentication = Auth Callout for every connection**
@@ -1696,6 +1706,26 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.35 (2026-09-10)** — No figure changes. v0.9.34 corrected v0.9.33 for asserting an unchecked
+  claim, and then asserted two of its own. Independent review found both. First: "all three
+  measurement tests move together or none can" was false — perturbing `MEASURED_MEMBER_CAP_BYTES`
+  from 424 to 425 reddened two, not three, because `spindle-helper` pinned its own literals
+  (`14_115`, `18_820`) and never read the shared constant. Second: "reddens for any other drift in
+  a capability's encoded width" was false — the pin's fixture injects its clock, so
+  `wall_clock_now_secs` was unreachable from it, and changing it from seconds to milliseconds (every
+  `exp` a 9-byte CBOR uint instead of 5, 428 B per cap) left the whole suite at 869 passed / 0
+  failed. Both are now true rather than softened: `spindle-helper` asserts
+  `MEASURED_32_CAP_TOKEN_CBOR_BYTES == 32 * MEASURED_MEMBER_CAP_BYTES + MEASURED_TOKEN_ENVELOPE_BYTES`
+  (a 547 B envelope: map framing, device certificate, session attestation), so the same perturbation
+  now reddens all three; and a new test bounds `wall_clock_now_secs` to `[2^16, 2^32)`, the band a
+  5-byte CBOR uint occupies and the band every measurement was taken in. Each is verified by the
+  perturbation that previously passed. Also swept: a seventh doc comment still describing the
+  deleted function-level pin, and two live pre-measurement estimates the earlier sweep missed
+  because it did not cover `deploy/` — a reference `nats-server.conf` saying capabilities are
+  "~200 B each" beside the very `max_control_line` raise sized for them, and a TypeScript test
+  comment saying entries are "~530 B". The pattern across v0.9.33, v0.9.34 and this entry is one
+  failure repeating at decreasing scale: each fix described a guarantee stronger than the one it
+  built. A claim about what a test catches is itself a claim requiring a test (td-331c11).
 - **v0.9.34 (2026-09-10)** — Corrects v0.9.33's pin, not its figures: every measured size in §A4
   stands unchanged. v0.9.33 asserted the basis was "pinned to the issuer by test." It was not. The
   test asserted the return length of `default_member_cap_nonce`, a function, and justified that as
@@ -1706,12 +1736,11 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
   16-byte defect with `cargo test --workspace` still reporting 869 passed / 0 failed. The pin now
   mints a capability through the production `RootKeyCapIssuer` — the constructor that installs the
   real nonce source, with realistic op-cert timestamps so the encoding is comparable — and asserts
-  its canonical encoded length equals `MEASURED_MEMBER_CAP_BYTES`. That is a strict superset: it
-  reddens for a truncated nonce, for a rewired `nonce_fn`, and for any other drift in a
-  capability's encoded width. It also closes the escape hatch a length-equality pin leaves open,
-  since the cheapest way to make it green after a genuine change is to edit the shared constant,
-  which immediately reddens the `spindle-core` and `spindle-helper` fixtures pinning the same
-  constant — all three move together or none can. The general lesson, recorded because this is the
+  its canonical encoded length equals `MEASURED_MEMBER_CAP_BYTES`. It reddens for a truncated
+  nonce and for a rewired `nonce_fn`. **[corrected v0.9.35]** This entry went on to claim it
+  reddens for any other encoded-width drift, and that three measurement tests move together or
+  none can. Both were unchecked and both were false; see v0.9.35, which makes them true rather
+  than restating them. The general lesson, recorded because this is the
   second time the document has been bitten by this exact basis: pinning a *value* is not pinning
   its *basis*, and a test that asserts one of its own premises in a comment has not tested that
   premise (td-331c11).

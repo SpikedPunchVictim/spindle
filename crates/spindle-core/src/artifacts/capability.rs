@@ -348,12 +348,13 @@ mod tests {
         // Minted with realistic values, matching the reference measurement this test reproduces:
         // ts = 1_755_907_200, a 90-day op-cert exp (1_763_683_200), cap_epoch = 7, a 21-day cap
         // exp, and a FINGERPRINT_LEN-byte nonce (see `issue`'s own doc comment — td-331c11 pins
-        // that length to `default_member_cap_nonce`'s actual output via a test in
-        // spindle-host-core, rather than a bare literal here). Every input this test mints with
-        // is a hardcoded constant (`ts`/`op_cert_exp`/the nonce/the subject) — nothing here reads
-        // a wall clock, so the encoded length reproduces bit-for-bit on every run. td-331c11
-        // tightened this from a +/-2 B tolerance (left over from when this figure was believed to
-        // vary run-to-run) to an equality assertion for that reason.
+        // that length to what the production `RootKeyCapIssuer` actually emits, via a test in
+        // spindle-host-core that mints through that issuer, rather than a bare literal here).
+        // Every input this test mints with is a hardcoded constant (`ts`/`op_cert_exp`/the
+        // nonce/the subject) — nothing here reads a wall clock, so the encoded length reproduces
+        // bit-for-bit on every run. td-331c11 tightened this from a +/-2 B tolerance (left over
+        // from when this figure was believed to vary run-to-run)
+        // to an equality assertion for that reason.
         const TWENTY_ONE_DAYS: u64 = 21 * 86_400;
         let ts = 1_755_907_200u64;
         let op_cert_exp = 1_763_683_200u64; // ts + 90 days

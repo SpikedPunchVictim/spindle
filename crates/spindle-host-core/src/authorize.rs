@@ -2810,7 +2810,7 @@ mod tests {
 
     // ---- td-331c11: the production issuer's own output is pinned, not an assumption about it ----
 
-    /// A [`RootKeyCapIssuer`] built exactly as production builds it — [`RootKeyCapIssuer::new`],
+    /// A [`RootKeyCapIssuer`] built by the production constructor — [`RootKeyCapIssuer::new`],
     /// which installs [`default_member_cap_nonce`] — with only the wall clock pinned so the
     /// measurement below is reproducible. Deliberately does NOT call
     /// [`RootKeyCapIssuer::with_nonce_fn`]: the nonce this issuer emits is the thing under test.
@@ -2847,11 +2847,15 @@ mod tests {
     ///
     /// So this test mints through [`RootKeyCapIssuer`] itself, built by the production constructor,
     /// and pins the encoded byte count end-to-end against the shared constant. It goes red for a
-    /// truncated nonce, for a rewired `nonce_fn`, and for any other drift in a capability's encoded
-    /// width — and because it pins the *shared* constant, the cheapest way to make it green again
-    /// is to edit `MEASURED_MEMBER_CAP_BYTES`, which immediately reddens the `spindle-core` and
-    /// `spindle-helper` measurement tests that pin the same constant. All three must move together
-    /// or none of them can.
+    /// truncated nonce, for a rewired `nonce_fn`, and for drift in any capability field this
+    /// issuer supplies — but NOT for a change to `wall_clock_now_secs`, which this fixture
+    /// replaces with a fixed clock; that gap is covered separately by
+    /// `wall_clock_now_secs_stays_in_the_five_byte_cbor_uint_band` below. Because it pins the
+    /// *shared* constant, the cheapest way to make it green again is to edit
+    /// `MEASURED_MEMBER_CAP_BYTES`, which reddens `spindle-core`'s
+    /// `keeps_measured_member_cap_bytes_honest` and, via the `32 * MEASURED_MEMBER_CAP_BYTES +
+    /// envelope` identity it asserts, `spindle-helper`'s `keeps_measured_32_cap_token_bytes_honest`
+    /// as well. All three move together.
     #[test]
     fn production_issuer_mints_caps_at_exactly_measured_member_cap_bytes() {
         let cap = realistic_cap_issuer(1_755_907_200)
@@ -2877,6 +2881,29 @@ mod tests {
             cap.nonce.len(),
             spindle_core::FINGERPRINT_LEN,
             "the production issuer's nonce must be exactly FINGERPRINT_LEN bytes (td-331c11)"
+        );
+    }
+
+    /// The pin above injects its clock, so [`wall_clock_now_secs`] itself is unreachable from it —
+    /// the same shape of gap that let a rewired `nonce_fn` slip past td-331c11's first attempt,
+    /// one axis over. The measured figures assume a timestamp in seconds, which CBOR encodes as a
+    /// 5-byte uint; a units change to milliseconds (~1.7e12) would encode as 9 bytes and silently
+    /// add 4 B to every timestamp field in every artifact. This asserts the production clock's
+    /// magnitude stays in the band the measurements were taken in. It reads the real wall clock
+    /// deliberately — that is the value under test — and is stable until the band's upper edge in
+    /// 2106, at which point every timestamp figure in this workspace needs re-measuring anyway.
+    #[test]
+    fn wall_clock_now_secs_stays_in_the_five_byte_cbor_uint_band() {
+        const FIVE_BYTE_UINT_MIN: u64 = 1 << 16;
+        const FIVE_BYTE_UINT_MAX: u64 = 1 << 32;
+        let now = wall_clock_now_secs();
+        assert!(
+            (FIVE_BYTE_UINT_MIN..FIVE_BYTE_UINT_MAX).contains(&now),
+            "wall_clock_now_secs() returned {now}, outside the [2^16, 2^32) band that CBOR encodes \
+             as a 5-byte uint -- every MEASURED_* size constant in this workspace was measured \
+             with timestamps in that band. If the unit changed (seconds -> milliseconds is the \
+             likely cause), every measurement fixture, every MEASURED_* constant and DESIGN.md \
+             must be re-measured together (td-331c11)"
         );
     }
 }

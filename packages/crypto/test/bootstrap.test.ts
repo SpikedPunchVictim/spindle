@@ -211,7 +211,8 @@ describe("buildBootstrapBundle / verifyBootstrapBundle", () => {
     // the bundle regardless of encoded size) would make this test fail, since it would never see
     // `TooLargeForQr` at all.
     //
-    // Real entries measure ~530 B each; the EC-M budget is 2331 B. 6 real entries safely exceed it
+    // Real entries measure 521 B each (measured, td-331c11 — this comment said ~530 B, a
+    // pre-measurement estimate); the EC-M budget is 2331 B. 6 real entries safely exceed it
     // regardless of small per-entry size drift, while staying well under MAX_BUNDLE_ENTRIES (32).
     const entries: BundleEntry[] = [];
     const entryFps: Uint8Array[] = [];
