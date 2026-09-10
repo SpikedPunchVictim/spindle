@@ -595,7 +595,9 @@ fn admin_command_vectors_verify() {
         assert_eq!(cmd.signing_input(), case.get("signing_input_hex").hex());
 
         let now = case.get("decoded").get("ts").as_u64();
-        let result = verify_admin_command(&cmd, &operator_pk, now);
+        let expected_signer_fp =
+            Fingerprint::from_slice(&cmd.signer_fp).expect("32-byte signer_fp");
+        let result = verify_admin_command(&cmd, &operator_pk, &expected_signer_fp, now);
         assert_eq!(result.is_ok(), case.get("signature_valid").as_bool());
     }
 }

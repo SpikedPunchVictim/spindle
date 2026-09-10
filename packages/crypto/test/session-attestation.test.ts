@@ -80,6 +80,41 @@ describe("verifySessionAttestation", () => {
     );
   });
 
+  // Regression pin: `bytesEqual([], [])` is vacuously `true`, so a naive
+  // `bytesEqual(expectedNatsFp, attestation.nats_fp)` binding check "verifies" a well-signed
+  // attestation that names an empty `nats_fp` against a caller that (by bug or omission) also
+  // supplies an empty `expectedNatsFp` — the check running and passing having bound nothing. This
+  // must fail before the length guard exists and pass after it.
+  it("rejects a well-signed attestation with an empty nats_fp verified against an empty expectedNatsFp", async () => {
+    const devicePk = await ed25519PublicKeyFromSeed(deviceSeed);
+    const emptyFp = new Uint8Array(0);
+    const att = await issueTestAttestation({ deviceSeed, natsFp: emptyFp, ts: 1_000n });
+    await expectArtifactError(
+      () => verifySessionAttestation(att, devicePk, emptyFp, 1_000n),
+      "SessionKeyMismatch",
+    );
+  });
+
+  it("rejects a 31-byte expectedNatsFp even when it otherwise matches attestation.nats_fp", async () => {
+    const devicePk = await ed25519PublicKeyFromSeed(deviceSeed);
+    const shortFp = natsFp.slice(0, 31);
+    const att = await issueTestAttestation({ deviceSeed, natsFp: shortFp, ts: 1_000n });
+    await expectArtifactError(
+      () => verifySessionAttestation(att, devicePk, shortFp, 1_000n),
+      "SessionKeyMismatch",
+    );
+  });
+
+  it("rejects a 33-byte expectedNatsFp even when it otherwise matches attestation.nats_fp", async () => {
+    const devicePk = await ed25519PublicKeyFromSeed(deviceSeed);
+    const longFp = new Uint8Array(33).fill(0xaa);
+    const att = await issueTestAttestation({ deviceSeed, natsFp: longFp, ts: 1_000n });
+    await expectArtifactError(
+      () => verifySessionAttestation(att, devicePk, longFp, 1_000n),
+      "SessionKeyMismatch",
+    );
+  });
+
   it("rejects a tampered signature", async () => {
     const devicePk = await ed25519PublicKeyFromSeed(deviceSeed);
     const att = await issueTestAttestation({ deviceSeed, natsFp, ts: 1_000n });

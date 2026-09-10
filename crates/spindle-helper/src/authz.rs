@@ -1650,20 +1650,55 @@ mod tests {
 
     #[test]
     fn wire_message_is_uniform_across_every_refusal_reason() {
-        let reasons = [
-            RefusalReason::TooManyCapabilities,
-            RefusalReason::NoCapabilitiesPresented,
-            RefusalReason::CapabilitySubjectMismatch,
-            RefusalReason::SubjectRevoked,
-            RefusalReason::BadNkeySignature,
-            RefusalReason::AdmissionClosed,
-            RefusalReason::AdmissionTokenAlreadyUsed,
-        ];
-        for reason in reasons {
-            assert_eq!(
-                AuthzDecision::Refused(reason).wire_message(),
-                UNIFORM_REFUSAL_MESSAGE
-            );
+        // This test used to hand-enumerate a subset of `RefusalReason` (7 of the then-16
+        // variants) and silently kept passing when `BadSessionAttestation` was added as the
+        // 17th — the list was never wrong, just incomplete, and nothing forced anyone to notice.
+        // `wire_message` itself can't be relied on to catch that: it matches on `AuthzDecision`,
+        // not on `RefusalReason`, so a reason that was never listed here is indistinguishable
+        // from one that was.
+        //
+        // The macro below makes the variant list the single source for two things at once: the
+        // `match` (with no `_` arm) that must name every `RefusalReason` variant to compile, and
+        // the values this test actually exercises. There is no second list to fall out of sync
+        // with — adding a `RefusalReason` variant without adding it to the invocation below is a
+        // compile error, not a silent gap. (Verified by hand: adding a dummy variant to
+        // `RefusalReason` without updating this list fails `cargo test -p spindle-helper` with
+        // "non-exhaustive patterns: `RefusalReason::Dummy` not covered".)
+        macro_rules! assert_uniform_for_every_reason {
+            ($($variant:ident),+ $(,)?) => {{
+                fn assert_exhaustive(reason: RefusalReason) {
+                    match reason {
+                        $(RefusalReason::$variant => {})+
+                    }
+                }
+                $(
+                    assert_exhaustive(RefusalReason::$variant);
+                    assert_eq!(
+                        AuthzDecision::Refused(RefusalReason::$variant).wire_message(),
+                        UNIFORM_REFUSAL_MESSAGE
+                    );
+                )+
+            }};
         }
+
+        assert_uniform_for_every_reason!(
+            TooManyCapabilities,
+            NoCapabilitiesPresented,
+            DeviceCertificateExpired,
+            BadDeviceCertificate,
+            BadSessionAttestation,
+            CapabilitySubjectMismatch,
+            SubjectRevoked,
+            BadNkeySignature,
+            BadCapabilitySignature,
+            HostCertificateExpired,
+            HostCertificateSessionMismatch,
+            BadHostSignature,
+            NoAdmissionRecord,
+            AdmissionClosed,
+            AdmissionTokenExpired,
+            BadAdmissionToken,
+            AdmissionTokenAlreadyUsed,
+        );
     }
 }

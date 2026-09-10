@@ -518,14 +518,157 @@ mod tests {
     /// only ever calls `PgStore::connect` once per process (`bin/helper.rs`).
     static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Extracts the database name (last path segment, minus any `?query`) from a Postgres
+    /// connection URL, or `None` if the URL has no parseable path segment at all (no `/` after
+    /// the authority, or a bare trailing `/` with nothing after it). Returning `None` here is a
+    /// reporting outcome, not a crash: [`require_test_database_name`] turns it into the same loud
+    /// panic as an unsafe-but-parseable name, rather than letting a malformed URL panic here with
+    /// a confusing message about string indices.
+    fn parse_database_name(url: &str) -> Option<String> {
+        let after_scheme = url.split_once("://")?.1;
+        let (_authority, path) = after_scheme.split_once('/')?;
+        let name = path.split('?').next().unwrap_or("");
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
+    /// Guards `test_store`'s TRUNCATE (below) against running against anything that isn't
+    /// unambiguously a test database.
+    ///
+    /// # Why this exists
+    /// The TRUNCATE below is correct and necessary — these tests share one physical database
+    /// (see `TEST_LOCK`'s doc comment) and need to start each test from a clean slate — but
+    /// *nothing else in this file* constrains which database `TEST_DATABASE_URL` is allowed to
+    /// name. The only previous gate was "is the env var set at all"; any set value, however
+    /// dangerous, sailed straight through to `PgStore::connect` and then the TRUNCATE.
+    /// `deploy/README.md` used to document exactly that dangerous value — pointing
+    /// `TEST_DATABASE_URL` at `.../spindle`, the live compose stack's own database (the same one
+    /// `helper`'s `DATABASE_URL` uses) — so following the repo's own documented procedure
+    /// destroyed a running stack's revocations, admission records, burned nonces, session
+    /// records, and TURN usage. This function is now the only thing standing between a
+    /// misconfigured `TEST_DATABASE_URL` and that outcome, which is why it panics rather than
+    /// silently skipping: a silent skip on a dangerous value would print a green test run over a
+    /// database it just destroyed — a false green is worse than no gate at all, because it
+    /// destroys trust in every other passing signal too.
+    ///
+    /// # Rule
+    /// The database name must *end* in `_test` (`spindle_test`, `spindle_alice_test`, any
+    /// per-developer variant). This is a suffix check, not a substring check, so
+    /// `spindle_test_fixtures` — a plausible name for a database that merely *holds* test
+    /// fixtures — is deliberately rejected: the suffix is the whole contract, and a substring
+    /// match would let a name that merely mentions "test" in passing satisfy a check meant to
+    /// gate a destructive TRUNCATE.
+    ///
+    /// Called *before* [`PgStore::connect`] and deliberately parses the name out of the URL
+    /// string alone rather than connecting first and asking Postgres — there is no reason to
+    /// open a connection to a database this function is about to reject.
+    fn require_test_database_name(url: &str) {
+        match parse_database_name(url) {
+            Some(name) if name.ends_with("_test") => {}
+            Some(name) => panic!(
+                "TEST_DATABASE_URL names database `{name}`, which does not end in `_test` -- \
+                 refusing to run pg_store's contract tests against it. Every test in this module \
+                 truncates revocation_epochs, revoked_subjects, admission_records, \
+                 burned_admission_nonces, session_records, and turn_usage before it runs; \
+                 pointing TEST_DATABASE_URL at a non-test database (e.g. the live compose \
+                 stack's `spindle`, deploy/docker-compose.yml's POSTGRES_DB) destroys real data. \
+                 Point TEST_DATABASE_URL at a dedicated database whose name ends in `_test` \
+                 instead, e.g. `spindle_test` -- see deploy/README.md."
+            ),
+            None => panic!(
+                "TEST_DATABASE_URL (`{url}`) has no parseable database name -- refusing to run \
+                 pg_store's contract tests against it (see require_test_database_name's doc \
+                 comment for why an unparseable target is treated as unsafe rather than \
+                 skipped). Point TEST_DATABASE_URL at a dedicated database whose name ends in \
+                 `_test`, e.g. `postgres://user:pass@host:port/spindle_test`."
+            ),
+        }
+    }
+
+    #[test]
+    fn parse_database_name_rejects_live_stack_name() {
+        assert_eq!(
+            parse_database_name("postgres://spindle:spindle-dev-only@127.0.0.1:12019/spindle")
+                .as_deref(),
+            Some("spindle")
+        );
+    }
+
+    #[test]
+    fn parse_database_name_accepts_test_suffix() {
+        assert_eq!(
+            parse_database_name("postgres://u:p@127.0.0.1:12019/spindle_test").as_deref(),
+            Some("spindle_test")
+        );
+    }
+
+    #[test]
+    fn parse_database_name_strips_query_string() {
+        assert_eq!(
+            parse_database_name("postgres://u:p@127.0.0.1:12019/spindle_test?sslmode=disable")
+                .as_deref(),
+            Some("spindle_test")
+        );
+    }
+
+    #[test]
+    fn parse_database_name_extracts_name_containing_but_not_ending_in_test() {
+        // `spindle_test_fixtures` contains `_test` but does not end with it -- extraction alone
+        // must not decide safety here, `require_test_database_name`'s `ends_with` check does.
+        assert_eq!(
+            parse_database_name("postgres://u:p@127.0.0.1:12019/spindle_test_fixtures").as_deref(),
+            Some("spindle_test_fixtures")
+        );
+    }
+
+    #[test]
+    fn parse_database_name_handles_trailing_slash_without_panicking() {
+        assert_eq!(parse_database_name("postgres://u:p@127.0.0.1:12019/"), None);
+    }
+
+    #[test]
+    fn parse_database_name_handles_no_path_segment_without_panicking() {
+        assert_eq!(parse_database_name("postgres://u:p@127.0.0.1:12019"), None);
+    }
+
+    #[test]
+    fn require_test_database_name_accepts_test_suffix() {
+        // Must not panic.
+        require_test_database_name("postgres://u:p@127.0.0.1:12019/spindle_test");
+    }
+
+    #[test]
+    #[should_panic(expected = "does not end in `_test`")]
+    fn require_test_database_name_panics_on_live_stack_name() {
+        require_test_database_name("postgres://spindle:spindle-dev-only@127.0.0.1:12019/spindle");
+    }
+
+    #[test]
+    #[should_panic(expected = "does not end in `_test`")]
+    fn require_test_database_name_panics_on_name_containing_but_not_ending_in_test() {
+        require_test_database_name("postgres://u:p@127.0.0.1:12019/spindle_test_fixtures");
+    }
+
+    #[test]
+    #[should_panic(expected = "no parseable database name")]
+    fn require_test_database_name_panics_on_unparseable_url() {
+        require_test_database_name("postgres://u:p@127.0.0.1:12019/");
+    }
+
     /// Connects a fresh [`PgStore`] against `TEST_DATABASE_URL`, or returns `None` with a printed
     /// notice (never a test failure) if the env var is unset — the gating mechanism the task brief
-    /// asks for.
+    /// asks for. Panics via [`require_test_database_name`] if the env var is set but does not
+    /// name a database that is unambiguously a test database — see that function's doc comment
+    /// for why this must be a loud failure rather than a silent skip.
     async fn test_store() -> Option<PgStore> {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
             println!("[SKIP] pg_store contract test -- TEST_DATABASE_URL not set");
             return None;
         };
+        require_test_database_name(&url);
         let operator_pk = SigningKey::from_bytes(&[0x42; 32]).verifying_key();
         let store = PgStore::connect(&url, AdmissionMode::Invite, operator_pk)
             .await

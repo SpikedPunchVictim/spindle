@@ -12,8 +12,8 @@
 // | HostOpKeyCert | host root |
 // | RevocationRecord | host op key or identity root |
 // | AdmissionToken | operator admission key |
-// | AdminCommand | operator admission key |
-// | SessionAttestation | device identity key |
+// | AdminCommand | operator admission key (`verifyAdminCommand` also takes the operator identity it binds to — `expectedSignerFp` — as a required argument, td-0bcab4) |
+// | SessionAttestation | device identity key (`verifySessionAttestation` likewise takes the value it binds — the connecting session's `nats_fp` — as a required argument rather than checking only a signature, td-0bcab4) |
 //
 // This module never reads a system clock: every time check takes a caller-supplied `now: bigint`
 // (Unix seconds), consistent with DESIGN.md §A7 ("clients compute an offset" from helper server
@@ -35,7 +35,7 @@ import {
 import { ed25519 } from "@noble/curves/ed25519.js";
 
 import { type BackendOption, ed25519Verify } from "./backend.js";
-import { deviceFpOf, rootFpOf } from "./fingerprint.js";
+import { deviceFpOf, FINGERPRINT_LEN, rootFpOf } from "./fingerprint.js";
 
 /** The `alg_id` suite version byte (DESIGN.md §A4): `1` = Ed25519 / X25519 / AES-256-GCM. Mirrors
  * `spindle-core::identity::ALG_ID_V1`. */
@@ -62,7 +62,8 @@ export type ArtifactErrorKind =
   | "DeviceFingerprintMismatch"
   | "UnsupportedAlgId"
   | "VersionTooLow"
-  | "SessionKeyMismatch";
+  | "SessionKeyMismatch"
+  | "SignerFingerprintMismatch";
 
 export class ArtifactError extends Error {
   readonly kind: ArtifactErrorKind;
@@ -134,6 +135,12 @@ export class ArtifactError extends Error {
       "session attestation does not name the connecting session key",
     );
   }
+  static signerFingerprintMismatch(): ArtifactError {
+    return new ArtifactError(
+      "SignerFingerprintMismatch",
+      "signer_fp does not match the expected admin command signer",
+    );
+  }
 }
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -142,6 +149,26 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
     if (a[i] !== b[i]) return false;
   }
   return true;
+}
+
+/** True if `expected` and `actual` are both exactly `FINGERPRINT_LEN` (32) bytes AND equal.
+ *
+ * A fingerprint *binding* check (one artifact's identity field compared against a value the
+ * caller already holds, e.g. `SessionAttestation.nats_fp` vs the connecting session key, or
+ * `AdminCommand.signer_fp` vs the operator identity the caller expects) must not delegate straight
+ * to `bytesEqual`: `bytesEqual([], [])` is vacuously `true`, so an attestation carrying an
+ * empty/omitted binding field, checked by a caller that (by bug or omission) also supplies an
+ * empty expected value, would "verify" a binding that was never actually compared. Rust gets this
+ * for free — `expected_*_fp: &Fingerprint` is a newtype that can only ever hold exactly 32 bytes,
+ * so the equivalent Rust comparison can't be fooled by a length-zero value on either side. This
+ * function is the TS twin of that guarantee: it rejects any non-32-byte input on either side
+ * before ever reaching `bytesEqual`. */
+function fingerprintsMatch(expected: Uint8Array, actual: Uint8Array): boolean {
+  return (
+    expected.length === FINGERPRINT_LEN &&
+    actual.length === FINGERPRINT_LEN &&
+    bytesEqual(expected, actual)
+  );
 }
 
 function absDiff(a: bigint, b: bigint): bigint {
@@ -331,20 +358,55 @@ export async function verifyAdmissionToken(
   checkExp(now, tok.exp);
 }
 
-/** Verifies `sig` and `|ts - now| <= 2 min` (A7b). Per-signer monotonic `seq` plus nonce replay
- * tracking is durable caller-owned state (helper/host audit chain), not this package's concern. */
+/** Verifies an admin command: it names `expectedSignerFp`, `sig` is valid under `operatorPk`, and
+ * `|ts - now| <= 2 min` (A7b). Per-signer monotonic `seq` plus nonce replay tracking is durable
+ * caller-owned state (helper/host audit chain), not this package's concern.
+ *
+ * **`expectedSignerFp` is a required argument, deliberately and non-negotiably.** This used to be
+ * exactly the API shape that produced td-0bcab4: `command.signer_fp` is carried inside the
+ * *signed* preimage — a well-signed command has skin in the game about who it claims to be from —
+ * but a `verifyAdminCommand(command, operatorPk, now)` that never compared it against anything
+ * would let a command bearing a valid signature from *some* key the caller trusted verify
+ * regardless of whose `signer_fp` it named. That is the same bearer-token shape
+ * `verifySessionAttestation` exists to close for `DeviceCertificate.nats_fp`: a signed binding
+ * field that no verifier actually reads. There is no valid caller that wants the signature checked
+ * without the binding, so this API does not offer one.
+ *
+ * Checks run cheap-structural-before-crypto (§A6), in this order:
+ * 1. Version floor — cheapest possible rejection, checked before any other work (DESIGN.md §A7b:
+ *    "Unknown `v` ⇒ reject").
+ * 2. `expectedSignerFp` matches `command.signer_fp` — the check this function exists to enforce.
+ *    Both sides must be exactly 32 bytes (`fingerprintsMatch`, not bare `bytesEqual`), for the
+ *    same reason `verifySessionAttestation`'s `nats_fp` binding does: `bytesEqual([], [])` is
+ *    vacuously `true`, so an unguarded comparison would let a well-signed command naming an empty
+ *    `signer_fp` "verify" against a caller that (by bug or omission) also passes an empty
+ *    `expectedSignerFp`.
+ * 3. `operatorPk` parses as a valid Ed25519 public key, and `sig` verifies over
+ *    `AdminCommand.signingInput(command)`.
+ * 4. Clock skew (`ts` ±2 min). */
 export async function verifyAdminCommand(
   command: AdminCommand,
   operatorPk: Uint8Array,
+  expectedSignerFp: Uint8Array,
   now: bigint,
   opts?: BackendOption,
 ): Promise<void> {
-  // Version floor — cheapest possible rejection, checked before any signature or timestamp work
-  // (DESIGN.md §A7b: "Unknown `v` ⇒ reject").
+  // 1. Version floor — cheapest possible rejection, checked before any signature, binding, or
+  // timestamp work (DESIGN.md §A7b: "Unknown `v` ⇒ reject").
   checkMinV(command.v, ADMIN_COMMAND_MIN_V);
 
+  // 2. signer_fp binding — the check this function exists to enforce (td-0bcab4's API shape).
+  // Must run before the signature check: naming the wrong signer is a structural mismatch,
+  // cheaper to reject than the crypto below.
+  if (!fingerprintsMatch(expectedSignerFp, command.signer_fp)) {
+    throw ArtifactError.signerFingerprintMismatch();
+  }
+
+  // 3. Signature.
   requireEd25519PublicKey(operatorPk);
   await verifySigOrThrow(operatorPk, AdminCommand.signingInput(command), command.sig, opts?.backend);
+
+  // 4. Clock skew.
   checkSkew(now, command.ts, ADMIN_COMMAND_CLOCK_SKEW_SECS);
 }
 
@@ -438,7 +500,13 @@ export async function verifyHostDeviceCert(
  * Checks run cheap-structural-before-crypto (§A6), in this order:
  * 1. `expectedNatsFp` matches `attestation.nats_fp` — the binding check td-0bcab4 exists for, run
  *    first because it is both the cheapest possible rejection and the one this function exists to
- *    enforce.
+ *    enforce. Both sides must be exactly 32 bytes (`fingerprintsMatch`, not bare `bytesEqual`):
+ *    `bytesEqual([], [])` is vacuously `true`, so an unguarded comparison would let a well-signed
+ *    attestation naming an empty `nats_fp` "verify" against a caller that (by bug or omission)
+ *    also passes an empty `expectedNatsFp` — the binding check running and passing having bound
+ *    nothing. Rust's `expected_nats_fp: &Fingerprint` gets this for free from the `Fingerprint`
+ *    newtype (always exactly 32 bytes); this length check is what gives the TS twin the same
+ *    guarantee.
  * 2. Clock skew: `|now - attestation.ts| <= 2 min`, via the same `checkSkew` idiom
  *    `verifyAdminCommand` uses (its internal `absDiff` orders the subtraction to avoid
  *    underflow-wrap on the unsigned `now`/`ts` wire values).
@@ -454,7 +522,7 @@ export async function verifySessionAttestation(
   // 1. nats_fp binding — the check this artifact exists for (td-0bcab4). Must run before any
   // crypto work, per §A6, and before the skew check too: naming the wrong session key is a
   // structural mismatch, cheaper to reject than either the timestamp or the signature.
-  if (!bytesEqual(expectedNatsFp, attestation.nats_fp)) throw ArtifactError.sessionKeyMismatch();
+  if (!fingerprintsMatch(expectedNatsFp, attestation.nats_fp)) throw ArtifactError.sessionKeyMismatch();
 
   // 2. Clock skew.
   checkSkew(now, attestation.ts, SESSION_ATTESTATION_CLOCK_SKEW_SECS);

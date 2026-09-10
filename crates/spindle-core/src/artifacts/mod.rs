@@ -13,8 +13,8 @@
 //! | [`HostDeviceCert`](spindle_proto::artifacts::HostDeviceCert) | host operating key, chained to the host root via an embedded `op_cert` (decision A10.35; self-verifying like `Capability`, but `verify_host_device_cert` additionally *requires* a pinned `host_fp` argument) |
 //! | [`RevocationRecord`](spindle_proto::artifacts::RevocationRecord) | host op key or identity root |
 //! | [`AdmissionToken`](spindle_proto::artifacts::AdmissionToken) | operator admission key |
-//! | [`AdminCommand`](spindle_proto::artifacts::AdminCommand) | operator admission key |
-//! | [`SessionAttestation`](spindle_proto::artifacts::SessionAttestation) | device identity key (the one artifact here whose `verify_*` takes the value it binds — the connecting session's `nats_fp` — as a required argument rather than checking only a signature) |
+//! | [`AdminCommand`](spindle_proto::artifacts::AdminCommand) | operator admission key (`verify_admin_command` also takes the operator identity it binds to — `expected_signer_fp` — as a required argument, td-0bcab4) |
+//! | [`SessionAttestation`](spindle_proto::artifacts::SessionAttestation) | device identity key (`verify_session_attestation` likewise takes the value it binds — the connecting session's `nats_fp` — as a required argument rather than checking only a signature, td-0bcab4) |
 //!
 //! This crate never reads a system clock: every time check takes a caller-supplied `now: u64`
 //! (Unix seconds), consistent with DESIGN.md §A7 ("clients compute an offset" from helper server
@@ -105,6 +105,18 @@ pub enum ArtifactError {
     /// the check ran and the byte comparison failed, not because the check was skipped.
     #[error("session attestation does not name the connecting session key")]
     SessionKeyMismatch,
+    /// [`admin_command::verify_admin_command`] (td-0bcab4's exact API shape, one artifact over):
+    /// `command.signer_fp` — carried inside the *signed* preimage — does not match the
+    /// `expected_signer_fp` the caller supplied for the `operator_pk` it is verifying against.
+    /// Before this variant existed, `verify_admin_command(command, operator_pk, now)` checked only
+    /// that *some* key the caller already trusted had signed the command, and never read
+    /// `signer_fp` at all — a signed binding field no verifier enforced, precisely the defect
+    /// class `SessionKeyMismatch` above exists to close for `SessionAttestation`. Checked before
+    /// the signature (§A6, cheapest rejection short of the version floor), so this error can only
+    /// fire because the check ran and the byte comparison failed, not because the check was
+    /// skipped.
+    #[error("signer_fp does not match the expected admin command signer")]
+    SignerFingerprintMismatch,
 }
 
 /// The version-floor check shared by [`capability::verify_capability`] and

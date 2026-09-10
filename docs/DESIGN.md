@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.29) + Execution Plan
+# Spindle — System Design Document (draft v0.9.30) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -100,6 +100,16 @@
 > implementation had neither, so `{root_pk, device_cert, caps}` was a bearer token and the device identity
 > key was never exercised at CONNECT; the host half was worse, since the never-expiring op cert embedded in
 > every member capability authorized a CONNECT **as the host**. Both proven live (td-0bcab4).
+> v0.9.30: two independent adversarial reviews of commit 8099677 correct four staleness defects and add one
+> alternative. §A4 step 2's check order is reversed to match code — certificate verification before session
+> attestation, since `sign_pk` is only trustworthy once the certificate is verified against the pinned root; the
+> device- and host-certificate signature preimages gain the `exp` they omitted; §A7's clock-skew paragraph's
+> stated remedy (helper returns server time in the callout reply) is corrected — never implementable client-side,
+> since the reply is addressed to nats-server and NATS `INFO` carries no time field, so a client whose clock is
+> off by more than the ±2 min `SessionAttestation` window cannot complete a CONNECT at all; `SessionAttestation`
+> gains a normative per-connect-minting, non-persistence contract (§A3/§A7b) closing a bearer-bundle-in-the-browser
+> risk; and A10.39 gains the rejected challenge-response alternative (measured: undoable in-browser under
+> non-extractable WebCrypto). The ±2 min window itself is deliberately left at 120s (td-e8b79f).
 
 ---
 
@@ -282,7 +292,7 @@ signer, result).
 - *Device* = keypair generated on-device: Ed25519 (sign) + X25519 (agree); `alg_id` is a **suite version byte**
   (`1` = Ed25519/X25519/AES-256-GCM; no P-256 fallback — all target browsers ship Ed25519/X25519);
   `device_fp = base32(SHA-256("spindle-dev-v1" || alg_id || sign_pk || agree_pk))`. Carries a **device certificate
-  signed only by the root**: `sig_root(device_fp, alg_id, sign_pk, agree_pk, ts)`. **[amended v0.9.16, A10.34]** The
+  signed only by the root**: `sig_root(device_fp, alg_id, sign_pk, agree_pk, ts, exp)`. **[amended v0.9.16, A10.34]** The
   certificate now publishes the `sign_pk`/`agree_pk` preimage that `device_fp` already commits to (above), giving A7's
   `X25519(dev_self, dev_agree_peer)` term a defined source; a verifier recomputes `device_fp` locally and checks it, so
   this is not a new trust assumption. Dropping `label` is not a change — A7b already recorded that the device certificate
@@ -294,7 +304,7 @@ signer, result).
   secondary cannot amplify); browsers are never root holders. Adding a device = scan QR from the primary device (or enter
   the recovery phrase on the new device, which then becomes primary).
 - *Host* = has a **host identity root** (`host_fp = hash(host_root_pk)`, backed up with the share config / recovery
-  phrase) that signs its **operating key** (`sig_host_root(host_op_pk, nats_fp, ts)`). Members pin `host_fp`; rotating
+  phrase) that signs its **operating key** (`sig_host_root(host_op_pk, nats_fp, ts, exp)`). Members pin `host_fp`; rotating
   or reinstalling the operating key from backup does **not** trigger the key-change wall; losing the host root = new
   host (re-invite everyone) — stated in the host UI at setup, with backup nagging. **[amended v0.9.16, A10.35]** A
   host has **two** fingerprints and they are not interchangeable: `host_fp = hash(host_root_pk)` is the **NATS
@@ -320,6 +330,16 @@ signer, result).
    warm on every connect, defeating this bullet's own "rotated per session". Removing it costs no connect
    material: `nats_fp` is a fingerprint of a *public* key, the seed stays in the OS keychain / IndexedDB above,
    and the callout derives the session fingerprint from the nkey NATS itself presents.
+
+**[added v0.9.30]** A `SessionAttestation` MUST be minted fresh for **every connect attempt, including every
+automatic reconnect**, and MUST NOT be persisted to disk or browser storage. Persisting one
+beside the session nkey seed recreates the bearer bundle this artifact exists to abolish: A3
+prices the nkey seed as low-value precisely because possessing it proves nothing on its own.
+Both client platforms support this without a wire change — natively, `async-nats`
+`with_auth_callback` is async, receives the server nonce, returns the full CONNECT credential
+set, and re-runs on every reconnect attempt; in the browser the NATS authenticator is
+**synchronous**, so a client keeps a short-lived background re-minter and the authenticator
+returns the freshest cached attestation.
 
 **Capabilities (host-signed, self-verifying)**
 ```
@@ -361,13 +381,16 @@ cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp
 **NATS authentication = Auth Callout for every connection**
 1. Device connects signing the server nonce with its session nkey and presents: device certificate (root-signed),
    session-nkey attestation, and the capabilities for this session (`member` caps, or one `invite` cap).
-2. Callout verifies (cheap checks first: sizes, counts, `exp`): nkey signature; the session attestation `sig_device(nats_fp, ts)` against the device certificate's `sign_pk`, and its
-   `nats_fp` against the connecting nkey's **[added v0.9.29]**; device cert → `root_fp`; each cap's
+2. Callout verifies (cheap checks first: sizes, counts, `exp`): nkey signature; device cert → `root_fp`; **then**
+   the session attestation `sig_device(nats_fp, ts)` against the now-verified certificate's `sign_pk`, and its
+   `nats_fp` against the connecting nkey's **[added v0.9.29; order tightened v0.9.30 — the attestation check
+   MUST follow certificate verification, because `sign_pk` is only trustworthy once the certificate carrying it
+   has been verified against the pinned root]**; each cap's
    `sig_host`, `exp`, `subject` matches `root_fp`; **best-effort** revocation/epoch check against the helper's durable
    store of host-signed records (A4 Revocation) — *the authoritative check is the host's per-request enforcement
    (A4b)*. Returns a user JWT with permissions (A5), limits (`payload` 64 KiB, `subs` ≤ 4N+8, `data` cap),
    `allowed_connection_types` (`WEBSOCKET` browser / `STANDARD` daemon), `exp` jittered in [45, 75] min.
-3. A host connection presents `sig_host_root(host_op_pk, nats_fp, ts)` (+ an admission invite on first connect);
+3. A host connection presents `sig_host_root(host_op_pk, nats_fp, ts, exp)` (+ an admission invite on first connect);
    callout checks `host_fp == hash(host_root_pk)`, **that the certificate's `nats_fp` equals the connecting
    nkey's** [added v0.9.29 — this is the certificate's session binding, and was previously stated nowhere as a
    check; the host's nkey is therefore **long-lived and minted at enrollment**, since the certificate is
@@ -986,8 +1009,15 @@ idempotent at the ICE layer, so a duplicate candidate under a new `seq` is harml
 network **reordering** delivers an out-of-order envelope, which is dropped rather than buffered (ICE recovers via
 its own retransmits).
 **Browser crypto**: WebCrypto Ed25519/X25519 (Firefox 129+, Safari 17+, Chrome 137+) with `@noble/curves` fallback;
-AES-GCM/HKDF native. **Clock skew**: the helper returns server time in the callout reply; clients compute an offset
-for `ts`/`exp` checks and the UI warns on large skew.
+AES-GCM/HKDF native. **Clock skew [corrected v0.9.30]**: clients MUST source wall-clock time out of band
+(OS/NTP natively; the OS clock or an HTTPS `Date` header in the browser). There is **no
+in-band offset source**: the callout reply is addressed to nats-server and never reaches the
+client, a refusal surfaces only as the uniform message, and NATS `INFO` — the one pre-CONNECT
+message — carries `nonce` but no server time. Because `SessionAttestation` (§A7b) is checked
+at ±2 min, a device whose clock is further off than that **cannot complete a CONNECT at all**,
+and the failure is indistinguishable from revocation or a stolen bundle. The UI warns on large
+skew. [Prior text claimed the helper returned server time in the callout reply and clients
+computed an offset; that mechanism was never implementable from the client side.]
 **Public-key encoding validity [added v0.9.28]**: an **Ed25519** public key MUST be the *canonical*
 encoding of its point (RFC 8032 §5.1.3), and a verifier MUST reject one that is not. Two rules, both
 required: the encoded `y` is `< p` (`p = 2^255 − 19`), and when the decompressed `x` is 0 the sign bit
@@ -1017,7 +1047,7 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 
 | Artifact | Tag | Signer | Time rule | Replay rule |
 |----------|-----|--------|-----------|-------------|
-| Envelope | `spindle-env-v1` | device key | `ts` ±2 min (helper server-time offset) | (sid, direction, seq) monotonic |
+| Envelope | `spindle-env-v1` | device key | `ts` ±2 min (client's own out-of-band clock, §A7) | (sid, direction, seq) monotonic |
 | Member/invite cap | `spindle-cap-v1` | host op key (chained: embedded root-signed HostOpKeyCert) [amended v0.9.5] | `exp` (no `nbf`; schema-of-record carries none [amended v0.9.4]) | invite: nonce burn (idempotent replay of result); member: n/a |
 | Admission token | `spindle-adm-v1` | operator key | `exp` days | nonce burn at helper (CAS, idempotent) |
 | Device certificate | `spindle-dev-cert-v2` [amended v0.9.29 — `nats_fp` removed] | identity root | `exp` 1 y; re-sign on contact | n/a (revocable) |
@@ -1026,7 +1056,7 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 | Admin command | `spindle-adm-cmd-v1` | operator key | `ts` ±2 min | per-signer monotonic `seq` + nonce; idempotent execution |
 | Host op-key cert | `spindle-host-cert-v1` | host root | `exp` 90 d | n/a (rotation) |
 | Host device cert | `spindle-host-dev-cert-v1` | host op key | `exp` 90 d | n/a (rotation) |
-| Session attestation | `spindle-sess-attest-v1` | device identity key | `ts` ±2 min (helper server-time offset) | n/a — inert without the nkey secret it names, whose possession the callout proves separately |
+| Session attestation | `spindle-sess-attest-v1` | device identity key | `ts` ±2 min (client's own out-of-band clock, §A7) | n/a — inert without the nkey secret it names, whose possession the callout proves separately; MUST be minted fresh per connect attempt (incl. reconnect) and MUST NOT be persisted (§A3) **[added v0.9.30]** |
 
 Root keys sign two artifact types (`spindle-dev-cert-v2`, `spindle-self-rev-v1`), and device identity keys
 likewise sign two (`spindle-env-v1`, `spindle-sess-attest-v1`) — the distinct tags prevent cross-artifact
@@ -1328,7 +1358,7 @@ Docker is explicitly not the primary dev environment.
 | 36 | Envelope `inbox` field semantics | **DECIDED 2026-08-31:** binding. The client MUST set the offer's signed `inbox` to the exact NATS reply subject it listens on; the host MUST reject any offer whose decrypted `inbox` differs from the reply subject the transport reported. §A6's `_INBOX_<c>.` prefix check is unchanged and still runs first — it needs no key, whereas the equality check is only possible after decryption. Rejected: "redundant" (leaves the field decorative, and it had already drifted); "authoritative" (the host would publish to a client-asserted subject, would still need the prefix check, and would abandon NATS request/reply for no gain). Forced by a latent defect found while deciding it: the client minted `inbox` from a second `new_inbox()` call while `request()` generated its own reply subject internally, so the signed value never matched the real one — invisible because nothing read the field. (S2 leg A step A finding, 2026-08-30.) |
 | 37 | `HostDeviceCert` residency | **DECIDED 2026-09-01:** one authority, two caches — the host mints and owns the cert (operating key, per A10.35); the registry caches it durably at `registry.devcert.<hfp>`, published on every host connect, and serves it via `helper.devcert.get.<nfp>` as an untrusted-by-construction carrier; the client pins the root at first contact (A10.3) and verifies every cert's chain up to it. A device-key rotation under a valid chain must not trigger A4's pinning wall — only a root or op-key break does. Rejected: invite-only distribution (can't reach existing members after rotation); host serves it in band (structurally impossible — the client needs the agreement key to construct its first message); helper mints/re-signs it (destroys §A7's "registry cannot read or forge" property, same reasoning as A10.34). See §A5b. |
 | 38 | Public-key encoding validity | **DECIDED 2026-09-08:** tighten Rust to RFC 8032 §5.1.3 canonical rather than loosen TypeScript. Ed25519 encodings must be canonical (`y < p`, and sign bit 0 when `x = 0`); X25519 stays unvalidated beyond length on **both** sides, mirroring `x25519-dalek`'s infallible `PublicKey::from`. Forced by measurement, not review: the ticket asserted Rust validated X25519 — it does not (`impl From<[u8; 32]> for PublicKey` is infallible), so adding the "missing" TypeScript check would have *created* a split; and `ed25519-dalek`'s `VerifyingKey::from_bytes` is only `CompressedEdwardsY::decompress`, which accepts `y ≥ p` where `@noble/curves` rejects it. Rejected: loosening TS to dalek's semantics (hand-rolled curve code in a package designed to delegate primitives); leaving the split documented (ships a known consensus fork). Verifiers implement the rule as a decompress/re-compress **round trip**, which subsumes both clauses by construction — the first attempt enumerated them and shipped only one. Parity proven over 4128 inputs, zero mismatches (§A7). |
-| 39 | Binding a NATS session to a device | **DECIDED 2026-09-09:** implement A3's `sig_device(nats_fp, ts)` as a first-class A7b artifact (`spindle-sess-attest-v1`), and **delete** the device certificate's now-redundant `nats_fp` (`spindle-dev-cert-v1` → `spindle-dev-cert-v2`). A3 named both mechanisms and the implementation had neither, making `{root_pk, device_cert, caps}` a bearer token — found by reading, then proven live (td-0bcab4). Rejected: enforcing `device_cert.nats_fp` instead (one comparison, no wire change, but a new nkey would then need a newly root-signed certificate, killing A3's "rotated per session" and forcing the person's root warm every connect); requiring both (more surface, no property the attestation lacks); retaining the field as documented-inert (an unenforced binding field in a signed artifact is exactly what caused this defect, and the removal is free today — nothing persists a device certificate server- or host-side, so there is no migration, only regenerated vectors and the TS twin; the cost only grows later). Deleting `nats_fp` is not a loss of connect material: `nats_fp = hash(nats_pk)` is a fingerprint of a *public* key, the nkey seed lives client-side (A3: OS keychain / IndexedDB), and the callout derives the session fingerprint from the nkey NATS itself presents on CONNECT. The attestation needs no replay rule: it is inert without the nkey secret it names, and the nkey signature over the server nonce independently proves possession of that secret. |
+| 39 | Binding a NATS session to a device | **DECIDED 2026-09-09:** implement A3's `sig_device(nats_fp, ts)` as a first-class A7b artifact (`spindle-sess-attest-v1`), and **delete** the device certificate's now-redundant `nats_fp` (`spindle-dev-cert-v1` → `spindle-dev-cert-v2`). A3 named both mechanisms and the implementation had neither, making `{root_pk, device_cert, caps}` a bearer token — found by reading, then proven live (td-0bcab4). Rejected: enforcing `device_cert.nats_fp` instead (one comparison, no wire change, but a new nkey would then need a newly root-signed certificate, killing A3's "rotated per session" and forcing the person's root warm every connect); requiring both (more surface, no property the attestation lacks); retaining the field as documented-inert (an unenforced binding field in a signed artifact is exactly what caused this defect, and the removal is free today — nothing persists a device certificate server- or host-side, so there is no migration, only regenerated vectors and the TS twin; the cost only grows later). Deleting `nats_fp` is not a loss of connect material: `nats_fp = hash(nats_pk)` is a fingerprint of a *public* key, the nkey seed lives client-side (A3: OS keychain / IndexedDB), and the callout derives the session fingerprint from the nkey NATS itself presents on CONNECT. The attestation needs no replay rule: it is inert without the nkey secret it names, and the nkey signature over the server nonce independently proves possession of that secret. **[added v0.9.30]** A fourth alternative — `sig_device(nonce || nats_fp)`, challenge-response over the same server nonce the session nkey already signs in the same instant — would have removed the clock dependence and made a captured attestation permanently unreplayable. It was rejected on **measured** grounds: it is buildable natively (`async-nats` `with_auth_callback` is async and receives the nonce) but **not in the browser**. The NATS JS `Authenticator` is `(nonce?: string) => Auth`, invoked synchronously inside the `Connect` constructor and spread onto the CONNECT with no `await` anywhere in the path; `crypto.subtle.sign` on a non-extractable key is async. Making it work would require A3's identity key to become **extractable** so a synchronous Ed25519 implementation could sign — directly defeating the storage-exfiltration resistance that motivates non-extractable WebCrypto in the first place. The alternative loses on security, not ergonomics. |
 
 ## A11. Alternatives considered
 
@@ -1528,6 +1558,29 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.30 (2026-09-09)** — Two independent adversarial reviews of commit 8099677 (the v0.9.29 session-binding
+  landing) found five staleness defects, corrected here. §A4's two signature preimages both omitted `exp`:
+  `sig_root(device_fp, alg_id, sign_pk, agree_pk, ts)` and `sig_host_root(host_op_pk, nats_fp, ts)` are corrected
+  to include it, matching `DeviceCertificate::unsigned_entries` and the analogous host signer, which always signed
+  over `exp`. §A4 step 2's check order is reversed: the doc taught attestation-before-certificate, the opposite
+  of the implemented order, and the code's own comment (`authz.rs:459-467`) argues that order is mandatory —
+  `sign_pk` is only trustworthy once the certificate carrying it has been verified against the pinned root; the
+  end state is unchanged (both checks remain unconditional), but the doc was teaching the weaker sequence. §A7's
+  clock-skew paragraph is corrected: the stated remedy — the helper returns server time in the callout reply —
+  was never implementable from the client side. The reply is addressed to `server_id` and consumed by
+  nats-server, not the client; a refused device sees only the uniform refusal string; and NATS `INFO`, the one
+  pre-CONNECT message, carries `nonce` but no time field. There is no in-band offset source, which makes
+  `SessionAttestation`'s ±2 min window a hard prerequisite for the very connect that was supposed to teach the
+  offset. §A7b's artifact table named the same discredited helper-supplied-offset mechanism in its time-rule
+  column for the Envelope and Session attestation rows, the Envelope row's copy predating this release; both
+  now read as the client's own out-of-band clock. `SessionAttestation` (§A3/§A7b) gains a new normative contract: it MUST be minted fresh for every
+  connect attempt, including every automatic reconnect, and MUST NOT be persisted to disk or browser storage —
+  caching it beside the session nkey seed recreates the bearer bundle this artifact exists to abolish. A10.39
+  gains the rejected challenge-response alternative, `sig_device(nonce || nats_fp)`: measured as buildable
+  natively but not in the browser, since the JS `Authenticator` runs synchronously with no `await` in the path
+  and `crypto.subtle.sign` on a non-extractable key is async. The ±2 min window itself was deliberately **left at
+  120s** (tracked as td-e8b79f, not closed here) — the new `SessionAttestation` reconnect contract above removes
+  the case that would have bitten in production; the bootstrap gap is documented honestly rather than papered over.
 - **v0.9.29 (2026-09-09)** — §A7b gains a tenth artifact, the **per-session device attestation**
   (`spindle-sess-attest-v1`, device identity key over `{nats_fp, ts}`), §A4 step 2 requires the callout to
   verify it against the presented device certificate's `sign_pk`, and the **device certificate drops its

@@ -556,15 +556,20 @@ impl AdmissionToken {
 /// `DeviceCertificate { device_fp, alg_id, sign_pk, agree_pk, ts, exp, sig_root }`
 /// (DESIGN.md §A4).
 ///
-/// **Label discrepancy (flagged per the task brief)**: A4's inline notation for the signature
-/// itself reads `sig_root(device_fp, nats_fp, ts, label)` — appearing to include `label` in the
-/// signed material. But A4's enrollment/device-bootstrap paragraph states device **labels are
+/// **Label discrepancy (historical)**: A4's inline notation for the signature itself used to
+/// read `sig_root(device_fp, nats_fp, ts, label)` — appearing to include `label` in the signed
+/// material. But A4's enrollment/device-bootstrap paragraph states device **labels are
 /// host-local display state, renameable by the person and the host owner — never baked into
-/// certificates**. Those two statements are in tension; this crate follows the later, more
+/// certificates**. Those two statements were in tension; this crate follows the later, more
 /// specific rule and omits `label` entirely from `DeviceCertificate`. Baking a renameable label
 /// into a signed, root-issued certificate would force a full re-sign (a root-key operation) on
 /// every rename, which the "never baked into certificates" rule is clearly written to avoid — so
 /// the omission is treated as the authoritative resolution rather than an oversight to preserve.
+/// DESIGN.md's notation has since been corrected — the signature is now written as
+/// `sig_root(device_fp, alg_id, sign_pk, agree_pk, ts, exp)` (see the `[amended v0.9.16, A10.34]` note
+/// below) and names neither `label` nor `nats_fp`, so the tension described above no longer
+/// exists in DESIGN.md itself; the reasoning is kept here as the record of why `label` was never
+/// carried.
 ///
 /// **[amended v0.9.16, A10.34]**: the certificate now also publishes `alg_id`/`sign_pk`/`agree_pk`
 /// — the exact preimage `device_fp` already commits to

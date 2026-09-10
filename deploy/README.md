@@ -74,20 +74,32 @@ Postgres-backed helper (`DATABASE_URL` set, as the compose file now sets it) wit
 behavior, which is the whole point of the `HelperView` trait boundary.
 
 To additionally exercise `crates/spindle-helper`'s Postgres-gated store-contract tests against
-this stack's own database:
+this stack's own Postgres server:
+
+**Warning:** these tests `TRUNCATE` every table `pg_store.rs` owns
+(`revocation_epochs`, `revoked_subjects`, `admission_records`, `burned_admission_nonces`,
+`session_records`, `turn_usage`) before each test run. `TEST_DATABASE_URL` must therefore never
+name the live stack's own database (`spindle`, the one `helper`'s `DATABASE_URL` uses) — doing so
+would destroy that stack's revocations, admissions, burned nonces, sessions, and TURN usage.
+Point it at a dedicated `spindle_test` database on the same server instead; `pg_store.rs` now
+enforces this itself (it panics if the database name doesn't end in `_test`), so a mistake here
+fails loudly rather than truncating live data.
 
 ```sh
 docker compose -f deploy/docker-compose.yml up -d
-TEST_DATABASE_URL="postgres://spindle:spindle-dev-only@127.0.0.1:12019/spindle" \
+psql "postgres://spindle:spindle-dev-only@127.0.0.1:12019/spindle" -c 'CREATE DATABASE spindle_test'
+TEST_DATABASE_URL="postgres://spindle:spindle-dev-only@127.0.0.1:12019/spindle_test" \
   cargo test -p spindle-helper
 docker compose -f deploy/docker-compose.yml down
 ```
 
-(Host-side Postgres port is `12019`, not the default `5432` — dev boxes commonly already have a
-Postgres bound to `5432`, and this machine runs several other containerized Postgres instances in
-the `5432`/`15433`-`15436` range; see `docker-compose.yml`'s port mapping comment. Only host-side
-tools need this — the `helper` container itself addresses `postgres:5432` over the compose network,
-unaffected.)
+(The `CREATE DATABASE` line only needs to run once per compose volume — `spindle_test` persists in
+the named `spindle-postgres-data` volume across `up`/`down` cycles, and is dropped only if that
+volume is. Host-side Postgres port is `12019`, not the default `5432` — dev boxes commonly already
+have a Postgres bound to `5432`, and this machine runs several other containerized Postgres
+instances in the `5432`/`15433`-`15436` range; see `docker-compose.yml`'s port mapping comment.
+Only host-side tools need this — the `helper` container itself addresses `postgres:5432` over the
+compose network, unaffected.)
 
 ## Files
 

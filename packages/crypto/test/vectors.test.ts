@@ -966,9 +966,14 @@ describe("admin-command.json", () => {
       const args = argsFromCanonicalCbor(c.canonical_cbor_hex);
       const cmd = parseAdminCommand(c.decoded, args);
       if (c.signature_valid) {
-        await expect(verifyAdminCommand(cmd, operatorPk, cmd.ts)).resolves.toBeUndefined();
+        await expect(
+          verifyAdminCommand(cmd, operatorPk, cmd.signer_fp, cmd.ts),
+        ).resolves.toBeUndefined();
       } else {
-        await expectArtifactError(() => verifyAdminCommand(cmd, operatorPk, cmd.ts), "BadSignature");
+        await expectArtifactError(
+          () => verifyAdminCommand(cmd, operatorPk, cmd.signer_fp, cmd.ts),
+          "BadSignature",
+        );
       }
     });
   }
@@ -977,7 +982,7 @@ describe("admin-command.json", () => {
     const args = argsFromCanonicalCbor(doc.cases[0].canonical_cbor_hex);
     const cmd = parseAdminCommand(doc.cases[0].decoded, args);
     await expectArtifactError(
-      () => verifyAdminCommand(cmd, operatorPk, cmd.ts + 121n),
+      () => verifyAdminCommand(cmd, operatorPk, cmd.signer_fp, cmd.ts + 121n),
       "TimestampSkew",
     );
   });
@@ -986,14 +991,19 @@ describe("admin-command.json", () => {
     const args = argsFromCanonicalCbor(doc.cases[0].canonical_cbor_hex);
     const cmd = parseAdminCommand(doc.cases[0].decoded, args);
     cmd.v = 0;
-    await expectArtifactError(() => verifyAdminCommand(cmd, operatorPk, cmd.ts), "VersionTooLow");
+    await expectArtifactError(
+      () => verifyAdminCommand(cmd, operatorPk, cmd.signer_fp, cmd.ts),
+      "VersionTooLow",
+    );
   });
 
   it("still verifies an admin command with v at the floor", async () => {
     const args = argsFromCanonicalCbor(doc.cases[0].canonical_cbor_hex);
     const cmd = parseAdminCommand(doc.cases[0].decoded, args);
     expect(cmd.v).toBe(1);
-    await expect(verifyAdminCommand(cmd, operatorPk, cmd.ts)).resolves.toBeUndefined();
+    await expect(
+      verifyAdminCommand(cmd, operatorPk, cmd.signer_fp, cmd.ts),
+    ).resolves.toBeUndefined();
   });
 
   it("checks the version floor before the signature — v below the floor plus a corrupted signature must report VersionTooLow, not BadSignature", async () => {
@@ -1001,6 +1011,34 @@ describe("admin-command.json", () => {
     const cmd = parseAdminCommand(doc.cases[0].decoded, args);
     cmd.v = 0;
     cmd.sig[0] ^= 0xff;
-    await expectArtifactError(() => verifyAdminCommand(cmd, operatorPk, cmd.ts), "VersionTooLow");
+    await expectArtifactError(
+      () => verifyAdminCommand(cmd, operatorPk, cmd.signer_fp, cmd.ts),
+      "VersionTooLow",
+    );
+  });
+
+  // td-0bcab4: pins the exact API shape that produced the original defect closed. A well-signed
+  // admin command that names a *different* signer_fp than the operator identity the caller
+  // expects must be rejected — before `expectedSignerFp` became a required argument,
+  // `verifyAdminCommand` never compared `signer_fp` against anything.
+  it("rejects a well-signed admin command naming a different signer_fp (td-0bcab4)", async () => {
+    const args = argsFromCanonicalCbor(doc.cases[0].canonical_cbor_hex);
+    const cmd = parseAdminCommand(doc.cases[0].decoded, args);
+    const someoneElsesFp = new Uint8Array(32).fill(0xbb);
+    await expectArtifactError(
+      () => verifyAdminCommand(cmd, operatorPk, someoneElsesFp, cmd.ts),
+      "SignerFingerprintMismatch",
+    );
+  });
+
+  it("checks the signer_fp binding before the signature — a wrong signer_fp plus a corrupted signature must report SignerFingerprintMismatch, not BadSignature", async () => {
+    const args = argsFromCanonicalCbor(doc.cases[0].canonical_cbor_hex);
+    const cmd = parseAdminCommand(doc.cases[0].decoded, args);
+    cmd.sig[0] ^= 0xff;
+    const someoneElsesFp = new Uint8Array(32).fill(0xbb);
+    await expectArtifactError(
+      () => verifyAdminCommand(cmd, operatorPk, someoneElsesFp, cmd.ts),
+      "SignerFingerprintMismatch",
+    );
   });
 });

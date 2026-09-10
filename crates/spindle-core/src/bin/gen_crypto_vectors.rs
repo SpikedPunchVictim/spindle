@@ -874,7 +874,7 @@ fn admin_command_vectors() -> Json {
         vec![0x93; 16],
         ts,
     );
-    assert!(verify_admin_command(&cmd, &operator.verifying_key(), ts).is_ok());
+    assert!(verify_admin_command(&cmd, &operator.verifying_key(), &signer_fp, ts).is_ok());
 
     fn decoded(c: &spindle_proto::artifacts::AdminCommand) -> Json {
         Json::Obj(vec![
@@ -891,7 +891,7 @@ fn admin_command_vectors() -> Json {
 
     let mut tampered = cmd.clone();
     tampered.sig = flip_last_byte(&cmd.sig);
-    assert!(verify_admin_command(&tampered, &operator.verifying_key(), ts).is_err());
+    assert!(verify_admin_command(&tampered, &operator.verifying_key(), &signer_fp, ts).is_err());
 
     let cases = vec![
         case(
