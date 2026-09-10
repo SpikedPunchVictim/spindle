@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.30) + Execution Plan
+# Spindle — System Design Document (draft v0.9.31) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -110,6 +110,15 @@
 > gains a normative per-connect-minting, non-persistence contract (§A3/§A7b) closing a bearer-bundle-in-the-browser
 > risk; and A10.39 gains the rejected challenge-response alternative (measured: undoable in-browser under
 > non-extractable WebCrypto). The ±2 min window itself is deliberately left at 120s (td-e8b79f).
+> v0.9.31: §A7b gains an eleventh artifact — the **per-connect host session attestation**
+> (`spindle-host-sess-attest-v1`, host **operating** key over `{nats_fp, ts}`, A10.40) — and the
+> Host op-key cert **drops `nats_fp`** (`spindle-host-cert-v2`). v0.9.29 had bound the host's NATS
+> session inside the root-signed op cert, which forced the host's nkey to be long-lived (the root
+> stays cold, so a fresh nkey could not get a fresh certificate) and left the binding enforced by a
+> single manual comparison at one call site while every other consumer of that cert — the issuance
+> chain embedded in every member capability — ignored the field entirely. Domain-separating the two
+> roles restores symmetry with the device path, makes the binding a required verifier argument in
+> both languages, and **returns the host nkey to per-session** (td-583db5; bears on td-ef5744).
 
 ---
 
@@ -304,7 +313,7 @@ signer, result).
   secondary cannot amplify); browsers are never root holders. Adding a device = scan QR from the primary device (or enter
   the recovery phrase on the new device, which then becomes primary).
 - *Host* = has a **host identity root** (`host_fp = hash(host_root_pk)`, backed up with the share config / recovery
-  phrase) that signs its **operating key** (`sig_host_root(host_op_pk, nats_fp, ts, exp)`). Members pin `host_fp`; rotating
+  phrase) that signs its **operating key** (`sig_host_root(host_op_pk, ts, exp)`). Members pin `host_fp`; rotating
   or reinstalling the operating key from backup does **not** trigger the key-change wall; losing the host root = new
   host (re-invite everyone) — stated in the host UI at setup, with backup nagging. **[amended v0.9.16, A10.35]** A
   host has **two** fingerprints and they are not interchangeable: `host_fp = hash(host_root_pk)` is the **NATS
@@ -313,6 +322,14 @@ signer, result).
   keypair is dedicated (generated like any other device — A4 Device, above), certified by the **operating** key:
   `sig_host_op(host_device_fp, alg_id, sign_pk, agree_pk, ts)`, chaining root→op→device, so a member that pins
   `host_fp` verifies it with no new trust anchor; the root stays cold and device-key rotation never re-walls members.
+  **[amended v0.9.31, A10.40]** The operating-key certificate no longer carries `nats_fp`: it is the
+  **issuance chain** — embedded in every member capability (A10.30) so a verifier can walk root →
+  operating key — and `verify_host_op_key_cert` never read the field. The host's per-connect NATS
+  binding is the separate `HostSessionAttestation` (`spindle-host-sess-attest-v1`, §A7b), signed at
+  CONNECT time by the **operating** key rather than the root. Because that key is warm by design (it
+  already signs capabilities), the host's nkey is **per-session again**, as A3 always intended — the
+  v0.9.29 constraint fixing it long-lived was an artifact of putting the binding in a root-signed
+  certificate, not a property the design wanted.
 - *Member* = a host-local record binding a `root_fp` (and its accepted device chain) to host-local state (A4b).
 
 **Two credentials per device**
@@ -346,7 +363,7 @@ returns the freshest cached attestation.
 cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp | device_fp, cap_epoch, exp, nonce,
         sig }
 ```
-`op_cert` is the existing Host op-key cert (`spindle-host-cert-v1`, A7b) embedded as its complete canonical encoding;
+`op_cert` is the existing Host op-key cert (`spindle-host-cert-v2`, A7b) embedded as its complete canonical encoding;
 `sig` is the operating key's signature over the capability.
 - **`cap_epoch` vs `grants_version`** (two jobs, two counters): `cap_epoch` bumps only on security events (member/
   device revocation) and invalidates caps; `grants_version` is host-internal (entitlement edits, cache invalidation)
@@ -371,11 +388,18 @@ cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp
   useless without the device key). **Renewal path (no lockout)**: a cap that is expired or stale-epoch but
   signature-valid still earns **connect-only** NATS permissions (same as an invite); the host verifies the device
   over the E2E channel and re-issues the current cap in the reply. Only *revoked* subjects are refused outright.
-- **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (**449 B each, measured** [v0.9.23,
-  16-byte cap nonce; the earlier 466 B was itself a mis-measurement from a differing cap nonce length], chain-carrying,
+- **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (**407 B each, measured** [**[amended v0.9.31]** re-measured after
+  `HostOpKeyCert.nats_fp` was removed — 449 B at v0.9.23 with a 16-byte cap nonce; the earlier
+  466 B was itself a mis-measurement from a differing cap nonce length], chain-carrying,
   v0.9.5, base64url). nats-server's default `max_control_line` is 4 KiB, so the registry sets it to **32 KiB**
   (A10.10) and clients present **only the caps for hosts they will use this session** (pinned/open hosts), max **32**
-  per connection (A10.5). A full 32-cap CONNECT token measures **19,751 B**, 40% under the 32 KiB ceiling. S12
+  per connection (A10.5). A full 32-cap CONNECT token measures **18,095 B**, **55%** of the 32 KiB ceiling
+  **[amended v0.9.31]**. Measured over the full envelope a real device presents — device
+  certificate, session attestation and 32 member caps, realistic wall-clock timestamps
+  (a 5-byte CBOR uint, worth 1 byte per field over a toy value) and a 16-byte cap nonce.
+  The superseded 19,751 B predates v0.9.30's `session_attest` field and could not be
+  reproduced under the current envelope, so this figure supersedes it outright rather
+  than adjusting it by the per-cap delta. S12
   measures.
 
 **NATS authentication = Auth Callout for every connection**
@@ -390,13 +414,23 @@ cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp
    store of host-signed records (A4 Revocation) — *the authoritative check is the host's per-request enforcement
    (A4b)*. Returns a user JWT with permissions (A5), limits (`payload` 64 KiB, `subs` ≤ 4N+8, `data` cap),
    `allowed_connection_types` (`WEBSOCKET` browser / `STANDARD` daemon), `exp` jittered in [45, 75] min.
-3. A host connection presents `sig_host_root(host_op_pk, nats_fp, ts, exp)` (+ an admission invite on first connect);
-   callout checks `host_fp == hash(host_root_pk)`, **that the certificate's `nats_fp` equals the connecting
-   nkey's** [added v0.9.29 — this is the certificate's session binding, and was previously stated nowhere as a
-   check; the host's nkey is therefore **long-lived and minted at enrollment**, since the certificate is
-   root-signed and the host root stays cold], **and the admission record / mode policy (A3b)**
-   → host permissions for `host.<own_fp>.>`. A connection presenting **no** valid cap is refused (A5 Sybil/flood
-   defense) — the `invite` cap is the only bootstrap path; per-IP limits in front of NATS bound callout cost.
+3. A host connection presents `sig_host_root(host_op_pk, ts, exp)` **plus a
+   `HostSessionAttestation` `sig_op(nats_fp, ts)`** (+ an admission invite on first connect);
+   callout checks `host_fp == hash(host_root_pk)`, the certificate's chain and `exp`, **then — and
+   only then — that the attestation names the connecting nkey and verifies under the `host_op_pk`
+   that certificate carries**, **and the admission record / mode policy (A3b)**
+   → host permissions for `host.<own_fp>.>`. A connection presenting **no** valid cap is refused
+   (A5 Sybil/flood defense) — the `invite` cap is the only bootstrap path; per-IP limits in front of
+   NATS bound callout cost.
+   **[amended v0.9.31, A10.40]** The order is load-bearing and mirrors step 2's: `host_op_pk` is
+   only trustworthy once the certificate carrying it has been verified against the pinned root.
+   Verifying the attestation against an unverified certificate's `host_op_pk` would let an attacker
+   present a self-made certificate naming their own key and satisfy the attestation with a signature
+   they produced themselves. A cheap byte comparison of the attestation's `nats_fp` against the
+   connecting nkey runs among the cheap checks (§A12 #24), but it is a cost filter, not the
+   authoritative check. Superseding v0.9.29: the certificate's own `nats_fp` was the binding, so the
+   host's nkey had to be long-lived; under A10.40 the attestation is signed by the warm operating
+   key, so the nkey is per-session again and the root stays cold.
 4. Why not `verify_and_map`/registry accounts: cannot express per-host scoping, revocation, browsers, or "no accounts
    at the registry." mTLS optional.
 
@@ -413,9 +447,11 @@ QR channel that conveys the root identity itself, so a signature would have no v
 already establish, and the one security-bearing value inside it — `member_cap` — is an independently verifiable
 signed artifact. **This holds only while the bundle stays on that channel**: relaying it over the network, cloud
 sync, or a file export makes it a signed artifact requiring a §A7b entry with its own tag, time rule, and replay
-rule. **QR ceiling**: an entry is ~546 B (two 32-byte keys plus a 449-byte cap, measured with a 16-byte cap nonce), so
-a version-40 QR carries **4** hosts at EC level M and **5** at level L with a short registry endpoint — at the
-256-byte `MAX_REGISTRY_LEN` ceiling it is **3** and **4** — against the 32-host presentation cap in §A4. Bundle
+rule. **QR ceiling**: an entry is ~504 B (two 32-byte keys plus a 407-byte cap, measured with a 16-byte cap
+nonce), so a version-40 QR carries **4** hosts at EC level M and **5** at level L with a
+short registry endpoint — and, **[amended v0.9.31]** since removing `HostOpKeyCert.nats_fp`
+shrank each entry by 42 B, **4** and **5** at the 256-byte `MAX_REGISTRY_LEN` ceiling too
+(previously 3 and 4) — against the 32-host presentation cap in §A4. Bundle
 construction fails loudly when the host list does not fit, naming the hosts left out, and the owner re-invites the new
 device to the remainder; multi-frame QR is held in reserve, unbuilt, pending evidence that a real host list needs it.
 All hosts accept the new device automatically (they pinned `root_fp`) and notify the owner ("Alex added *iPhone*"). Any
@@ -1054,13 +1090,15 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 | Revocation record | `spindle-rev-v1` | host op key [amended v0.9.18] | none (permanent) | **max-wins, never decreases**; old records cannot roll back |
 | Self-revocation record | `spindle-self-rev-v1` | identity root | none (permanent) | **max-wins per root**, never decreases |
 | Admin command | `spindle-adm-cmd-v1` | operator key | `ts` ±2 min | per-signer monotonic `seq` + nonce; idempotent execution |
-| Host op-key cert | `spindle-host-cert-v1` | host root | `exp` 90 d | n/a (rotation) |
+| Host op-key cert | `spindle-host-cert-v2` [amended v0.9.31 — `nats_fp` removed] | host root | `exp` 90 d | n/a (rotation) |
 | Host device cert | `spindle-host-dev-cert-v1` | host op key | `exp` 90 d | n/a (rotation) |
 | Session attestation | `spindle-sess-attest-v1` | device identity key | `ts` ±2 min (client's own out-of-band clock, §A7) | n/a — inert without the nkey secret it names, whose possession the callout proves separately; MUST be minted fresh per connect attempt (incl. reconnect) and MUST NOT be persisted (§A3) **[added v0.9.30]** |
+| Host session attestation | `spindle-host-sess-attest-v1` | host **operating** key | `ts` ±2 min (client's own out-of-band clock, §A7) | n/a — inert without the nkey secret it names, whose possession the callout proves separately; minted fresh per connect attempt **[added v0.9.31]** |
 
-Root keys sign two artifact types (`spindle-dev-cert-v2`, `spindle-self-rev-v1`), and device identity keys
-likewise sign two (`spindle-env-v1`, `spindle-sess-attest-v1`) — the distinct tags prevent cross-artifact
-signature confusion. The device pair matters most: an envelope signature and a session attestation are both
+Root keys sign two artifact types (`spindle-dev-cert-v2`, `spindle-self-rev-v1`); device identity
+keys likewise sign two (`spindle-env-v1`, `spindle-sess-attest-v1`); and **[amended v0.9.31]** the
+host operating key signs three (`spindle-cap-v1`, `spindle-rev-v1`, `spindle-host-sess-attest-v1`)
+— the distinct tags prevent cross-artifact signature confusion. The device pair matters most: an envelope signature and a session attestation are both
 produced online by the same key on the same connection, so the tag is the only thing standing between them.
 Host and helper both use helper server time for `exp`/`nbf` checks (single
 authority; ±2 min).
@@ -1069,11 +1107,12 @@ authority; ±2 min).
 `crates/spindle-proto/src/lib.rs` (Stage 2 implementation), superseding this table for field-level detail. Two
 clarifications resolved during implementation: (1) **Device certificate carries no `label` field** — A4's "labels
 never baked into certificates" rule supersedes the older inline notation that listed `label`; (2) only **Envelope**,
-**Member/invite cap** (Capability), and **Admin command** carry an explicit `v` field — for the other seven artifacts (Admission token, Device certificate, Revocation record,
-Self-revocation record, Host op-key cert, Host device cert, Session attestation)
+**Member/invite cap** (Capability), and **Admin command** carry an explicit `v` field — for the other **eight** artifacts (Admission token, Device certificate, Revocation record,
+Self-revocation record, Host op-key cert, Host device cert, Session attestation, **Host session
+attestation** [added v0.9.31])
 the A7b domain tag above is itself the version discriminant; (3) the Capability artifact carries no `nbf` field —
 `exp` is the sole time bound; (4) the pre-committed root-rotation record (`sig_old_root(new_root_pk)`, §A4) is not one
-of the ten cataloged wire artifacts — v1 implements it crate-locally in spindle-core with its own domain tag;
+of the eleven cataloged wire artifacts — v1 implements it crate-locally in spindle-core with its own domain tag;
 promoting it to a spindle-proto wire type (with golden vectors) is flagged for when rotation records first cross the
 wire (device↔host sync); (5)
 **[amended v0.9.5, A10.30]** the Capability now embeds the HostOpKeyCert (complete canonical encoding, a byte-string
@@ -1085,7 +1124,15 @@ this is a **wire-visible change requiring regenerated golden vectors and the Typ
 binding is the Session attestation (`spindle-sess-attest-v1`), and the field was retained by no verifier in
 either language. Because the artifact has no `v` field, this is expressed by the domain tag:
 `spindle-dev-cert-v1` → **`spindle-dev-cert-v2`**. Like (6), a **wire-visible change requiring regenerated
-golden vectors and the TypeScript twin**.
+golden vectors and the TypeScript twin**. (8) **[amended v0.9.31, A10.40]** The Host op-key cert **no longer carries `nats_fp`** either — the
+same shape as (7), one artifact over. It serves two unrelated roles: the issuance chain embedded in
+every capability, whose verifier never read the field, and the host's own CONNECT credential, where
+one manual comparison at a single call site enforced it. The binding is now the Host session
+attestation (`spindle-host-sess-attest-v1`), whose verifier takes the expected `nats_fp` as a
+**required argument** in both languages, so it cannot be forgotten the way a carried field can.
+Because the artifact has no `v` field, this is expressed by the domain tag: `spindle-host-cert-v1` →
+**`spindle-host-cert-v2`**. Like (6) and (7), a **wire-visible change requiring regenerated golden
+vectors and the TypeScript twin**.
 
 ## A8. Transport, VFS RPC, and file safety (→ ADR-005)
 
@@ -1359,6 +1406,7 @@ Docker is explicitly not the primary dev environment.
 | 37 | `HostDeviceCert` residency | **DECIDED 2026-09-01:** one authority, two caches — the host mints and owns the cert (operating key, per A10.35); the registry caches it durably at `registry.devcert.<hfp>`, published on every host connect, and serves it via `helper.devcert.get.<nfp>` as an untrusted-by-construction carrier; the client pins the root at first contact (A10.3) and verifies every cert's chain up to it. A device-key rotation under a valid chain must not trigger A4's pinning wall — only a root or op-key break does. Rejected: invite-only distribution (can't reach existing members after rotation); host serves it in band (structurally impossible — the client needs the agreement key to construct its first message); helper mints/re-signs it (destroys §A7's "registry cannot read or forge" property, same reasoning as A10.34). See §A5b. |
 | 38 | Public-key encoding validity | **DECIDED 2026-09-08:** tighten Rust to RFC 8032 §5.1.3 canonical rather than loosen TypeScript. Ed25519 encodings must be canonical (`y < p`, and sign bit 0 when `x = 0`); X25519 stays unvalidated beyond length on **both** sides, mirroring `x25519-dalek`'s infallible `PublicKey::from`. Forced by measurement, not review: the ticket asserted Rust validated X25519 — it does not (`impl From<[u8; 32]> for PublicKey` is infallible), so adding the "missing" TypeScript check would have *created* a split; and `ed25519-dalek`'s `VerifyingKey::from_bytes` is only `CompressedEdwardsY::decompress`, which accepts `y ≥ p` where `@noble/curves` rejects it. Rejected: loosening TS to dalek's semantics (hand-rolled curve code in a package designed to delegate primitives); leaving the split documented (ships a known consensus fork). Verifiers implement the rule as a decompress/re-compress **round trip**, which subsumes both clauses by construction — the first attempt enumerated them and shipped only one. Parity proven over 4128 inputs, zero mismatches (§A7). |
 | 39 | Binding a NATS session to a device | **DECIDED 2026-09-09:** implement A3's `sig_device(nats_fp, ts)` as a first-class A7b artifact (`spindle-sess-attest-v1`), and **delete** the device certificate's now-redundant `nats_fp` (`spindle-dev-cert-v1` → `spindle-dev-cert-v2`). A3 named both mechanisms and the implementation had neither, making `{root_pk, device_cert, caps}` a bearer token — found by reading, then proven live (td-0bcab4). Rejected: enforcing `device_cert.nats_fp` instead (one comparison, no wire change, but a new nkey would then need a newly root-signed certificate, killing A3's "rotated per session" and forcing the person's root warm every connect); requiring both (more surface, no property the attestation lacks); retaining the field as documented-inert (an unenforced binding field in a signed artifact is exactly what caused this defect, and the removal is free today — nothing persists a device certificate server- or host-side, so there is no migration, only regenerated vectors and the TS twin; the cost only grows later). Deleting `nats_fp` is not a loss of connect material: `nats_fp = hash(nats_pk)` is a fingerprint of a *public* key, the nkey seed lives client-side (A3: OS keychain / IndexedDB), and the callout derives the session fingerprint from the nkey NATS itself presents on CONNECT. The attestation needs no replay rule: it is inert without the nkey secret it names, and the nkey signature over the server nonce independently proves possession of that secret. **[added v0.9.30]** A fourth alternative — `sig_device(nonce || nats_fp)`, challenge-response over the same server nonce the session nkey already signs in the same instant — would have removed the clock dependence and made a captured attestation permanently unreplayable. It was rejected on **measured** grounds: it is buildable natively (`async-nats` `with_auth_callback` is async and receives the nonce) but **not in the browser**. The NATS JS `Authenticator` is `(nonce?: string) => Auth`, invoked synchronously inside the `Connect` constructor and spread onto the CONNECT with no `await` anywhere in the path; `crypto.subtle.sign` on a non-extractable key is async. Making it work would require A3's identity key to become **extractable** so a synchronous Ed25519 implementation could sign — directly defeating the storage-exfiltration resistance that motivates non-extractable WebCrypto in the first place. The alternative loses on security, not ergonomics. |
+| 40 | Domain-separating the host op-key cert | **DECIDED 2026-09-10 (user decision):** split `HostOpKeyCert`'s two roles into two artifacts. The cert **drops `nats_fp`** (`spindle-host-cert-v1` → `v2`) and becomes the issuance chain only; the per-connect binding becomes `HostSessionAttestation {nats_fp, ts, sig_op}` (`spindle-host-sess-attest-v1`), signed by the **operating** key. A10.39 fixed the device half but left the host half one level weaker: `verify_host_op_key_cert` never read `nats_fp`, so the binding lived in a single manual comparison at one call site whose own comment noted no other caller performed it — while the device path made the expected `nats_fp` a *required argument* the verifier cannot skip. The codebase had already recognised the split in a comment rather than a type: the test fixtures built capability-issuance op certs with a **dummy** `nats_fp`, documented as "an issuance-time cert, not the one the host presents on its own CONNECT". A binding field filled with a deliberately meaningless value because its consuming context ignores it is the A10.39 shape. Migration cost is zero *today* — every `issue_host_op_key_cert` call site is a test module, fixture, spike, or vector generator, because host enrollment is unshipped (td-539ffa, td-ef5744) — the same argument A10.39 used to delete rather than document-as-inert. **Consequence:** the host nkey returns to **per-session**. v0.9.29 fixed it long-lived only because the binding sat in a root-signed certificate and §A4 keeps the host root cold; the operating key is warm by design, so a fresh nkey gets a fresh attestation without ever waking the root. This retires the long-lived host nkey seed as a durable credential and changes what td-ef5744 (host key custody) must decide. Rejected: keeping one artifact and making `expected_nats_fp` a required argument of `verify_host_op_key_cert` (the issuance-chain caller has no session to name, so it would have to pass a dummy — re-creating the fixture's tell in the API itself); documenting the field as inert (A10.39's rejected option, for its reasons). The host attack is now closed **by construction**, not merely by a comparison. A member holding a capability has `host_root_pk` and the `op_cert`, but never the operating *private* key -- so it cannot forge a valid `HostSessionAttestation` for any nkey, its own included. Under the old design that member held working attack material outright. |
 
 ## A11. Alternatives considered
 
@@ -1558,6 +1606,26 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.31 (2026-09-10)** — Closes the host half of td-0bcab4's last open acceptance item (td-583db5).
+  `HostOpKeyCert` is domain-separated: it **drops `nats_fp`** (`spindle-host-cert-v1` → `v2`) and
+  becomes the issuance chain only, while the per-connect binding becomes a new eleventh A7b artifact,
+  `HostSessionAttestation {nats_fp, ts, sig_op}` (`spindle-host-sess-attest-v1`), signed by the host
+  **operating** key. v0.9.29 had enforced the host binding by comparing the certificate's own
+  `nats_fp` against the connecting nkey — one manual comparison at one call site, in a certificate
+  whose every other consumer (the chain embedded in each member capability) ignored the field.
+  A10.40 records the decision, the dummy-`nats_fp` fixture evidence, and the zero-migration argument.
+  Two properties change. §A4 step 3 now states the check order explicitly — certificate before
+  attestation, for exactly the reason §A4 step 2 gives — and the binding becomes a required verifier
+  argument in both languages rather than a field a caller may forget to read. And the host's nkey is
+  **per-session again**: §A3's v0.9.29 note fixing it long-lived was a consequence of putting the
+  binding in a root-signed artifact while §A4 keeps the host root cold; the operating key is warm by
+  design, so the constraint dissolves. That retires the long-lived host nkey seed as an unbooked
+  durable credential and bears directly on td-ef5744 (host key custody), which must not settle
+  custody around a long-lived seed. A measured side effect: each bootstrap `BundleEntry` embeds a `HostOpKeyCert`, so the
+  entry shrank 546 B -> 504 B and the QR ceiling at the 256-byte `MAX_REGISTRY_LEN`
+  improved from 3/4 hosts to 4/5 (EC-M/EC-L); the short-registry figures are unchanged at
+  4/5. Caught by `keeps_measured_entry_bytes_honest` and
+  `qr_ceiling_matches_the_documented_host_counts`, which exist to fail exactly this way.
 - **v0.9.30 (2026-09-09)** — Two independent adversarial reviews of commit 8099677 (the v0.9.29 session-binding
   landing) found five staleness defects, corrected here. §A4's two signature preimages both omitted `exp`:
   `sig_root(device_fp, alg_id, sign_pk, agree_pk, ts)` and `sig_host_root(host_op_pk, nats_fp, ts)` are corrected
@@ -1601,6 +1669,8 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
   there is no migration cost, because device certificates are held only client-side and nothing persists
   them. Enforcing the host binding also fixes the host's nkey as **long-lived and minted at enrollment**:
   its certificate is root-signed, and §A4 keeps the host root cold.
+  **[superseded v0.9.31, A10.40]** — the binding moved out of the root-signed certificate into an
+  operating-key-signed per-connect attestation, so the nkey is per-session again.
 - **v0.9.28 (2026-09-09)** — §A7 gains **public-key encoding validity** as a normative, cross-implementation
   rule, and A10.38 records the decision behind it. Ed25519 public keys must be canonically encoded per RFC 8032
   §5.1.3 — both `y < p` *and* sign bit 0 when the decompressed `x` is 0 — and a verifier must reject a
