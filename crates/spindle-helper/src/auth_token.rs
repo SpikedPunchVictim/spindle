@@ -48,6 +48,28 @@ use spindle_proto::artifacts::{
 };
 use spindle_proto::canonical::CborValue;
 
+/// MEASURED 2026-09-10, not estimated: DESIGN.md §A4/§A5's "A full 32-cap CONNECT token measures
+/// **18,095 B**, **55%** of the 32 KiB ceiling" — the base64url length of a device's CONNECT
+/// `auth_token` envelope (this module's device-connection shape, above) carrying a
+/// `DeviceCertificate`, a `SessionAttestation`, and 32 member `Capability`s. Measured with
+/// realistic Unix-seconds `ts`/`exp` throughout (~1.76e9 — a 5-byte CBOR uint, 1 byte per field
+/// wider than a toy value like `ts: 0`/`exp: 2_000_000`) and each cap's 16-byte nonce — see
+/// `spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES`'s doc comment for that per-cap figure
+/// this token-level measurement is 32 of, plus a device cert and session attestation on top.
+/// Pinned by `keeps_measured_32_cap_token_bytes_honest` below, which mints the envelope through
+/// `encode_device_token` — the same builder every other test in this module uses.
+#[cfg(test)]
+const MEASURED_32_CAP_TOKEN_CBOR_BYTES: usize = 13_571;
+/// The base64url (no padding) encoding of [`MEASURED_32_CAP_TOKEN_CBOR_BYTES`] — the length that
+/// actually counts against nats-server's `max_control_line`, since DESIGN.md §A4 presents the
+/// token base64url-encoded on the wire, not as raw CBOR.
+#[cfg(test)]
+const MEASURED_32_CAP_TOKEN_B64_BYTES: usize = 18_095;
+/// nats-server's default `max_control_line` is 4 KiB; DESIGN.md §A4/A10.10 says the registry
+/// raises this ceiling to 32 KiB specifically so a full 32-cap CONNECT bundle fits.
+#[cfg(test)]
+const NATS_MAX_CONTROL_LINE_BYTES: usize = 32 * 1024;
+
 /// Errors decoding a presented `auth_token`. Internal-only, like [`crate::natsjwt::NatsJwtError`]
 /// — never put on the wire; every caller collapses this to
 /// [`crate::authz::UNIFORM_REFUSAL_MESSAGE`] (DESIGN.md §A5 "uniform silent drops").
@@ -418,6 +440,117 @@ mod tests {
     fn rejects_invalid_base64() {
         let err = decode_auth_token("not!valid!base64").unwrap_err();
         assert!(matches!(err, AuthTokenError::Base64(_)));
+    }
+
+    // ---- MEASURED_32_CAP_TOKEN_*_BYTES stays honest ----
+
+    /// Builds one member [`Capability`] chained to its own freshly minted host, with realistic
+    /// Unix-seconds timestamps throughout and a 16-byte nonce — see
+    /// [`MEASURED_32_CAP_TOKEN_CBOR_BYTES`]'s doc comment for why realism matters here (a toy
+    /// timestamp like the rest of this module's tests use understates every timestamp field by a
+    /// byte, which is exactly the bug this measurement exists to catch).
+    fn realistic_member_cap(
+        host_seed: u8,
+        op_seed: u8,
+        subject: Fingerprint,
+        now: u64,
+    ) -> Capability {
+        const NINETY_DAYS: u64 = 90 * 86_400;
+        const TWENTY_ONE_DAYS: u64 = 21 * 86_400;
+        let host_root = RootKey::from_seed([host_seed; 32]);
+        let op_signer = spindle_core::SigningKey::from_bytes(&[op_seed; 32]);
+        let op_cert = issue_host_op_key_cert(
+            &host_root,
+            &op_signer.verifying_key(),
+            now,
+            now + NINETY_DAYS,
+        );
+        issue_capability(
+            &host_root.public_key(),
+            &op_cert,
+            &op_signer,
+            CapKind::Member,
+            subject,
+            7, // cap_epoch, matching DESIGN.md's own example
+            now + TWENTY_ONE_DAYS,
+            vec![0xAA; 16], // 16-byte nonce
+        )
+    }
+
+    #[test]
+    fn keeps_measured_32_cap_token_bytes_honest() {
+        // DESIGN.md §A4/§A5's "A full 32-cap CONNECT token measures 18,095 B, 55% of the 32 KiB
+        // ceiling" is pinned here against a real envelope: a device certificate, a session
+        // attestation, and 32 member caps, each minted with realistic Unix-seconds timestamps and
+        // a 16-byte cap nonce (see MEASURED_32_CAP_TOKEN_CBOR_BYTES's doc comment for why realism
+        // matters — a toy `ts`/`exp` understates every timestamp field by a CBOR byte, and an
+        // envelope missing device_cert or session_attest undercounts the whole thing).
+        //
+        // Tolerance: +/-2 B per cap-bearing field (33 signature-bearing artifacts: 1 device cert,
+        // 1 session attestation, 32 caps) for the same reason `keeps_measured_entry_bytes_honest`
+        // and `keeps_measured_member_cap_bytes_honest` use +/-2 B each — a timestamp ticking past
+        // a CBOR shortest-form width boundary between now and whenever this test next runs. Scaled
+        // up (rather than reused as a flat +/-2) because 32 independent artifacts each carry their
+        // own independently-drifting timestamp fields.
+        let now = 1_755_907_200u64; // matches DESIGN.md's own reference measurement
+        let root = RootKey::from_seed([0xE0; 32]);
+        let device = DeviceKey::from_seeds([0xE1; 32], [0xE2; 32]);
+        const NINETY_DAYS: u64 = 90 * 86_400;
+        let device_cert = issue_device_certificate(
+            &root,
+            device.alg_id(),
+            &device.sign_public_key(),
+            &device.agree_public_key(),
+            now,
+            now + NINETY_DAYS,
+        );
+        let nats_fp = Fingerprint::of_parts(&[b"nats-session"]);
+        let session_attest = issue_session_attestation(&device, nats_fp, now);
+        let subject = root.root_fp();
+        let caps: Vec<Capability> = (0u8..32)
+            .map(|i| {
+                realistic_member_cap(0xA0u8.wrapping_add(i), 0xB0u8.wrapping_add(i), subject, now)
+            })
+            .collect();
+        let token = encode_device_token(
+            &root.public_key().to_bytes(),
+            &device_cert,
+            Some(&session_attest),
+            &caps,
+        );
+
+        let b64_len = token.len();
+        let cbor_len = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&token)
+            .expect("valid base64url")
+            .len();
+
+        let tolerance = 2 * 33; // 33 independently-timestamped signed artifacts, +/-2 B each
+        assert!(
+            cbor_len.abs_diff(MEASURED_32_CAP_TOKEN_CBOR_BYTES) <= tolerance,
+            "32-cap token's raw canonical CBOR encoded to {cbor_len} B, expected within \
+             {tolerance} B of MEASURED_32_CAP_TOKEN_CBOR_BYTES ({MEASURED_32_CAP_TOKEN_CBOR_BYTES} \
+             B) — update DESIGN.md §A4/§A5's 32-cap token figures and these constants together if \
+             this genuinely drifted"
+        );
+        assert!(
+            b64_len.abs_diff(MEASURED_32_CAP_TOKEN_B64_BYTES) <= tolerance,
+            "32-cap token's base64url encoding is {b64_len} B, expected within {tolerance} B of \
+             MEASURED_32_CAP_TOKEN_B64_BYTES ({MEASURED_32_CAP_TOKEN_B64_BYTES} B) — update \
+             DESIGN.md §A4/§A5's 32-cap token figures and these constants together if this \
+             genuinely drifted"
+        );
+
+        // DESIGN.md rounds this to "55%"; the reference measurement it supersedes-from records
+        // 55.2%. Assert against the actual measured bytes, not the rounded prose figure, with
+        // enough slack to absorb the tolerance bands above.
+        let pct = b64_len as f64 / NATS_MAX_CONTROL_LINE_BYTES as f64 * 100.0;
+        assert!(
+            (54.0..=57.0).contains(&pct),
+            "32-cap token is {pct:.1}% of the {NATS_MAX_CONTROL_LINE_BYTES}-byte max_control_line \
+             ceiling, expected roughly 55% — update DESIGN.md §A4/§A5's percentage figure if this \
+             genuinely drifted"
+        );
     }
 
     #[test]

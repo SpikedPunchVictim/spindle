@@ -308,6 +308,63 @@ mod tests {
         verify_capability(&cap, 1_500).expect("v == floor must verify");
     }
 
+    // ---- MEASURED_MEMBER_CAP_BYTES stays honest ----
+
+    /// Like [`test_host`] but with realistic Unix-seconds timestamps on the embedded
+    /// `HostOpKeyCert`, rather than [`test_host`]'s placeholder `ts = 0`. CBOR's canonical integer
+    /// encoding uses the shortest form that fits a value, so a real device's timestamps (~1.75e9,
+    /// a 5-byte CBOR uint: 1-byte header + 4-byte argument) encode wider than a small placeholder
+    /// like `10_000` (3 bytes: 1-byte header + 2-byte argument) — only this helper's output is
+    /// safe to measure against [`spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES`]. Mirrors
+    /// `spindle-core::artifacts::bootstrap`'s own `realistic_test_host`/`realistic_entry` helpers.
+    fn realistic_test_host(root_seed: [u8; 32], op_seed: [u8; 32], ts: u64, exp: u64) -> TestHost {
+        let root = RootKey::from_seed(root_seed);
+        let op_signer = SigningKey::from_bytes(&op_seed);
+        let op_cert = issue_host_op_key_cert(&root, &op_signer.verifying_key(), ts, exp);
+        TestHost {
+            root,
+            op_signer,
+            op_cert,
+        }
+    }
+
+    #[test]
+    fn keeps_measured_member_cap_bytes_honest() {
+        // DESIGN.md §A4/§A5's "**407 B each, measured**" (the per-member-capability figure the
+        // 32-cap CONNECT token figure in `auth_token.rs` builds on) is pinned by
+        // `spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES`. A genuine drift in a real cap's
+        // encoded size means DESIGN.md and that constant must be updated together.
+        //
+        // Minted with realistic values, matching the reference measurement this test reproduces:
+        // ts = 1_755_907_200, a 90-day op-cert exp (1_763_683_200), cap_epoch = 7, a 21-day cap
+        // exp, and a 16-byte nonce — the same nonce length `MEASURED_ENTRY_BYTES`'s own doc
+        // comment flags as what makes this figure move. Tolerance chosen the same way
+        // `keeps_measured_entry_bytes_honest` (this crate's `bootstrap` module) chooses its own:
+        // +/-2 B leaves room for a single field crossing a CBOR shortest-form boundary between now
+        // and whenever this test next runs, without being so loose it would fail to flag a
+        // genuine future drift (e.g. a larger op_cert chain).
+        const TWENTY_ONE_DAYS: u64 = 21 * 86_400;
+        let ts = 1_755_907_200u64;
+        let op_cert_exp = 1_763_683_200u64; // ts + 90 days
+        let host = realistic_test_host([0x90; 32], [0x91; 32], ts, op_cert_exp);
+        let cap = issue(
+            &host,
+            CapKind::Member,
+            Fingerprint::of_parts(&[b"subject"]),
+            7,
+            ts + TWENTY_ONE_DAYS,
+        );
+        let measured = cap.to_canonical_bytes().len();
+        let tolerance = 2usize;
+        assert!(
+            measured.abs_diff(spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES) <= tolerance,
+            "capability encoded to {measured} B, expected within {tolerance} B of \
+             MEASURED_MEMBER_CAP_BYTES ({} B) — update DESIGN.md §A4/§A5's \"407 B each\" figure \
+             and MEASURED_MEMBER_CAP_BYTES together if this genuinely drifted",
+            spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES
+        );
+    }
+
     #[test]
     fn version_check_fires_before_signature_check() {
         // v below the floor AND a corrupted signature — the version error must win, pinning the
