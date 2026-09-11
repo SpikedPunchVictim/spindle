@@ -46,13 +46,13 @@
 //! run as "no *obvious* new ambient clock read", not as a proof that every `now` value flowing
 //! through this crate traces back to a caller argument.
 //!
-//! A second hole, demonstrated rather than assumed: an aliased import —
+//! A further hole, demonstrated rather than assumed: an aliased import —
 //! `use std::time::SystemTime as Clock; Clock::now()` — is **not caught**, because the scan
 //! matches the literal substring `SystemTime::now`, and an alias renames that text away before
 //! this guard ever sees it. No such alias exists in this repo today; it is disclosed because a
 //! heuristic that only lists its catches and not its misses invites more trust than it has earned.
 //!
-//! A third hole, also demonstrated: because the scan masks string literals before matching, a
+//! And another, also demonstrated: because the scan masks string literals before matching, a
 //! position inside a multi-line string literal is invisible to it — a clock read planted there is
 //! not caught. A `SystemTime::now()` read planted inside `artifacts/bootstrap.rs`'s multi-line
 //! `#[error("bundle encodes to … dropped {} host(s) to fit")]` string passes this guard GREEN.
@@ -298,19 +298,23 @@ fn relative_path_str(base: &Path, file: &Path) -> String {
 ///
 /// This masker was copied from `redaction_guard.rs`'s `mask_non_code`; the two have since
 /// DIVERGED: this copy handles char literals and `redaction_guard.rs`'s does not. That gap is
-/// latent rather than live — an independent review measured `redaction_guard.rs`'s scan set at
-/// 797 blind positions of 38,964 (2.0%), all multi-line string interiors, and the char-literal
-/// fix would change exactly 0 of them. See **td-9b5c87**, which tracks bringing it across.
+/// latent rather than live: a review measured `redaction_guard.rs`'s blind set and found the
+/// char-literal fix would change none of it, so there is no false green there today. The figures
+/// and the open question of what those blind positions actually are live on **td-9b5c87**, which
+/// tracks bringing the fix across — not here, where they would rot.
 ///
 /// Neither masker special-cases raw strings (`r"..."`/`r#"..."#`/`br"..."`/`br#"..."#`). Checked
-/// with `grep -rnE '(^|[^A-Za-z0-9_])(br|r)#*"' crates/spindle-core/src` on 2026-09-11 (after
-/// manually excluding matches like `"r".repeat(...)`, where `r` is ordinary string content
-/// rather than a raw-string prefix): no raw string exists under `crates/spindle-core/src` today
-/// — the only `r"`-looking hits are `"r".repeat(...)` in `bootstrap.rs`, ordinary strings
-/// containing the letter r. If one is ever added, an odd number of `"` inside it desyncs the
-/// scanner: the region between that internal quote and the raw string's actual closing quote is
-/// scanned as code, so a forbidden pattern sitting there is reported as a hit — a false red,
-/// flagging string content as a violation. The desync also carries past the string's real end,
+/// with `git grep -nE '(^|[^A-Za-z0-9_])(br|r)#*"' -- crates/spindle-core/src` on 2026-09-11 —
+/// `git grep` deliberately, not this shell's `grep`, which wraps ugrep with `--ignore-files` and
+/// silently skips gitignored paths, making it unsound for an absence claim. Discounting matches
+/// like `"r".repeat(...)`, where `r` is ordinary string content rather than a raw-string prefix:
+/// no raw string exists under `crates/spindle-core/src` today — the only `r"`-looking hits are
+/// the three `"r".repeat(...)` calls in `bootstrap.rs`, ordinary strings containing the letter r.
+///
+/// If one is ever added, an odd number of `"` inside it desyncs the scanner: the region between
+/// that internal quote and the raw string's actual closing quote is scanned as code, so a
+/// forbidden pattern sitting there is reported as a hit — a false red, flagging string content
+/// as a violation. The desync also carries past the string's real end,
 /// masking the real code that follows as if it were still inside a string — a false green. Both
 /// failure modes occur, not one or the other.
 fn mask_non_code(src: &[u8]) -> Vec<u8> {
