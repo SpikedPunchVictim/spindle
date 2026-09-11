@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.36) + Execution Plan
+# Spindle — System Design Document (draft v0.9.37) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -141,6 +141,17 @@
 > both false. The first was made true by building the coupling it described; the second was both
 > narrowed — the pin cannot see the production clock, and now says so — and backed by a new guard
 > on that clock. Each is verified by perturbation (td-331c11).
+> v0.9.36: no figure changes; the v0.9.32 host-key-custody amendment specified custody for the
+> **wrong key type** — A4 and A10.41 said "custody of this *root* key" and then described
+> `DeviceKey`'s API, whose `from_seeds` takes **two** seeds, so the persistence rule as written
+> could not execute. The host root is a `RootKey`, built from **one** seed by `RootKey::from_seed`,
+> already the supported recovery-phrase constructor. Corrected, plus three decisions the same
+> review found missing: a keychain miss is a **refusal to start**, never an implicit first run; the
+> `0600`/`0700` rule is **POSIX-scoped**; and "the root stays cold" means *certifies an operating
+> key, never signs routine traffic*, not *offline* (td-ef5744).
+> v0.9.37: no figure changes; the v0.9.36 entry above was itself missing from this block, and the
+> custody argument's load-bearing claim cited a test fixture rather than production code
+> (td-ef5744).
 
 ---
 
@@ -362,9 +373,13 @@ signer, result).
   persisted.** The operating key and the host's own envelope `DeviceKey` are **generated fresh
   and certified under the root** — the `HostOpKeyCert` and device-certificate chain A4 already
   defines — so they need no custody of their own and rotate without touching the seed. This is
-  why one seed suffices: **`host_fp` *is* `root_fp`**
-  (`crates/spindle-test-fixtures/src/lib.rs:130-133`), and every §A5 subject is scoped by
-  `host_fp`, so restoring the seed restores the identity members are bound to. Note the two are
+  why one seed suffices: **`host_fp` *is* `root_fp`** — the helper derives it that way on the live
+  authorization path (`crates/spindle-helper/src/authz.rs:630`, `let host_fp =
+  root_fp_of(&presented.host_root_pk);`), and §A4 and §A5 each state it independently (`host_fp` is
+  always root-derived). The test fixture that mirrors it
+  (`crates/spindle-test-fixtures/src/lib.rs:130-133`) is an illustration, not the authority. Every
+  §A5 subject is scoped by `host_fp`, so restoring the seed restores the identity members are bound
+  to. Note the two are
   deliberately distinct keys, not one: `DeviceKey` (`identity.rs:161`) takes **two** seeds
   (`from_seeds(sign_seed, agree_seed)`), has no serialization path, and is deliberately not
   `Clone`; collapsing the host's root fingerprint and its envelope device fingerprint into one is
@@ -1740,6 +1755,16 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.37 (2026-09-11)** — No figure changes, and no change to the v0.9.36 custody decision, which
+  independent review approved. Two sourcing/convention corrections it raised. The running per-version
+  summary block had no v0.9.36 entry, although it carries one for every release through v0.9.35
+  including the two prior no-figure-change ones — a reader trusting that block would have concluded
+  v0.9.35 was current. And the custody argument's load-bearing claim, **`host_fp` *is* `root_fp`**,
+  cited a *test fixture* as its authority; it now cites the live helper authorization path
+  (`crates/spindle-helper/src/authz.rs:630`) and the two places §A4/§A5 already assert it. The claim
+  was true either way — this workspace's recorded lesson is that a test reproducing a rule proves only
+  that the test matches the rule, so a normative claim must trace to the production code that makes it
+  true.
 - **v0.9.36 (2026-09-11)** — No figure changes. Corrects the v0.9.32 host-key-custody amendment,
   which independent review found specified custody for the wrong key type. A4 and A10.41 said
   "custody of this **root** key" and then described `DeviceKey`'s API; the host root key is a
