@@ -64,7 +64,8 @@
 //!
 //! # Neuter-verification
 //!
-//! Demonstrated on 2026-09-11, not assumed. Appending
+//! Demonstrated on 2026-09-11, not assumed. Each probe below was appended after a blank
+//! separator line, and the recorded line numbers assume that separator. Appending
 //!
 //! ```text
 //! fn probe_ambient_clock() -> std::time::SystemTime {
@@ -103,10 +104,28 @@
 //! `gen_crypto_vectors.rs:65`'s `out.push('"');` put roughly 90% of that file's line positions
 //! inside a spurious `Str` mode the scan could not see into; line 1500 happened to fall inside
 //! the ~10% that stayed visible. An independent review measured it by inserting the probe at
-//! every line position: 1352 of 1497 positions in that file, and 1375 of 6441 across the whole
-//! broadened Rust scan, were invisible. Before the broadening only 8 lines were blind, all
-//! genuine multi-line string interiors — so the broadening had made this guard strictly WORSE on
-//! the axis it advertises, until the char-literal handling below closed it.
+//! every line position, and I re-measured all of it: 1352 of 1498 positions in that file, and
+//! 1375 of 6458 across the whole broadened Rust scan, were invisible. (The review reported the
+//! same numerators over denominators one smaller per file; it counted existing lines, this counts
+//! insertion positions. The blind counts themselves agree exactly.) Before the broadening the
+//! same method found 23 blind positions of 3292 across the eleven `src/artifacts/*.rs` files —
+//! bootstrap.rs 19, capability.rs 3, artifacts/mod.rs 1 — all genuine multi-line string
+//! interiors — so the broadening had made this guard strictly WORSE on the axis it advertises,
+//! until the char-literal handling below closed it.
+//!
+//! The figure 23 replaces an earlier "8" in this block, which was wrong. That 8 came from a
+//! review report that said 8 about a different scope — the broadened scan's
+//! non-`gen_crypto_vectors` remainder — and was re-scoped here into a claim about the
+//! pre-broadening scan set without being measured. A number inherited from a report is not a
+//! measured number, and this file is the last place that distinction should blur. All four
+//! figures in this block were re-measured directly.
+//!
+//! Successor measurement, same method, current masker: **54 blind positions of 6458** across
+//! the whole tree — 0.8%, every one in `gen_crypto_vectors.rs`. An independent review
+//! compile-classified all 54: none is a real-code position; each sits inside a multi-line
+//! string literal containing an apostrophe (`device's`, `sig_op's`, `Rust's`). Twelve of the 54
+//! were "visible" under the old masker only because it was already desynced at those points, so
+//! they are not a regression.
 //!
 //! The fix was then neutered on 2026-09-11, at the lines that were previously blind:
 //!
@@ -315,12 +334,20 @@ fn relative_path_str(base: &Path, file: &Path) -> String {
 /// `gen_crypto_vectors.rs:65`) be mistaken for the start of a string, flipping the scanner into
 /// `Str` mode over real code that followed.
 ///
-/// Copied from `redaction_guard.rs`'s `mask_non_code`, including one remaining stated limit: it
-/// does not special-case raw strings (`r"..."`/`r#"..."#`/`br"..."`/`br#"..."#`). Checked with
-/// `grep -rnE '(^|[^A-Za-z0-9_])(br|r)#*"' crates/spindle-core/src` on 2026-09-11 (after manually
-/// excluding matches like `"r".repeat(...)`, where `r` is ordinary string content rather than a
-/// raw-string prefix): no raw string literal exists anywhere under `crates/spindle-core/src`
-/// today. If one is ever added, its contents would be scanned as if they were code.
+/// This masker was copied from `redaction_guard.rs`'s `mask_non_code`; the two have since
+/// DIVERGED: this copy handles char literals and `redaction_guard.rs`'s does not. That gap is
+/// latent rather than live — an independent review measured `redaction_guard.rs`'s scan set at
+/// 797 blind positions of 38,964 (2.0%), all multi-line string interiors, and the char-literal
+/// fix would change exactly 0 of them. See **td-9b5c87**, which tracks bringing it across.
+///
+/// Neither masker special-cases raw strings (`r"..."`/`r#"..."#`/`br"..."`/`br#"..."#`). Checked
+/// with `grep -rnE '(^|[^A-Za-z0-9_])(br|r)#*"' crates/spindle-core/src` on 2026-09-11 (after
+/// manually excluding matches like `"r".repeat(...)`, where `r` is ordinary string content
+/// rather than a raw-string prefix): no raw string exists under `crates/spindle-core/src` today
+/// — the only `r"`-looking hits are `"r".repeat(...)` in `bootstrap.rs`, ordinary strings
+/// containing the letter r. If one is ever added, its contents are scanned as code, and an odd
+/// number of `"` inside it desyncs the scanner over the real code that FOLLOWS it — a false
+/// green, not a false red.
 fn mask_non_code(src: &[u8]) -> Vec<u8> {
     #[derive(Clone, Copy, PartialEq)]
     enum Mode {
