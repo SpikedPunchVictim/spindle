@@ -41,3 +41,7 @@ pnpm-debug.log*
 
 # td
 .todos/
+
+# Python bytecode
+__pycache__/
+*.pyc
