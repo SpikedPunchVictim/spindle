@@ -68,11 +68,9 @@
 //! deliberately excluded from failing the test: a doc comment that *describes* the forbidden
 //! rule (e.g. this very file's own prose, or a doc comment in `artifacts/mod.rs` explaining why
 //! `SystemTime::now` must never appear) would otherwise trip the guard it is trying to justify.
-//! The masking pass below blanks out comment and string bytes before scanning. It started as a
-//! copy of `redaction_guard.rs`'s `mask_non_code`, written for the same reason, but the two have
-//! since diverged: this copy also handles Rust char literals and `redaction_guard.rs`'s does not.
-//! That divergence is tracked as **td-9b5c87**; see `mask_non_code`'s own doc comment below for
-//! what it means for each file's blind spots.
+//! The masking pass blanks out comment and string bytes before scanning; it lives in the shared
+//! `common::mask_non_code` module, which both this guard and `redaction_guard.rs` use. Its
+//! behaviour is pinned by `tests/rust_mask.rs`.
 //!
 //! # Neuter-verification
 //!
@@ -103,6 +101,9 @@
 //! Every planted probe was reverted afterward, and each file was confirmed byte-identical to its
 //! original (`cmp` clean, `git diff --quiet` clean).
 
+mod common;
+
+use common::mask_non_code;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -276,218 +277,6 @@ fn relative_path_str(base: &Path, file: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
-}
-
-/// Replaces the contents of `//` line comments, `/* */` block comments, and `"..."` string
-/// literals with ASCII spaces, byte-for-byte (newlines are always preserved), so a scan of the
-/// output cannot mistake comment/string text for real code — e.g. this very module's own doc
-/// comments, which quote `SystemTime::now`, must not trip the guard they explain. Every byte
-/// offset in the output lines up with the same offset (and line number) in the original source.
-///
-/// Char literals (`'x'`, `'\n'`, `'\''`, `'\u{2764}'`) and lifetimes (`'a`, `'static`, `'_`) are
-/// both handled directly in `Code` mode, without ever switching into `Str` mode on a bare `'`:
-/// on seeing `'`, [`char_literal_len`] looks ahead to decide which shape follows — an escape
-/// (`\` plus one more byte, or `\u{...}`) or exactly one, possibly multi-byte UTF-8, character,
-/// then a closing `'`, is a char literal, and gets blanked to ASCII spaces for its full byte
-/// length; anything else (no closing `'` in that position) is a lifetime, and is emitted
-/// unchanged. This distinction matters because a Rust char literal can never contain any
-/// `FORBIDDEN_PATTERNS` entry — they are all multi-character — so blanking one can never hide
-/// real code, while *not* handling char literals let one's own closing quote (e.g. `'"'` in
-/// `gen_crypto_vectors.rs:65`) be mistaken for the start of a string, flipping the scanner into
-/// `Str` mode over real code that followed.
-///
-/// This masker was copied from `redaction_guard.rs`'s `mask_non_code`; the two have since
-/// DIVERGED: this copy handles char literals and `redaction_guard.rs`'s does not. That gap is
-/// latent *as far as char literals go*, and that is the only claim measurement supports: the
-/// char-literal fix changes none of `redaction_guard.rs`'s blind positions, in either direction.
-/// It does NOT follow that that guard has no false green — it has one, from a different cause.
-/// A backslash-terminated raw string desyncs its masker over real code in
-/// `spindle-vfs/src/confine/windows.rs`, demonstrated live and tracked as **td-5a459e**. An
-/// earlier version of this comment drew the stronger conclusion from the narrower measurement;
-/// do not restore it. The figures live on **td-9b5c87** (char literals) and **td-5a459e** (raw
-/// strings), not here, where they would rot.
-///
-/// Neither masker special-cases raw strings (`r"..."`/`r#"..."#`/`br"..."`/`br#"..."#`). The
-/// receipt below covers only THIS guard's scan set; `redaction_guard.rs` scans six other crates,
-/// where the same search returns 17 raw strings and one of them is already desyncing it
-/// (td-5a459e). Checked with
-/// `git grep -nE '(^|[^A-Za-z0-9_])(br|r)#*"' -- crates/spindle-core/src` on 2026-09-11 —
-/// `git grep` deliberately, not this shell's `grep`, which wraps ugrep with `--ignore-files` and
-/// silently skips gitignored paths, making it unsound for an absence claim. Discounting matches
-/// like `"r".repeat(...)`, where `r` is ordinary string content rather than a raw-string prefix:
-/// no raw string exists under `crates/spindle-core/src` today — the only `r"`-looking hits are
-/// the three `"r".repeat(...)` calls in `bootstrap.rs`, ordinary strings containing the letter r.
-///
-/// If one is ever added, an odd number of `"` inside it desyncs the scanner: the region between
-/// that internal quote and the raw string's actual closing quote is scanned as code, so a
-/// forbidden pattern sitting there is reported as a hit — a false red, flagging string content
-/// as a violation. The desync also carries past the string's real end,
-/// masking the real code that follows as if it were still inside a string — a false green. Both
-/// failure modes occur, not one or the other.
-fn mask_non_code(src: &[u8]) -> Vec<u8> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Mode {
-        Code,
-        LineComment,
-        BlockComment,
-        Str,
-    }
-
-    let mut mode = Mode::Code;
-    let mut out = Vec::with_capacity(src.len());
-    let mut i = 0;
-    let mut escaped = false;
-
-    while i < src.len() {
-        let b = src[i];
-        let next = src.get(i + 1).copied();
-        match mode {
-            Mode::Code => {
-                if b == b'/' && next == Some(b'/') {
-                    mode = Mode::LineComment;
-                    out.push(b' ');
-                    out.push(b' ');
-                    i += 2;
-                    continue;
-                }
-                if b == b'/' && next == Some(b'*') {
-                    mode = Mode::BlockComment;
-                    out.push(b' ');
-                    out.push(b' ');
-                    i += 2;
-                    continue;
-                }
-                if b == b'"' {
-                    mode = Mode::Str;
-                    out.push(b' ');
-                    i += 1;
-                    continue;
-                }
-                if b == b'\'' {
-                    if let Some(len) = char_literal_len(src, i) {
-                        for &lb in &src[i..i + len] {
-                            out.push(if lb == b'\n' { b'\n' } else { b' ' });
-                        }
-                        i += len;
-                        continue;
-                    }
-                    // Not a char literal — a lifetime (`'a`, `'static`, `'_`) or a lone `'`.
-                    // Emit unchanged and stay in Code mode: never enter Str mode on a bare `'`.
-                    out.push(b'\'');
-                    i += 1;
-                    continue;
-                }
-                out.push(b);
-                i += 1;
-            }
-            Mode::LineComment => {
-                out.push(if b == b'\n' {
-                    mode = Mode::Code;
-                    b'\n'
-                } else {
-                    b' '
-                });
-                i += 1;
-            }
-            Mode::BlockComment => {
-                if b == b'*' && next == Some(b'/') {
-                    mode = Mode::Code;
-                    out.push(b' ');
-                    out.push(b' ');
-                    i += 2;
-                    continue;
-                }
-                out.push(if b == b'\n' { b'\n' } else { b' ' });
-                i += 1;
-            }
-            Mode::Str => {
-                if escaped {
-                    escaped = false;
-                    out.push(if b == b'\n' { b'\n' } else { b' ' });
-                    i += 1;
-                    continue;
-                }
-                if b == b'\\' {
-                    escaped = true;
-                    out.push(b' ');
-                    i += 1;
-                    continue;
-                }
-                if b == b'"' {
-                    mode = Mode::Code;
-                    out.push(b' ');
-                    i += 1;
-                    continue;
-                }
-                out.push(if b == b'\n' { b'\n' } else { b' ' });
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
-/// If `src[i]` (a `'`) begins a char literal, returns its total byte length including both
-/// quotes; otherwise returns `None` (the `'` begins a lifetime, or is otherwise not a char
-/// literal). Used by [`mask_non_code`] to distinguish `'x'`/`'\n'`/`'\u{2764}'` from `'a`/`'static`
-/// without ever mistaking the former's closing `'` for the start of a string.
-///
-/// A char literal is `'` followed by either an escape (`\` plus one more byte, or the variable-
-/// length `\u{...}` form) or exactly one — possibly multi-byte UTF-8 — character, followed by a
-/// closing `'`. A lifetime has no closing `'` in that position, since it is a bare identifier
-/// (`'a`, `'static`, `'_`) used without one.
-fn char_literal_len(src: &[u8], i: usize) -> Option<usize> {
-    debug_assert_eq!(src[i], b'\'');
-    let mut j = i + 1;
-    if j >= src.len() {
-        return None;
-    }
-    if src[j] == b'\\' {
-        j += 1;
-        if j >= src.len() {
-            return None;
-        }
-        if src[j] == b'u' && src.get(j + 1) == Some(&b'{') {
-            // `\u{...}`: consume up to and including the closing `}`.
-            j += 2;
-            while j < src.len() && src[j] != b'}' {
-                j += 1;
-            }
-            if j >= src.len() {
-                return None;
-            }
-            j += 1;
-        } else {
-            // A simple escape (`\n`, `\t`, `\r`, `\0`, `\\`, `\'`, `\"`, ...): backslash plus
-            // exactly one more byte.
-            j += 1;
-        }
-    } else {
-        j += utf8_char_len(src[j]);
-    }
-    if src.get(j) == Some(&b'\'') {
-        Some(j + 1 - i)
-    } else {
-        None
-    }
-}
-
-/// Byte length of the UTF-8 character starting with leading byte `b`, from its high bits.
-/// Defaults to `1` for a continuation byte or another invalid leading byte, which cannot occur
-/// in valid UTF-8 source text (the caller only ever sees bytes from a `String`'s `.as_bytes()`)
-/// but keeps this defensive rather than panicking.
-fn utf8_char_len(b: u8) -> usize {
-    if b & 0x80 == 0 {
-        1
-    } else if b & 0xE0 == 0xC0 {
-        2
-    } else if b & 0xF0 == 0xE0 {
-        3
-    } else if b & 0xF8 == 0xF0 {
-        4
-    } else {
-        1
-    }
 }
 
 /// 1-based line number containing `byte_offset` in `src`.

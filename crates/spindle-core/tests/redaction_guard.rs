@@ -61,6 +61,9 @@
 //! breaking a scanned crate's source on every `cargo test` run would defeat the point of a CI
 //! guard.
 
+mod common;
+
+use common::mask_non_code;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -201,107 +204,8 @@ fn rust_files_under(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Replaces the contents of `//` line comments, `/* */` block comments, and `"..."` string
-/// literals with ASCII spaces, byte-for-byte (newlines are always preserved, everywhere), so
-/// that later scanning never mistakes comment/string text for real syntax — e.g. a doc comment
-/// mentioning `tracing::warn!(%device_fp, ...)` as an example must not itself be flagged — while
-/// every byte offset in the output still lines up with the same offset (and line number) in the
-/// original source.
-///
-/// Deliberately simple: this does not special-case raw strings (`r"..."`/`r#"..."#`) or char
-/// literals/lifetimes (`'a`). Neither shape appears inside a `tracing::` call's arguments
-/// anywhere in this workspace today; a heuristic guard test doesn't need a full Rust tokenizer.
-fn mask_non_code(src: &[u8]) -> Vec<u8> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Mode {
-        Code,
-        LineComment,
-        BlockComment,
-        Str,
-    }
-
-    let mut mode = Mode::Code;
-    let mut out = Vec::with_capacity(src.len());
-    let mut i = 0;
-    let mut escaped = false;
-
-    while i < src.len() {
-        let b = src[i];
-        let next = src.get(i + 1).copied();
-        match mode {
-            Mode::Code => {
-                if b == b'/' && next == Some(b'/') {
-                    mode = Mode::LineComment;
-                    out.push(b' ');
-                    out.push(b' ');
-                    i += 2;
-                    continue;
-                }
-                if b == b'/' && next == Some(b'*') {
-                    mode = Mode::BlockComment;
-                    out.push(b' ');
-                    out.push(b' ');
-                    i += 2;
-                    continue;
-                }
-                if b == b'"' {
-                    mode = Mode::Str;
-                    out.push(b' ');
-                    i += 1;
-                    continue;
-                }
-                out.push(b);
-                i += 1;
-            }
-            Mode::LineComment => {
-                out.push(if b == b'\n' {
-                    mode = Mode::Code;
-                    b'\n'
-                } else {
-                    b' '
-                });
-                i += 1;
-            }
-            Mode::BlockComment => {
-                if b == b'*' && next == Some(b'/') {
-                    mode = Mode::Code;
-                    out.push(b' ');
-                    out.push(b' ');
-                    i += 2;
-                    continue;
-                }
-                out.push(if b == b'\n' { b'\n' } else { b' ' });
-                i += 1;
-            }
-            Mode::Str => {
-                if escaped {
-                    escaped = false;
-                    out.push(if b == b'\n' { b'\n' } else { b' ' });
-                    i += 1;
-                    continue;
-                }
-                if b == b'\\' {
-                    escaped = true;
-                    out.push(b' ');
-                    i += 1;
-                    continue;
-                }
-                if b == b'"' {
-                    mode = Mode::Code;
-                    out.push(b' ');
-                    i += 1;
-                    continue;
-                }
-                out.push(if b == b'\n' { b'\n' } else { b' ' });
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
 /// Finds every `tracing::{trace,debug,info,warn,error}!( ... )` call in `masked` (comments and
-/// string contents already blanked out — see [`mask_non_code`]) and returns the byte range of
+/// string contents already blanked out — see `mask_non_code`) and returns the byte range of
 /// its argument list, exclusive of the enclosing parens.
 fn find_macro_spans(masked: &str) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
@@ -341,7 +245,7 @@ fn find_macro_spans(masked: &str) -> Vec<(usize, usize)> {
 }
 
 /// Returns the index of the `)` matching the `(` at `open_idx`, by depth counting. Safe to run
-/// on [`mask_non_code`]'s output because parens inside strings/comments have already been
+/// on `mask_non_code`'s output because parens inside strings/comments have already been
 /// blanked out, so every remaining paren is real syntax.
 fn find_matching_paren(bytes: &[u8], open_idx: usize) -> Option<usize> {
     let mut depth = 0i32;
