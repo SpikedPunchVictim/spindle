@@ -17,10 +17,10 @@
 //! file is the missing half.
 //!
 //! This test exists because it was demonstrated that widening
-//! `SESSION_ATTESTATION_CLOCK_SKEW_SECS` from 120 to 3600 left the entire 872-test Rust suite and
-//! all 184 crypto tests green. A device is refused when its clock is off by more than this window;
-//! silently widening one language's copy of it loosens a security bound in that language alone,
-//! and nothing before this test would have noticed.
+//! `SESSION_ATTESTATION_CLOCK_SKEW_SECS` from 120 to 3600 left the entire Rust workspace suite
+//! and the whole crypto suite green — zero failures in either language. A device is refused when
+//! its clock is off by more than this window; silently widening one language's copy of it loosens
+//! a security bound in that language alone, and nothing before this test would have noticed.
 //!
 //! The TypeScript half of that guarantee is enforced here by `parse_bigint_const`, a plain text
 //! scanner, *and* by `packages/crypto/test/clock-skew-value.test.ts`, which imports the real
@@ -36,7 +36,7 @@
 //!
 //! - `SESSION_ATTESTATION_CLOCK_SKEW_SECS: u64 = 120` → `3600` turned this test RED naming the
 //!   Rust constant. Before this guard existed, that same edit left the entire workspace green —
-//!   872 passed, 0 failed — which is why the guard was written: the four boundary tests all use
+//!   zero failures — which is why the guard was written: the four boundary tests all use
 //!   the symbolic constant, so they pin the inclusive/exclusive semantics and not the value.
 //! - `HOST_SESSION_ATTESTATION_CLOCK_SKEW_SECS = 120n` → `3600n` in `artifacts.ts` turned this
 //!   test RED naming the `HOST_`-prefixed twin, not the shorter `SESSION_…` name it contains as a
@@ -222,6 +222,16 @@ fn read_nonempty(path: &Path) -> String {
 /// that all four constants equal 120 in both languages is a property of *this pair of tests
 /// together*, not of this file alone -- a Rust-only test run exercises only this file, and this
 /// file alone would have been falsely green in the scenario demonstrated above.
+///
+/// This scanner also has no string- or template-literal state: it has no notion of being inside
+/// a `"..."`, `'...'`, or `` `...` `` at all, so a decoy occurrence of the declaration text inside
+/// a TypeScript template literal or string is read the same as a live declaration. An independent
+/// review demonstrated this today with a template literal containing
+/// `` `export const CLOCK_SKEW_SECS = 120n;` `` while the real binding was re-exported at
+/// `3600n` elsewhere in the same file -- this Rust guard passed green. The backstop for that shape
+/// is, again, `packages/crypto/test/clock-skew-value.test.ts`: it imports the real bindings rather
+/// than reading source text, and it did catch that construction. This scanner and that test are a
+/// pair for exactly this reason, not two copies of the same check.
 ///
 /// Matching on `name` is exact, not substring: the character immediately before and after
 /// the matched name must not be alphanumeric or an underscore, and the text immediately before the

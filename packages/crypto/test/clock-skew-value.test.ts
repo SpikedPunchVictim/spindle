@@ -17,9 +17,10 @@
 // the value 120 itself, which none of those tests pin.
 //
 // This test exists because it was demonstrated that widening
-// `SESSION_ATTESTATION_CLOCK_SKEW_SECS` from 120 to 3600 left the entire 872-test Rust suite and
-// all 184 crypto tests green. A device is refused when its clock is off by more than this window;
-// silently widening one language's copy of it loosens a security bound in that language alone.
+// `SESSION_ATTESTATION_CLOCK_SKEW_SECS` from 120 to 3600 left the entire Rust workspace suite
+// and the whole crypto suite green — zero failures in either language. A device is refused when
+// its clock is off by more than this window; silently widening one language's copy of it loosens
+// a security bound in that language alone.
 //
 // # Neuter-verification
 //

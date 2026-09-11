@@ -10,24 +10,24 @@
 //! explicit caller-supplied parameter, never from an ambient system clock read anywhere under
 //! this crate's whole `src` tree, including `src/bin/`. `spindle-core` is the pure
 //! artifact/envelope verification library: it takes every notion of "now" as a caller-supplied
-//! parameter and has no legitimate reason to read a clock itself, so this guard now scans the
-//! whole `crates/spindle-core/src` tree recursively, not just `src/artifacts/` and
-//! `src/envelope.rs` by name. The clock is supplied at the edge, by
-//! callers outside this crate — `crates/spindle-net/src/signaling/wire.rs:44` is exactly such a
-//! legitimate caller: it reads `SystemTime::now()` and passes the result in as the `now:` field to
-//! `envelope::open`. That is the intended layering, not a violation, and it is the distinction this
-//! guard exists to enforce: the library stays clock-free; the edge supplies the clock.
+//! parameter and has no legitimate reason to read a clock itself, so this guard scans the whole
+//! `crates/spindle-core/src` tree recursively, not just `src/artifacts/` and `src/envelope.rs` by
+//! name. The clock is supplied at the edge, by callers outside this crate —
+//! `crates/spindle-net/src/signaling/wire.rs`'s `wire::now()` function (`wire.rs:44-49`) is
+//! exactly such a legitimate caller: it reads `SystemTime::now()` and passes the result in as the
+//! `now:` field to `envelope::open`. That is the intended layering, not a violation, and it is the
+//! distinction this guard exists to enforce: the library stays clock-free; the edge supplies the
+//! clock.
 //!
 //! `envelope.rs`'s own clock-skew check lives at the same layer as `src/artifacts/`'s checks: its
-//! `open` function's `if skew > CLOCK_SKEW_SECS` at `:320` is a live clock-skew validity check,
-//! exactly the shape this guard exists to hold ambient-clock-free. `spindle-core` (and
-//! `packages/crypto`, its TypeScript twin) reads no ambient clock anywhere;
-//! `crates/spindle-net/src/signaling/wire.rs:44`'s `SystemTime::now()` read is exactly the kind
-//! of edge caller this layering expects, not a violation of it. What does not exist yet is
-//! A10.42's *computed clock offset* — a configured time source derived from the diagnostic bound
-//! checks described in this file's opening paragraph — and this guard's job is to hold the
-//! ambient-clock-free ground in `spindle-core`'s own sources before and after that diagnostic
-//! lands, not to detect a violation after the fact.
+//! `open` function's `if skew > CLOCK_SKEW_SECS` at `envelope.rs:320` is a live clock-skew
+//! validity check, exactly the shape this guard exists to hold ambient-clock-free. `spindle-core`
+//! (and `packages/crypto`, its TypeScript twin) reads no ambient clock anywhere; `wire::now()`
+//! (`wire.rs:44-49`) is exactly the kind of edge caller this layering expects, not a violation of
+//! it. What does not exist yet is A10.42's *computed clock offset* — a configured time source
+//! derived from the diagnostic bound checks described in this file's opening paragraph — and this
+//! guard's job is to hold the ambient-clock-free ground in `spindle-core`'s own sources before and
+//! after that diagnostic lands, not to detect a violation after the fact.
 //!
 //! This is a pure text scan over every `.rs` file under `crates/spindle-core/src` — it does not
 //! compile or type-check anything, so it runs under a plain `cargo test -p spindle-core` with no
@@ -46,11 +46,21 @@
 //! run as "no *obvious* new ambient clock read", not as a proof that every `now` value flowing
 //! through this crate traces back to a caller argument.
 //!
-//! One further hole, demonstrated rather than assumed: an aliased import —
+//! A second hole, demonstrated rather than assumed: an aliased import —
 //! `use std::time::SystemTime as Clock; Clock::now()` — is **not caught**, because the scan
 //! matches the literal substring `SystemTime::now`, and an alias renames that text away before
 //! this guard ever sees it. No such alias exists in this repo today; it is disclosed because a
 //! heuristic that only lists its catches and not its misses invites more trust than it has earned.
+//!
+//! A third hole, also demonstrated: because the scan masks string literals before matching, a
+//! position inside a multi-line string literal is invisible to it — a clock read planted there is
+//! not caught. A `SystemTime::now()` read planted inside `artifacts/bootstrap.rs`'s multi-line
+//! `#[error("bundle encodes to … dropped {} host(s) to fit")]` string passes this guard GREEN.
+//! Such positions are not real code, so this is a limit on the guard's reach rather than a live
+//! hole in what it protects, but it is a real limit, and the set of blind positions moves every
+//! time the sources change. This file does not record a count of them: a measured figure in a
+//! comment is correct only on the day it is written, and this file has already shipped one stale
+//! inherited count that outlived its accuracy.
 //!
 //! ## Comments and string literals
 //!
@@ -58,88 +68,40 @@
 //! deliberately excluded from failing the test: a doc comment that *describes* the forbidden
 //! rule (e.g. this very file's own prose, or a doc comment in `artifacts/mod.rs` explaining why
 //! `SystemTime::now` must never appear) would otherwise trip the guard it is trying to justify.
-//! The masking pass below blanks out comment and string bytes before scanning, exactly as
-//! `redaction_guard.rs` does for the same reason — see that file's `mask_non_code` for the
-//! precedent this guard's version is copied from.
+//! The masking pass below blanks out comment and string bytes before scanning. It started as a
+//! copy of `redaction_guard.rs`'s `mask_non_code`, written for the same reason, but the two have
+//! since diverged: this copy also handles Rust char literals and `redaction_guard.rs`'s does not.
+//! That divergence is tracked as **td-9b5c87**; see `mask_non_code`'s own doc comment below for
+//! what it means for each file's blind spots.
 //!
 //! # Neuter-verification
 //!
-//! Demonstrated on 2026-09-11, not assumed. Each probe below was appended after a blank
-//! separator line, and the recorded line numbers assume that separator. Appending
+//! Demonstrated on 2026-09-11, not assumed:
 //!
-//! ```text
-//! fn probe_ambient_clock() -> std::time::SystemTime {
-//!     let now = std::time::SystemTime::now();
-//!     now
-//! }
-//! ```
+//! - appending a `SystemTime::now()` read to `src/artifacts/mod.rs` turns this test RED; reverting
+//!   it leaves the file byte-identical to its original (`cmp` clean, `git diff --quiet` clean).
+//! - the comment- and string-masking was neutered separately: a line comment containing
+//!   `SystemTime::now`, a block comment containing `Instant::now` and `chrono`, and a `&str`
+//!   constant containing `Utc::now` were all appended to the same file at once, and the test
+//!   stayed green. That is the evidence for the masking claim above — without it, "matches in
+//!   comments and strings are excluded" would itself be an untested assertion about what this
+//!   test catches.
+//! - appending a `SystemTime::now()` read to `src/envelope.rs` turns this test RED. That file is
+//!   scanned because it performs the envelope clock-skew validity check described above, and an
+//!   earlier version of this guard did not cover it.
+//! - appending a `SystemTime::now()` read to `src/bin/gen_crypto_vectors.rs` turns this test RED.
+//!   That file sits in a subdirectory of `src/`, outside the old `artifacts/`-plus-`envelope.rs`
+//!   scan, so reddening on it demonstrates both that the walk recurses and that it reaches files
+//!   no hand-maintained list ever named.
+//! - the char-literal handling in `mask_non_code` was neutered by planting probes immediately
+//!   after `gen_crypto_vectors.rs`'s `out.push('"');` and again after its whole
+//!   `match c { '"' => …, '\\' => …, '\n' => … }` block — both probes were reported. Before the
+//!   char-literal handling existed, the first of those two passed GREEN: the closing `'"'` flipped
+//!   the masker into `Str` mode over the real code that followed, hiding a real ambient-clock
+//!   read.
 //!
-//! to `src/artifacts/mod.rs` turned this test RED with
-//! `artifacts/mod.rs:328: found `SystemTime::now` (`let now = std::time::SystemTime::now();`)`,
-//! and removing it turned the test green again with the file byte-identical to its original
-//! (`cmp` clean, `git diff --quiet` clean).
-//!
-//! The comment- and string-masking was neutered separately in the same run: a line comment
-//! containing `SystemTime::now`, a block comment containing `Instant::now` and `chrono`, and a
-//! `&str` constant containing `Utc::now` were all appended to the same file at once, and the
-//! test stayed green. That is the evidence for the masking claim above — without it, "matches in
-//! comments are excluded" would itself be an untested assertion about what this test catches.
-//!
-//! The `src/envelope.rs` addition was neutered separately on the same day: appending a
-//! `std::time::SystemTime::now()` read to `src/envelope.rs` turned this test RED naming
-//! `envelope.rs:758`, and reverting it left the file byte-identical to its original (`cmp` clean,
-//! `git diff --quiet` clean). That file is scanned because it performs the envelope clock-skew
-//! validity check at `:320`, and an earlier version of this guard did not cover it. The broadened
-//! recursive scan was neutered on the same day: appending a
-//! `std::time::SystemTime::now()` read to `src/bin/gen_crypto_vectors.rs` turned this test RED
-//! naming `src/bin/gen_crypto_vectors.rs:1500`, and reverting it left the file byte-identical to
-//! its original (`cmp` clean, `git diff --quiet` clean). That file was chosen deliberately: it sits
-//! in a SUBDIRECTORY of `src/` and outside the old `artifacts/`-plus-`envelope.rs` scan, so
-//! reddening on it demonstrates both that the walk recurses and that it reaches files the
-//! hand-maintained list never named.
-//!
-//! That `gen_crypto_vectors.rs:1500` demonstration was real — it did redden, and reverting it
-//! left the file clean — but it did not prove what it appeared to prove about this scan's
-//! coverage of that file. `mask_non_code` had no char-literal handling at the time, and
-//! `gen_crypto_vectors.rs:65`'s `out.push('"');` put roughly 90% of that file's line positions
-//! inside a spurious `Str` mode the scan could not see into; line 1500 happened to fall inside
-//! the ~10% that stayed visible. An independent review measured it by inserting the probe at
-//! every line position, and I re-measured all of it: 1352 of 1498 positions in that file, and
-//! 1375 of 6458 across the whole broadened Rust scan, were invisible. (The review reported the
-//! same numerators over denominators one smaller per file; it counted existing lines, this counts
-//! insertion positions. The blind counts themselves agree exactly.) Before the broadening the
-//! same method found 23 blind positions of 3292 across the eleven `src/artifacts/*.rs` files —
-//! bootstrap.rs 19, capability.rs 3, artifacts/mod.rs 1 — all genuine multi-line string
-//! interiors — so the broadening had made this guard strictly WORSE on the axis it advertises,
-//! until the char-literal handling below closed it.
-//!
-//! The figure 23 replaces an earlier "8" in this block, which was wrong. That 8 came from a
-//! review report that said 8 about a different scope — the broadened scan's
-//! non-`gen_crypto_vectors` remainder — and was re-scoped here into a claim about the
-//! pre-broadening scan set without being measured. A number inherited from a report is not a
-//! measured number, and this file is the last place that distinction should blur. All four
-//! figures in this block were re-measured directly.
-//!
-//! Successor measurement, same method, current masker: **54 blind positions of 6458** across
-//! the whole tree — 0.8%, every one in `gen_crypto_vectors.rs`. An independent review
-//! compile-classified all 54: none is a real-code position; each sits inside a multi-line
-//! string literal containing an apostrophe (`device's`, `sig_op's`, `Rust's`). Twelve of the 54
-//! were "visible" under the old masker only because it was already desynced at those points, so
-//! they are not a regression.
-//!
-//! The fix was then neutered on 2026-09-11, at the lines that were previously blind:
-//!
-//! - the same `std::time::SystemTime::now()` read planted as line 66 — immediately after the
-//!   `out.push('"');` that used to swallow the rest of the file — turned this test RED naming
-//!   `gen_crypto_vectors.rs:66`. Under the old masker that exact probe passed GREEN.
-//! - two probes planted at once, after line 65 and after line 76, were BOTH reported (`:66` and
-//!   `:78`). The second sits after the whole `match c { '"' => …, '\\' => …, '\n' => … }` block,
-//!   so the masker stayed in code mode across four char literals including the escaped
-//!   backslash — the shape most likely to desync.
-//! - the original tail perturbation still reproduces exactly at `:1500`.
-//!
-//! Every one was reverted, and the file confirmed byte-identical afterwards (`cmp` clean,
-//! `git diff --quiet` clean).
+//! Every planted probe was reverted afterward, and each file was confirmed byte-identical to its
+//! original (`cmp` clean, `git diff --quiet` clean).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -345,9 +307,12 @@ fn relative_path_str(base: &Path, file: &Path) -> String {
 /// manually excluding matches like `"r".repeat(...)`, where `r` is ordinary string content
 /// rather than a raw-string prefix): no raw string exists under `crates/spindle-core/src` today
 /// — the only `r"`-looking hits are `"r".repeat(...)` in `bootstrap.rs`, ordinary strings
-/// containing the letter r. If one is ever added, its contents are scanned as code, and an odd
-/// number of `"` inside it desyncs the scanner over the real code that FOLLOWS it — a false
-/// green, not a false red.
+/// containing the letter r. If one is ever added, an odd number of `"` inside it desyncs the
+/// scanner: the region between that internal quote and the raw string's actual closing quote is
+/// scanned as code, so a forbidden pattern sitting there is reported as a hit — a false red,
+/// flagging string content as a violation. The desync also carries past the string's real end,
+/// masking the real code that follows as if it were still inside a string — a false green. Both
+/// failure modes occur, not one or the other.
 fn mask_non_code(src: &[u8]) -> Vec<u8> {
     #[derive(Clone, Copy, PartialEq)]
     enum Mode {
