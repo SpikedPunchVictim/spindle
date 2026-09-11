@@ -22,6 +22,14 @@
 //! silently widening one language's copy of it loosens a security bound in that language alone,
 //! and nothing before this test would have noticed.
 //!
+//! The TypeScript half of that guarantee is enforced here by `parse_bigint_const`, a plain text
+//! scanner, *and* by `packages/crypto/test/clock-skew-value.test.ts`, which imports the real
+//! TypeScript bindings and compares their runtime values directly. Both are needed: see
+//! `parse_bigint_const`'s doc comment for a demonstrated false green this text scanner alone could
+//! produce, and for why the TS-side real-import test is the actual backstop against it. Read this
+//! file's cross-language coverage as a property of that pair, not of this file in isolation --
+//! a Rust-only test run exercises only the text scanner half.
+//!
 //! # Neuter-verification
 //!
 //! Demonstrated on 2026-09-11, not assumed. Three perturbations, each reverted after measuring:
@@ -188,7 +196,34 @@ fn read_nonempty(path: &Path) -> String {
 ///
 /// Lines whose trimmed form starts with `//` or `*` are skipped, so this cannot mistake a
 /// commented-out declaration, or a doc-comment continuation line describing one, for a live
-/// export. Matching on `name` is exact, not substring: the character immediately before and after
+/// export. A `/* */` block comment is also tracked across lines, with a simple `in_block_comment`
+/// flag toggled by `/*` and `*/`: a line that opens a block comment, lies inside one, or closes
+/// one is skipped in full, at line granularity, the same way a `//`- or `*`-prefixed line is.
+/// That flag closes a demonstrated false green: before it existed,
+///
+/// ```text
+/// /**
+/// export const CLOCK_SKEW_SECS = 120n;
+/// */
+/// export const CLOCK_SKEW_SECS =
+///   3600n;
+/// ```
+///
+/// found exactly one declaration -- the commented-out `120n` -- because nothing tracked
+/// block-comment state across lines, and passed with the wrong value while the live export was
+/// actually `3600n`. This scanner remains line-oriented, not a full TypeScript parser, and a
+/// declaration split across lines (as `CLOCK_SKEW_SECS` is in that same example's last two lines)
+/// is still not recognized: this function would find zero declarations of it, since each line is
+/// matched independently. That is a documented limit, not fixed here -- closing it fully would
+/// mean writing a TypeScript expression parser rather than a heuristic guard test. The actual
+/// backstop for that shape is `packages/crypto/test/clock-skew-value.test.ts`, which does not
+/// parse source text at all: it imports the real TypeScript binding and compares its runtime
+/// value directly, so a value this scanner cannot follow is still caught there. The guarantee
+/// that all four constants equal 120 in both languages is a property of *this pair of tests
+/// together*, not of this file alone -- a Rust-only test run exercises only this file, and this
+/// file alone would have been falsely green in the scenario demonstrated above.
+///
+/// Matching on `name` is exact, not substring: the character immediately before and after
 /// the matched name must not be alphanumeric or an underscore, and the text immediately before the
 /// match (trimmed) must end in `export const`. Both guards exist for the same reason --
 /// `SESSION_ATTESTATION_CLOCK_SKEW_SECS` is a suffix of
@@ -204,9 +239,23 @@ fn read_nonempty(path: &Path) -> String {
 /// (td-db47f9) after a first-match parser there shipped a false-green once already.
 fn parse_bigint_const(src: &str, path: &Path, name: &str) -> u64 {
     let mut found: Vec<u64> = Vec::new();
+    let mut in_block_comment = false;
 
     for line in src.lines() {
         let trimmed = line.trim();
+
+        if in_block_comment {
+            if trimmed.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if trimmed.contains("/*") {
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
         if trimmed.starts_with("//") || trimmed.starts_with('*') {
             continue;
         }

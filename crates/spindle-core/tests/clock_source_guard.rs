@@ -7,11 +7,12 @@
 //!
 //! That property rests on every artifact validity check in `crates/spindle-core/src/artifacts/`
 //! *plus* `src/envelope.rs`'s own clock-skew validity check taking its notion of "now" from an
-//! explicit caller-supplied parameter, never from an ambient system clock read anywhere in this
-//! crate's library sources. `spindle-core` is the pure artifact/envelope verification library: it
-//! takes every notion of "now" as a caller-supplied parameter and has no legitimate reason to read
-//! a clock itself, so this guard now scans the whole `crates/spindle-core/src` tree recursively,
-//! not just `src/artifacts/` and `src/envelope.rs` by name. The clock is supplied at the edge, by
+//! explicit caller-supplied parameter, never from an ambient system clock read anywhere under
+//! this crate's whole `src` tree, including `src/bin/`. `spindle-core` is the pure
+//! artifact/envelope verification library: it takes every notion of "now" as a caller-supplied
+//! parameter and has no legitimate reason to read a clock itself, so this guard now scans the
+//! whole `crates/spindle-core/src` tree recursively, not just `src/artifacts/` and
+//! `src/envelope.rs` by name. The clock is supplied at the edge, by
 //! callers outside this crate — `crates/spindle-net/src/signaling/wire.rs:44` is exactly such a
 //! legitimate caller: it reads `SystemTime::now()` and passes the result in as the `now:` field to
 //! `envelope::open`. That is the intended layering, not a violation, and it is the distinction this
@@ -19,10 +20,14 @@
 //!
 //! `envelope.rs`'s own clock-skew check lives at the same layer as `src/artifacts/`'s checks: its
 //! `open` function's `if skew > CLOCK_SKEW_SECS` at `:320` is a live clock-skew validity check,
-//! exactly the shape this guard exists to hold ambient-clock-free. As of this guard's introduction
-//! there is no clock source wired into Spindle at all (A10.42's cold-clock diagnostic is not yet
-//! implemented), so this test's job is to hold that ground *before* one gets wired in, not to
-//! detect a violation after the fact.
+//! exactly the shape this guard exists to hold ambient-clock-free. `spindle-core` (and
+//! `packages/crypto`, its TypeScript twin) reads no ambient clock anywhere;
+//! `crates/spindle-net/src/signaling/wire.rs:44`'s `SystemTime::now()` read is exactly the kind
+//! of edge caller this layering expects, not a violation of it. What does not exist yet is
+//! A10.42's *computed clock offset* — a configured time source derived from the diagnostic bound
+//! checks described in this file's opening paragraph — and this guard's job is to hold the
+//! ambient-clock-free ground in `spindle-core`'s own sources before and after that diagnostic
+//! lands, not to detect a violation after the fact.
 //!
 //! This is a pure text scan over every `.rs` file under `crates/spindle-core/src` — it does not
 //! compile or type-check anything, so it runs under a plain `cargo test -p spindle-core` with no
@@ -91,6 +96,31 @@
 //! in a SUBDIRECTORY of `src/` and outside the old `artifacts/`-plus-`envelope.rs` scan, so
 //! reddening on it demonstrates both that the walk recurses and that it reaches files the
 //! hand-maintained list never named.
+//!
+//! That `gen_crypto_vectors.rs:1500` demonstration was real — it did redden, and reverting it
+//! left the file clean — but it did not prove what it appeared to prove about this scan's
+//! coverage of that file. `mask_non_code` had no char-literal handling at the time, and
+//! `gen_crypto_vectors.rs:65`'s `out.push('"');` put roughly 90% of that file's line positions
+//! inside a spurious `Str` mode the scan could not see into; line 1500 happened to fall inside
+//! the ~10% that stayed visible. An independent review measured it by inserting the probe at
+//! every line position: 1352 of 1497 positions in that file, and 1375 of 6441 across the whole
+//! broadened Rust scan, were invisible. Before the broadening only 8 lines were blind, all
+//! genuine multi-line string interiors — so the broadening had made this guard strictly WORSE on
+//! the axis it advertises, until the char-literal handling below closed it.
+//!
+//! The fix was then neutered on 2026-09-11, at the lines that were previously blind:
+//!
+//! - the same `std::time::SystemTime::now()` read planted as line 66 — immediately after the
+//!   `out.push('"');` that used to swallow the rest of the file — turned this test RED naming
+//!   `gen_crypto_vectors.rs:66`. Under the old masker that exact probe passed GREEN.
+//! - two probes planted at once, after line 65 and after line 76, were BOTH reported (`:66` and
+//!   `:78`). The second sits after the whole `match c { '"' => …, '\\' => …, '\n' => … }` block,
+//!   so the masker stayed in code mode across four char literals including the escaped
+//!   backslash — the shape most likely to desync.
+//! - the original tail perturbation still reproduces exactly at `:1500`.
+//!
+//! Every one was reverted, and the file confirmed byte-identical afterwards (`cmp` clean,
+//! `git diff --quiet` clean).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -110,14 +140,24 @@ const FORBIDDEN_PATTERNS: &[&str] = &[
     "OffsetDateTime::now",
 ];
 
-/// Files that must be present among the scanned set — these four hold the A10.42 clock-skew
-/// validity checks this guard exists to protect. Listed explicitly (rather than relying on the
-/// minimum count alone) so a rename or removal of any one of them fails loudly by name, not just
-/// as a number going down.
+/// Files that must be present among the scanned set, matched by path RELATIVE TO the scanned
+/// `src` root (not by bare basename) — these four hold the A10.42 clock-skew validity checks
+/// this guard exists to protect. Listed explicitly (rather than relying on the minimum count
+/// alone) so a rename or removal of any one of them fails loudly by name, not just as a number
+/// going down. Matching on the relative path rather than `file_name()` alone means a benign move
+/// that keeps a file inside this tree (e.g. `envelope.rs` -> `envelope/mod.rs`) is reported
+/// accurately as "moved to a different path" instead of being misdiagnosed as "renamed or moved
+/// out of spindle-core", and a stub file that merely shares a basename somewhere else in the tree
+/// can no longer satisfy this check by accident.
+///
+/// A10.42 also covers `exp` and revocation checks that live in `capability.rs`,
+/// `host_op_key_cert.rs`, `device_cert.rs`, `host_device_cert.rs`, `admission_token.rs`, and
+/// `revocation.rs` — those files are scanned because they sit under `src` like everything else,
+/// but they are not name-pinned here the way the four ±120s skew-check files below are.
 const MUST_BE_PRESENT: &[&str] = &[
-    "session_attest.rs",
-    "host_session_attest.rs",
-    "admin_command.rs",
+    "artifacts/session_attest.rs",
+    "artifacts/host_session_attest.rs",
+    "artifacts/admin_command.rs",
     "envelope.rs",
 ];
 
@@ -128,6 +168,13 @@ const MUST_BE_PRESENT: &[&str] = &[
 /// silently-shrinking scan set — an off-by-a-few floor would let a dropped file slip through
 /// unnoticed. Adding a new file under `src` raises the true count above this floor and stays
 /// green; only a *drop* below 17 (a move, rename, or scan-logic regression) turns this red.
+///
+/// This is a floor, not a tight pin, and that is a real limitation: once the true count climbs
+/// above 17 because a file was added without this constant being bumped to match, the floor stops
+/// protecting against a later drop of up to that same margin — e.g. if the tree grows to 19 files
+/// and this constant is left at 17, two files could later disappear and this assertion would stay
+/// green. Bump this constant whenever a `.rs` file is added under `src`, rather than treating 17
+/// as a permanent tripwire.
 const MIN_RS_FILE_COUNT: usize = 17;
 
 #[test]
@@ -146,12 +193,12 @@ fn artifacts_never_read_an_ambient_clock() {
     for &expected in MUST_BE_PRESENT {
         let present = files
             .iter()
-            .any(|f| f.file_name().and_then(|n| n.to_str()) == Some(expected));
+            .any(|f| relative_path_str(&src_dir, f) == expected);
         assert!(
             present,
-            "expected {} to contain {expected} somewhere in its tree, but it was not found — did \
-             it get renamed or moved out of spindle-core? It holds an A10.42 clock-skew validity \
-             check this guard exists to protect.",
+            "expected {expected} to be present in the scan set at that path relative to {} \
+             — it is missing from the scan set at its expected path. It holds an A10.42 \
+             clock-skew validity check this guard exists to protect.",
             src_dir.display()
         );
     }
@@ -237,16 +284,43 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `file`'s path relative to `base`, with components joined by `/` regardless of the host OS's
+/// native path separator, so a `MUST_BE_PRESENT` entry like `"artifacts/session_attest.rs"`
+/// compares correctly on Windows (where `Path` would otherwise join components with `\`) as well
+/// as on Unix.
+fn relative_path_str(base: &Path, file: &Path) -> String {
+    file.strip_prefix(base)
+        .unwrap_or(file)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Replaces the contents of `//` line comments, `/* */` block comments, and `"..."` string
 /// literals with ASCII spaces, byte-for-byte (newlines are always preserved), so a scan of the
 /// output cannot mistake comment/string text for real code — e.g. this very module's own doc
 /// comments, which quote `SystemTime::now`, must not trip the guard they explain. Every byte
 /// offset in the output lines up with the same offset (and line number) in the original source.
 ///
-/// Copied from `redaction_guard.rs`'s `mask_non_code`, including its stated limits: it does not
-/// special-case raw strings (`r"..."`/`r#"..."#`) or char literals/lifetimes (`'a`), because
-/// neither shape appears anywhere in `src/artifacts/` today and a heuristic guard test doesn't
-/// need a full Rust tokenizer.
+/// Char literals (`'x'`, `'\n'`, `'\''`, `'\u{2764}'`) and lifetimes (`'a`, `'static`, `'_`) are
+/// both handled directly in `Code` mode, without ever switching into `Str` mode on a bare `'`:
+/// on seeing `'`, [`char_literal_len`] looks ahead to decide which shape follows — an escape
+/// (`\` plus one more byte, or `\u{...}`) or exactly one, possibly multi-byte UTF-8, character,
+/// then a closing `'`, is a char literal, and gets blanked to ASCII spaces for its full byte
+/// length; anything else (no closing `'` in that position) is a lifetime, and is emitted
+/// unchanged. This distinction matters because a Rust char literal can never contain any
+/// `FORBIDDEN_PATTERNS` entry — they are all multi-character — so blanking one can never hide
+/// real code, while *not* handling char literals let one's own closing quote (e.g. `'"'` in
+/// `gen_crypto_vectors.rs:65`) be mistaken for the start of a string, flipping the scanner into
+/// `Str` mode over real code that followed.
+///
+/// Copied from `redaction_guard.rs`'s `mask_non_code`, including one remaining stated limit: it
+/// does not special-case raw strings (`r"..."`/`r#"..."#`/`br"..."`/`br#"..."#`). Checked with
+/// `grep -rnE '(^|[^A-Za-z0-9_])(br|r)#*"' crates/spindle-core/src` on 2026-09-11 (after manually
+/// excluding matches like `"r".repeat(...)`, where `r` is ordinary string content rather than a
+/// raw-string prefix): no raw string literal exists anywhere under `crates/spindle-core/src`
+/// today. If one is ever added, its contents would be scanned as if they were code.
 fn mask_non_code(src: &[u8]) -> Vec<u8> {
     #[derive(Clone, Copy, PartialEq)]
     enum Mode {
@@ -283,6 +357,20 @@ fn mask_non_code(src: &[u8]) -> Vec<u8> {
                 if b == b'"' {
                     mode = Mode::Str;
                     out.push(b' ');
+                    i += 1;
+                    continue;
+                }
+                if b == b'\'' {
+                    if let Some(len) = char_literal_len(src, i) {
+                        for &lb in &src[i..i + len] {
+                            out.push(if lb == b'\n' { b'\n' } else { b' ' });
+                        }
+                        i += len;
+                        continue;
+                    }
+                    // Not a char literal — a lifetime (`'a`, `'static`, `'_`) or a lone `'`.
+                    // Emit unchanged and stay in Code mode: never enter Str mode on a bare `'`.
+                    out.push(b'\'');
                     i += 1;
                     continue;
                 }
@@ -334,6 +422,69 @@ fn mask_non_code(src: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// If `src[i]` (a `'`) begins a char literal, returns its total byte length including both
+/// quotes; otherwise returns `None` (the `'` begins a lifetime, or is otherwise not a char
+/// literal). Used by [`mask_non_code`] to distinguish `'x'`/`'\n'`/`'\u{2764}'` from `'a`/`'static`
+/// without ever mistaking the former's closing `'` for the start of a string.
+///
+/// A char literal is `'` followed by either an escape (`\` plus one more byte, or the variable-
+/// length `\u{...}` form) or exactly one — possibly multi-byte UTF-8 — character, followed by a
+/// closing `'`. A lifetime has no closing `'` in that position, since it is a bare identifier
+/// (`'a`, `'static`, `'_`) used without one.
+fn char_literal_len(src: &[u8], i: usize) -> Option<usize> {
+    debug_assert_eq!(src[i], b'\'');
+    let mut j = i + 1;
+    if j >= src.len() {
+        return None;
+    }
+    if src[j] == b'\\' {
+        j += 1;
+        if j >= src.len() {
+            return None;
+        }
+        if src[j] == b'u' && src.get(j + 1) == Some(&b'{') {
+            // `\u{...}`: consume up to and including the closing `}`.
+            j += 2;
+            while j < src.len() && src[j] != b'}' {
+                j += 1;
+            }
+            if j >= src.len() {
+                return None;
+            }
+            j += 1;
+        } else {
+            // A simple escape (`\n`, `\t`, `\r`, `\0`, `\\`, `\'`, `\"`, ...): backslash plus
+            // exactly one more byte.
+            j += 1;
+        }
+    } else {
+        j += utf8_char_len(src[j]);
+    }
+    if src.get(j) == Some(&b'\'') {
+        Some(j + 1 - i)
+    } else {
+        None
+    }
+}
+
+/// Byte length of the UTF-8 character starting with leading byte `b`, from its high bits.
+/// Defaults to `1` for a continuation byte or another invalid leading byte, which cannot occur
+/// in valid UTF-8 source text (the caller only ever sees bytes from a `String`'s `.as_bytes()`)
+/// but keeps this defensive rather than panicking.
+fn utf8_char_len(b: u8) -> usize {
+    if b & 0x80 == 0 {
+        1
+    } else if b & 0xE0 == 0xC0 {
+        2
+    } else if b & 0xF0 == 0xE0 {
+        3
+    } else if b & 0xF8 == 0xF0 {
+        4
+    } else {
+        1
+    }
 }
 
 /// 1-based line number containing `byte_offset` in `src`.

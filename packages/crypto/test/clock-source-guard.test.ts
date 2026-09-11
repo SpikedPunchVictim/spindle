@@ -15,9 +15,19 @@
 // clock-skew validity check, exactly the shape this guard exists to hold ambient-clock-free.
 // `artifacts.ts`'s own module doc already states the rule in prose ("This module never reads a
 // system clock: every time check takes a caller-supplied `now: bigint`"); this test is the
-// enforcement that prose lacked. As of writing, no clock source is wired into Spindle at all
-// (A10.42's cold-clock diagnostic is not yet implemented), so this guard's job is to hold this
-// ground *before* one gets wired in, not to detect a violation after the fact.
+// enforcement that prose lacked.
+//
+// `packages/crypto` (like its Rust twin, `spindle-core`) reads no ambient clock anywhere; the
+// pure verification library takes every "now" as a caller-supplied parameter, and the edge
+// supplies it. On the Rust side, `crates/spindle-net/src/signaling/wire.rs:44`'s
+// `SystemTime::now()` read is exactly this kind of legitimate edge caller, not a violation of the
+// rule this guard enforces — TypeScript has no direct twin of that call site today, but the same
+// layering applies if and when one is added: an edge caller outside this package may read a
+// clock and pass the result in; this package itself may not. What does not exist yet is A10.42's
+// *computed clock offset* — a configured time source derived from the diagnostic bound checks
+// named in this file's opening paragraph — and this guard's job is to hold the ambient-clock-free
+// ground in this package's own sources before and after that diagnostic lands, not to detect a
+// violation after the fact.
 //
 // This is the TypeScript twin of `crates/spindle-core/tests/clock_source_guard.rs` — same
 // invariant, same text-scan approach, same precedent (`redaction_guard.rs`'s comment/string
@@ -59,7 +69,7 @@
 // # Neuter-verification
 //
 // Demonstrated on 2026-09-11, not assumed. Appending `const probeNow = Date.now();` to
-// `src/artifacts.ts` turned this test RED with ``artifacts.ts:620: found `Date.now` (`const
+// `src/artifacts.ts` turned this test RED with ``artifacts.ts:625: found `Date.now` (`const
 // probeNow = Date.now();`)``, and removing it turned the test green again with the file
 // byte-identical to its original (`cmp` clean, `git diff --quiet` clean).
 //
@@ -147,9 +157,13 @@ function collectTsFiles(dir: string, out: string[]): void {
  * original source.
  *
  * Deliberately simple, mirroring `redaction_guard.rs`'s `mask_non_code`: no special handling of
- * regex literals (`/.../`) — none appear in any scanned file — and template-literal
- * `${...}` interpolations are masked along with the rest of the template rather than being
- * recursively re-parsed as code (see this file's header comment on that limitation). */
+ * regex literals (`/.../`). `backend.ts:79` and `:83` each have two (`.replace(/\+/g, "-")` and
+ * friends, for base64url's `+`/`-` and `/`/`_` swaps) — the only regex literals in any scanned
+ * file — and measurement found no desync at those lines: none of `FORBIDDEN_PATTERNS` appears
+ * inside a regex literal there, so this scanner's blindness to that shape happens not to matter
+ * today, not because the shape is absent. Template-literal `${...}` interpolations are masked
+ * along with the rest of the template rather than being recursively re-parsed as code (see this
+ * file's header comment on that limitation). */
 type Mode = "code" | "line-comment" | "block-comment" | "single" | "double" | "template";
 
 function maskNonCode(src: string): string {
