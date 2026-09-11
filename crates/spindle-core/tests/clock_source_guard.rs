@@ -298,13 +298,20 @@ fn relative_path_str(base: &Path, file: &Path) -> String {
 ///
 /// This masker was copied from `redaction_guard.rs`'s `mask_non_code`; the two have since
 /// DIVERGED: this copy handles char literals and `redaction_guard.rs`'s does not. That gap is
-/// latent rather than live: a review measured `redaction_guard.rs`'s blind set and found the
-/// char-literal fix would change none of it, so there is no false green there today. The figures
-/// and the open question of what those blind positions actually are live on **td-9b5c87**, which
-/// tracks bringing the fix across — not here, where they would rot.
+/// latent *as far as char literals go*, and that is the only claim measurement supports: the
+/// char-literal fix changes none of `redaction_guard.rs`'s blind positions, in either direction.
+/// It does NOT follow that that guard has no false green — it has one, from a different cause.
+/// A backslash-terminated raw string desyncs its masker over real code in
+/// `spindle-vfs/src/confine/windows.rs`, demonstrated live and tracked as **td-5a459e**. An
+/// earlier version of this comment drew the stronger conclusion from the narrower measurement;
+/// do not restore it. The figures live on **td-9b5c87** (char literals) and **td-5a459e** (raw
+/// strings), not here, where they would rot.
 ///
-/// Neither masker special-cases raw strings (`r"..."`/`r#"..."#`/`br"..."`/`br#"..."#`). Checked
-/// with `git grep -nE '(^|[^A-Za-z0-9_])(br|r)#*"' -- crates/spindle-core/src` on 2026-09-11 —
+/// Neither masker special-cases raw strings (`r"..."`/`r#"..."#`/`br"..."`/`br#"..."#`). The
+/// receipt below covers only THIS guard's scan set; `redaction_guard.rs` scans six other crates,
+/// where the same search returns 17 raw strings and one of them is already desyncing it
+/// (td-5a459e). Checked with
+/// `git grep -nE '(^|[^A-Za-z0-9_])(br|r)#*"' -- crates/spindle-core/src` on 2026-09-11 —
 /// `git grep` deliberately, not this shell's `grep`, which wraps ugrep with `--ignore-files` and
 /// silently skips gitignored paths, making it unsound for an absence claim. Discounting matches
 /// like `"r".repeat(...)`, where `r` is ordinary string content rather than a raw-string prefix:
