@@ -115,6 +115,12 @@ pub const QR_V40_M_CAPACITY_BYTES: usize = 2331;
 /// but not M). This constant is DOCUMENTATION for those figures only: `spindle-core`'s QR fit
 /// check measures the real canonical encoding of each candidate bundle instead of trusting this
 /// estimate.
+///
+/// **[contested — td-331c11]** The "can no longer drift silently" claim above is weaker than it
+/// reads: this constant is not coupled to `MEASURED_MEMBER_CAP_BYTES`. Perturbing that constant
+/// leaves `spindle-core`'s `keeps_measured_entry_bytes_honest` green — this figure is pinned by
+/// its own fixture and, transitively, by `FINGERPRINT_LEN`, not by the per-cap figure it is
+/// arithmetically built from. The 521 B value is correct and independently measured.
 pub const MEASURED_ENTRY_BYTES: usize = 521;
 
 /// Errors produced while converting between the bootstrap bundle wire types and

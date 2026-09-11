@@ -138,8 +138,9 @@
 > against the shared `MEASURED_MEMBER_CAP_BYTES` (td-331c11).
 > v0.9.35: no figure changes; v0.9.34's own two claims about that pin — that three measurement
 > tests move together, and that it catches any encoded-width drift — were themselves unchecked and
-> both false. Rather than soften them, the coupling and the clock guard they described were built,
-> and each is now verified by perturbation (td-331c11).
+> both false. The first was made true by building the coupling it described; the second was both
+> narrowed — the pin cannot see the production clock, and now says so — and backed by a new guard
+> on that clock. Each is verified by perturbation (td-331c11).
 
 ---
 
@@ -454,8 +455,8 @@ cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp
   it now asserts `32 * MEASURED_MEMBER_CAP_BYTES + envelope` instead, and the perturbation reddens
   all three measurement tests. And the pin cannot see a change to the production clock, because its
   fixture injects one; a separate test bounds `wall_clock_now_secs` to the `[2^16, 2^32)` band the
-  measurements assume, since a seconds-to-milliseconds change would widen every timestamp field by
-  a CBOR byte unnoticed (td-331c11). S12
+  measurements assume, since a seconds-to-milliseconds change would widen each affected timestamp
+  field from a 5-byte CBOR uint to a 9-byte one unnoticed (td-331c11). S12
   measures.
 
 **NATS authentication = Auth Callout for every connection**
@@ -1714,10 +1715,13 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
   a capability's encoded width" was false — the pin's fixture injects its clock, so
   `wall_clock_now_secs` was unreachable from it, and changing it from seconds to milliseconds (every
   `exp` a 9-byte CBOR uint instead of 5, 428 B per cap) left the whole suite at 869 passed / 0
-  failed. Both are now true rather than softened: `spindle-helper` asserts
+  failed. The first was made true, the second narrowed and separately guarded: `spindle-helper`
+  asserts
   `MEASURED_32_CAP_TOKEN_CBOR_BYTES == 32 * MEASURED_MEMBER_CAP_BYTES + MEASURED_TOKEN_ENVELOPE_BYTES`
-  (a 547 B envelope: map framing, device certificate, session attestation), so the same perturbation
-  now reddens all three; and a new test bounds `wall_clock_now_secs` to `[2^16, 2^32)`, the band a
+  (547 B = 449 B envelope -- map framing, device certificate, session attestation -- plus a 2 B
+  array header and 32 three-byte CBOR byte-string headers, so it is specific to this cap count and
+  length bucket, not structural), so the same perturbation now reddens all three; and a new test
+  bounds `wall_clock_now_secs` to `[2^16, 2^32)`, the band a
   5-byte CBOR uint occupies and the band every measurement was taken in. Each is verified by the
   perturbation that previously passed. Also swept: a seventh doc comment still describing the
   deleted function-level pin, and two live pre-measurement estimates the earlier sweep missed

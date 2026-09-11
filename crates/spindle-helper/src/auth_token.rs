@@ -64,9 +64,9 @@ use spindle_proto::canonical::CborValue;
 /// rather than leaving this constant to drift out from under it silently again (previously
 /// 13,571 B / 18,095 B / 55.2%, measured against a 16-byte nonce no production issuer ever
 /// emitted — td-331c11). This crate's own figure is in turn pinned to `MEASURED_MEMBER_CAP_BYTES`
-/// by the identity assertion in `keeps_measured_32_cap_token_bytes_honest` below. Pinned by
-/// `keeps_measured_32_cap_token_bytes_honest` below, which mints the envelope through
-/// `encode_device_token` — the same builder every other test in this module uses.
+/// by the identity assertion in `keeps_measured_32_cap_token_bytes_honest` below, which mints
+/// the envelope through `encode_device_token` — the same builder every other test in this
+/// module uses.
 #[cfg(test)]
 const MEASURED_32_CAP_TOKEN_CBOR_BYTES: usize = 14_115;
 /// The base64url (no padding) encoding of [`MEASURED_32_CAP_TOKEN_CBOR_BYTES`] — the length that
@@ -74,14 +74,26 @@ const MEASURED_32_CAP_TOKEN_CBOR_BYTES: usize = 14_115;
 /// token base64url-encoded on the wire, not as raw CBOR.
 #[cfg(test)]
 const MEASURED_32_CAP_TOKEN_B64_BYTES: usize = 18_820;
-/// The non-capability remainder of a 32-cap CONNECT token: the envelope map framing, the
-/// `DeviceCertificate` and the `SessionAttestation`. Named so the token figure can be expressed as
+/// The non-capability remainder of a 32-cap CONNECT token, so the token figure can be expressed as
 /// `32 * MEASURED_MEMBER_CAP_BYTES + MEASURED_TOKEN_ENVELOPE_BYTES` rather than as a bare literal
 /// that happens to agree with it. That identity is asserted in
-/// `keeps_measured_32_cap_token_bytes_honest` below, which is what actually makes this crate's
-/// figures move when the per-cap figure moves — before td-331c11's follow-up they were merely
-/// documented as moving together while `MEASURED_MEMBER_CAP_BYTES` could change with this crate
-/// still green.
+/// `keeps_measured_32_cap_token_bytes_honest` below, alongside a per-cap length check without which
+/// this constant would be a free variable absorbing any drift between that test's fixture and
+/// `MEASURED_MEMBER_CAP_BYTES`.
+///
+/// It is NOT purely envelope, and the difference matters. Caps are embedded as CBOR byte strings
+/// (see `encode_device_token` above), so each carries a length header of its own:
+///
+/// ```text
+/// 547 = 449  envelope proper -- map framing, DeviceCertificate, SessionAttestation
+///     +   2  caps array header (0x98 0x20, for 32 elements)
+///     +  96  32 x 3-byte bstr headers (a 3-byte header spans 256..=65535 B)
+/// ```
+///
+/// So this value is specific to 32 caps in that length bucket: a cap smaller than 256 B or larger
+/// than 65,535 B changes the header width and moves this constant by 32 B, and a different cap
+/// count moves both the array header and the per-cap total. Re-derive it rather than assuming it
+/// is structural (td-331c11).
 #[cfg(test)]
 const MEASURED_TOKEN_ENVELOPE_BYTES: usize = 547;
 /// nats-server's default `max_control_line` is 4 KiB; DESIGN.md §A4/A10.10 says the registry
@@ -548,6 +560,23 @@ mod tests {
             .decode(&token)
             .expect("valid base64url")
             .len();
+
+        // Without this, MEASURED_TOKEN_ENVELOPE_BYTES is a free variable: it silently absorbs any
+        // divergence between this crate's fixture and the pinned per-cap figure, and the identity
+        // below still passes. Demonstrated: minting 425 B caps here and repairing the three
+        // literals leaves the whole suite green with MEASURED_MEMBER_CAP_BYTES still 424
+        // (td-331c11).
+        for (i, cap) in caps.iter().enumerate() {
+            let len = cap.to_canonical_bytes().len();
+            assert_eq!(
+                len,
+                spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES,
+                "cap {i} minted by this test encodes to {len} B, not MEASURED_MEMBER_CAP_BYTES \
+                 ({} B) -- this test's envelope arithmetic below assumes every cap is exactly that \
+                 size (td-331c11)",
+                spindle_proto::artifacts::MEASURED_MEMBER_CAP_BYTES
+            );
+        }
 
         // The coupling that makes this crate's figures move with the per-cap figure. Without it,
         // `MEASURED_MEMBER_CAP_BYTES` could change and this test would stay green on a literal

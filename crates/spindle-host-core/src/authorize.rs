@@ -379,8 +379,16 @@ pub const MEMBER_CAP_DEFAULT_TTL_SECS: u64 = 6 * 7 * 24 * 60 * 60;
 /// system clock reads before the epoch — a misconfigured clock should degrade a minted cap's
 /// `exp` (making it trivially expired, which is the fail-closed direction), not crash the connect
 /// path outright. Mirrors `spindle-hostd`'s own `wall_clock_now_secs`
-/// (`crates/spindle-hostd/src/lib.rs:119`) exactly; duplicated rather than imported because
+/// (`crates/spindle-hostd/src/lib.rs:156`) — duplicated rather than imported because
 /// `spindle-hostd` depends on this crate, not the other way around.
+///
+/// **[contested — td-331c11]** That mirroring is asserted, not enforced: changing the
+/// `spindle-hostd` copy to milliseconds reddens nothing anywhere in the workspace, because
+/// `wall_clock_now_secs_stays_in_the_five_byte_cbor_uint_band` guards only this copy. Today that
+/// is latent rather than live — `spindle-hostd` does not yet construct a `RootKeyCapIssuer`
+/// (`crates/spindle-hostd/src/lib.rs:270-283` defers it to Stage 7), so its clock stamps no
+/// measured artifact. When Stage 7 wires the issuer, the two copies must be collapsed or the
+/// guard extended to both.
 fn wall_clock_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2892,6 +2900,11 @@ mod tests {
     /// magnitude stays in the band the measurements were taken in. It reads the real wall clock
     /// deliberately — that is the value under test — and is stable until the band's upper edge in
     /// 2106, at which point every timestamp figure in this workspace needs re-measuring anyway.
+    ///
+    /// **[contested — td-331c11]** "every artifact" above is overbroad: only fields stamped from
+    /// this crate's `wall_clock_now_secs` move. A `HostOpKeyCert`'s `ts`/`exp` come from its
+    /// callers, and this crate has no production op-cert TTL constant. The 4 B delta and the
+    /// mechanism are correct; the reach is disputed. The assertion below is unaffected.
     #[test]
     fn wall_clock_now_secs_stays_in_the_five_byte_cbor_uint_band() {
         const FIVE_BYTE_UINT_MIN: u64 = 1 << 16;
