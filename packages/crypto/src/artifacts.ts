@@ -17,8 +17,13 @@
 // | HostSessionAttestation | host operating key (`verifyHostSessionAttestation` likewise requires the connecting session's `nats_fp` as an argument, td-583db5 — the host-side mirror of `SessionAttestation`, added v0.9.31 to give `HostOpKeyCert`'s per-connect binding the same required-argument shape; `HostOpKeyCert` itself is issuance-chain only as of v0.9.31) |
 //
 // This module never reads a system clock: every time check takes a caller-supplied `now: bigint`
-// (Unix seconds), consistent with DESIGN.md §A7 ("clients compute an offset" from helper server
-// time).
+// (Unix seconds). Enforced, not merely stated — see `test/clock-source-guard.test.ts`, which
+// scans this whole `src` tree for ambient clock reads. The rule is DESIGN.md §A10.42's: a client
+// may compute a clock offset for DIAGNOSIS, but it must never feed signing time, `exp`, or
+// revocation checks, because a time source is not an authenticated channel. Do not cite §A7's
+// older "clients compute an offset from helper server time" remedy here — v0.9.30 retracted it as
+// never implementable client-side (DESIGN.md:107, :1893): the callout reply is an
+// `authorization_response` JWT addressed to the server, which the client never sees.
 
 import {
   ADMIN_COMMAND_MIN_V,

@@ -42,7 +42,7 @@ mod host_session_attest;
 mod revocation;
 mod session_attest;
 
-pub use admin_command::{issue_admin_command, verify_admin_command};
+pub use admin_command::{issue_admin_command, verify_admin_command, ADMIN_COMMAND_CLOCK_SKEW_SECS};
 pub use admission_token::{issue_admission_token, verify_admission_token};
 pub use bootstrap::{
     build_bootstrap_bundle, verify_bootstrap_bundle, BundleError, QrEcLevel, VerifiedBundle,

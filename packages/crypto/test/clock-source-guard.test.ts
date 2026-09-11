@@ -5,11 +5,17 @@
 // channel; folding one into a validity check would turn a safe refusal (wrong or compromised
 // clock) into an acceptance of an expired or revoked artifact.
 //
-// That property rests on `artifacts.ts` and `bootstrap.ts` taking every notion of "now" from an
-// explicit caller-supplied `now: bigint` parameter, never from an ambient clock read inside this
-// package. `artifacts.ts`'s own module doc already states the rule in prose ("This module never
-// reads a system clock: every time check takes a caller-supplied `now: bigint`"); this test is
-// the enforcement that prose lacked. As of writing, no clock source is wired into Spindle at all
+// That property rests on every `.ts` file under `packages/crypto/src` taking every notion of
+// "now" from an explicit caller-supplied `now: bigint` parameter, never from an ambient clock read
+// inside this package. This guard scans the whole `src` tree recursively, not a fixed list of
+// files, because there is no legitimate reason for any file in this package to read a clock
+// itself — the clock is supplied at the edge, by callers outside this package. `envelope.ts` is
+// singled out below because it performs the same kind of check on the same kind of ground: its
+// `open` function's `if (absDiff(params.now, env.ts) > CLOCK_SKEW_SECS)` at :338 is a live
+// clock-skew validity check, exactly the shape this guard exists to hold ambient-clock-free.
+// `artifacts.ts`'s own module doc already states the rule in prose ("This module never reads a
+// system clock: every time check takes a caller-supplied `now: bigint`"); this test is the
+// enforcement that prose lacked. As of writing, no clock source is wired into Spindle at all
 // (A10.42's cold-clock diagnostic is not yet implemented), so this guard's job is to hold this
 // ground *before* one gets wired in, not to detect a violation after the fact.
 //
@@ -24,8 +30,9 @@
 // a legitimately caller-supplied `now`. Nor can it see a clock read inside an imported dependency
 // (e.g. `@noble/curves`) that this file merely calls into. This guard only proves that the
 // specific ambient-clock APIs it knows about — `Date.now`, `new Date`, and `performance.now` —
-// are not spelled out, as real code, inside these two files. Treat a passing run as "no *obvious*
-// new ambient clock read", not as a proof that every `now` value traces back to a caller argument.
+// are not spelled out, as real code, anywhere under `packages/crypto/src`. Treat a passing run as
+// "no *obvious* new ambient clock read", not as a proof that every `now` value traces back to a
+// caller argument.
 //
 // ## Comments and string literals
 //
@@ -35,12 +42,19 @@
 // would otherwise trip the guard it exists to justify. Template-literal interpolations
 // (`` `${...}` ``) are masked along with the rest of the template's text, since this scan does not
 // parse `${}` back into code — a `Date.now()` call written inside a template interpolation would
-// therefore be invisible to this guard. That shape does not appear anywhere in either scanned file
+// therefore be invisible to this guard. That shape does not appear anywhere in any scanned file
 // today; a heuristic guard test doesn't need a full TypeScript tokenizer to know that.
 //
 // Matching is plain substring search, so it can over-match: a local binding literally named
 // `myDate` followed by `.now()` would contain the substring `Date.now` and be flagged even though
-// it has nothing to do with `globalThis.Date`. No such binding exists in either scanned file.
+// it has nothing to do with `globalThis.Date`. No such binding exists in any scanned file.
+//
+// It can also under-match, in the opposite direction: `const { now: destructuredNow } = Date;
+// destructuredNow();` is **not caught**, because the scan looks for the literal substring
+// `Date.now`, and destructuring `now` off `Date` before calling it never spells that substring out
+// anywhere in the source. No such destructuring exists in any scanned file today; it is
+// disclosed because a heuristic that only lists its over-matches and not its under-matches invites
+// more trust than it has earned.
 //
 // # Neuter-verification
 //
@@ -55,6 +69,18 @@
 // literal containing `Date.now` were all appended to the same file at once, and the test stayed
 // green. That is the evidence for the masking claim above — without it, "matches in comments and
 // strings are excluded" would itself be an untested assertion about what this test catches.
+//
+// The `envelope.ts` addition was neutered separately on the same day: appending `const probeEnvNow
+// = Date.now();` to `src/envelope.ts` turned this test RED naming `envelope.ts:353`, and reverting
+// it left the file byte-identical to its original (`cmp` clean, `git diff --quiet` clean). That
+// file is scanned because it performs the envelope clock-skew validity check at `:338`, and an
+// earlier version of this guard claimed in its own header that the property rested on
+// `artifacts.ts` and `bootstrap.ts` alone — which `envelope.ts:338` made false. The broadened
+// recursive scan was neutered on the same day: appending `const probeRecursion =
+// Date.now();` to `src/primitives.ts` turned this test RED naming `primitives.ts:78`, and reverting
+// it left the file byte-identical to its original (`cmp` clean, `git diff --quiet` clean). That
+// file was chosen because it is outside the three names the old `SCANNED_FILES` list held, so
+// reddening on it demonstrates the walk reaches files that list never named.
 
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -66,8 +92,20 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const packageRoot = path.resolve(here, "..");
 const srcDir = path.join(packageRoot, "src");
 
-/** Files this guard scans, relative to `src/`. Both take a caller-supplied `now: bigint`. */
-const SCANNED_FILES = ["artifacts.ts", "bootstrap.ts"];
+/** Files that must be present among the scanned set — these three hold the A10.42 clock-skew
+ * validity checks (or state the no-ambient-clock rule) this guard exists to protect. Checked by
+ * name, in addition to the minimum-count floor below, so a rename or removal of any one of them
+ * fails loudly by name, not just as a number going down. */
+const MUST_BE_PRESENT = ["artifacts.ts", "bootstrap.ts", "envelope.ts"];
+
+/** Conservative floor on how many `.ts` files this scan should find under `packages/crypto/src`.
+ * There are 8 files directly under `src` today (artifacts.ts, backend.ts, bootstrap.ts, bytes.ts,
+ * envelope.ts, fingerprint.ts, index.ts, primitives.ts), confirmed by listing the directory on
+ * 2026-09-11. Pinned at that exact count (not "just under" it) because this guard's whole purpose
+ * is to catch a silently-shrinking scan set — an off-by-a-few floor would let a dropped file slip
+ * through unnoticed. Adding a new file under `src` raises the true count above this floor and
+ * stays green; only a *drop* below 8 (a move, rename, or scan-logic regression) turns this red. */
+const MIN_TS_FILE_COUNT = 8;
 
 /** Ambient clock APIs this guard looks for, as plain substrings of masked source text. */
 const FORBIDDEN_PATTERNS = ["Date.now", "new Date", "performance.now"];
@@ -79,13 +117,37 @@ interface Violation {
   text: string;
 }
 
+/** Recursively collects every `.ts` file under `dir`, sorted for deterministic reporting. */
+function tsFilesUnderRecursive(dir: string): string[] {
+  const out: string[] = [];
+  collectTsFiles(dir, out);
+  out.sort();
+  return out;
+}
+
+/** Recursive helper for {@link tsFilesUnderRecursive}: walks `dir`, pushing every `.ts` file it
+ * finds into `out` and recursing into every subdirectory. */
+function collectTsFiles(dir: string, out: string[]): void {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      collectTsFiles(entryPath, out);
+    } else if (entry.isFile() && entryPath.endsWith(".ts")) {
+      out.push(entryPath);
+    }
+  }
+}
+
 /** Replaces `//` line comments, `/* *​/` block comments, and `"..."`/`'...'`/`` `...` `` string
- * and template literals with ASCII spaces, byte-for-byte (newlines preserved), so scanning the
- * result cannot mistake comment/string text for real code. Every character offset in the output
- * lines up with the same offset (and line number) in the original source.
+ * and template literals with ASCII spaces, code-unit-for-code-unit (newlines preserved), so
+ * scanning the result cannot mistake comment/string text for real code. This iterates UTF-16 code
+ * units (JavaScript string indexing), not bytes, so it is character-based rather than byte-based;
+ * every code-unit offset in the output lines up with the same offset (and line number) in the
+ * original source.
  *
  * Deliberately simple, mirroring `redaction_guard.rs`'s `mask_non_code`: no special handling of
- * regex literals (`/.../`) — none appear in either scanned file — and template-literal
+ * regex literals (`/.../`) — none appear in any scanned file — and template-literal
  * `${...}` interpolations are masked along with the rest of the template rather than being
  * recursively re-parsed as code (see this file's header comment on that limitation). */
 type Mode = "code" | "line-comment" | "block-comment" | "single" | "double" | "template";
@@ -196,16 +258,30 @@ function lineNumberAt(src: string, offset: number): number {
 }
 
 describe("clock-source-guard", () => {
-  it("artifacts.ts and bootstrap.ts never read an ambient clock", () => {
+  it("every .ts file under src never reads an ambient clock", () => {
+    const files = tsFilesUnderRecursive(srcDir);
+
+    // Pinned to a minimum count derived from what's on disk (see MIN_TS_FILE_COUNT above), not
+    // just checked non-empty, so that a shrinking scan (e.g. an edit that silently drops a file
+    // from the walk) fails loudly instead of quietly — a shrunk file set would otherwise still
+    // pass this test by scanning less.
+    expect(files.length).toBeGreaterThanOrEqual(MIN_TS_FILE_COUNT);
+
+    for (const name of MUST_BE_PRESENT) {
+      const present = files.some((f) => path.basename(f) === name);
+      if (!present) {
+        throw new Error(
+          `expected ${name} to be found under ${srcDir} — did it get moved or renamed? It holds ` +
+            "an A10.42 clock-skew validity check (or states the no-ambient-clock rule) this " +
+            "guard exists to protect.",
+        );
+      }
+    }
+
     const violations: Violation[] = [];
     let totalBytesRead = 0;
 
-    for (const name of SCANNED_FILES) {
-      const filePath = path.join(srcDir, name);
-      if (!fs.existsSync(filePath)) {
-        throw new Error(`expected ${filePath} to exist — did it get moved or renamed?`);
-      }
-
+    for (const filePath of files) {
       const original = fs.readFileSync(filePath, "utf8");
       if (original.length === 0) {
         throw new Error(`${filePath} was read as empty — refusing to treat that as a clean scan`);
