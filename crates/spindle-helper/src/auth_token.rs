@@ -655,15 +655,21 @@ mod tests {
         root
     }
 
-    /// Scans `deploy/nats/nats-server.conf`'s text for its `max_control_line: <value>` setting
-    /// and returns `<value>` as a `usize`. Ignores comment lines (first non-whitespace char
-    /// `#`) -- the comment block directly above the real setting also mentions
-    /// `max_control_line` in prose, so a scan that didn't skip comments could match that line
-    /// instead of the actual setting. Tolerates the file's `key: value` form with surrounding
-    /// whitespace and an optional trailing `# ...` comment after the value. Panics naming
-    /// `conf_path` if no `max_control_line` setting is found at all -- a silently-absent
-    /// setting must fail this test, never pass it vacuously.
+    /// Scans `deploy/nats/nats-server.conf`'s text for every `max_control_line: <value>`
+    /// setting and returns the single value found. Ignores comment lines (first non-whitespace
+    /// char `#`) -- this is defensive, not load-bearing today: with the current exact
+    /// `key.trim() == "max_control_line"` match, a commented-out line is already rejected by
+    /// the `split_once(':')` check below (no comment line in this file's prose contains a
+    /// colon), but the skip means a commented-out setting can never be mistaken for a live one
+    /// if that key match is ever loosened. Tolerates the file's `key: value` form with
+    /// surrounding whitespace and an optional trailing `# ...` comment after the value. Panics
+    /// naming `conf_path` if no `max_control_line` setting is found at all -- a silently-absent
+    /// setting must fail this test, never pass it vacuously -- and also panics naming
+    /// `conf_path` if more than one is found: nats-server applies the *last* occurrence in the
+    /// file, so a duplicate makes this file ambiguous and the agreement check below unsound
+    /// (td-db47f9). Refusing here is deliberate -- this never "takes the last one".
     fn parse_max_control_line(conf_text: &str, conf_path: &Path) -> usize {
+        let mut found: Vec<usize> = Vec::new();
         for line in conf_text.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with('#') {
@@ -676,19 +682,30 @@ mod tests {
                 continue;
             }
             let value = rest.split('#').next().unwrap_or(rest).trim();
-            return value.parse().unwrap_or_else(|e| {
+            let parsed: usize = value.parse().unwrap_or_else(|e| {
                 panic!(
                     "{} sets max_control_line to {value:?}, which does not parse as a usize: \
                      {e}",
                     conf_path.display()
                 )
             });
+            found.push(parsed);
         }
-        panic!(
-            "{} has no max_control_line setting -- td-db47f9's config/constant agreement test \
-             cannot run without one",
-            conf_path.display()
-        );
+        match found.len() {
+            0 => panic!(
+                "{} has no max_control_line setting -- td-db47f9's config/constant agreement \
+                 test cannot run without one",
+                conf_path.display()
+            ),
+            1 => found[0],
+            n => panic!(
+                "{} declares max_control_line {n} times ({found:?}) -- nats-server applies \
+                 only the LAST occurrence in the file, so a duplicate makes this file ambiguous \
+                 and td-db47f9's config/constant agreement check unsound; remove the duplicate \
+                 before this test can run",
+                conf_path.display()
+            ),
+        }
     }
 
     /// td-db47f9: `NATS_MAX_CONTROL_LINE_BYTES` above and `deploy/nats/nats-server.conf`'s
@@ -698,13 +715,21 @@ mod tests {
     /// alone (leaving this Rust constant at `32 * 1024`), and the whole workspace test suite
     /// still passed 870/0/17 -- even though every real 32-cap CONNECT (18,820 B, see
     /// `MEASURED_32_CAP_TOKEN_B64_BYTES` above) would then be silently dropped by the deployed
-    /// nats-server. This test reads the deployed value out of the conf file instead of
-    /// restating it as a second Rust literal, so the two cannot drift apart without a red test.
+    /// nats-server. This test reads the deployed value out of the conf file rather than
+    /// restating it as a second Rust literal, and it refuses to run at all against a conf that
+    /// declares `max_control_line` more than once (see `parse_max_control_line` above --
+    /// nats-server applies only the last occurrence, so a duplicate would make the value this
+    /// test reads unsound) -- so the two cannot drift apart *silently*. Stated precisely, what
+    /// this checks is that `NATS_MAX_CONTROL_LINE_BYTES` equals the reference conf's single
+    /// declared value -- not that no drift can ever occur.
     ///
     /// Limitation, stated plainly: this pins the *reference* config checked into `deploy/` --
     /// DESIGN.md §A4/§A10.10's worked example -- not whatever `max_control_line` a given
     /// operator actually runs their own nats-server deployment with. An operator who copies
-    /// this file and edits it afterward is outside what this test can see.
+    /// this file and edits it afterward is outside what this test can see. It is also a check
+    /// on this one file's single declared value, not on the effective limit nats-server would
+    /// enforce: nats-server's own `include` directive means a real deployment could still
+    /// override `max_control_line` from another file this test never reads.
     #[test]
     fn nats_max_control_line_matches_deployed_conf() {
         let conf_path = workspace_root().join("deploy/nats/nats-server.conf");
