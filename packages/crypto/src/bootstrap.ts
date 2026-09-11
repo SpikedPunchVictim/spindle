@@ -263,11 +263,11 @@ export class BundleError extends Error {
  * to bust the QR budget; see that branch's comment for why that guarantee is what makes the
  * empty-prefix case provably unreachable.
  *
- * **The fit check measures the REAL canonical encoding, never
- * `@spindle/proto`'s `MEASURED_ENTRY_BYTES`.** That constant is documentation for DESIGN.md
- * :328-329's "4 hosts at EC level M, 5 at level L" figures only — it is not a lower bound this
- * function is allowed to trust. A future artifact (e.g. a larger op-cert chain, or a second cap
- * embedded per entry) could grow a single entry's encoding well past 530 B; measuring the real
+ * **The fit check measures the REAL canonical encoding, never `spindle-proto`'s
+ * `MEASURED_ENTRY_BYTES` (the Rust crate).** That constant is documentation for
+ * DESIGN.md:328-329's "4 hosts at EC level M, 5 at level L" figures only — it is not a lower bound
+ * this function is allowed to trust. A future artifact (e.g. a larger op-cert chain, or a second
+ * cap embedded per entry) could grow a single entry's encoding well past 530 B; measuring the real
  * bytes here means such a change is caught by this check automatically, rather than silently
  * producing a bundle that fails to scan once printed.
  *

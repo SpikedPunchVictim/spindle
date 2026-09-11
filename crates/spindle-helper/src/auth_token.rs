@@ -49,7 +49,7 @@ use spindle_proto::artifacts::{
 use spindle_proto::canonical::CborValue;
 
 /// MEASURED 2026-09-10, not estimated: DESIGN.md §A4/§A5's "A full 32-cap CONNECT token measures
-/// **18,820 B**, **57.4%** of the 32 KiB ceiling" — the base64url length of a device's CONNECT
+/// **18,820 B**, **57%** of the 32 KiB ceiling" — the base64url length of a device's CONNECT
 /// `auth_token` envelope (this module's device-connection shape, above) carrying a
 /// `DeviceCertificate`, a `SessionAttestation`, and 32 member `Capability`s. Measured with
 /// realistic Unix-seconds `ts`/`exp` throughout (~1.76e9 — a 5-byte CBOR uint, 1 byte per field
@@ -264,6 +264,8 @@ mod tests {
     use spindle_core::identity::{DeviceKey, RootKey};
     use spindle_core::FINGERPRINT_LEN;
     use spindle_proto::artifacts::CapKind;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     fn b64url(bytes: &[u8]) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -607,8 +609,9 @@ mod tests {
              DESIGN.md §A4/§A5's 32-cap token figures and these constants together"
         );
 
-        // The "share of the 32 KiB ceiling" prose figure (DESIGN.md §A4/§A5: 18,820 / 32,768 =
-        // 57.4%) is a pure function of b64_len, already pinned exactly above — a separate
+        // The "share of the 32 KiB ceiling" prose figure (18,820 / 32,768 = 57.4% computed,
+        // which DESIGN.md §A4/§A5 rounds to 57%) is a pure function of b64_len, already
+        // pinned exactly above — a separate
         // percentage-range assertion here could never independently fail (it would only ever
         // restate the assertion above in different units), so td-331c11 deleted the dead ±range
         // check that used to sit here (see MEASURED_32_CAP_TOKEN_CBOR_BYTES's doc comment for the
@@ -622,6 +625,99 @@ mod tests {
             "32-cap token ({b64_len} B) must fit under nats-server's raised \
              {NATS_MAX_CONTROL_LINE_BYTES}-byte max_control_line ceiling (DESIGN.md §A4/A10.10) — \
              this is the actual requirement the ceiling raise exists to satisfy"
+        );
+    }
+
+    // ---- td-db47f9: the ceiling is read from the deployed config, not restated ----
+
+    /// `crates/spindle-helper` sits two directories below the workspace root
+    /// (`<root>/crates/spindle-helper`); derive `<root>` from `CARGO_MANIFEST_DIR` rather than
+    /// the process's current directory, so this test doesn't depend on where `cargo test` was
+    /// invoked from (mirrors `redaction_guard.rs`'s `workspace_root` in `spindle-core`).
+    fn workspace_root() -> PathBuf {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected {} to be two directories below the workspace root",
+                    manifest_dir.display()
+                )
+            })
+            .to_path_buf();
+        assert!(
+            root.join("Cargo.toml").is_file(),
+            "derived workspace root {} has no Cargo.toml -- CARGO_MANIFEST_DIR layout \
+             assumption is wrong",
+            root.display()
+        );
+        root
+    }
+
+    /// Scans `deploy/nats/nats-server.conf`'s text for its `max_control_line: <value>` setting
+    /// and returns `<value>` as a `usize`. Ignores comment lines (first non-whitespace char
+    /// `#`) -- the comment block directly above the real setting also mentions
+    /// `max_control_line` in prose, so a scan that didn't skip comments could match that line
+    /// instead of the actual setting. Tolerates the file's `key: value` form with surrounding
+    /// whitespace and an optional trailing `# ...` comment after the value. Panics naming
+    /// `conf_path` if no `max_control_line` setting is found at all -- a silently-absent
+    /// setting must fail this test, never pass it vacuously.
+    fn parse_max_control_line(conf_text: &str, conf_path: &Path) -> usize {
+        for line in conf_text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let Some((key, rest)) = trimmed.split_once(':') else {
+                continue;
+            };
+            if key.trim() != "max_control_line" {
+                continue;
+            }
+            let value = rest.split('#').next().unwrap_or(rest).trim();
+            return value.parse().unwrap_or_else(|e| {
+                panic!(
+                    "{} sets max_control_line to {value:?}, which does not parse as a usize: \
+                     {e}",
+                    conf_path.display()
+                )
+            });
+        }
+        panic!(
+            "{} has no max_control_line setting -- td-db47f9's config/constant agreement test \
+             cannot run without one",
+            conf_path.display()
+        );
+    }
+
+    /// td-db47f9: `NATS_MAX_CONTROL_LINE_BYTES` above and `deploy/nats/nats-server.conf`'s
+    /// `max_control_line` setting are two hand-kept copies of one operational limit, and until
+    /// this test nothing checked they agreed. That gap was real, not hypothetical: an
+    /// independent reviewer demonstrated it by changing the conf's `max_control_line` to 8192
+    /// alone (leaving this Rust constant at `32 * 1024`), and the whole workspace test suite
+    /// still passed 870/0/17 -- even though every real 32-cap CONNECT (18,820 B, see
+    /// `MEASURED_32_CAP_TOKEN_B64_BYTES` above) would then be silently dropped by the deployed
+    /// nats-server. This test reads the deployed value out of the conf file instead of
+    /// restating it as a second Rust literal, so the two cannot drift apart without a red test.
+    ///
+    /// Limitation, stated plainly: this pins the *reference* config checked into `deploy/` --
+    /// DESIGN.md §A4/§A10.10's worked example -- not whatever `max_control_line` a given
+    /// operator actually runs their own nats-server deployment with. An operator who copies
+    /// this file and edits it afterward is outside what this test can see.
+    #[test]
+    fn nats_max_control_line_matches_deployed_conf() {
+        let conf_path = workspace_root().join("deploy/nats/nats-server.conf");
+        let conf_text = fs::read_to_string(&conf_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", conf_path.display()));
+        let deployed = parse_max_control_line(&conf_text, &conf_path);
+        assert_eq!(
+            deployed, NATS_MAX_CONTROL_LINE_BYTES,
+            "deploy/nats/nats-server.conf's max_control_line ({deployed} B) and this crate's \
+             NATS_MAX_CONTROL_LINE_BYTES ({NATS_MAX_CONTROL_LINE_BYTES} B) have diverged -- the \
+             32-cap CONNECT token figure above (MEASURED_32_CAP_TOKEN_B64_BYTES) is measured \
+             against NATS_MAX_CONTROL_LINE_BYTES as a stand-in for the real ceiling nats-server \
+             enforces, so both must move together (td-db47f9, DESIGN.md §A4/§A10.10)"
         );
     }
 

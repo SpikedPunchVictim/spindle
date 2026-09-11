@@ -73,19 +73,15 @@ export const QR_V40_L_CAPACITY_BYTES = 2953;
 /** See {@link QR_V40_L_CAPACITY_BYTES} — same standard, error-correction level M. */
 export const QR_V40_M_CAPACITY_BYTES = 2331;
 
-/** MEASURED 2026-09-07, not estimated: a member cap encodes to 449 canonical bytes (of which 185
- * is the embedded `op_cert`), plus two 32-byte keys, giving one `BundleEntry` its 546-byte size.
- * Measured with realistic Unix-seconds timestamps (~1.757e9) and a 16-byte cap nonce. The cap
- * nonce length is what makes this figure move — nothing in DESIGN.md pins it — which is why an
- * earlier measurement recorded 466 B for the cap. DESIGN.md:328-329 derives from this that a
- * version-40 QR carries 4 hosts at EC level M and 5 at level L with a short registry endpoint; at
- * the 256-byte {@link MAX_REGISTRY_LEN} ceiling it is 3 and 4. Measured whole-bundle sizes: with
- * a 21-byte registry, n=4 encodes to 2228 B (fits M's 2331) and n=5 to 2774 B (fits L's 2953 but
- * not M); with a 256-byte registry, n=4 is 2465 B and does not fit M. This constant is
- * **documentation** for those figures only — `spindle-core`'s QR-fit check measures the real
- * canonical encoding of each candidate bundle rather than trusting this estimate, because a
- * future larger `Capability` must not silently break the check. */
-export const MEASURED_ENTRY_BYTES = 546;
+/* MEASURED_ENTRY_BYTES is deliberately NOT mirrored here. Rust owns the measured bundle-entry
+ * size (`crates/spindle-proto/src/bootstrap.rs`, currently 521 B) because a test pins it there --
+ * `keeps_measured_entry_bytes_honest` in `spindle-core` measures a real entry's canonical
+ * encoding and fails when it drifts. This package had a second copy with no such test; it sat
+ * stale at 546 B (a pre-`nats_fp`-removal, 16-byte-cap-nonce figure) through a fully green TS
+ * gate, along with the derived QR host counts in its doc comment. An undefended documentation
+ * constant is exactly what failed, so it is deleted rather than re-synced (td-1d7eea). Nothing in
+ * TypeScript ever read its value. If a TS consumer genuinely needs the figure, add it WITH a test
+ * that measures a real entry -- do not restore a bare literal. */
 
 /** Errors produced while converting between the bundle wire types and `CborValue`/bytes. Mirrors
  * the shape of `SignalingError`: `"Proto"` wraps every rejection kind `ProtoError` already defines
