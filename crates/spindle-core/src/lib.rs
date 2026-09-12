@@ -52,7 +52,10 @@ pub mod identity;
 mod base32;
 
 pub use artifacts::checked_verifying_key;
-pub use clock_diagnostics::{ClockDiagnosis, ClockDiagnosticError, ClockOffset};
+pub use clock_diagnostics::{
+    diagnose_clock_from_https, offset_from_date_header, ClockDiagnosis, ClockDiagnosticError,
+    ClockOffset, DateHeaderError, HttpsDateError, HttpsDateSource, HttpsDateSourceError,
+};
 pub use envelope::{
     derive_bootstrap_key, derive_session_key, direction_byte, open, seal, EnvelopeError,
     OpenParams, SealParams, SessionKey,

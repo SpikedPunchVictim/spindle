@@ -231,17 +231,19 @@ fn artifacts_never_read_an_ambient_clock() {
 /// **diagnostic only**: it may be displayed, and it may never be folded into signing time, an
 /// `exp` check, or a revocation check.
 ///
-/// `HttpsDateSource` and `offset_from_date_header` are listed *before that code exists*, on
-/// purpose. A10.42 leg (2) is decided but unbuilt; putting its names under the rule now means the
-/// rule is in place before the temptation is, rather than being written afterwards by whoever is
-/// mid-way through wiring an offset into something. If leg (2) lands under different names, add
-/// those names here in the same commit.
+/// `HttpsDateSource`, `offset_from_date_header`, and `diagnose_clock_from_https` are leg (2)
+/// (td-7e3556): the OPTIONAL operator-configured HTTPS `Date` time source, implemented in
+/// `src/clock_diagnostics.rs` alongside leg (1). All three are real as of that change — this list
+/// was written before leg (2) existed, so that the rule was in place before the temptation was,
+/// rather than being written afterwards by whoever was mid-way through wiring an offset into
+/// something. If leg (2)'s names ever change, update this list in the same commit.
 const DIAGNOSTIC_ONLY_SYMBOLS: &[&str] = &[
     "ClockOffset",
     "ClockDiagnosis",
     "diagnose_clock",
     "HttpsDateSource",
     "offset_from_date_header",
+    "diagnose_clock_from_https",
 ];
 
 /// Floor on how many `.rs` files the validity-path scan below should find — every file under
