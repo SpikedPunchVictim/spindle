@@ -113,13 +113,18 @@ use std::path::{Path, PathBuf};
 /// entries respectively. `OffsetDateTime::now_utc`/`now_local` are the `time` crate's ambient
 /// reads; `Instant::now` is monotonic rather than wall-clock but is included anyway since it is
 /// still an ambient read this module has no legitimate reason to perform.
-const FORBIDDEN_PATTERNS: &[&str] = &[
-    "SystemTime::now",
-    "Instant::now",
-    "chrono",
-    "Utc::now",
-    "Local::now",
-    "OffsetDateTime::now",
+const FORBIDDEN_PATTERNS: &[(&str, Boundary)] = &[
+    ("SystemTime::now", Boundary::Prefix),
+    ("Instant::now", Boundary::Prefix),
+    // `chrono` is the one pattern with a real collision against a legitimate longer name: a
+    // binding called `chronology` starts at an identifier boundary, so only the check on the
+    // byte AFTER the match distinguishes it from `chrono::Utc::now()`.
+    ("chrono", Boundary::Exact),
+    ("Utc::now", Boundary::Prefix),
+    ("Local::now", Boundary::Prefix),
+    // `Prefix`, not `Exact`: the `time` crate's only real ambient reads are `now_utc()` and
+    // `now_local()`, and both continue the identifier past `now`.
+    ("OffsetDateTime::now", Boundary::Prefix),
 ];
 
 /// Files that must be present among the scanned set, matched by path RELATIVE TO the scanned
@@ -165,18 +170,55 @@ fn is_identifier_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// A raw substring search has no identifier boundary, so a pattern like `"chrono"` matches not
-/// only real code but also any identifier that merely *contains* it — `synchronous` is the
-/// concrete case here, mirroring the TypeScript twin's `new DateHeaderError` colliding with the
-/// `"new Date"` pattern. A match at `masked[idx..idx + pattern.len()]` counts only when the byte
-/// immediately before it (if any) and the byte immediately after it (if any) are both NOT
-/// identifier bytes — i.e. the pattern isn't embedded inside a larger name.
-fn is_identifier_boundary_match(masked: &str, idx: usize, pattern: &str) -> bool {
+/// How much of an identifier a forbidden pattern is meant to be — i.e. whether a match that
+/// continues into a longer name still counts.
+///
+/// The two halves of a boundary check are not equally safe. Requiring the byte BEFORE a match to
+/// be a non-identifier byte only ever *removes* false positives: a pattern starting partway into
+/// a longer name (`chrono` inside `synchronous` or `my_chronology`) is never a real occurrence,
+/// so that half always applies. Requiring the byte AFTER is the dangerous half, because
+/// suppressing a match there is exactly how a guard goes silently blind.
+///
+/// It did. The first version of this check applied both halves unconditionally, which stopped
+/// `"OffsetDateTime::now"` from matching the `time` crate's only real ambient reads —
+/// `now_utc()` and `now_local()` — and stopped `"diagnose_clock"` from matching leg (1)'s
+/// entry point `diagnose_clock_from_capabilities`, purely because the next byte is `_`. Both
+/// were found by an independent review that planted them as live code and watched this guard
+/// pass green.
+///
+/// So the default is [`Boundary::Prefix`]: a following identifier byte does NOT disqualify a
+/// match. Over-firing is loud, immediate, and fixable; under-firing is silent and indefinite.
+/// A pattern opts into [`Boundary::Exact`] only where a real collision with a legitimate longer
+/// name exists, and that collision is named at the opt-in site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    /// The pattern is a complete identifier: a following identifier byte means this match is a
+    /// different, longer name, so it does not count.
+    Exact,
+    /// The pattern is the stem of a family of forbidden names: a following identifier byte is
+    /// expected rather than disqualifying.
+    Prefix,
+}
+
+/// True when the match at `masked[idx..idx + pattern.len()]` sits at a real identifier boundary
+/// for `boundary`'s rule. See [`Boundary`] for why the two ends are treated differently.
+fn is_identifier_boundary_match(
+    masked: &str,
+    idx: usize,
+    pattern: &str,
+    boundary: Boundary,
+) -> bool {
     let bytes = masked.as_bytes();
-    let before_ok = idx == 0 || !is_identifier_byte(bytes[idx - 1]);
-    let after_idx = idx + pattern.len();
-    let after_ok = after_idx >= bytes.len() || !is_identifier_byte(bytes[after_idx]);
-    before_ok && after_ok
+    if idx > 0 && is_identifier_byte(bytes[idx - 1]) {
+        return false;
+    }
+    match boundary {
+        Boundary::Prefix => true,
+        Boundary::Exact => {
+            let after_idx = idx + pattern.len();
+            after_idx >= bytes.len() || !is_identifier_byte(bytes[after_idx])
+        }
+    }
 }
 
 /// One identifier-boundary match of a pattern in masked source, with enough context to report or
@@ -194,18 +236,18 @@ struct PatternHit {
 ///
 /// Extracted as a standalone function, independent of any file path, so both the two real scans
 /// below and this file's own tests can feed it synthetic source strings directly.
-fn find_pattern_hits(original: &str, patterns: &[&'static str]) -> Vec<PatternHit> {
+fn find_pattern_hits(original: &str, patterns: &[(&'static str, Boundary)]) -> Vec<PatternHit> {
     let masked_bytes = mask_non_code(original.as_bytes());
     let masked = String::from_utf8(masked_bytes)
         .expect("masking only replaces bytes with ASCII spaces/newlines, so UTF-8 stays valid");
 
     let mut hits = Vec::new();
-    for &pattern in patterns {
+    for &(pattern, boundary) in patterns {
         let mut search_from = 0;
         while let Some(rel) = masked[search_from..].find(pattern) {
             let byte_offset = search_from + rel;
             search_from = byte_offset + pattern.len();
-            if !is_identifier_boundary_match(&masked, byte_offset, pattern) {
+            if !is_identifier_boundary_match(&masked, byte_offset, pattern, boundary) {
                 continue;
             }
             let line_no = line_number_at(original, byte_offset);
@@ -295,13 +337,16 @@ fn artifacts_never_read_an_ambient_clock() {
 /// was written before leg (2) existed, so that the rule was in place before the temptation was,
 /// rather than being written afterwards by whoever was mid-way through wiring an offset into
 /// something. If leg (2)'s names ever change, update this list in the same commit.
-const DIAGNOSTIC_ONLY_SYMBOLS: &[&str] = &[
-    "ClockOffset",
-    "ClockDiagnosis",
-    "diagnose_clock",
-    "HttpsDateSource",
-    "offset_from_date_header",
-    "diagnose_clock_from_https",
+const DIAGNOSTIC_ONLY_SYMBOLS: &[(&str, Boundary)] = &[
+    ("ClockOffset", Boundary::Prefix),
+    ("ClockDiagnosis", Boundary::Prefix),
+    // Every entry here is a `Prefix`, and `diagnose_clock` is why: leg (1)'s bundle entry point
+    // is `diagnose_clock_from_capabilities`, and `HttpsDateSourceError` extends
+    // `HttpsDateSource`. Naming each stem catches the whole family, including names added later.
+    ("diagnose_clock", Boundary::Prefix),
+    ("HttpsDateSource", Boundary::Prefix),
+    ("offset_from_date_header", Boundary::Prefix),
+    ("diagnose_clock_from_https", Boundary::Prefix),
 ];
 
 /// Floor on how many `.rs` files the validity-path scan below should find — every file under
@@ -488,6 +533,12 @@ fn line_number_at(src: &str, byte_offset: usize) -> usize {
 /// still be caught after adding the identifier-boundary check — one assertion per pattern, so a
 /// pattern that silently stops matching fails by name rather than being hidden inside an
 /// aggregate count.
+///
+/// The first version of this fixture wrote `OffsetDateTime::now()`, which is **not** a `time`
+/// crate API. It was the one form for that pattern that the boundary bug did not blind, so the
+/// test passed while both real forms went dark — a correct assertion over a fixture that could
+/// not fail. Every line below is now a spelling real code would use, and `now_utc`/`now_local`
+/// are here because they are precisely what regressed.
 #[test]
 fn forbidden_patterns_still_catch_every_real_ambient_clock_form() {
     let source = "\
@@ -497,11 +548,55 @@ fn probe() {
     let _c = chrono::Utc::now();
     let _d = Utc::now();
     let _e = Local::now();
-    let _f = OffsetDateTime::now();
+    let _f = OffsetDateTime::now_utc();
+    let _g = OffsetDateTime::now_local();
+    let _h = time::OffsetDateTime::now_utc();
 }
 ";
-    let hits = find_pattern_hits(source, FORBIDDEN_PATTERNS);
-    for &pattern in FORBIDDEN_PATTERNS {
+    assert_every_pattern_is_caught(source, FORBIDDEN_PATTERNS);
+}
+
+/// The same positive half for `DIAGNOSTIC_ONLY_SYMBOLS`, which had none. The identifier-boundary
+/// check was applied to both lists but proved safe for only one, and the unproved list was the
+/// one that went blind to `diagnose_clock_from_capabilities` — leg (1)'s bundle entry point, the
+/// single most likely symbol for someone to fold into an `exp` check.
+///
+/// Built from the real exported names of `clock_diagnostics.rs`, including the suffixed forms
+/// that no list entry spells out, so the `Prefix` rule is pinned by the names it exists to cover
+/// rather than by the stems it literally contains.
+#[test]
+fn diagnostic_only_symbols_still_catch_every_real_exported_form() {
+    let source = "\
+fn probe() {
+    let _a = ClockOffset::internal_from_seconds(0);
+    let _b: ClockDiagnosis = todo!();
+    let _c = diagnose_clock(0, &[], &[]);
+    let _d = diagnose_clock_from_capabilities(0, &[], &[]);
+    let _e = diagnose_clock_from_https(0, source);
+    let _f: &dyn HttpsDateSource = todo!();
+    let _g = HttpsDateSourceError(String::new());
+    let _h = offset_from_date_header(0, header);
+}
+";
+    assert_every_pattern_is_caught(source, DIAGNOSTIC_ONLY_SYMBOLS);
+
+    // The two suffixed names are the regression itself: assert them by hit text, not just by
+    // stem, so a future `Exact` on either stem fails here rather than silently narrowing.
+    let hits = find_pattern_hits(source, DIAGNOSTIC_ONLY_SYMBOLS);
+    for suffixed in ["diagnose_clock_from_capabilities", "HttpsDateSourceError"] {
+        assert!(
+            hits.iter().any(|h| h.text.contains(suffixed)),
+            "expected the scan to reach `{suffixed}`, the form the boundary bug blinded it to; \
+             got hits: {hits:?}"
+        );
+    }
+}
+
+/// Shared body of the two positive halves: every pattern in `patterns` must produce at least one
+/// hit in `source`, reported by name.
+fn assert_every_pattern_is_caught(source: &str, patterns: &[(&'static str, Boundary)]) {
+    let hits = find_pattern_hits(source, patterns);
+    for &(pattern, _) in patterns {
         assert!(
             hits.iter().any(|h| h.pattern == pattern),
             "expected pattern `{pattern}` to still be caught by the identifier-boundary scan; \

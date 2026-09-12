@@ -134,7 +134,15 @@ const MUST_BE_PRESENT = ["artifacts.ts", "bootstrap.ts", "envelope.ts"];
 const MIN_TS_FILE_COUNT = 9;
 
 /** Ambient clock APIs this guard looks for, as plain substrings of masked source text. */
-const FORBIDDEN_PATTERNS = ["Date.now", "new Date", "performance.now"];
+const FORBIDDEN_PATTERNS: readonly GuardPattern[] = [
+  // `Prefix` unless a real collision forces otherwise — see {@link Boundary}.
+  { pattern: "Date.now", boundary: "prefix" },
+  // `new Date` is the one pattern with a real, live collision: `new DateHeaderError(...)` in
+  // `clock-diagnostics.ts` contains the literal substring `new Date`, so only the check on the
+  // character AFTER the match separates it from a genuine `new Date()`.
+  { pattern: "new Date", boundary: "exact" },
+  { pattern: "performance.now", boundary: "prefix" },
+];
 
 /** A10.42's diagnostic-only symbols (TypeScript names), mirroring
  * `clock_source_guard.rs`'s `DIAGNOSTIC_ONLY_SYMBOLS`. A clock offset computed by
@@ -142,13 +150,19 @@ const FORBIDDEN_PATTERNS = ["Date.now", "new Date", "performance.now"];
  * HTTPS `Date` source — is diagnostic only: it may be displayed, and it may never be folded into
  * signing time, an `exp` check, or a revocation check. If any of `clock-diagnostics.ts`'s exported
  * names change, update this list in the same commit. */
-const DIAGNOSTIC_ONLY_SYMBOLS = [
-  "ClockOffset",
-  "ClockDiagnosis",
-  "diagnoseClock",
-  "HttpsDateSource",
-  "offsetFromDateHeader",
-  "diagnoseClockFromHttps",
+const DIAGNOSTIC_ONLY_SYMBOLS: readonly GuardPattern[] = [
+  { pattern: "ClockOffset", boundary: "prefix" },
+  { pattern: "ClockDiagnosis", boundary: "prefix" },
+  { pattern: "ClockDiagnosticError", boundary: "prefix" },
+  // Every entry here is a `prefix`, and `diagnoseClock` is why: leg (1)'s bundle entry point is
+  // `diagnoseClockFromCapabilities`, and `HttpsDateSourceError` extends `HttpsDateSource`.
+  // Naming each stem catches the whole family, including names added later.
+  { pattern: "diagnoseClock", boundary: "prefix" },
+  { pattern: "HttpsDateSource", boundary: "prefix" },
+  { pattern: "HttpsDateError", boundary: "prefix" },
+  { pattern: "DateHeaderError", boundary: "prefix" },
+  { pattern: "offsetFromDateHeader", boundary: "prefix" },
+  { pattern: "diagnoseClockFromHttps", boundary: "prefix" },
 ];
 
 /** The A10.42 artifact validity paths in this package: the two files that actually run an `exp`
@@ -322,18 +336,42 @@ function isIdentifierChar(ch: string): boolean {
   return /[A-Za-z0-9_$]/.test(ch);
 }
 
-/** A raw substring search has no identifier boundary, so a pattern like `"new Date"` matches not
- * only real code but also any identifier that merely *contains* it — `new DateHeaderError(...)`
- * is the concrete case that motivated this: `clock-diagnostics.ts` had to route all ten of that
- * class's error constructions through a `private static make(...)` indirection purely to avoid
- * spelling `new DateHeaderError(` at a call site, because that text contains the literal
- * substring `new Date`. A match at `masked[idx..idx + pattern.length]` counts only when the
- * character immediately before it (if any) and the character immediately after it (if any) are
- * both NOT identifier characters — i.e. the pattern isn't embedded inside a larger name. */
-function isIdentifierBoundaryMatch(masked: string, idx: number, pattern: string): boolean {
+/** How much of an identifier a forbidden pattern is meant to be — i.e. whether a match that
+ * continues into a longer name still counts.
+ *
+ * The two halves of a boundary check are not equally safe. Requiring the character BEFORE a match
+ * to be a non-identifier character only ever *removes* false positives: a pattern starting partway
+ * into a longer name (`Date.now` inside `someDate.now()`) is never a real occurrence, so that half
+ * always applies. Requiring the character AFTER is the dangerous half, because suppressing a match
+ * there is exactly how a guard goes silently blind.
+ *
+ * It did. The first version of this check applied both halves unconditionally, which stopped
+ * `"diagnoseClock"` from matching leg (1)'s entry point `diagnoseClockFromCapabilities` and
+ * `"HttpsDateSource"` from matching `HttpsDateSourceError`, purely because the next character
+ * continues the identifier. An independent review demonstrated it by appending a real
+ * `verifyCapabilityWithClockHelp` — folding a diagnostic offset straight into an `exp` check —
+ * to `src/artifacts.ts` and watching this guard report 4 passed.
+ *
+ * So the default is `"prefix"`: a following identifier character does NOT disqualify a match.
+ * Over-firing is loud, immediate, and fixable; under-firing is silent and indefinite. A pattern
+ * opts into `"exact"` only where a real collision with a legitimate longer name exists, and that
+ * collision is named at the opt-in site. */
+type Boundary = "exact" | "prefix";
+
+/** One forbidden pattern and the boundary rule it is matched under. */
+interface GuardPattern {
+  pattern: string;
+  boundary: Boundary;
+}
+
+/** True when the match at `masked[idx..idx + pattern.length]` sits at a real identifier boundary
+ * for `boundary`'s rule. See {@link Boundary} for why the two ends are treated differently. */
+function isIdentifierBoundaryMatch(masked: string, idx: number, pattern: string, boundary: Boundary): boolean {
   const before = idx > 0 ? masked[idx - 1] : "";
+  if (isIdentifierChar(before)) return false;
+  if (boundary === "prefix") return true;
   const after = idx + pattern.length < masked.length ? masked[idx + pattern.length] : "";
-  return !isIdentifierChar(before) && !isIdentifierChar(after);
+  return !isIdentifierChar(after);
 }
 
 /** One identifier-boundary match of a pattern in masked source, with enough context to report or
@@ -350,17 +388,17 @@ interface PatternHit {
  *
  * Extracted as a standalone function, independent of any file path, so both the two real scans
  * below and this file's own tests can feed it synthetic source strings directly. */
-function findPatternHits(original: string, patterns: readonly string[]): PatternHit[] {
+function findPatternHits(original: string, patterns: readonly GuardPattern[]): PatternHit[] {
   const masked = maskNonCode(original);
   const hits: PatternHit[] = [];
 
-  for (const pattern of patterns) {
+  for (const { pattern, boundary } of patterns) {
     let searchFrom = 0;
     for (;;) {
       const idx = masked.indexOf(pattern, searchFrom);
       if (idx === -1) break;
       searchFrom = idx + pattern.length;
-      if (!isIdentifierBoundaryMatch(masked, idx, pattern)) continue;
+      if (!isIdentifierBoundaryMatch(masked, idx, pattern, boundary)) continue;
       const line = lineNumberAt(original, idx);
       const text = (original.split("\n")[line - 1] ?? "").trim();
       hits.push({ line, pattern, text });
@@ -368,6 +406,18 @@ function findPatternHits(original: string, patterns: readonly string[]): Pattern
   }
 
   return hits;
+}
+
+/** Shared body of the two positive halves: every pattern in `patterns` must produce at least one
+ * hit in `source`, reported by name. */
+function expectEveryPatternCaught(source: string, patterns: readonly GuardPattern[]): void {
+  const hits = findPatternHits(source, patterns);
+  for (const { pattern } of patterns) {
+    expect(
+      hits.some((h) => h.pattern === pattern),
+      `expected pattern \`${pattern}\` to still be caught by the identifier-boundary scan; got hits: ${JSON.stringify(hits)}`,
+    ).toBe(true);
+  }
 }
 
 describe("clock-source-guard", () => {
@@ -493,12 +543,36 @@ describe("clock-source-guard", () => {
   // embedded in a larger identifier must not be (negative).
   it("still catches every real ambient-clock form after the identifier-boundary fix", () => {
     const source = ["const a = new Date();", "const b = Date.now();", "const c = performance.now();"].join("\n");
+    expectEveryPatternCaught(source, FORBIDDEN_PATTERNS);
+  });
 
-    const hits = findPatternHits(source, FORBIDDEN_PATTERNS);
-    for (const pattern of FORBIDDEN_PATTERNS) {
+  // The same positive half for DIAGNOSTIC_ONLY_SYMBOLS, which had none. The identifier-boundary
+  // check was applied to both lists but proved safe for only one, and the unproved list was the
+  // one that went blind to `diagnoseClockFromCapabilities` — leg (1)'s bundle entry point, the
+  // single most likely symbol for someone to fold into an `exp` check.
+  it("still catches every real diagnostic-only symbol after the identifier-boundary fix", () => {
+    const source = [
+      "const a = ClockOffset.internalFromSeconds(0n);",
+      "const b: ClockDiagnosis = d;",
+      "const c = new ClockDiagnosticError('x');",
+      "const d = diagnoseClock(0n, [], []);",
+      "const e = diagnoseClockFromCapabilities(0n, [], []);",
+      "const f = await diagnoseClockFromHttps(0n, src);",
+      "const g: HttpsDateSource = src;",
+      "const h = new HttpsDateSourceError('x');",
+      "const i = new HttpsDateError('x');",
+      "const j = new DateHeaderError('x');",
+      "const k = offsetFromDateHeader(0n, header);",
+    ].join("\n");
+    expectEveryPatternCaught(source, DIAGNOSTIC_ONLY_SYMBOLS);
+
+    // The two suffixed names are the regression itself: assert them by hit text, not just by
+    // stem, so a future `"exact"` on either stem fails here rather than silently narrowing.
+    const hits = findPatternHits(source, DIAGNOSTIC_ONLY_SYMBOLS);
+    for (const suffixed of ["diagnoseClockFromCapabilities", "HttpsDateSourceError"]) {
       expect(
-        hits.some((h) => h.pattern === pattern),
-        `expected pattern \`${pattern}\` to still be caught by the identifier-boundary scan; got hits: ${JSON.stringify(hits)}`,
+        hits.some((h) => h.text.includes(suffixed)),
+        `expected the scan to reach \`${suffixed}\`, the form the boundary bug blinded it to; got hits: ${JSON.stringify(hits)}`,
       ).toBe(true);
     }
   });

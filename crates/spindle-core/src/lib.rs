@@ -53,8 +53,9 @@ mod base32;
 
 pub use artifacts::checked_verifying_key;
 pub use clock_diagnostics::{
-    diagnose_clock_from_https, offset_from_date_header, ClockDiagnosis, ClockDiagnosticError,
-    ClockOffset, DateHeaderError, HttpsDateError, HttpsDateSource, HttpsDateSourceError,
+    diagnose_clock, diagnose_clock_from_capabilities, diagnose_clock_from_https,
+    offset_from_date_header, ClockDiagnosis, ClockDiagnosticError, ClockOffset, DateHeaderError,
+    HttpsDateError, HttpsDateSource, HttpsDateSourceError,
 };
 pub use envelope::{
     derive_bootstrap_key, derive_session_key, direction_byte, open, seal, EnvelopeError,
