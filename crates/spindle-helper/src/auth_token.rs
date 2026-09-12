@@ -20,9 +20,11 @@
 //! Each of `device_cert`/`session_attest` (both arms)/`host_op_cert`/`caps[i]`/`admission_token`
 //! is the artifact's own `to_canonical_bytes()` output re-embedded as a CBOR byte string; the
 //! whole envelope is canonical-CBOR-encoded, then base64url (no padding), matching DESIGN.md's
-//! presentation rule. The **encode/builder** side of this envelope (`fixtures::device_auth_token`/
-//! `fixtures::host_auth_token`) stays test-fixture-only in the spike crate — nothing but test
-//! harnesses need to *build* one; the responder only ever needs to *decode* one.
+//! presentation rule. The **encode/builder** side of this envelope
+//! (`spindle_test_fixtures::fixtures::device_auth_token`/`host_auth_token`, in the in-repo
+//! `spindle-test-fixtures` dev-dependency crate — this crate's own tests call it, and so does
+//! `spindle-net`'s live integration test) stays test-code-only: no production encoder exists
+//! anywhere in this workspace; the responder only ever needs to *decode* one.
 //!
 //! `session_attest` (device arm added v0.9.29, td-0bcab4 §A4 step 2; host arm added v0.9.31,
 //! td-583db5) is **required** on both arms, unlike `admission_token` on the host arm above. On the
@@ -65,8 +67,8 @@ use spindle_proto::canonical::CborValue;
 /// 13,571 B / 18,095 B / 55.2%, measured against a 16-byte nonce no production issuer ever
 /// emitted — td-331c11). This crate's own figure is in turn pinned to `MEASURED_MEMBER_CAP_BYTES`
 /// by the identity assertion in `keeps_measured_32_cap_token_bytes_honest` below, which mints
-/// the envelope through `encode_device_token` — the same builder every other test in this
-/// module uses.
+/// the envelope through `fixtures::device_auth_token` — the same builder every other test in
+/// this module uses, and the one the live stack's own CONNECT path drives (td-8e239e).
 #[cfg(test)]
 const MEASURED_32_CAP_TOKEN_CBOR_BYTES: usize = 14_115;
 /// The base64url (no padding) encoding of [`MEASURED_32_CAP_TOKEN_CBOR_BYTES`] — the length that
@@ -82,7 +84,7 @@ const MEASURED_32_CAP_TOKEN_B64_BYTES: usize = 18_820;
 /// `MEASURED_MEMBER_CAP_BYTES`.
 ///
 /// It is NOT purely envelope, and the difference matters. Caps are embedded as CBOR byte strings
-/// (see `encode_device_token` above), so each carries a length header of its own:
+/// (see `fixtures::device_auth_token` above), so each carries a length header of its own:
 ///
 /// ```text
 /// 547 = 449  envelope proper -- map framing, DeviceCertificate, SessionAttestation
@@ -258,12 +260,13 @@ pub fn nats_fp_of_nkey(pubkey_str: &str) -> Result<Fingerprint, AuthTokenError> 
 mod tests {
     use super::*;
     use spindle_core::artifacts::{
-        issue_capability, issue_device_certificate, issue_host_op_key_cert,
+        issue_admission_token, issue_capability, issue_device_certificate, issue_host_op_key_cert,
         issue_host_session_attestation, issue_session_attestation,
     };
     use spindle_core::identity::{DeviceKey, RootKey};
     use spindle_core::FINGERPRINT_LEN;
     use spindle_proto::artifacts::CapKind;
+    use spindle_test_fixtures::fixtures::{device_auth_token, host_auth_token};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -271,46 +274,39 @@ mod tests {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
-    /// `session_attest` is `Option` here purely so `rejects_a_device_token_missing_session_attest`
-    /// can build an envelope that omits the field entirely — every other caller passes `Some(..)`.
-    fn encode_device_token(
+    /// Builds a device envelope with `session_attest` omitted entirely — the shape
+    /// `rejects_a_device_token_missing_session_attest` needs, and the one
+    /// `fixtures::device_auth_token` deliberately cannot produce, since that field has no
+    /// "absent" case on the live path (td-583db5). Kept local for exactly that reason: it
+    /// exists to build an INVALID envelope. It is not on the measured path, so it cannot
+    /// drift `MEASURED_32_CAP_TOKEN_*` (td-8e239e).
+    fn device_token_without_session_attest(
         root_pk_bytes: &[u8; 32],
         device_cert: &DeviceCertificate,
-        session_attest: Option<&SessionAttestation>,
-        caps: &[Capability],
     ) -> String {
-        let cap_bytes: Vec<CborValue> = caps
-            .iter()
-            .map(|c| CborValue::bytes(c.to_canonical_bytes()))
-            .collect();
-        let mut entries = vec![
+        let env = CborValue::map(vec![
             ("kind", CborValue::text("device")),
             ("root_pk", CborValue::bytes(root_pk_bytes.to_vec())),
             (
                 "device_cert",
                 CborValue::bytes(device_cert.to_canonical_bytes()),
             ),
-        ];
-        if let Some(attest) = session_attest {
-            entries.push((
-                "session_attest",
-                CborValue::bytes(attest.to_canonical_bytes()),
-            ));
-        }
-        entries.push(("caps", CborValue::array(cap_bytes)));
-        let env = CborValue::map(entries);
+            ("caps", CborValue::array(vec![])),
+        ]);
         b64url(&spindle_proto::canonical_encode(&env))
     }
 
-    /// `session_attest` is `Option` here purely so `rejects_a_host_token_missing_session_attest`
-    /// can build an envelope that omits the field entirely — every other caller passes `Some(..)`.
-    fn encode_host_token(
+    /// Builds a host envelope with `session_attest` omitted entirely — the shape
+    /// `rejects_a_host_token_missing_session_attest` needs, and the one
+    /// `fixtures::host_auth_token` deliberately cannot produce, since that field has no "absent"
+    /// case on the live path (td-583db5). Kept local for exactly that reason: it exists to build
+    /// an INVALID envelope. It is not on the measured path, so it cannot drift
+    /// `MEASURED_32_CAP_TOKEN_*` (td-8e239e).
+    fn host_token_without_session_attest(
         host_root_pk_bytes: &[u8; 32],
         host_op_cert: &HostOpKeyCert,
-        session_attest: Option<&HostSessionAttestation>,
-        admission_token: Option<&AdmissionToken>,
     ) -> String {
-        let mut entries = vec![
+        let env = CborValue::map(vec![
             ("kind", CborValue::text("host")),
             (
                 "host_root_pk",
@@ -320,20 +316,8 @@ mod tests {
                 "host_op_cert",
                 CborValue::bytes(host_op_cert.to_canonical_bytes()),
             ),
-        ];
-        if let Some(attest) = session_attest {
-            entries.push((
-                "session_attest",
-                CborValue::bytes(attest.to_canonical_bytes()),
-            ));
-        }
-        if let Some(tok) = admission_token {
-            entries.push((
-                "admission_token",
-                CborValue::bytes(tok.to_canonical_bytes()),
-            ));
-        }
-        b64url(&spindle_proto::canonical_encode(&CborValue::map(entries)))
+        ]);
+        b64url(&spindle_proto::canonical_encode(&env))
     }
 
     #[test]
@@ -350,7 +334,7 @@ mod tests {
         );
         let nats_fp = Fingerprint::of_parts(&[b"nats"]);
         let attest = issue_session_attestation(&device, nats_fp, 0);
-        let token = encode_device_token(&root.public_key().to_bytes(), &cert, Some(&attest), &[]);
+        let token = device_auth_token(&root.public_key().to_bytes(), &cert, &attest, &[]);
 
         let decoded = decode_auth_token(&token).expect("decode succeeds");
         let DecodedAuthToken::Device(d) = decoded else {
@@ -387,8 +371,7 @@ mod tests {
             2_000_000,
             vec![0xAA; 8],
         );
-        let token =
-            encode_device_token(&root.public_key().to_bytes(), &cert, Some(&attest), &[cap]);
+        let token = device_auth_token(&root.public_key().to_bytes(), &cert, &attest, &[cap]);
 
         let decoded = decode_auth_token(&token).expect("decode succeeds");
         let DecodedAuthToken::Device(d) = decoded else {
@@ -413,7 +396,7 @@ mod tests {
             0,
             2_000_000,
         );
-        let token = encode_device_token(&root.public_key().to_bytes(), &cert, None, &[]);
+        let token = device_token_without_session_attest(&root.public_key().to_bytes(), &cert);
 
         let err = decode_auth_token(&token).unwrap_err();
         assert!(
@@ -429,18 +412,49 @@ mod tests {
         let cert = issue_host_op_key_cert(&host_root, &op_signer.verifying_key(), 0, 2_000_000);
         let nats_fp = Fingerprint::of_parts(&[b"host-nats"]);
         let attest = issue_host_session_attestation(&op_signer, nats_fp, 0);
-        let token = encode_host_token(
-            &host_root.public_key().to_bytes(),
-            &cert,
-            Some(&attest),
-            None,
-        );
+        let token = host_auth_token(&host_root.public_key().to_bytes(), &cert, &attest, None);
 
         let decoded = decode_auth_token(&token).expect("decode succeeds");
         let DecodedAuthToken::Host(h) = decoded else {
             panic!("expected a host payload");
         };
         assert!(h.admission_token.is_none());
+    }
+
+    /// td-8e239e: nothing in this workspace encoded a token carrying an `admission_token` before
+    /// this test, so `decode_auth_token`'s present-branch above had no round-trip coverage at all
+    /// — `authz.rs`'s admission-token tests build `PresentedHost` directly and never go through
+    /// this envelope.
+    #[test]
+    fn decodes_a_host_token_with_an_admission_token() {
+        let host_root = RootKey::from_seed([0x61; 32]);
+        let op_signer = spindle_core::SigningKey::from_bytes(&[0x62; 32]);
+        let cert = issue_host_op_key_cert(&host_root, &op_signer.verifying_key(), 0, 2_000_000);
+        let nats_fp = Fingerprint::of_parts(&[b"host-nats-admission"]);
+        let attest = issue_host_session_attestation(&op_signer, nats_fp, 0);
+        let operator = spindle_core::SigningKey::from_bytes(&[0x63; 32]);
+        let tok = issue_admission_token(
+            &operator,
+            vec![0xCC; 16],
+            2_000_000,
+            "workshop-nas".to_string(),
+            "default".to_string(),
+        );
+        let token = host_auth_token(
+            &host_root.public_key().to_bytes(),
+            &cert,
+            &attest,
+            Some(&tok),
+        );
+
+        let decoded = decode_auth_token(&token).expect("decode succeeds");
+        let DecodedAuthToken::Host(h) = decoded else {
+            panic!("expected a host payload");
+        };
+        assert_eq!(
+            h.admission_token.expect("present").to_canonical_bytes(),
+            tok.to_canonical_bytes()
+        );
     }
 
     /// td-583db5: `session_attest` is required, not optional, on the host arm (see the module
@@ -453,7 +467,7 @@ mod tests {
         let host_root = RootKey::from_seed([0x51; 32]);
         let op_signer = spindle_core::SigningKey::from_bytes(&[0x52; 32]);
         let cert = issue_host_op_key_cert(&host_root, &op_signer.verifying_key(), 0, 2_000_000);
-        let token = encode_host_token(&host_root.public_key().to_bytes(), &cert, None, None);
+        let token = host_token_without_session_attest(&host_root.public_key().to_bytes(), &cert);
 
         let err = decode_auth_token(&token).unwrap_err();
         assert!(
@@ -550,10 +564,10 @@ mod tests {
                 realistic_member_cap(0xA0u8.wrapping_add(i), 0xB0u8.wrapping_add(i), subject, now)
             })
             .collect();
-        let token = encode_device_token(
+        let token = device_auth_token(
             &root.public_key().to_bytes(),
             &device_cert,
-            Some(&session_attest),
+            &session_attest,
             &caps,
         );
 

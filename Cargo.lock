@@ -3306,6 +3306,7 @@ dependencies = [
  "sha1",
  "spindle-core",
  "spindle-proto",
+ "spindle-test-fixtures",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",

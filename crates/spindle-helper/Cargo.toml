@@ -72,6 +72,12 @@ sha1 = "0.10"
 # tokio multi-thread test runtime (see pg_store.rs's module docs on why `PgStore`'s HelperView
 # impl needs `block_in_place`, which panics on the default current-thread `#[tokio::test]` flavor).
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
+# td-8e239e: the 32-cap token size measurement (`keeps_measured_32_cap_token_bytes_honest`) and
+# the decode tests now build their envelopes with `fixtures::device_auth_token`/`host_auth_token`
+# — the same encoders `spindle-net`'s live integration tests drive — instead of a second private
+# copy that could drift from them silently. DEV-ONLY, matching that crate's own rule that it must
+# never appear in any crate's `[dependencies]`.
+spindle-test-fixtures = { path = "../spindle-test-fixtures" }
 
 [[bin]]
 name = "spindle-helper"

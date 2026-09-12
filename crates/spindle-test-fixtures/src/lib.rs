@@ -32,8 +32,8 @@ pub mod fixtures {
     use spindle_core::identity::{DeviceKey, RootKey};
     use spindle_core::{Fingerprint, SigningKey};
     use spindle_proto::artifacts::{
-        CapKind, Capability, DeviceCertificate, HostOpKeyCert, HostSessionAttestation,
-        SessionAttestation,
+        AdmissionToken, CapKind, Capability, DeviceCertificate, HostOpKeyCert,
+        HostSessionAttestation, SessionAttestation,
     };
     use spindle_proto::canonical::CborValue;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -225,8 +225,12 @@ pub mod fixtures {
     }
 
     /// The host CONNECT `auth_token`, byte-compatible with
-    /// `spindle_helper::auth_token::decode_auth_token`'s `kind: "host"` arm. No admission token:
-    /// the composed stack runs `ADMISSION_MODE=open`.
+    /// `spindle_helper::auth_token::decode_auth_token`'s `kind: "host"` arm.
+    ///
+    /// `admission_token` is a parameter (not baked in as always-absent) because
+    /// `decode_auth_token`'s host arm accepts the field — pass `Some(&tok)` to exercise that
+    /// branch. The live stack's own callers pass `None`: the composed stack runs
+    /// `ADMISSION_MODE=open`, so a real host connection never carries one.
     ///
     /// `session_attest` (added v0.9.31, td-583db5 §A4 step 3) is required — see
     /// `spindle_helper::auth_token`'s module doc for why this field, unlike `admission_token`, has
@@ -235,8 +239,9 @@ pub mod fixtures {
         host_root_pk_bytes: &[u8; 32],
         host_op_cert: &HostOpKeyCert,
         session_attest: &HostSessionAttestation,
+        admission_token: Option<&AdmissionToken>,
     ) -> String {
-        let env = CborValue::map(vec![
+        let mut entries = vec![
             ("kind", CborValue::text("host")),
             (
                 "host_root_pk",
@@ -250,8 +255,14 @@ pub mod fixtures {
                 "session_attest",
                 CborValue::bytes(session_attest.to_canonical_bytes()),
             ),
-        ]);
-        b64url(&spindle_proto::canonical_encode(&env))
+        ];
+        if let Some(tok) = admission_token {
+            entries.push((
+                "admission_token",
+                CborValue::bytes(tok.to_canonical_bytes()),
+            ));
+        }
+        b64url(&spindle_proto::canonical_encode(&CborValue::map(entries)))
     }
 }
 
@@ -354,8 +365,12 @@ pub async fn connect_host(
     let ts = fixtures::now();
     let cert = host.op_key_cert(ts, exp);
     let session_attest = host.session_attestation(nats_fp, ts);
-    let token =
-        fixtures::host_auth_token(&host.root.public_key().to_bytes(), &cert, &session_attest);
+    let token = fixtures::host_auth_token(
+        &host.root.public_key().to_bytes(),
+        &cert,
+        &session_attest,
+        None,
+    );
     let (opts, events) = base_opts();
     let client = opts
         .nkey(session.seed().expect("session nkey seed"))

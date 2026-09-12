@@ -1202,7 +1202,7 @@ async fn live_a_member_cap_holder_must_not_authorize_a_host_connect() {
     let forged_attest =
         issue_host_session_attestation(&attacker_signing_key, attacker_nats_fp, fixtures::now());
     let forged_token =
-        fixtures::host_auth_token(&host_root_pk_bytes, &op_cert_from_cap, &forged_attest);
+        fixtures::host_auth_token(&host_root_pk_bytes, &op_cert_from_cap, &forged_attest, None);
     let (opts, _events) = base_opts();
     let forged_result = opts
         .nkey(attacker_session.seed().expect("attacker nkey seed"))
@@ -1252,6 +1252,7 @@ async fn live_a_member_cap_holder_must_not_authorize_a_host_connect() {
         &host_root_pk_bytes,
         &real_op_cert,
         &genuine_but_misnamed_attest,
+        None,
     );
     let unrelated_session = nkeys::KeyPair::new_user();
     let (opts2, _events2) = base_opts();
