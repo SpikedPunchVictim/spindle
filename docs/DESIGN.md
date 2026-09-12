@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.40) + Execution Plan
+# Spindle — System Design Document (draft v0.9.41) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -177,6 +177,9 @@
 > persisted nkey seed to the host that A10.40 retired. A9b was not swept. **Decided: renewal
 > re-issues both certificates without re-minting the `DeviceKey`, and a failed renewal keeps
 > serving while refusing new capabilities** (A10.45).
+> v0.9.41: no figure changes and no decisions; A9c's `spindle-test-fixtures` line described one
+> consumer fewer than the crate has. Its token encoders are now reached by `spindle-helper`'s unit
+> tests, which never touch the callout wiring the line named as the crate's whole purpose.
 
 ---
 
@@ -1498,9 +1501,10 @@ spindle/
 │   ├── spindle-client-core/    #   client library: sessions, pinning store, transfer queue, key custody
 │   ├── spindle-helper/         #   broker-helper service bin: callout responder, presence, TURN, revocation
 │   │                           #   store, admin verifier; Postgres (sqlx)
-│   └── spindle-test-fixtures/  #   dev-only shared NATS auth-callout fixtures for the live test suites; never a
-│                               #   runtime dependency of anything — exists so a second, driftable copy of the
-│                               #   callout bootstrap is never written.
+│   └── spindle-test-fixtures/  #   dev-only: the shared NATS auth-callout bootstrap the live test suites
+│                               #   need, plus the token encoders other crates' unit tests reach for; never
+│                               #   a runtime dependency of anything — exists so a second, driftable copy of
+│                               #   the callout bootstrap is never written.
 │
 ├── apps/
 │   ├── host/                   # Tauri 2 tray app — spindle-host-core in-process
@@ -1824,6 +1828,13 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.41 (2026-09-12)** — No figure changes, no decisions. A9c's manifest described
+  `spindle-test-fixtures` as "dev-only shared NATS auth-callout fixtures for the live test suites",
+  which was true when the crate was added (v0.9.19) and is now one consumer short: `spindle-helper`'s
+  `auth_token.rs` **unit** tests reach for its token encoders and never touch the callout wiring the
+  line named as the crate's whole purpose. The line now names both halves. The v0.9.19 entries in the
+  head block and in this list say the same thing and are left alone — they are dated records of what
+  was decided then, not claims about what the crate is today.
 - **v0.9.40 (2026-09-12)** — No figure changes. An independent adversarial review REJECTED v0.9.39,
   making this the third consecutive correction to carry a defect of the family it was fixing
   (v0.9.36 → v0.9.38 → v0.9.39). Two of v0.9.39's four new "consequences to state plainly" had wrong
