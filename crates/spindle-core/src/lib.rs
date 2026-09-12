@@ -17,6 +17,10 @@
 //!   which is deliberately not one of those seven signed artifacts — see that submodule's doc
 //!   comment.
 //! - [`envelope`] — the A7 end-to-end signaling envelope: session-key derivation, `seal`/`open`.
+//! - [`clock_diagnostics`] — DESIGN.md §A10.42 leg (1), the always-on local clock bound check:
+//!   compares a caller-supplied `local_now` against `max(HostOpKeyCert.ts)` from already-verified
+//!   artifacts and reports a [`ClockDiagnosis`]. Diagnostic only — [`ClockOffset`] has no
+//!   conversion into a timestamp, because a time source is not an authenticated channel.
 //!
 //! # Design notes and ambiguities (reported, not silently resolved)
 //!
@@ -40,6 +44,7 @@
 //!   "Audit log"), which must not gain a direct crypto dependency of its own.
 
 pub mod artifacts;
+pub mod clock_diagnostics;
 pub mod envelope;
 pub mod fingerprint;
 pub mod identity;
@@ -47,6 +52,7 @@ pub mod identity;
 mod base32;
 
 pub use artifacts::checked_verifying_key;
+pub use clock_diagnostics::{ClockDiagnosis, ClockDiagnosticError, ClockOffset};
 pub use envelope::{
     derive_bootstrap_key, derive_session_key, direction_byte, open, seal, EnvelopeError,
     OpenParams, SealParams, SessionKey,

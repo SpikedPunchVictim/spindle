@@ -144,20 +144,21 @@ const MUST_BE_PRESENT: &[&str] = &[
 ];
 
 /// Conservative floor on how many `.rs` files this scan should find under
-/// `crates/spindle-core/src`. Derived by running
-/// `find crates/spindle-core/src -name "*.rs" | wc -l` on 2026-09-11, which returned 17. Pinned at
+/// `crates/spindle-core/src`. Re-derived by running
+/// `find crates/spindle-core/src -name "*.rs" | wc -l` on 2026-09-12, after `clock_diagnostics.rs`
+/// landed (td-7e3556), which returned 18. Pinned at
 /// that exact count (not "just under" it) because this guard's whole purpose is to catch a
 /// silently-shrinking scan set — an off-by-a-few floor would let a dropped file slip through
 /// unnoticed. Adding a new file under `src` raises the true count above this floor and stays
-/// green; only a *drop* below 17 (a move, rename, or scan-logic regression) turns this red.
+/// green; only a *drop* below 18 (a move, rename, or scan-logic regression) turns this red.
 ///
 /// This is a floor, not a tight pin, and that is a real limitation: once the true count climbs
-/// above 17 because a file was added without this constant being bumped to match, the floor stops
-/// protecting against a later drop of up to that same margin — e.g. if the tree grows to 19 files
-/// and this constant is left at 17, two files could later disappear and this assertion would stay
-/// green. Bump this constant whenever a `.rs` file is added under `src`, rather than treating 17
+/// above 18 because a file was added without this constant being bumped to match, the floor stops
+/// protecting against a later drop of up to that same margin — e.g. if the tree grows to 20 files
+/// and this constant is left at 18, two files could later disappear and this assertion would stay
+/// green. Bump this constant whenever a `.rs` file is added under `src`, rather than treating 18
 /// as a permanent tripwire.
-const MIN_RS_FILE_COUNT: usize = 17;
+const MIN_RS_FILE_COUNT: usize = 18;
 
 #[test]
 fn artifacts_never_read_an_ambient_clock() {
@@ -223,6 +224,146 @@ fn artifacts_never_read_an_ambient_clock() {
         violations.len(),
         violations.join("\n"),
     );
+}
+
+/// A10.42's diagnostic-only symbols. A clock offset computed by `src/clock_diagnostics.rs` (leg
+/// (1), td-7e3556) — or, later, by the optional configured HTTPS `Date` source (leg (2)) — is
+/// **diagnostic only**: it may be displayed, and it may never be folded into signing time, an
+/// `exp` check, or a revocation check.
+///
+/// `HttpsDateSource` and `offset_from_date_header` are listed *before that code exists*, on
+/// purpose. A10.42 leg (2) is decided but unbuilt; putting its names under the rule now means the
+/// rule is in place before the temptation is, rather than being written afterwards by whoever is
+/// mid-way through wiring an offset into something. If leg (2) lands under different names, add
+/// those names here in the same commit.
+const DIAGNOSTIC_ONLY_SYMBOLS: &[&str] = &[
+    "ClockOffset",
+    "ClockDiagnosis",
+    "diagnose_clock",
+    "HttpsDateSource",
+    "offset_from_date_header",
+];
+
+/// Floor on how many `.rs` files the validity-path scan below should find — every file under
+/// `crates/spindle-core/src/artifacts/` plus `src/envelope.rs`. Derived on 2026-09-12 by
+/// `find crates/spindle-core/src/artifacts -name "*.rs" | wc -l` (11) plus `envelope.rs` (1) = 12.
+/// Same rationale as [`MIN_RS_FILE_COUNT`]: a scan that silently finds nothing must not pass for
+/// the wrong reason. Bump it when a file is added under `src/artifacts/`.
+const MIN_VALIDITY_PATH_FILE_COUNT: usize = 12;
+
+/// Proves that no artifact validity path in `spindle-core` *names* one of A10.42's diagnostic-only
+/// clock symbols as real code — the structural half of "the offset is diagnostic only".
+///
+/// The sibling test above holds the other half: no validity path reads an ambient clock, so every
+/// time check keeps taking a caller-supplied `now`. That alone does not stop a caller computing a
+/// diagnostic offset and passing it in *as* that `now`, which is the defect A10.42 actually
+/// forbids: a time source is not an authenticated channel, and folding one into a validity check
+/// turns a safe refusal into an acceptance of an expired or revoked artifact.
+///
+/// # Scope: validity paths only, not the whole `src` tree
+///
+/// This scan covers every `.rs` file under `crates/spindle-core/src/artifacts/` plus
+/// `src/envelope.rs` — the files that hold `exp`, revocation, and clock-skew checks. It
+/// deliberately does **not** walk all of `src`, because `src/clock_diagnostics.rs` (which defines
+/// these symbols) and `src/lib.rs` (which re-exports them) name them entirely legitimately.
+/// Widening the scan to the whole tree would make this test fail on the very module it exists to
+/// contain.
+///
+/// # What this does NOT prove
+///
+/// It is a text scan, nothing more. A diagnostic offset threaded through an intermediate `i64`
+/// variable, or laundered through a helper in another module that takes a plain `u64` and hands
+/// it on, is invisible to it — exactly the indirection hole the sibling test's own preamble
+/// discloses. That is precisely why `ClockOffset` carries no conversion into a timestamp in the
+/// first place: neither defence is sufficient alone, and the two are layered on purpose. A
+/// passing run means "no validity path spells one of these names", not "no diagnostic value can
+/// reach a validity check".
+#[test]
+fn validity_paths_never_consult_a_diagnostic_clock_offset() {
+    let src_dir = spindle_core_src_dir();
+    let files = validity_path_files(&src_dir);
+
+    assert!(
+        files.len() >= MIN_VALIDITY_PATH_FILE_COUNT,
+        "expected at least {MIN_VALIDITY_PATH_FILE_COUNT} validity-path .rs file(s) under {}, \
+         found {} — did files get moved, renamed, or deleted? A guard that silently scans fewer \
+         files would pass for the wrong reason.",
+        src_dir.display(),
+        files.len()
+    );
+    // `MUST_BE_PRESENT` already names `envelope.rs` alongside the three artifact skew-check files,
+    // so this one loop covers both halves of the presence check and a rename fails loudly by name.
+    for &expected in MUST_BE_PRESENT {
+        let present = files
+            .iter()
+            .any(|f| relative_path_str(&src_dir, f) == expected);
+        assert!(
+            present,
+            "expected {expected} to be present in the validity-path scan set at that path \
+             relative to {} — it holds an A10.42 validity check that must never consult a \
+             diagnostic clock offset.",
+            src_dir.display()
+        );
+    }
+
+    let mut violations = Vec::new();
+    for file in &files {
+        let original = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()));
+        assert!(
+            !original.is_empty(),
+            "{} was read as empty — refusing to treat an empty read as a clean scan",
+            file.display()
+        );
+        // Same masker as the sibling test: a symbol named in a doc comment explaining *why* it is
+        // forbidden must not trip the guard that comment is justifying.
+        let masked_bytes = mask_non_code(original.as_bytes());
+        let masked = String::from_utf8(masked_bytes)
+            .expect("masking only replaces bytes with ASCII spaces/newlines, so UTF-8 stays valid");
+
+        for &symbol in DIAGNOSTIC_ONLY_SYMBOLS {
+            let mut search_from = 0;
+            while let Some(rel) = masked[search_from..].find(symbol) {
+                let byte_offset = search_from + rel;
+                let line_no = line_number_at(&original, byte_offset);
+                let line_text = original.lines().nth(line_no - 1).unwrap_or("").trim();
+                violations.push(format!(
+                    "{}:{line_no}: found `{symbol}` (`{line_text}`) — A10.42 makes every clock \
+                     offset diagnostic only: it may be displayed, never fed into signing time, an \
+                     `exp` check, or a revocation check. A time source is not an authenticated \
+                     channel, so folding one in here would turn a safe refusal into an acceptance \
+                     of an expired or revoked artifact.",
+                    file.display(),
+                ));
+                search_from = byte_offset + symbol.len();
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "\n\nclock_source_guard found {} diagnostic-clock symbol(s) named in an artifact \
+         validity path:\n\n{}\n",
+        violations.len(),
+        violations.join("\n"),
+    );
+}
+
+/// The A10.42 artifact validity paths: every `.rs` file under `src/artifacts/`, plus
+/// `src/envelope.rs` (whose `open` runs its own clock-skew validity check). Deliberately narrower
+/// than [`rust_files_under_recursive`] — see
+/// [`validity_paths_never_consult_a_diagnostic_clock_offset`]'s doc comment for why.
+fn validity_path_files(src_dir: &Path) -> Vec<PathBuf> {
+    let artifacts_dir = src_dir.join("artifacts");
+    assert!(
+        artifacts_dir.is_dir(),
+        "expected {} to exist — did spindle-core's artifacts directory get moved or renamed?",
+        artifacts_dir.display()
+    );
+    let mut files = rust_files_under_recursive(&artifacts_dir);
+    files.push(src_dir.join("envelope.rs"));
+    files.sort();
+    files
 }
 
 /// `crates/spindle-core/src` sits directly under this crate's manifest directory; derive it from
