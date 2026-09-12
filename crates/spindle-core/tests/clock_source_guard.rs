@@ -160,6 +160,71 @@ const MUST_BE_PRESENT: &[&str] = &[
 /// as a permanent tripwire.
 const MIN_RS_FILE_COUNT: usize = 18;
 
+/// True for bytes that can appear inside a Rust identifier (ASCII letters, digits, `_`).
+fn is_identifier_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// A raw substring search has no identifier boundary, so a pattern like `"chrono"` matches not
+/// only real code but also any identifier that merely *contains* it — `synchronous` is the
+/// concrete case here, mirroring the TypeScript twin's `new DateHeaderError` colliding with the
+/// `"new Date"` pattern. A match at `masked[idx..idx + pattern.len()]` counts only when the byte
+/// immediately before it (if any) and the byte immediately after it (if any) are both NOT
+/// identifier bytes — i.e. the pattern isn't embedded inside a larger name.
+fn is_identifier_boundary_match(masked: &str, idx: usize, pattern: &str) -> bool {
+    let bytes = masked.as_bytes();
+    let before_ok = idx == 0 || !is_identifier_byte(bytes[idx - 1]);
+    let after_idx = idx + pattern.len();
+    let after_ok = after_idx >= bytes.len() || !is_identifier_byte(bytes[after_idx]);
+    before_ok && after_ok
+}
+
+/// One identifier-boundary match of a pattern in masked source, with enough context to report or
+/// assert on it.
+#[derive(Debug)]
+struct PatternHit {
+    line: usize,
+    pattern: &'static str,
+    text: String,
+}
+
+/// Pure scan of `original` for identifier-boundary matches of any of `patterns`. Masks comments
+/// and string literals first (via the shared [`mask_non_code`]) so a match inside prose doesn't
+/// count, then searches the masked text but reports line numbers and text against `original`.
+///
+/// Extracted as a standalone function, independent of any file path, so both the two real scans
+/// below and this file's own tests can feed it synthetic source strings directly.
+fn find_pattern_hits(original: &str, patterns: &[&'static str]) -> Vec<PatternHit> {
+    let masked_bytes = mask_non_code(original.as_bytes());
+    let masked = String::from_utf8(masked_bytes)
+        .expect("masking only replaces bytes with ASCII spaces/newlines, so UTF-8 stays valid");
+
+    let mut hits = Vec::new();
+    for &pattern in patterns {
+        let mut search_from = 0;
+        while let Some(rel) = masked[search_from..].find(pattern) {
+            let byte_offset = search_from + rel;
+            search_from = byte_offset + pattern.len();
+            if !is_identifier_boundary_match(&masked, byte_offset, pattern) {
+                continue;
+            }
+            let line_no = line_number_at(original, byte_offset);
+            let line_text = original
+                .lines()
+                .nth(line_no - 1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            hits.push(PatternHit {
+                line: line_no,
+                pattern,
+                text: line_text,
+            });
+        }
+    }
+    hits
+}
+
 #[test]
 fn artifacts_never_read_an_ambient_clock() {
     let src_dir = spindle_core_src_dir();
@@ -195,25 +260,18 @@ fn artifacts_never_read_an_ambient_clock() {
             "{} was read as empty — refusing to treat an empty read as a clean scan",
             file.display()
         );
-        let masked_bytes = mask_non_code(original.as_bytes());
-        let masked = String::from_utf8(masked_bytes)
-            .expect("masking only replaces bytes with ASCII spaces/newlines, so UTF-8 stays valid");
 
-        for &pattern in FORBIDDEN_PATTERNS {
-            let mut search_from = 0;
-            while let Some(rel) = masked[search_from..].find(pattern) {
-                let byte_offset = search_from + rel;
-                let line_no = line_number_at(&original, byte_offset);
-                let line_text = original.lines().nth(line_no - 1).unwrap_or("").trim();
-                violations.push(format!(
-                    "{}:{line_no}: found `{pattern}` (`{line_text}`) — A10.42 requires every \
-                     artifact validity check to take a caller-supplied `now`, so that a wrong or \
-                     compromised time source can only cause a refusal, never an acceptance. \
-                     Reading an ambient clock here bypasses that.",
-                    file.display(),
-                ));
-                search_from = byte_offset + pattern.len();
-            }
+        for hit in find_pattern_hits(&original, FORBIDDEN_PATTERNS) {
+            violations.push(format!(
+                "{}:{}: found `{}` (`{}`) — A10.42 requires every artifact validity check to \
+                 take a caller-supplied `now`, so that a wrong or compromised time source can \
+                 only cause a refusal, never an acceptance. Reading an ambient clock here \
+                 bypasses that.",
+                file.display(),
+                hit.line,
+                hit.pattern,
+                hit.text,
+            ));
         }
     }
 
@@ -317,28 +375,21 @@ fn validity_paths_never_consult_a_diagnostic_clock_offset() {
             "{} was read as empty — refusing to treat an empty read as a clean scan",
             file.display()
         );
-        // Same masker as the sibling test: a symbol named in a doc comment explaining *why* it is
-        // forbidden must not trip the guard that comment is justifying.
-        let masked_bytes = mask_non_code(original.as_bytes());
-        let masked = String::from_utf8(masked_bytes)
-            .expect("masking only replaces bytes with ASCII spaces/newlines, so UTF-8 stays valid");
-
-        for &symbol in DIAGNOSTIC_ONLY_SYMBOLS {
-            let mut search_from = 0;
-            while let Some(rel) = masked[search_from..].find(symbol) {
-                let byte_offset = search_from + rel;
-                let line_no = line_number_at(&original, byte_offset);
-                let line_text = original.lines().nth(line_no - 1).unwrap_or("").trim();
-                violations.push(format!(
-                    "{}:{line_no}: found `{symbol}` (`{line_text}`) — A10.42 makes every clock \
-                     offset diagnostic only: it may be displayed, never fed into signing time, an \
-                     `exp` check, or a revocation check. A time source is not an authenticated \
-                     channel, so folding one in here would turn a safe refusal into an acceptance \
-                     of an expired or revoked artifact.",
-                    file.display(),
-                ));
-                search_from = byte_offset + symbol.len();
-            }
+        // Same masker (and the same identifier-boundary scan) as the sibling test above: a symbol
+        // named in a doc comment explaining *why* it is forbidden must not trip the guard that
+        // comment is justifying, and a symbol merely embedded in a larger identifier must not
+        // either.
+        for hit in find_pattern_hits(&original, DIAGNOSTIC_ONLY_SYMBOLS) {
+            violations.push(format!(
+                "{}:{}: found `{}` (`{}`) — A10.42 makes every clock offset diagnostic only: it \
+                 may be displayed, never fed into signing time, an `exp` check, or a revocation \
+                 check. A time source is not an authenticated channel, so folding one in here \
+                 would turn a safe refusal into an acceptance of an expired or revoked artifact.",
+                file.display(),
+                hit.line,
+                hit.pattern,
+                hit.text,
+            ));
         }
     }
 
@@ -429,4 +480,51 @@ fn line_number_at(src: &str, byte_offset: usize) -> usize {
         .filter(|&&b| b == b'\n')
         .count()
         + 1
+}
+
+// ---- proof that the identifier-boundary fix does not open a hole --------------------------
+
+/// Positive half of the proof: every real ambient-clock form `FORBIDDEN_PATTERNS` names must
+/// still be caught after adding the identifier-boundary check — one assertion per pattern, so a
+/// pattern that silently stops matching fails by name rather than being hidden inside an
+/// aggregate count.
+#[test]
+fn forbidden_patterns_still_catch_every_real_ambient_clock_form() {
+    let source = "\
+fn probe() {
+    let _a = SystemTime::now();
+    let _b = Instant::now();
+    let _c = chrono::Utc::now();
+    let _d = Utc::now();
+    let _e = Local::now();
+    let _f = OffsetDateTime::now();
+}
+";
+    let hits = find_pattern_hits(source, FORBIDDEN_PATTERNS);
+    for &pattern in FORBIDDEN_PATTERNS {
+        assert!(
+            hits.iter().any(|h| h.pattern == pattern),
+            "expected pattern `{pattern}` to still be caught by the identifier-boundary scan; \
+             got hits: {hits:?}"
+        );
+    }
+}
+
+/// Negative half of the proof: an identifier that merely *contains* a forbidden pattern must not
+/// be flagged — `synchronous` contains `chrono` (latent today, the same shape as the TypeScript
+/// twin's already-live `new DateHeaderError` collision with `"new Date"`), and `my_chronology`
+/// is the same shape with the pattern embedded mid-identifier rather than at its start.
+#[test]
+fn identifier_embedded_occurrences_are_not_flagged() {
+    let source = "\
+fn probe() {
+    let _synchronous = true;
+    let _my_chronology = 1;
+}
+";
+    let hits = find_pattern_hits(source, FORBIDDEN_PATTERNS);
+    assert!(
+        hits.is_empty(),
+        "expected no hits for identifier-embedded occurrences, got: {hits:?}"
+    );
 }

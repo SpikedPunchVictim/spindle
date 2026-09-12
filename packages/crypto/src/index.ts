@@ -57,3 +57,22 @@ export {
   buildBootstrapBundle,
   verifyBootstrapBundle,
 } from "./bootstrap.js";
+
+export type {
+  ClockDiagnosis,
+  ClockDiagnosticErrorKind,
+  DateHeaderErrorKind,
+  HttpsDateErrorKind,
+  HttpsDateSource,
+} from "./clock-diagnostics.js";
+export {
+  ClockDiagnosticError,
+  ClockOffset,
+  DateHeaderError,
+  diagnoseClock,
+  diagnoseClockFromCapabilities,
+  diagnoseClockFromHttps,
+  HttpsDateError,
+  HttpsDateSourceError,
+  offsetFromDateHeader,
+} from "./clock-diagnostics.js";

@@ -91,6 +91,21 @@
 // it left the file byte-identical to its original (`cmp` clean, `git diff --quiet` clean). That
 // file was chosen because it is outside the three names the old `SCANNED_FILES` list held, so
 // reddening on it demonstrates the walk reaches files that list never named.
+//
+// # A second, structural guard: validity paths must never NAME a diagnostic clock symbol
+//
+// `src/clock-diagnostics.ts` (DESIGN.md §A10.42, td-7e3556) landed a *type-level* speed bump —
+// `ClockOffset` has exactly one accessor and no conversion into a timestamp — but that type's own
+// doc comment admits it is "a speed bump, not a proof": nothing stops a caller from reading
+// `.diagnosticSeconds()` and folding the raw `bigint` into a validity check by hand. The second
+// `it` block below is the structural layer underneath that type-level one, mirroring
+// `crates/spindle-core/tests/clock_source_guard.rs`'s
+// `validity_paths_never_consult_a_diagnostic_clock_offset`: it scans this package's artifact
+// validity paths (`artifacts.ts` and `envelope.ts` — the two files that actually run an `exp` or
+// clock-skew comparison; `bootstrap.ts` is in `MUST_BE_PRESENT` above because it states/relies on
+// the no-ambient-clock rule while forwarding `now` into `verifyCapability`, not because it runs a
+// comparison of its own) for the literal names of leg (1)/leg (2)'s diagnostic-only symbols. Two
+// defences layered on purpose, neither sufficient alone — same rationale as the Rust twin's.
 
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -109,16 +124,45 @@ const srcDir = path.join(packageRoot, "src");
 const MUST_BE_PRESENT = ["artifacts.ts", "bootstrap.ts", "envelope.ts"];
 
 /** Conservative floor on how many `.ts` files this scan should find under `packages/crypto/src`.
- * There are 8 files directly under `src` today (artifacts.ts, backend.ts, bootstrap.ts, bytes.ts,
- * envelope.ts, fingerprint.ts, index.ts, primitives.ts), confirmed by listing the directory on
- * 2026-09-11. Pinned at that exact count (not "just under" it) because this guard's whole purpose
- * is to catch a silently-shrinking scan set — an off-by-a-few floor would let a dropped file slip
+ * There are 9 files directly under `src` today (artifacts.ts, backend.ts, bootstrap.ts, bytes.ts,
+ * clock-diagnostics.ts, envelope.ts, fingerprint.ts, index.ts, primitives.ts), confirmed by
+ * listing the directory on 2026-09-12 (clock-diagnostics.ts added, DESIGN.md §A10.42 leg (2)
+ * twin). Pinned at that exact count (not "just under" it) because this guard's whole purpose is to
+ * catch a silently-shrinking scan set — an off-by-a-few floor would let a dropped file slip
  * through unnoticed. Adding a new file under `src` raises the true count above this floor and
- * stays green; only a *drop* below 8 (a move, rename, or scan-logic regression) turns this red. */
-const MIN_TS_FILE_COUNT = 8;
+ * stays green; only a *drop* below 9 (a move, rename, or scan-logic regression) turns this red. */
+const MIN_TS_FILE_COUNT = 9;
 
 /** Ambient clock APIs this guard looks for, as plain substrings of masked source text. */
 const FORBIDDEN_PATTERNS = ["Date.now", "new Date", "performance.now"];
+
+/** A10.42's diagnostic-only symbols (TypeScript names), mirroring
+ * `clock_source_guard.rs`'s `DIAGNOSTIC_ONLY_SYMBOLS`. A clock offset computed by
+ * `src/clock-diagnostics.ts` — leg (1)'s local bound check, or leg (2)'s optional configured
+ * HTTPS `Date` source — is diagnostic only: it may be displayed, and it may never be folded into
+ * signing time, an `exp` check, or a revocation check. If any of `clock-diagnostics.ts`'s exported
+ * names change, update this list in the same commit. */
+const DIAGNOSTIC_ONLY_SYMBOLS = [
+  "ClockOffset",
+  "ClockDiagnosis",
+  "diagnoseClock",
+  "HttpsDateSource",
+  "offsetFromDateHeader",
+  "diagnoseClockFromHttps",
+];
+
+/** The A10.42 artifact validity paths in this package: the two files that actually run an `exp`
+ * or clock-skew comparison (`verifyCapability` and friends in `artifacts.ts`; `open`'s clock-skew
+ * check in `envelope.ts`). Deliberately narrower than {@link tsFilesUnderRecursive}'s whole-`src`
+ * walk above — widening this to the whole tree would fail this test on `clock-diagnostics.ts`
+ * itself, which names these symbols entirely legitimately (it defines them), and on `index.ts`,
+ * which re-exports them just as legitimately. */
+const VALIDITY_PATH_FILE_NAMES = ["artifacts.ts", "envelope.ts"];
+
+/** Floor on how many validity-path files the second guard below should find — both entries of
+ * {@link VALIDITY_PATH_FILE_NAMES}. Same rationale as {@link MIN_TS_FILE_COUNT}: a scan that
+ * silently finds nothing must not pass for the wrong reason. */
+const MIN_VALIDITY_PATH_FILE_COUNT = 2;
 
 interface Violation {
   file: string;
@@ -271,6 +315,61 @@ function lineNumberAt(src: string, offset: number): number {
   return count;
 }
 
+/** True for characters that can appear inside a TypeScript identifier: ASCII letters, digits,
+ * `_`, and `$` (valid in identifiers, e.g. `$1`, `foo$bar`). */
+function isIdentifierChar(ch: string): boolean {
+  if (ch === "") return false;
+  return /[A-Za-z0-9_$]/.test(ch);
+}
+
+/** A raw substring search has no identifier boundary, so a pattern like `"new Date"` matches not
+ * only real code but also any identifier that merely *contains* it — `new DateHeaderError(...)`
+ * is the concrete case that motivated this: `clock-diagnostics.ts` had to route all ten of that
+ * class's error constructions through a `private static make(...)` indirection purely to avoid
+ * spelling `new DateHeaderError(` at a call site, because that text contains the literal
+ * substring `new Date`. A match at `masked[idx..idx + pattern.length]` counts only when the
+ * character immediately before it (if any) and the character immediately after it (if any) are
+ * both NOT identifier characters — i.e. the pattern isn't embedded inside a larger name. */
+function isIdentifierBoundaryMatch(masked: string, idx: number, pattern: string): boolean {
+  const before = idx > 0 ? masked[idx - 1] : "";
+  const after = idx + pattern.length < masked.length ? masked[idx + pattern.length] : "";
+  return !isIdentifierChar(before) && !isIdentifierChar(after);
+}
+
+/** One identifier-boundary match of a pattern in masked source, with enough context to report or
+ * assert on it. */
+interface PatternHit {
+  line: number;
+  pattern: string;
+  text: string;
+}
+
+/** Pure scan of `original` for identifier-boundary matches of any of `patterns`. Masks comments
+ * and string/template literals first (via {@link maskNonCode}) so a match inside prose doesn't
+ * count, then searches the masked text but reports line numbers and text against `original`.
+ *
+ * Extracted as a standalone function, independent of any file path, so both the two real scans
+ * below and this file's own tests can feed it synthetic source strings directly. */
+function findPatternHits(original: string, patterns: readonly string[]): PatternHit[] {
+  const masked = maskNonCode(original);
+  const hits: PatternHit[] = [];
+
+  for (const pattern of patterns) {
+    let searchFrom = 0;
+    for (;;) {
+      const idx = masked.indexOf(pattern, searchFrom);
+      if (idx === -1) break;
+      searchFrom = idx + pattern.length;
+      if (!isIdentifierBoundaryMatch(masked, idx, pattern)) continue;
+      const line = lineNumberAt(original, idx);
+      const text = (original.split("\n")[line - 1] ?? "").trim();
+      hits.push({ line, pattern, text });
+    }
+  }
+
+  return hits;
+}
+
 describe("clock-source-guard", () => {
   it("every .ts file under src never reads an ambient clock", () => {
     const files = tsFilesUnderRecursive(srcDir);
@@ -302,18 +401,8 @@ describe("clock-source-guard", () => {
       }
       totalBytesRead += original.length;
 
-      const masked = maskNonCode(original);
-
-      for (const pattern of FORBIDDEN_PATTERNS) {
-        let searchFrom = 0;
-        for (;;) {
-          const idx = masked.indexOf(pattern, searchFrom);
-          if (idx === -1) break;
-          const line = lineNumberAt(original, idx);
-          const text = (original.split("\n")[line - 1] ?? "").trim();
-          violations.push({ file: filePath, line, pattern, text });
-          searchFrom = idx + pattern.length;
-        }
+      for (const hit of findPatternHits(original, FORBIDDEN_PATTERNS)) {
+        violations.push({ file: filePath, ...hit });
       }
     }
 
@@ -335,5 +424,97 @@ describe("clock-source-guard", () => {
         `clock-source-guard found ${violations.length} ambient clock read(s):\n${report}`,
       );
     }
+  });
+
+  // Mirrors `crates/spindle-core/tests/clock_source_guard.rs`'s
+  // `validity_paths_never_consult_a_diagnostic_clock_offset` — the structural layer underneath
+  // `ClockOffset`'s type-level speed bump (see this file's header comment). A passing run means
+  // "no validity path spells one of these names", not "no diagnostic value can reach a validity
+  // check" — it is a text scan, nothing more, and cannot see a diagnostic value laundered through
+  // an intermediate `bigint` variable or a helper that takes a plain `bigint` and hands it on.
+  // That is exactly why `ClockOffset` carries no conversion into a timestamp in the first place:
+  // neither defence is sufficient alone, and the two are layered on purpose.
+  it("validity paths never consult a diagnostic clock offset", () => {
+    const files = VALIDITY_PATH_FILE_NAMES.map((name) => path.join(srcDir, name));
+
+    // A floor on how many files this scan should find, so a scan that silently finds nothing (a
+    // rename, a moved file, a typo in VALIDITY_PATH_FILE_NAMES) fails loudly rather than passing
+    // for having scanned nothing.
+    expect(files.length).toBeGreaterThanOrEqual(MIN_VALIDITY_PATH_FILE_COUNT);
+
+    for (const filePath of files) {
+      if (!fs.existsSync(filePath)) {
+        throw new Error(
+          `expected ${filePath} to exist — did it get moved or renamed? It holds an A10.42 ` +
+            "validity check that must never consult a diagnostic clock offset.",
+        );
+      }
+    }
+
+    const violations: Violation[] = [];
+    let totalBytesRead = 0;
+
+    for (const filePath of files) {
+      const original = fs.readFileSync(filePath, "utf8");
+      if (original.length === 0) {
+        throw new Error(`${filePath} was read as empty — refusing to treat that as a clean scan`);
+      }
+      totalBytesRead += original.length;
+
+      for (const hit of findPatternHits(original, DIAGNOSTIC_ONLY_SYMBOLS)) {
+        violations.push({ file: filePath, ...hit });
+      }
+    }
+
+    // Same defence as the sibling test above: a guard that silently scanned zero (or empty)
+    // files would pass for the wrong reason.
+    expect(totalBytesRead).toBeGreaterThan(0);
+
+    if (violations.length > 0) {
+      const report = violations
+        .map(
+          (v) =>
+            `${v.file}:${v.line}: found \`${v.pattern}\` (\`${v.text}\`) — A10.42 makes every ` +
+            "clock offset diagnostic only: it may be displayed, never fed into signing time, an " +
+            "`exp` check, or a revocation check. A time source is not an authenticated channel, " +
+            "so folding one in here would turn a safe refusal into an acceptance of an expired " +
+            "or revoked artifact.",
+        )
+        .join("\n");
+      throw new Error(
+        `clock-source-guard found ${violations.length} diagnostic-clock symbol(s) named in an ` +
+          `artifact validity path:\n${report}`,
+      );
+    }
+  });
+
+  // Proof that the identifier-boundary fix ({@link isIdentifierBoundaryMatch}) does not open a
+  // hole: every real ambient-clock form must still be caught (positive), and an occurrence merely
+  // embedded in a larger identifier must not be (negative).
+  it("still catches every real ambient-clock form after the identifier-boundary fix", () => {
+    const source = ["const a = new Date();", "const b = Date.now();", "const c = performance.now();"].join("\n");
+
+    const hits = findPatternHits(source, FORBIDDEN_PATTERNS);
+    for (const pattern of FORBIDDEN_PATTERNS) {
+      expect(
+        hits.some((h) => h.pattern === pattern),
+        `expected pattern \`${pattern}\` to still be caught by the identifier-boundary scan; got hits: ${JSON.stringify(hits)}`,
+      ).toBe(true);
+    }
+  });
+
+  it("does not flag an occurrence merely embedded in a larger identifier", () => {
+    // `new DateHeaderError(...)` is the concrete case that motivated the fix (see
+    // `clock-diagnostics.ts`). `someDate.now()` and `myPerformance.nowish` are the same shape for
+    // the other two forbidden patterns.
+    const source = [
+      "class DateHeaderError extends Error {}",
+      "new DateHeaderError();",
+      "someDate.now();",
+      "myPerformance.nowish;",
+    ].join("\n");
+
+    const hits = findPatternHits(source, FORBIDDEN_PATTERNS);
+    expect(hits, `expected no hits for identifier-embedded occurrences, got: ${JSON.stringify(hits)}`).toEqual([]);
   });
 });
