@@ -67,8 +67,9 @@ use spindle_proto::canonical::CborValue;
 /// 13,571 B / 18,095 B / 55.2%, measured against a 16-byte nonce no production issuer ever
 /// emitted — td-331c11). This crate's own figure is in turn pinned to `MEASURED_MEMBER_CAP_BYTES`
 /// by the identity assertion in `keeps_measured_32_cap_token_bytes_honest` below, which mints
-/// the envelope through `fixtures::device_auth_token` — the same builder every other test in
-/// this module uses, and the one the live stack's own CONNECT path drives (td-8e239e).
+/// the envelope through `spindle_test_fixtures::fixtures::device_auth_token` — the same builder
+/// every other test in this module uses, and the one the live stack's own CONNECT path drives
+/// (td-8e239e).
 #[cfg(test)]
 const MEASURED_32_CAP_TOKEN_CBOR_BYTES: usize = 14_115;
 /// The base64url (no padding) encoding of [`MEASURED_32_CAP_TOKEN_CBOR_BYTES`] — the length that
@@ -84,7 +85,8 @@ const MEASURED_32_CAP_TOKEN_B64_BYTES: usize = 18_820;
 /// `MEASURED_MEMBER_CAP_BYTES`.
 ///
 /// It is NOT purely envelope, and the difference matters. Caps are embedded as CBOR byte strings
-/// (see `fixtures::device_auth_token` above), so each carries a length header of its own:
+/// (see `spindle_test_fixtures::fixtures::device_auth_token`), so each carries a length header of
+/// its own:
 ///
 /// ```text
 /// 547 = 449  envelope proper -- map framing, DeviceCertificate, SessionAttestation

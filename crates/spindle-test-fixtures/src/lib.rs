@@ -1,7 +1,9 @@
 //! **DEV-ONLY.** This crate exists solely to be a `[dev-dependencies]` entry of other crates'
-//! integration tests. It must never appear in any crate's `[dependencies]`, and it ships no
-//! production code — only the NATS Auth Callout bootstrap fixtures and live-stack connection
-//! helpers that [`crate::fixtures`] and this crate's top-level connection helpers below provide.
+//! tests. It must never appear in any crate's `[dependencies]`, and it ships no production code —
+//! only the NATS Auth Callout bootstrap fixtures and live-stack connection helpers that
+//! [`crate::fixtures`] and this crate's top-level connection helpers below provide. Not only
+//! integration tests: `spindle-helper`'s `src/auth_token.rs` unit tests build their envelopes with
+//! the token encoders in [`crate::fixtures`] without ever starting a live stack (td-8e239e).
 //!
 //! # Why this crate exists
 //!

@@ -2,9 +2,11 @@
 # fixtures and live-stack connection helpers that `crates/spindle-net/tests/live_signaling.rs`
 # graduated out of its own `mod fixtures` (see that file's module doc comment for the full
 # narrative: the callout bootstrap recipe, the 2026-08-31 incident, the "rebuild the helper image"
-# warning). It exists solely to be a `[dev-dependencies]` entry of other crates' integration tests
-# (`spindle-net`'s `tests/live_signaling.rs`, and `spindle-hostd`'s own live test) — it must never
-# appear in any crate's `[dependencies]`.
+# warning). It exists solely to be a `[dev-dependencies]` entry of other crates' tests — it must
+# never appear in any crate's `[dependencies]`. Three consumers today: `spindle-net`'s
+# `tests/live_signaling.rs` and `spindle-hostd`'s `tests/live_hostd.rs`, both integration tests
+# driving the live stack, and `spindle-helper`'s `src/auth_token.rs` **unit** tests, which reach
+# only for the token encoders in `fixtures` and never touch the connection helpers (td-8e239e).
 [package]
 name = "spindle-test-fixtures"
 version.workspace = true
