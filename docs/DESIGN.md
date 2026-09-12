@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.37) + Execution Plan
+# Spindle — System Design Document (draft v0.9.38) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -152,6 +152,15 @@
 > v0.9.37: no figure changes; the v0.9.36 entry above was itself missing from this block, and the
 > custody argument's load-bearing claim cited a test fixture rather than production code
 > (td-ef5744).
+> v0.9.38: no figure changes; §A4 carried two statements that do not compose. It said the
+> operating key and the host's envelope `DeviceKey` are "generated fresh ... so they need no
+> custody of their own", and also defined the root staying cold as a custody layer that loads it
+> "at enrollment and at restore" — but generating fresh at every start loads the root at every
+> start, which that enumeration does not cover. Whether the op key was persisted was never
+> stated anywhere. **Decided: the operating key is ephemeral**, re-minted and re-certified each
+> process start, never written down; one secret is persisted, the root seed. The cold
+> enumeration is corrected, and A9b's open lifetime/rotation entry is filled in (A10.43;
+> td-448139).
 
 ---
 
@@ -355,8 +364,9 @@ signer, result).
   keypair is dedicated (generated like any other device — A4 Device, above), certified by the **operating** key:
   `sig_host_op(host_device_fp, alg_id, sign_pk, agree_pk, ts)`, chaining root→op→device, so a member that pins
   `host_fp` verifies it with no new trust anchor; the root stays cold — meaning **used only to certify an
-  operating key, never to sign routine traffic**, not that it is offline: A10.41's custody layer necessarily loads
-  it at enrollment and at restore — and device-key rotation never re-walls members.
+  operating key, never to sign routine traffic**, not that it is offline: under A10.43 the operating key is
+  ephemeral, so A10.41's custody layer loads the root at **every process start**, as well as at enrollment and
+  at restore [corrected v0.9.38] — and device-key rotation never re-walls members.
   **[amended v0.9.31, A10.40]** The operating-key certificate no longer carries `nats_fp`: it is the
   **issuance chain** — embedded in every member capability (A10.30) so a verifier can walk root →
   operating key — and `verify_host_op_key_cert` never read the field. The host's per-connect NATS
@@ -372,8 +382,19 @@ signer, result).
   test-only constructor. **A host holds four private scalars, and exactly one of them is
   persisted.** The operating key and the host's own envelope `DeviceKey` are **generated fresh
   and certified under the root** — the `HostOpKeyCert` and device-certificate chain A4 already
-  defines — so they need no custody of their own and rotate without touching the seed. This is
-  why one seed suffices: **`host_fp` *is* `root_fp`** — the helper derives it that way on the live
+  defines — so they need no custody of their own and rotate without touching the seed.
+  **[added v0.9.38, A10.43]** "Generated fresh" means **at every process start**: the operating key is
+  ephemeral, never written anywhere, re-minted from the OS CSPRNG and re-certified under the root each time
+  the daemon starts. That is what makes one persisted secret sufficient, and it is why the cold enumeration
+  above names every process start rather than only enrollment and restore. Three consequences to state
+  plainly. The `HostOpKeyCert` is re-issued each start, so its `ts` advances with the process rather than with
+  a rotation ceremony — A10.42's local bound check reads exactly that field and gets a tighter bound from a
+  freshly restarted host than from a long-running one. Op-key rotation needs no ceremony, because a restart
+  *is* the rotation. And this does **not** reopen v0.9.31: that amendment returned the host nkey to
+  per-**session**, and sessions reconnect within one process, so a fresh nkey still cannot obtain a fresh
+  certificate without a restart — which is why A10.40's per-connect attestation, signed by the warm operating
+  key, remains the binding rather than the certificate.
+  This is why one seed suffices: **`host_fp` *is* `root_fp`** — the helper derives it that way on the live
   authorization path (`crates/spindle-helper/src/authz.rs:630`, `let host_fp =
   root_fp_of(&presented.host_root_pk);`), and §A4 and §A5 each state it independently (`host_fp` is
   always root-derived). The test fixture that mirrors it
@@ -1370,9 +1391,10 @@ web-bundle integrity) · TURN `use-auth-secret` (**dual-secret overlap window** 
 allocations) · NATS server TLS certs (clients trust the private CA root shipped in the invite pin policy) · private
 CA (hardened profile + admin certs; short lifetimes in lieu of revocation) · helper DB credentials · host root /
 op key / user roots & device keys (covered in A4). (host root seed: holder and blast radius are specified in
-A4/A10.41; **lifetime and rotation remain open** — the root is long-lived by construction, but no rotation
-ceremony is specified beyond A4's pre-committed-rotation path, and the operating key's rotation cadence is
-unstated.) **[DEFAULT] lifetimes where not stated elsewhere**: release signing key — offline, pre-committed next-key hash,
+A4/A10.41; **lifetime and rotation [filled in v0.9.38, A10.43]** — the root seed is long-lived by
+construction and rotates only through A4's pre-committed-rotation path, on compromise or planned
+succession; the **operating key rotates at every process start**, since A10.43 makes it ephemeral, so it
+has no ceremony and no cadence of its own.) **[DEFAULT] lifetimes where not stated elsewhere**: release signing key — offline, pre-committed next-key hash,
 rotated only on compromise or planned succession; TURN `use-auth-secret` — rotated monthly via the dual-secret
 overlap; NATS server TLS certs — 90-day, auto-renewed; helper DB credentials — 90-day rotation, leader-managed.
 
@@ -1556,6 +1578,7 @@ Docker is explicitly not the primary dev environment.
 | 40 | Domain-separating the host op-key cert | **DECIDED 2026-09-10 (user decision):** split `HostOpKeyCert`'s two roles into two artifacts. The cert **drops `nats_fp`** (`spindle-host-cert-v1` → `v2`) and becomes the issuance chain only; the per-connect binding becomes `HostSessionAttestation {nats_fp, ts, sig_op}` (`spindle-host-sess-attest-v1`), signed by the **operating** key. A10.39 fixed the device half but left the host half one level weaker: `verify_host_op_key_cert` never read `nats_fp`, so the binding lived in a single manual comparison at one call site whose own comment noted no other caller performed it — while the device path made the expected `nats_fp` a *required argument* the verifier cannot skip. The codebase had already recognised the split in a comment rather than a type: the test fixtures built capability-issuance op certs with a **dummy** `nats_fp`, documented as "an issuance-time cert, not the one the host presents on its own CONNECT". A binding field filled with a deliberately meaningless value because its consuming context ignores it is the A10.39 shape. Migration cost is zero *today* — every `issue_host_op_key_cert` call site is a test module, fixture, spike, or vector generator, because host enrollment is unshipped (td-539ffa, td-ef5744) — the same argument A10.39 used to delete rather than document-as-inert. **Consequence:** the host nkey returns to **per-session**. v0.9.29 fixed it long-lived only because the binding sat in a root-signed certificate and §A4 keeps the host root cold; the operating key is warm by design, so a fresh nkey gets a fresh attestation without ever waking the root. This retires the long-lived host nkey seed as a durable credential and changes what td-ef5744 (host key custody) must decide. Rejected: keeping one artifact and making `expected_nats_fp` a required argument of `verify_host_op_key_cert` (the issuance-chain caller has no session to name, so it would have to pass a dummy — re-creating the fixture's tell in the API itself); documenting the field as inert (A10.39's rejected option, for its reasons). The host attack is now closed **by construction**, not merely by a comparison. A member holding a capability has `host_root_pk` and the `op_cert`, but never the operating *private* key -- so it cannot forge a valid `HostSessionAttestation` for any nkey, its own included. Under the old design that member held working attack material outright. |
 | 41 | Host key custody | **DECIDED 2026-09-10 (user decision):** generate the host root key on first run from the OS CSPRNG and persist the 32-byte seed, never the derived keypair (`RootKey::from_seed`, `crates/spindle-core/src/identity.rs:61`, already the supported recovery-phrase constructor; neither key type gains an export accessor); present the seed once, at first run, as a recovery phrase — the out-of-band path that restores host identity after loss or reinstall. A `HostKeyStore` trait provides the seam: desktop/Tauri custody stores the seed in the OS keychain; headless/server custody stores it in a seed file, `0600` with a `0700` parent directory, and the host **refuses to start** if either is found wider — naming the path and the mode, rather than silently correcting it, since a silent fix would conceal that the seed may already have been read. Rejected: *provisioning-only*, an operator ceremony before every host can start — hostile to the single-tray-app shape A10.26 already decided; *generation-only, no recovery* — leaves the host-key-loss gap (A12 #35) this decision exists to close; *keychain everywhere*, A4 read literally — makes the headless server case unsupported by construction, since a daemon has no Secret Service without a session D-Bus and an unlocked keyring; *encrypted file everywhere* (passphrase + KDF) — one seam, identical on both platforms, genuinely attractive, but a daemon needs the passphrase at every start, so it either prompts (unusable as a service) or stashes it, which is circular, and it adds a KDF + AEAD dependency for a property the OS keychain already supplies on the desktop half — held as a designed-but-unbuilt fallback; *plain `0600` file everywhere* — simplest, but would require amending A4 to weaken it rather than to describe it; *an export accessor on the key type* — would create the first path for private key bytes to leave `DeviceKey`, permanently widening the secret's blast radius, and buys nothing the custody layer does not already hold via the seed. This removes the stated blocker for `spindle-hostd` regaining a binary target: its own doc comment names host-identity custody not existing anywhere in the workspace as the reason it ships none (`crates/spindle-hostd/src/lib.rs:16-37`). Accepted residual risk: the headless store is plaintext at rest behind filesystem ACLs only — a backup snapshot, a synced folder, or a container image layer containing that file discloses the seed; an encrypted-at-rest store is designed but not built. Hardware-backed custody (TPM, Secure Enclave) is out of scope for v1. **Corrected v0.9.36**, after independent review found the v0.9.32 text specified custody for a `DeviceKey` while naming the root key — different types, and `DeviceKey::from_seeds` takes two 32-byte seeds, so the persistence rule as written could not execute. Three further decisions recorded: **(a)** only the root seed is persisted — the operating key and the host's envelope `DeviceKey` are generated fresh and certified under the root, so a restore yields a new `device_fp` while `host_fp` (= `root_fp`) survives and members stay bound; rejected: *KDF-derived child seeds*, which would make the KDF and its domain tags normative wire design that Rust and TypeScript must reproduce byte-for-byte, and would need a persisted rotation counter, and *storing all four seeds*, at 128 B far too long for a recovery phrase. **(b)** An absent, locked or unreadable keychain entry is a **refusal to start**, never an implicit first run; rejected: *a separate non-secret enrollment marker*, which adds a second piece of state that can itself desynchronise and whose loss re-enables the silent-generate path. **(c)** The `0600`/`0700` rule is **POSIX-scoped**; rejected: *refusing whenever the mode cannot be verified*, which would block correctly-protected NAS/SMB hosts and make Windows seed-file deployments impossible, and *warning and continuing*, which would weaken a rule A9c heads "enforced, not aspirational". Bears on td-ef5744. |
 | 42 | Cold-clock diagnostics | **DECIDED 2026-09-10:** before minting a `SessionAttestation`, a client always runs a local bound check against the signed `ts` lower bound every `HostOpKeyCert` in its bundle already carries (`spindle-proto/src/artifacts.rs:949`) — provable-behind when local time precedes it, honestly ambiguous when every held capability's `exp` has passed, since `Capability` carries no `ts` to disambiguate that direction. An operator MAY additionally configure an HTTPS endpoint whose `Date` header gives a precise offset. Both are diagnostic only: neither MUST be fed into signing time, `exp` checks, or revocation checks — a time source is not an authenticated channel, and folding one into validity checks would turn a safe refusal into an acceptance of an expired or revoked artifact. Rejected: *in-band offset from the helper* — already disproved in v0.9.30, since the callout reply never reaches the client, refusals are uniform, and NATS `INFO` carries no time field; *a default third-party time host* — discloses a device's existence to an outside party on every connect; *widening the ±2 min window* — weakens the time bound without fixing the cold-bootstrap case, reopening ground already decided (td-e8b79f); *challenge-response over the server nonce* — rejected on measured grounds in A10.39, since the browser NATS `Authenticator` runs synchronously while `crypto.subtle.sign` on a non-extractable key is async, which would force the identity key to become extractable. Closes td-e8b79f. |
+| 43 | Host operating-key custody | **DECIDED 2026-09-12 (user decision):** the operating key is **ephemeral** — generated fresh from the OS CSPRNG and re-certified under the root at **every process start**, never persisted. Exactly one secret has custody: the 32-byte root seed (A10.41). This makes A4's "they need no custody of their own" literally true, and corrects A4's cold enumeration, which said the custody layer loads the root "at enrollment and at restore"; under this decision it loads at every start, so "the root stays cold" means *certifies an operating key, never signs routine traffic* (A10.41, v0.9.36) and nothing more. Rejected: *op key persisted beside the seed* — preserves the narrow "enrollment and restore" reading, but adds a second secret with its own custody and its own rotation ceremony, directly contradicting A4's "need no custody of their own", and buys nothing a restart does not already give. *Root in the keychain, op key in the POSIX seed file* — splits the stores by sensitivity, but then A9c's `0600`/`0700` mode-bit rule guards the op key rather than the root, weakening the thing that rule exists to protect, and a headless host has no keychain to put the root in — which is A10.41's own reason for the seed-file path — so the split collapses exactly where it is needed. Consequence accepted: a long-running host and a frequently-restarted one present certificates of very different ages, and A10.42's bound check is only ever as tight as whichever is on hand. Closes td-448139. |
 
 ## A11. Alternatives considered
 
@@ -1755,6 +1778,19 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.38 (2026-09-12)** — No figure changes. Closes a fork the v0.9.36 review left open: two §A4
+  statements did not compose. A4 said the operating key and the host's envelope `DeviceKey` are "generated
+  fresh and certified under the root ... so they need no custody of their own", and also defined the root
+  staying cold as a custody layer that "necessarily loads it at enrollment and at restore". If the op key is
+  not persisted it must be re-minted at every process start, which loads the root at every process start —
+  something that enumeration does not cover, and a materially weaker reading of cold than v0.9.36 had just
+  written down. Whether the op key was persisted was never stated anywhere in this document, so the rule
+  could not be implemented without inventing the answer: a softer instance of the could-not-execute defect
+  the v0.9.36 amendment itself existed to fix. **Decided (user decision): the operating key is ephemeral**,
+  re-minted and re-certified each start, never written down. A4's cold enumeration is corrected to name every
+  process start, A4's custody paragraph states what "generated fresh" means and the three things that follow
+  from it, A9b's open lifetime/rotation entry is filled in, and A10.43 records the decision with both
+  rejected alternatives (td-448139).
 - **v0.9.37 (2026-09-11)** — No figure changes, and no change to the v0.9.36 custody decision, which
   independent review approved. Two sourcing/convention corrections it raised. The running per-version
   summary block had no v0.9.36 entry, although it carries one for every release through v0.9.35
