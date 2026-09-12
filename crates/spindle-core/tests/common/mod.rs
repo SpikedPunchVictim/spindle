@@ -168,8 +168,8 @@ fn string_len(src: &[u8], i: usize) -> Option<usize> {
     }
 }
 
-/// If `src[i]` begins a char or byte-char literal (`'x'`, `'\n'`, `'\''`, `'\u{2764}'`, `b'x'`),
-/// returns its total byte length; otherwise `None` — in particular for a lifetime (`'a`,
+/// If `src[i]` begins a char or byte-char literal (`'x'`, `'\n'`, `'\''`, `'\x41'`, `'\u{2764}'`,
+/// `b'x'`), returns its total byte length; otherwise `None` — in particular for a lifetime (`'a`,
 /// `'static`, `'_`), which has no closing `'` in the position a char literal would have one.
 fn char_literal_len(src: &[u8], i: usize) -> Option<usize> {
     if src[i] == b'b' && src.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_byte(src[i - 1])) {
@@ -180,9 +180,8 @@ fn char_literal_len(src: &[u8], i: usize) -> Option<usize> {
         return None;
     }
 
-    // The following is the proven `'`-literal logic from `clock_source_guard.rs`'s
-    // `char_literal_len`, reused verbatim (with `debug_assert_eq!` retained as-is).
-    debug_assert_eq!(src[i], b'\'');
+    // Parse the literal's body — one escape sequence or one UTF-8 character — then require
+    // the closing `'` to sit immediately after it.
     let mut j = i + 1;
     if j >= src.len() {
         return None;
@@ -201,6 +200,11 @@ fn char_literal_len(src: &[u8], i: usize) -> Option<usize> {
                 return None;
             }
             j += 1;
+        } else if src[j] == b'x'
+            && src.get(j + 1).is_some_and(|b| b.is_ascii_hexdigit())
+            && src.get(j + 2).is_some_and(|b| b.is_ascii_hexdigit())
+        {
+            j += 3;
         } else {
             j += 1;
         }

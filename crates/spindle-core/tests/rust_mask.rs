@@ -72,21 +72,65 @@ fn ident_boundary_guard_stops_a_trailing_r_becoming_a_raw_string_prefix() {
 }
 
 #[test]
-fn raw_byte_and_c_string_prefixed_forms_are_masked() {
-    let src = r####"let a = br"bytes"; let b = br#"bytes"#; let c = cr#"cstr"#; after();"####;
+fn raw_byte_string_backslash_terminated_body_does_not_swallow_later_code() {
+    // Neuter check: deleting the `br`/`cr` prefix branch from `raw_string_len` makes this
+    // fall through to a plain-string read. A plain string treats the trailing backslash as
+    // an escape and consumes the real closing quote — the td-5a459e bug, reproduced here on
+    // the `br"..."` prefixed form.
+    let src = r#"let v = relative.starts_with(br"\\?\");
+tracing::warn!(%device_fp, "probe");
+"#;
     let out = masked(src);
-    assert!(!out.contains("bytes"));
-    assert!(!out.contains("cstr"));
-    assert!(out.contains("after();"));
+    assert!(
+        out.contains("tracing::warn!"),
+        "masked output lost real code after a backslash-terminated br-string: {out:?}"
+    );
+}
+
+#[test]
+fn raw_byte_string_hashed_with_inner_quote_does_not_swallow_later_code() {
+    // Neuter check: without the `br`/`cr` branch this is read as a plain string starting at
+    // the first `"`, which terminates at the inner quote below instead of the real `"#`
+    // terminator, leaking the rest of the literal's content as visible "code".
+    let src = r####"let a = br#"has "quotes" inside"#;
+tracing::warn!(%device_fp, "probe");
+"####;
+    let out = masked(src);
+    assert!(!out.contains("quotes"));
+    assert!(
+        out.contains("tracing::warn!"),
+        "masked output lost real code after a hashed br-string with an inner quote: {out:?}"
+    );
+}
+
+#[test]
+fn raw_c_string_hashed_with_inner_quote_does_not_swallow_later_code() {
+    // Same failure mode as the br#"..."# case above, on the `cr#"..."#` prefixed form.
+    let src = r####"let a = cr#"has "quotes" inside"#;
+tracing::warn!(%device_fp, "probe");
+"####;
+    let out = masked(src);
+    assert!(!out.contains("quotes"));
+    assert!(
+        out.contains("tracing::warn!"),
+        "masked output lost real code after a hashed cr-string with an inner quote: {out:?}"
+    );
 }
 
 #[test]
 fn byte_string_and_c_string_are_masked() {
-    let src = r#"let a = b"byte string"; let c = c"c string"; after();"#;
-    let out = masked(src);
-    assert!(!out.contains("byte string"));
-    assert!(!out.contains("c string"));
-    assert!(out.contains("after();"));
+    // Exact-output equality (not just `!contains`) so leaving the `b`/`c` prefix byte
+    // visible — the only change if that prefix branch in `string_len` is removed — fails.
+    let byte_str = r#"b"byte string""#;
+    let c_str = r#"c"c string""#;
+    let src = format!("let a = {byte_str}; let c = {c_str}; after();");
+    let out = masked(&src);
+    let expected = format!(
+        "let a = {}; let c = {}; after();",
+        " ".repeat(byte_str.len()),
+        " ".repeat(c_str.len()),
+    );
+    assert_eq!(out, expected);
 }
 
 #[test]
@@ -143,17 +187,110 @@ fn char_literal_containing_a_quote_does_not_desync_the_scanner() {
 
 #[test]
 fn char_and_byte_char_literals_are_masked_surrounding_code_visible() {
-    let src = r#"let a = '\''; let b = '\\'; let c = '\u{2764}'; let d = 'x'; let e = b'x'; z();"#;
+    // Exact-output equality for the byte-char case (`e`) so leaving its `b` prefix byte
+    // visible — the only change if the `b'` recursion in `char_literal_len` is removed —
+    // fails.
+    let lit_a = r#"'\''"#;
+    let lit_b = r#"'\\'"#;
+    let lit_c = r#"'\u{2764}'"#;
+    let lit_d = "'x'";
+    let lit_e = "b'x'";
+    let src = format!(
+        "let a = {lit_a}; let b = {lit_b}; let c = {lit_c}; let d = {lit_d}; \
+         let e = {lit_e}; z();"
+    );
+    let out = masked(&src);
+    let expected = format!(
+        "let a = {}; let b = {}; let c = {}; let d = {}; let e = {}; z();",
+        " ".repeat(lit_a.len()),
+        " ".repeat(lit_b.len()),
+        " ".repeat(lit_c.len()),
+        " ".repeat(lit_d.len()),
+        " ".repeat(lit_e.len()),
+    );
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn hex_escape_char_literal_is_masked_and_following_code_stays_classified() {
+    // `char_literal_len` recognizing only `\u{...}` (not `\xNN`) means `'\x41'` is not
+    // recognized as a char literal at all: it falls through to plain code, its own closing
+    // quote gets mistaken for the OPENING quote of a bogus literal that swallows the real
+    // `,`, and the following literal's content is left dangling as visible "code" instead
+    // of being masked.
+    let src = r#"let v = ['\x41', 'B']; f();"#;
     let out = masked(src);
-    assert!(out.contains("let a ="));
-    assert!(out.contains("let b ="));
-    assert!(out.contains("let c ="));
-    assert!(out.contains("let d ="));
-    assert!(out.contains("let e ="));
-    assert!(out.contains("z();"));
     assert!(
-        !out.contains("2764"),
-        "char literal content must be masked: {out:?}"
+        !out.contains("41"),
+        "the \\x41 hex escape must be masked: {out:?}"
+    );
+    assert!(
+        !out.contains('B'),
+        "the following char literal must be masked, not left dangling as bare code: {out:?}"
+    );
+    assert!(
+        out.contains(','),
+        "the real comma after the hex-escape literal must stay visible: {out:?}"
+    );
+    assert!(
+        out.contains("f();"),
+        "code after both literals must stay visible: {out:?}"
+    );
+}
+
+#[test]
+fn hex_escape_byte_char_literal_is_masked_and_following_code_stays_classified() {
+    // Same failure mode as the plain-char case above, through the `b'` recursion in
+    // `char_literal_len`: an unrecognized `\xNN` escape inside a byte-char literal causes
+    // the same comma-and-next-literal desync, one position later.
+    let src = r#"let v = [b'\xFF', 'B']; f();"#;
+    let out = masked(src);
+    assert!(
+        !out.contains("FF"),
+        "the \\xFF hex escape must be masked: {out:?}"
+    );
+    assert!(
+        !out.contains('B'),
+        "the following char literal must be masked, not left dangling as bare code: {out:?}"
+    );
+    assert!(
+        out.contains(','),
+        "the real comma after the byte-char literal must stay visible: {out:?}"
+    );
+    assert!(
+        out.contains("f();"),
+        "code after both literals must stay visible: {out:?}"
+    );
+}
+
+#[test]
+fn malformed_hex_escape_is_not_treated_as_a_char_literal() {
+    // `\xZZ` is not a valid Rust escape (`Z` is not a hex digit), so this is not a char
+    // literal at all — pins that the `\x` handling validates its two digits rather than
+    // unconditionally consuming any two bytes after `x`.
+    let src = r#"let v = '\xZZ'; f();"#;
+    let out = masked(src);
+    assert_eq!(
+        out, src,
+        "a malformed \\xZZ escape must not be masked as a char literal: {out:?}"
+    );
+}
+
+#[test]
+fn non_ascii_char_literal_is_masked_code_after_it_stays_visible() {
+    // The only construct that exercises `utf8_char_len`'s multi-byte branches: replacing
+    // that function's body with a constant `1` would advance past just the leading byte of
+    // '❤', land mid-character, fail to find the closing `'`, and leave the whole literal
+    // visible as "code" instead of masking it.
+    let src = "let e = '❤'; f();";
+    let out = masked(src);
+    assert!(
+        !out.contains('❤'),
+        "non-ASCII char literal content must be masked: {out:?}"
+    );
+    assert!(
+        out.contains("f();"),
+        "code after the char literal must stay visible: {out:?}"
     );
 }
 

@@ -94,9 +94,9 @@
 //! - the char-literal handling in `mask_non_code` was neutered by planting probes immediately
 //!   after `gen_crypto_vectors.rs`'s `out.push('"');` and again after its whole
 //!   `match c { '"' => …, '\\' => …, '\n' => … }` block — both probes were reported. Before the
-//!   char-literal handling existed, the first of those two passed GREEN: the closing `'"'` flipped
-//!   the masker into `Str` mode over the real code that followed, hiding a real ambient-clock
-//!   read.
+//!   char-literal handling existed, the first of those two passed GREEN: the closing `'"'` was
+//!   mistaken for the start of a string literal, swallowing the real code that followed and
+//!   hiding a real ambient-clock read.
 //!
 //! Every planted probe was reverted afterward, and each file was confirmed byte-identical to its
 //! original (`cmp` clean, `git diff --quiet` clean).
