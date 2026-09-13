@@ -304,6 +304,32 @@ describe("offsetFromDateHeader", () => {
     expect(offset.diagnosticSeconds()).toBe(784_111_777n);
   });
 
+  // RFC 9110's `OWS = *( SP / HTAB )` may survive into the value an HTTP client hands over.
+  // Trimming it is what keeps an untrimmed header from failing the fixed-length check and
+  // silently producing no diagnostic at all.
+  it("surrounding OWS is trimmed before the length check", () => {
+    for (const header of [
+      " Sun, 06 Nov 1994 08:49:37 GMT",
+      "Sun, 06 Nov 1994 08:49:37 GMT ",
+      "\t Sun, 06 Nov 1994 08:49:37 GMT \t",
+      "   Sun, 06 Nov 1994 08:49:37 GMT   ",
+    ]) {
+      expect(offsetFromDateHeader(0n, header).diagnosticSeconds(), header).toBe(784_111_777n);
+    }
+  });
+
+  // Only SP and HTAB are OWS. `String.prototype.trim` would also strip \n, \r, and U+00A0;
+  // accepting those would widen what counts as a well-formed Date header past RFC 9110.
+  it("non-OWS whitespace is not trimmed", () => {
+    for (const header of [
+      "\nSun, 06 Nov 1994 08:49:37 GMT",
+      "Sun, 06 Nov 1994 08:49:37 GMT\r",
+      "\u00a0Sun, 06 Nov 1994 08:49:37 GMT",
+    ]) {
+      expectThrowsDateHeaderError(() => offsetFromDateHeader(0n, header));
+    }
+  });
+
   it("year before Unix epoch is rejected", () => {
     const err = expectDateHeaderError(() => offsetFromDateHeader(0n, "Wed, 01 Jan 1969 00:00:00 GMT"), "BeforeUnixEpoch");
     expect(err.year).toBe(1969);

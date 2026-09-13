@@ -271,6 +271,11 @@ pub trait HttpsDateSource {
     /// header, and folding any failure (DNS, TLS, timeout, non-2xx, missing header) into
     /// [`HttpsDateSourceError`]'s opaque message. This trait does not see or judge the request in
     /// any other way — it is not told the endpoint, and it does not retry.
+    ///
+    /// *Raw* means raw: leading and trailing RFC 9110 `OWS` may be left on, because
+    /// [`offset_from_date_header`] trims it. An implementation that trims anyway is equally
+    /// correct — this is a promise that forgetting to cannot lose the diagnostic, not a request
+    /// to forget.
     fn fetch_date_header(&self) -> Result<String, HttpsDateSourceError>;
 }
 
@@ -540,6 +545,18 @@ fn parse_imf_fixdate(date_header: &str) -> Result<u64, DateHeaderError> {
 /// section for the full statement, including the negative (locally-ahead) case this leg can prove
 /// and leg (1) cannot.
 ///
+/// # Leading and trailing OWS is trimmed here, not by the caller
+///
+/// RFC 9110 permits optional whitespace (`SP` / `HTAB`) around a field value, and an HTTP client
+/// may hand it over untrimmed. [`HttpsDateSource`] asks for the *raw* header value, so this
+/// function owns the trim rather than making every implementer remember it. Only ASCII `SP` and
+/// `HTAB` are trimmed — not `str::trim`'s full Unicode whitespace set, since a non-ASCII byte in
+/// this header is a malformed header and must reach [`DateHeaderError::NonAscii`], not be quietly
+/// stripped.
+///
+/// The failure this prevents is silent: an untrimmed header fails the fixed-length check, yields
+/// no offset, and an absent diagnostic looks exactly like a healthy clock.
+///
 /// # Arithmetic
 ///
 /// A 4-digit year keeps both `server_unix` and `local_now` comfortably inside `i64`, but the
@@ -550,6 +567,7 @@ pub fn offset_from_date_header(
     local_now: u64,
     date_header: &str,
 ) -> Result<ClockOffset, DateHeaderError> {
+    let date_header = date_header.trim_matches([' ', '\t']);
     let server_unix = parse_imf_fixdate(date_header)?;
     let server = i64::try_from(server_unix).unwrap_or(i64::MAX);
     let local = i64::try_from(local_now).unwrap_or(i64::MAX);
@@ -963,6 +981,42 @@ mod tests {
             offset_from_date_header(0, long),
             Err(DateHeaderError::InvalidLength { len: 30 })
         );
+    }
+
+    /// RFC 9110's `OWS = *( SP / HTAB )` may survive into the value an HTTP client hands over.
+    /// Trimming it here is what keeps an untrimmed header from failing the fixed-length check and
+    /// silently producing no diagnostic at all.
+    #[test]
+    fn surrounding_ows_is_trimmed_before_the_length_check() {
+        let expected = 784_111_777;
+        for header in [
+            " Sun, 06 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Nov 1994 08:49:37 GMT ",
+            "\t Sun, 06 Nov 1994 08:49:37 GMT \t",
+            "   Sun, 06 Nov 1994 08:49:37 GMT   ",
+        ] {
+            let offset = offset_from_date_header(0, header)
+                .unwrap_or_else(|e| panic!("{header:?} must parse after trimming, got {e:?}"));
+            assert_eq!(offset.diagnostic_seconds(), expected, "for {header:?}");
+        }
+    }
+
+    /// Only `SP` and `HTAB` are `OWS`. `str::trim` would also strip `\n`, `\r`, and every Unicode
+    /// space; accepting those would widen what counts as a well-formed `Date` header past what
+    /// RFC 9110 says it is. `\u{a0}` is two bytes, so the 31-byte input is also proof the length
+    /// check still runs on raw bytes after the trim.
+    #[test]
+    fn non_ows_whitespace_is_not_trimmed() {
+        for header in [
+            "\nSun, 06 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Nov 1994 08:49:37 GMT\r",
+            "\u{a0}Sun, 06 Nov 1994 08:49:37 GMT",
+        ] {
+            assert!(
+                offset_from_date_header(0, header).is_err(),
+                "{header:?} is not OWS-padded and must stay rejected"
+            );
+        }
     }
 
     /// A multi-byte UTF-8 input must be rejected, never panic — the length check runs on raw

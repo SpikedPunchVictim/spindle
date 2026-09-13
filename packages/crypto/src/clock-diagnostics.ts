@@ -341,6 +341,10 @@ export interface HttpsDateSource {
    * {@link HttpsDateSourceError} rejection. This interface does not see or judge the request in
    * any other way — it is not told the endpoint, and it does not retry.
    *
+   * *Raw* means raw: leading and trailing RFC 9110 `OWS` may be left on, because
+   * {@link offsetFromDateHeader} trims it. An implementation that trims anyway is equally correct
+   * — this is a promise that forgetting to cannot lose the diagnostic, not a request to forget.
+   *
    * Returns a `Promise`, not a synchronous value: every I/O-shaped seam in this package is async
    * (see `verifyCapability` and friends in `artifacts.ts`), and a real fetch is async.
    */
@@ -679,6 +683,21 @@ function parseImfFixdate(dateHeader: string): bigint {
 }
 
 /**
+ * Strips leading and trailing RFC 9110 `OWS` (`OWS = *( SP / HTAB )`) and nothing else.
+ *
+ * Deliberately not `String.prototype.trim`, which also strips `\n`, `\r`, `\f`, `\v`, U+00A0,
+ * and the rest of Unicode's whitespace: those are not `OWS`, and silently accepting them would
+ * widen what counts as a well-formed `Date` header past what RFC 9110 says it is.
+ */
+function trimOws(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && (value[start] === " " || value[start] === "\t")) start += 1;
+  while (end > start && (value[end - 1] === " " || value[end - 1] === "\t")) end -= 1;
+  return value.slice(start, end);
+}
+
+/**
  * The pure core of leg (2) (DESIGN.md §A10.42, td-7e3556): parses `dateHeader` as strict
  * IMF-fixdate and computes its offset against `localNow`. No clock, no I/O, no dependency —
  * testable with plain string literals.
@@ -689,6 +708,19 @@ function parseImfFixdate(dateHeader: string): bigint {
  * section for the full statement, including the negative (locally-ahead) case this leg can prove
  * and leg (1) cannot.
  *
+ * # Leading and trailing OWS is trimmed here, not by the caller
+ *
+ * RFC 9110 permits optional whitespace (`SP` / `HTAB`) around a field value, and an HTTP client
+ * may hand it over untrimmed. {@link HttpsDateSource} asks for the *raw* header value, so this
+ * function owns the trim rather than making every implementer remember it. Only ASCII `SP` and
+ * `HTAB` are trimmed — not `String.prototype.trim`'s full Unicode whitespace set, since a
+ * non-ASCII character in this header is a malformed header and must reach
+ * {@link DateHeaderError} as such, not be quietly stripped.
+ *
+ * The failure this prevents is silent: an untrimmed header fails the fixed-length check, yields no
+ * offset, and an absent diagnostic looks exactly like a healthy clock. Rust's twin trims
+ * identically (`clock_diagnostics.rs`, `offset_from_date_header`).
+ *
  * # Arithmetic — see {@link diagnoseClock}'s "Arithmetic" section
  *
  * Rust's twin narrows both `serverUnix` and `localNow` into `i64` with explicit
@@ -698,7 +730,7 @@ function parseImfFixdate(dateHeader: string): bigint {
  * not a separate one.
  */
 export function offsetFromDateHeader(localNow: bigint, dateHeader: string): ClockOffset {
-  const serverUnix = parseImfFixdate(dateHeader);
+  const serverUnix = parseImfFixdate(trimOws(dateHeader));
   return ClockOffset.internalFromSeconds(serverUnix - localNow);
 }
 
