@@ -1008,7 +1008,7 @@ mod tests {
         );
     }
 
-    /// RFC 9110's `OWS = *( SP / HTAB )` may survive into the value an HTTP client hands over.    /// RFC 9110's `OWS = *( SP / HTAB )` may survive into the value an HTTP client hands over.
+    /// RFC 9110's `OWS = *( SP / HTAB )` may survive into the value an HTTP client hands over.
     /// Trimming it here is what keeps an untrimmed header from failing the fixed-length check and
     /// silently producing no diagnostic at all.
     #[test]
@@ -1028,20 +1028,60 @@ mod tests {
 
     /// Only `SP` and `HTAB` are `OWS`. `str::trim` would also strip `\n`, `\r`, and every Unicode
     /// space; accepting those would widen what counts as a well-formed `Date` header past what
-    /// RFC 9110 says it is. `\u{a0}` is two bytes, so the 31-byte input is also proof the length
-    /// check still runs on raw bytes after the trim.
+    /// RFC 9110 says it is.
+    ///
+    /// Asserts the exact variant, not merely `is_err()`: the three inputs are rejected by two
+    /// *different* checks, and a bare `is_err()` cannot tell them apart. `\u{a0}` is non-ASCII, so
+    /// it is refused by the ASCII gate that runs before any byte indexing at all — it never
+    /// reaches the length check the other two fail. An earlier version of this comment claimed it
+    /// did, which the assertion below now makes unwritable.
     #[test]
     fn non_ows_whitespace_is_not_trimmed() {
-        for header in [
-            "\nSun, 06 Nov 1994 08:49:37 GMT",
-            "Sun, 06 Nov 1994 08:49:37 GMT\r",
-            "\u{a0}Sun, 06 Nov 1994 08:49:37 GMT",
+        for (header, expected) in [
+            (
+                "\nSun, 06 Nov 1994 08:49:37 GMT",
+                DateHeaderError::InvalidLength { len: 30 },
+            ),
+            (
+                "Sun, 06 Nov 1994 08:49:37 GMT\r",
+                DateHeaderError::InvalidLength { len: 30 },
+            ),
+            (
+                "\u{a0}Sun, 06 Nov 1994 08:49:37 GMT",
+                DateHeaderError::NonAscii,
+            ),
         ] {
-            assert!(
-                offset_from_date_header(0, header).is_err(),
+            assert_eq!(
+                offset_from_date_header(0, header),
+                Err(expected),
                 "{header:?} is not OWS-padded and must stay rejected"
             );
         }
+    }
+
+    /// Trimming before the fixed-length check moves which check a padded malformed input fails.
+    /// A 29-byte input that is 28 bytes of payload plus one `SP` used to pass the length check and
+    /// fail the layout check (`InvalidFormat`); it now fails the length check as 28 bytes. Every
+    /// such input is still rejected and the twins still agree, but the variant a caller sees
+    /// changed, so it is pinned rather than left to drift.
+    #[test]
+    fn trimming_moves_which_check_a_padded_malformed_input_fails() {
+        let padded = " Sun, 06 Nov 1994 08:49:37 GM";
+        assert_eq!(
+            padded.len(),
+            29,
+            "29 raw bytes: the pre-trim length check passed"
+        );
+        assert_eq!(
+            offset_from_date_header(0, padded),
+            Err(DateHeaderError::InvalidLength { len: 28 })
+        );
+
+        // The branch it used to reach, still reachable with an unpadded 29-byte input.
+        assert_eq!(
+            offset_from_date_header(0, "Sun, 06 Nov 1994 08:49:37 GMX"),
+            Err(DateHeaderError::InvalidFormat)
+        );
     }
 
     /// A multi-byte UTF-8 input must be rejected, never panic — the length check runs on raw

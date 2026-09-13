@@ -320,14 +320,33 @@ describe("offsetFromDateHeader", () => {
 
   // Only SP and HTAB are OWS. `String.prototype.trim` would also strip \n, \r, and U+00A0;
   // accepting those would widen what counts as a well-formed Date header past RFC 9110.
+  //
+  // Asserts the exact kind, not merely that it threw: the three inputs are rejected by two
+  // DIFFERENT checks, and a bare "it threw" cannot tell them apart. U+00A0 is non-ASCII, so it is
+  // refused by the ASCII gate that runs before any indexing — it never reaches the length check
+  // the other two fail. Mirrors Rust's `non_ows_whitespace_is_not_trimmed`.
   it("non-OWS whitespace is not trimmed", () => {
-    for (const header of [
-      "\nSun, 06 Nov 1994 08:49:37 GMT",
-      "Sun, 06 Nov 1994 08:49:37 GMT\r",
-      "\u00a0Sun, 06 Nov 1994 08:49:37 GMT",
-    ]) {
-      expectThrowsDateHeaderError(() => offsetFromDateHeader(0n, header));
+    for (const [header, kind] of [
+      ["\nSun, 06 Nov 1994 08:49:37 GMT", "InvalidLength"],
+      ["Sun, 06 Nov 1994 08:49:37 GMT\r", "InvalidLength"],
+      ["\u00a0Sun, 06 Nov 1994 08:49:37 GMT", "NonAscii"],
+    ] as const) {
+      expectDateHeaderError(() => offsetFromDateHeader(0n, header), kind);
     }
+  });
+
+  // Trimming before the fixed-length check moves which check a padded malformed input fails: a
+  // 29-character input that is 28 of payload plus one SP used to pass the length check and fail
+  // the layout check, and now fails the length check as 28. Still rejected, still agreeing with
+  // Rust — but the kind a caller sees changed, so it is pinned rather than left to drift.
+  // Mirrors Rust's `trimming_moves_which_check_a_padded_malformed_input_fails`.
+  it("trimming moves which check a padded malformed input fails", () => {
+    const padded = " Sun, 06 Nov 1994 08:49:37 GM";
+    expect(padded.length).toBe(29);
+    expect(expectDateHeaderError(() => offsetFromDateHeader(0n, padded), "InvalidLength").len).toBe(28);
+
+    // The branch it used to reach, still reachable with an unpadded 29-character input.
+    expectDateHeaderError(() => offsetFromDateHeader(0n, "Sun, 06 Nov 1994 08:49:37 GMX"), "InvalidFormat");
   });
 
   it("year before Unix epoch is rejected", () => {
@@ -501,6 +520,13 @@ describe("the u64 domain", () => {
   it("every entry point rejects an out-of-domain localNow", async () => {
     expect(() => diagnoseClock(-1n, [], [])).toThrow(RangeError);
     expect(() => diagnoseClockFromCapabilities(-1n, [], [])).toThrow(RangeError);
+    // A bundle with a MALFORMED capability is the fixture that matters. A well-formed one decodes
+    // and reaches the `diagnoseClock` delegation, which throws RangeError either way — so it
+    // cannot see whether `diagnoseClockFromCapabilities` checks for itself. This one cannot
+    // decode, so without the up-front check the loop throws MalformedOpCert and the caller bug is
+    // masked by a diagnosis of the bundle.
+    const undecodable = { ...fakeCapability(7_000n, 0n), op_cert: new Uint8Array([0xff, 0xff, 0xff]) };
+    expect(() => diagnoseClockFromCapabilities(-1n, [undecodable], [])).toThrow(RangeError);
     expect(() => offsetFromDateHeader(-1n, "Sun, 06 Nov 1994 08:49:37 GMT")).toThrow(RangeError);
     await expect(diagnoseClockFromHttps(-1n, new FakeGoodSource("Sun, 06 Nov 1994 08:49:37 GMT"))).rejects.toThrow(
       RangeError,

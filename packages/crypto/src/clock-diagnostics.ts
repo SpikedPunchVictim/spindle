@@ -212,7 +212,7 @@ const U64_EXCLUSIVE_MAX = 1n << 64n;
  * one Rust catches at compile time, not a diagnostic outcome. It is deliberately NOT a new
  * {@link ClockDiagnosticErrorKind} — a kind would invite callers to handle it as a result.
  *
- * What this does NOT equalize is saturation: `[i64::MAX, 2**64)` is legal `u64` on both sides,
+ * What this does NOT equalize is saturation: `[2**63, 2**64)` is legal `u64` on both sides,
  * and there Rust clamps while `bigint` stays exact. That divergence is disclosed in
  * {@link diagnoseClock}'s "Arithmetic" section and pinned by test, and it is now the only one.
  */
@@ -266,7 +266,12 @@ function maxBigint(values: readonly bigint[]): bigint {
  * *property* Rust's saturation protects (never silently flipping sign) holds here unconditionally
  * and by construction.
  *
- * Saturation is the ONLY surviving divergence. Every other way `bigint` is wider than `u64` —
+ * Saturation is the only surviving divergence *in what the shared `u64` domain computes*. It is
+ * not the only one in the file: {@link ClockOffset.internalFromSeconds} is a public static on an
+ * exported class, where Rust's `ClockOffset(i64)` has a module-private field and cannot be built
+ * from outside — so a TypeScript caller can construct an offset no Rust `ClockOffset` can hold.
+ * That one is pre-existing, disclosed at {@link ClockOffset}, and about construction rather than
+ * arithmetic. Within the arithmetic: every other way `bigint` is wider than `u64` —
  * negative values, values at or above `2**64` — is rejected by {@link assertU64} at each entry
  * point, so the two twins take the same domain and differ only inside `[2**63, 2**64)`, where
  * Rust clamps to `i64::MAX` and this returns the exact value. Both are pinned by test
@@ -336,6 +341,11 @@ export function diagnoseClockFromCapabilities(
   capabilities: readonly Capability[],
   extraOpCerts: readonly HostOpKeyCert[],
 ): ClockDiagnosis {
+  // Up front, not left to the `diagnoseClock` delegation below: the decode loop runs first, so a
+  // caller bug would otherwise cost a full CBOR decode of every held capability — the same reason
+  // `diagnoseClockFromHttps` checks before awaiting.
+  assertU64(localNow, "localNow");
+
   const opCertTimestamps: bigint[] = [];
   const capabilityExps: bigint[] = [];
 
