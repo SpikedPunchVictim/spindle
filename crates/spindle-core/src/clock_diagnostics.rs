@@ -559,10 +559,16 @@ fn parse_imf_fixdate(date_header: &str) -> Result<u64, DateHeaderError> {
 ///
 /// # Arithmetic
 ///
-/// A 4-digit year keeps both `server_unix` and `local_now` comfortably inside `i64`, but the
-/// subtraction is still done with explicit `i64::try_from` and `saturating_sub` rather than
-/// relying on that headroom — exactly as [`seconds_behind`] does for leg (1), and for the same
-/// reason: it must never silently wrap into a value that prints as the wrong sign.
+/// The parser bounds `server_unix` to a 4-digit year, which sits comfortably inside `i64`.
+/// `local_now` has no such bound — it is whatever the caller passes, up to `u64::MAX` — so the
+/// subtraction is done with explicit `i64::try_from` and `saturating_sub` rather than relying on
+/// headroom only one of the two operands has. Exactly as [`seconds_behind`] does for leg (1), and
+/// for the same reason: it must never silently wrap into a value that prints as the wrong sign.
+///
+/// A `local_now` above `i64::MAX` therefore saturates: `i64::try_from` yields `i64::MAX`, and the
+/// offset is clamped rather than exact. It keeps the right sign, which is the property a
+/// diagnostic needs. The TypeScript twin's `bigint` has no width and stays exact there — a
+/// disclosed divergence, pinned by test on both sides (td-fc3b88).
 pub fn offset_from_date_header(
     local_now: u64,
     date_header: &str,
@@ -983,7 +989,26 @@ mod tests {
         );
     }
 
-    /// RFC 9110's `OWS = *( SP / HTAB )` may survive into the value an HTTP client hands over.
+    /// `local_now` is caller-supplied `u64` with no upper bound, so leg (2) has the same
+    /// saturation edge leg (1) does: above `i64::MAX` the narrowing clamps and the offset is no
+    /// longer exact. It must still be *negative* — locally-ahead is the direction a clock that far
+    /// forward is actually in, and the sign is what a diagnostic is read for.
+    ///
+    /// The TypeScript twin is exact here (`bigint` has no width); its
+    /// `"leg (2) is EXACT where the Rust twin saturates at i64::MAX"` cites this test by name.
+    #[test]
+    fn leg_two_local_now_above_i64_max_saturates() {
+        let offset = offset_from_date_header(u64::MAX, "Sun, 06 Nov 1994 08:49:37 GMT")
+            .expect("a well-formed header must still parse");
+        assert_eq!(offset.diagnostic_seconds(), 784_111_777 - i64::MAX);
+        assert_eq!(offset.diagnostic_seconds(), -9_223_372_036_070_664_030);
+        assert!(
+            offset.diagnostic_seconds() < 0,
+            "must read as locally-ahead"
+        );
+    }
+
+    /// RFC 9110's `OWS = *( SP / HTAB )` may survive into the value an HTTP client hands over.    /// RFC 9110's `OWS = *( SP / HTAB )` may survive into the value an HTTP client hands over.
     /// Trimming it here is what keeps an untrimmed header from failing the fixed-length check and
     /// silently producing no diagnostic at all.
     #[test]

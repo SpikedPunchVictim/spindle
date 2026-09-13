@@ -438,3 +438,85 @@ describe("diagnoseClockFromHttps", () => {
     }
   });
 });
+
+// ---- the u64 domain, and the one divergence it does not close (td-fc3b88) --------------------
+//
+// Rust's twins take `u64`. Two things follow that TypeScript does not get for free:
+//
+//   1. Out-of-domain inputs are not writable in Rust at all. `bigint` is unbounded and signed, so
+//      they ARE writable here, and until td-fc3b88 they got an answer — `diagnoseClock(-1n, [0n],
+//      [])` returned a confident `ProvablyBehind`. `assertU64` now rejects them at every entry
+//      point, so both twins take the same domain.
+//   2. Inside that shared domain, `[2**63, 2**64)` is legal on both sides and the two do NOT
+//      agree: Rust narrows with `i64::try_from(..).unwrap_or(i64::MAX)` and clamps, `bigint` has
+//      no width and stays exact. That is the only surviving divergence, and these tests are what
+//      make it an asserted property rather than an undocumented accident. Each cites the Rust
+//      test it diverges from, so neither side can drift without the other's number being wrong.
+
+const U64_MAX = 2n ** 64n - 1n;
+
+describe("the u64 domain", () => {
+  // Rust: `an_absurd_bound_saturates_instead_of_wrapping` asserts
+  // `behind_by.diagnostic_seconds() == i64::MAX` for the same input. This asserts the exact value
+  // instead. Both refuse to flip sign, which is the property A10.42 actually requires.
+  it("leg (1) is EXACT where the Rust twin saturates at i64::MAX", () => {
+    const diagnosis = diagnoseClock(0n, [U64_MAX], []);
+    expect(diagnosis.kind).toBe("ProvablyBehind");
+    if (diagnosis.kind !== "ProvablyBehind") throw new Error("unreachable");
+    expect(diagnosis.behindBy.diagnosticSeconds()).toBe(U64_MAX);
+    expect(diagnosis.behindBy.diagnosticSeconds()).toBeGreaterThan(2n ** 63n - 1n); // Rust clamps here
+    expect(diagnosis.boundTs).toBe(U64_MAX);
+  });
+
+  // Rust: `leg_two_local_now_above_i64_max_saturates` asserts -9223372036070664030 for this input
+  // (784111777 - i64::MAX). Exact here, and still negative — locally-ahead, the correct direction.
+  it("leg (2) is EXACT where the Rust twin saturates at i64::MAX", () => {
+    const offset = offsetFromDateHeader(U64_MAX, "Sun, 06 Nov 1994 08:49:37 GMT");
+    expect(offset.diagnosticSeconds()).toBe(784_111_777n - U64_MAX);
+    expect(offset.diagnosticSeconds()).toBeLessThan(0n);
+  });
+
+  // The boundary itself: the largest legal u64 is accepted, one more is not. A test written
+  // against `U64_MAX` alone would leave the actual number free (see the symbolic-constant trap).
+  it("2**64 - 1 is accepted and 2**64 is rejected", () => {
+    expect(() => diagnoseClock(18_446_744_073_709_551_615n, [], [])).not.toThrow();
+    expect(() => diagnoseClock(18_446_744_073_709_551_616n, [], [])).toThrow(RangeError);
+  });
+
+  // The silent case td-fc3b88 was filed for: this used to return ProvablyBehind { behindBy: 1n }.
+  it("a negative localNow is rejected, not answered", () => {
+    expect(() => diagnoseClock(-1n, [0n], [])).toThrow(RangeError);
+  });
+
+  it("a negative capability exp is rejected, not answered", () => {
+    expect(() => diagnoseClock(0n, [], [-5n])).toThrow(RangeError);
+  });
+
+  it("a negative op-cert timestamp is rejected", () => {
+    expect(() => diagnoseClock(0n, [-1n], [])).toThrow(RangeError);
+  });
+
+  // Every entry point, not just the one the finding named — the check is worth nothing if a
+  // caller can reach the arithmetic around it.
+  it("every entry point rejects an out-of-domain localNow", async () => {
+    expect(() => diagnoseClock(-1n, [], [])).toThrow(RangeError);
+    expect(() => diagnoseClockFromCapabilities(-1n, [], [])).toThrow(RangeError);
+    expect(() => offsetFromDateHeader(-1n, "Sun, 06 Nov 1994 08:49:37 GMT")).toThrow(RangeError);
+    await expect(diagnoseClockFromHttps(-1n, new FakeGoodSource("Sun, 06 Nov 1994 08:49:37 GMT"))).rejects.toThrow(
+      RangeError,
+    );
+  });
+
+  // diagnoseClockFromHttps checks before awaiting: a caller bug must not cost a network request.
+  it("diagnoseClockFromHttps rejects before it calls the source", async () => {
+    let called = false;
+    const source: HttpsDateSource = {
+      async fetchDateHeader(): Promise<string> {
+        called = true;
+        return "Sun, 06 Nov 1994 08:49:37 GMT";
+      },
+    };
+    await expect(diagnoseClockFromHttps(-1n, source)).rejects.toThrow(RangeError);
+    expect(called).toBe(false);
+  });
+});

@@ -196,6 +196,32 @@ export class ClockDiagnosticError extends Error {
   }
 }
 
+/** Exclusive upper bound of Rust's `u64` — the domain every `bigint` below stands in for. */
+const U64_EXCLUSIVE_MAX = 1n << 64n;
+
+/**
+ * Throws unless `value` is in `[0, 2**64)`, the domain of the Rust twin's `u64`.
+ *
+ * Rust rejects an out-of-domain value at compile time: `diagnose_clock(-1, ..)` is not a program.
+ * `bigint` is unbounded and signed, so a TypeScript caller can write it, and without this check it
+ * gets an answer — `diagnoseClock(-1n, [0n], [])` used to return a confident `ProvablyBehind` with
+ * `behindBy` of 1. That is the silent direction of the failure, and the one the twins exist to
+ * rule out, so the check throws rather than clamping or reporting no evidence.
+ *
+ * `RangeError`, not {@link ClockDiagnosticError}: this is a caller bug in the same class as the
+ * one Rust catches at compile time, not a diagnostic outcome. It is deliberately NOT a new
+ * {@link ClockDiagnosticErrorKind} — a kind would invite callers to handle it as a result.
+ *
+ * What this does NOT equalize is saturation: `[i64::MAX, 2**64)` is legal `u64` on both sides,
+ * and there Rust clamps while `bigint` stays exact. That divergence is disclosed in
+ * {@link diagnoseClock}'s "Arithmetic" section and pinned by test, and it is now the only one.
+ */
+function assertU64(value: bigint, label: string): void {
+  if (value < 0n || value >= U64_EXCLUSIVE_MAX) {
+    throw new RangeError(`${label} must be a u64 (0 <= v < 2**64), got ${value}`);
+  }
+}
+
 function maxBigint(values: readonly bigint[]): bigint {
   let max = values[0];
   for (let i = 1; i < values.length; i++) {
@@ -239,12 +265,22 @@ function maxBigint(values: readonly bigint[]): bigint {
  * magnitude. This is a genuine, disclosed language-level divergence, not an oversight — the
  * *property* Rust's saturation protects (never silently flipping sign) holds here unconditionally
  * and by construction.
+ *
+ * Saturation is the ONLY surviving divergence. Every other way `bigint` is wider than `u64` —
+ * negative values, values at or above `2**64` — is rejected by {@link assertU64} at each entry
+ * point, so the two twins take the same domain and differ only inside `[2**63, 2**64)`, where
+ * Rust clamps to `i64::MAX` and this returns the exact value. Both are pinned by test
+ * (td-fc3b88); neither ever reports the wrong sign.
  */
 export function diagnoseClock(
   localNow: bigint,
   opCertTimestamps: readonly bigint[],
   capabilityExps: readonly bigint[],
 ): ClockDiagnosis {
+  assertU64(localNow, "localNow");
+  for (let i = 0; i < opCertTimestamps.length; i++) assertU64(opCertTimestamps[i], `opCertTimestamps[${i}]`);
+  for (let i = 0; i < capabilityExps.length; i++) assertU64(capabilityExps[i], `capabilityExps[${i}]`);
+
   // Checked first: this is the direction A10.42 can prove, so it wins over the ambiguous case. An
   // empty array is no signed lower bound at all, so this leg is skipped rather than faked — but
   // the ambiguous leg below still runs, since it rests on `exp` alone.
@@ -724,12 +760,13 @@ function trimOws(value: string): string {
  * # Arithmetic — see {@link diagnoseClock}'s "Arithmetic" section
  *
  * Rust's twin narrows both `serverUnix` and `localNow` into `i64` with explicit
- * `i64::try_from`/`saturating_sub`, even though a 4-digit year keeps both comfortably inside `i64`
- * range, "exactly as it does for leg (1), and for the same reason". `bigint` has no fixed width,
- * so `serverUnix - localNow` is always exact here — the same disclosed divergence as leg (1)'s,
- * not a separate one.
+ * `i64::try_from`/`saturating_sub`. A 4-digit year keeps `serverUnix` comfortably inside `i64`,
+ * but `localNow` is caller-supplied and unbounded up to `u64::MAX`, so above `i64::MAX` Rust
+ * saturates and the offset is clamped. `bigint` has no fixed width, so `serverUnix - localNow` is
+ * always exact here — the same disclosed divergence as leg (1)'s, not a separate one.
  */
 export function offsetFromDateHeader(localNow: bigint, dateHeader: string): ClockOffset {
+  assertU64(localNow, "localNow");
   const serverUnix = parseImfFixdate(trimOws(dateHeader));
   return ClockOffset.internalFromSeconds(serverUnix - localNow);
 }
@@ -753,6 +790,8 @@ export function offsetFromDateHeader(localNow: bigint, dateHeader: string): Cloc
  * always propagated as an error — never swallowed into a default offset.
  */
 export async function diagnoseClockFromHttps(localNow: bigint, source: HttpsDateSource): Promise<ClockOffset> {
+  // Up front, not inside `offsetFromDateHeader` below: a caller bug should not cost a request.
+  assertU64(localNow, "localNow");
   let dateHeader: string;
   try {
     dateHeader = await source.fetchDateHeader();
