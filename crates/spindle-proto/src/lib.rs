@@ -62,6 +62,7 @@
 pub mod artifacts;
 pub mod bootstrap;
 pub mod canonical;
+pub mod invite;
 pub mod signaling;
 pub mod tags;
 pub mod vfs_rpc;
