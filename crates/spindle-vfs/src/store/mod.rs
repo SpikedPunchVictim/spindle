@@ -1657,14 +1657,19 @@ impl Store {
     ///
     /// **Identity is by [`crate::confine::fold_key`], not by the literal `subpath` string**
     /// (SCHEMA_V8, td-ea075e) — the upsert's conflict target keys on `fold_subpath`, inheriting
-    /// DESIGN.md §A4b's case/Unicode-fold overwrite rule (`docs/DESIGN.md:372-373`) from the same
+    /// DESIGN.md §A4b's case/Unicode-fold overwrite rule (its "Edge rules" bullet: "creating a name
+    /// that collides case-insensitively or under Unicode normalization with an existing dirent **is**
+    /// an overwrite") from the same
     /// function `crate::algebra::EffectiveGrants` already uses (via
     /// `VirtualPath::descends_from_or_eq`) to evaluate these very rows, instead of this table
     /// re-deciding that identity question on raw bytes. **On a fold-collision, the pre-existing
     /// literal `subpath` spelling wins** — the conflict arm updates only `perms`, never `subpath`
     /// — the same rule commit `b0c2f3f` established for a fold-collision upload landing on the
     /// existing dirent: the row's *name* is decided once, by whichever spelling created it, and
-    /// only its *permissions* are ever replaced afterward.
+    /// only its *permissions* are ever replaced afterward. Both halves — the spelling rule and the
+    /// fact that a repeat **replaces** `perms` rather than unioning them — are recorded in DESIGN.md
+    /// §A4b and A10 row 47 (v0.9.45), and discriminated by
+    /// [`Store::add_entitlement`]'s two upsert tests.
     pub fn add_entitlement(
         &self,
         group_id: GroupId,
@@ -2707,6 +2712,44 @@ mod tests {
             "Photos",
             "the pre-existing literal spelling must win over the later one (see \
              add_entitlement's doc comment / commit b0c2f3f)"
+        );
+    }
+
+    /// DESIGN.md §A4b / A10.47: a repeated grant to an identity-equal key **replaces** `perms`, it
+    /// does not union them. The sibling test above cannot show this — it grants `BROWSE` and then
+    /// `BROWSE | DOWNLOAD`, a strict *superset*, which reads identically under replace and under
+    /// union. This one shrinks the set instead, so the two rules disagree about the answer and the
+    /// assertion can only be satisfied by replace.
+    ///
+    /// Measured before it was written: substituting a bitwise-OR upsert for
+    /// `DO UPDATE SET perms = excluded.perms` left all 188 tests in this crate green.
+    #[test]
+    fn add_entitlement_replaces_perms_on_a_repeat_rather_than_unioning_them() {
+        let (store, group_id, share_id) = entitlement_fixture();
+
+        store
+            .add_entitlement(
+                group_id,
+                share_id,
+                &vp("Photos"),
+                Perms::BROWSE | Perms::DOWNLOAD,
+            )
+            .expect("add_entitlement Photos browse+download");
+        store
+            .add_entitlement(group_id, share_id, &vp("Photos"), Perms::BROWSE)
+            .expect("re-grant Photos with download withdrawn");
+
+        let entitlements = store.list_entitlements().expect("list");
+        assert_eq!(
+            entitlements.len(),
+            1,
+            "a repeat must upsert, got {entitlements:?}"
+        );
+        assert_eq!(
+            entitlements[0].perms,
+            Perms::BROWSE,
+            "a repeated grant must REPLACE perms; union would have kept DOWNLOAD, which is the \
+             failure mode A10.47 rejects — an editing surface could then never reduce a grant"
         );
     }
 
