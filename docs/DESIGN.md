@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.43) + Execution Plan
+# Spindle — System Design Document (draft v0.9.44) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -189,6 +189,12 @@
 > outside tests, fixtures and vector generators — because there is no client. Restated as a
 > requirement on the client when it is built; `spindle-core`'s crate doc, which had inherited the
 > claim as "the always-on local clock bound check", is corrected with it.
+> v0.9.44: one decision (A10.46) and one artifact. Invites are **addressed, not bearer** — A4 called
+> an invite a bearer token while A4 step 2's verification list required every cap's `subject` to
+> match the presenting `root_fp`, unconditionally, which is also what the callout implements. Both
+> halves could not be right. The admin learns the invitee's `root_fp` out of band and mints an
+> invite naming it, so a stolen invite is inert. A new **unsigned** container carries the cap plus
+> the registry endpoint and TLS pin policy that A4 has claimed since v0.6 and nothing implements.
 
 ---
 
@@ -534,10 +540,15 @@ cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp
   registry of hosts or members**. **[amended v0.9.5, A10.30]** The cap now embeds the root→op-key chain instead of
   being signed directly by the host root, so `host_fp` is always root-derived (§A4/§A5's pinning assumption) even
   though the day-to-day signer is the operating key — the root stays cold and op-key rotation never re-walls members.
-- `invite`: **bearer** token — single-use enforced by the **host** (nonce burned on redemption; the helper cannot
+- `invite`: **addressed to one `root_fp`, never a bearer token** [amended v0.9.44, A10.46] — `subject` is the
+  invitee's identity root fingerprint, learned out of band before the invite is minted, so a stolen invite is inert
+  without that person's root private key and A4 step 2's `subject == root_fp` check applies to invites with no
+  special case. Single-use is still enforced by the **host** (nonce burned on redemption; the helper cannot
   enforce single-use), `exp` in **hours** (default 24 h, owner-adjustable), scope = `connect` only, rate-limited per
-  nonce at the host, may embed an initial group (A4b). Shared as QR/link; the payload also carries the **registry
-  endpoint + TLS pin policy** (so clients need no baked-in registry address; admission tokens likewise).
+  nonce at the host, may embed an initial group (A4b). Shared as QR/link inside the **invite payload container**
+  (§A7b, `spindle-invite-v1`), which carries the capability plus the **registry endpoint list + TLS pin policy** so
+  clients need no baked-in registry address. [The same sentence used to claim "admission tokens likewise";
+  `AdmissionToken` carries no endpoint either, and that half is tracked as td-1dff5e rather than restated here.]
   **Redemption is idempotent**: the host stores `nonce → {member_id, issued_cap}` atomically; re-presentation of the
   same nonce within `exp` replays the stored cap (a crash or lost reply between burn and delivery cannot strand the
   invitee). The same rule applies to admission invites at the helper. **It also carries the host's public keys →
@@ -668,7 +679,11 @@ fallback is per-host owner **re-invite** (member record migrates to the new root
 Everything here lives **only on the host** (SQLite) and is enforced **only by the host**. The registry never sees it.
 
 **Members** — `{member_id, root_fp, display_name, status: invited|active|revoked, devices[{device_fp, label, added,
-revoked?}], groups[], created}`. "Creating an account" == issuing an invite; redemption creates the member.
+revoked?}], groups[], created}`. "Creating an account" == creating the member record **and its entitlements** up
+front, in `invited` status, against the `root_fp` the admin already holds; the invite is minted for that member, and
+redemption only **activates** it (`add_member` → `activate_member`). [amended v0.9.44, A10.46 — the earlier
+"redemption creates the member" ordering was the bearer model's, and cannot attach entitlements before it knows who
+the member is.]
 Owner = implicit member with all rights; **owner-only administration in v1** (decided), performed **only in the
 host's local UI** (tray/desktop) — no remote admin surface in v1 (A10.11).
 
@@ -1303,6 +1318,16 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 | Session attestation | `spindle-sess-attest-v1` | device identity key | `ts` ±2 min (client's own out-of-band clock, §A7) | n/a — inert without the nkey secret it names, whose possession the callout proves separately; MUST be minted fresh per connect attempt (incl. reconnect) and MUST NOT be persisted (§A3) **[added v0.9.30]** |
 | Host session attestation | `spindle-host-sess-attest-v1` | host **operating** key | `ts` ±2 min (client's own out-of-band clock, §A7) | n/a — inert without the nkey secret it names, whose possession the callout proves separately; minted fresh per connect attempt **[added v0.9.31]** |
 
+**Not in the catalog above, deliberately: the invite payload container** (`spindle-invite-v1`,
+`{v, cap, endpoints[], tls_pin}`, canonical CBOR, base64url for QR/link) **is unsigned.** It is a container for an
+already-signed capability plus transport hints, not a signed artifact, and the distinction is load-bearing: the whole
+invite is trusted **on first use, as one blob** — this is where A10.3's `host_fp` pinning happens — so an attacker who
+can rewrite the endpoint can rewrite `host_root_pk` in the same breath. A signature over part of an
+atomically-trusted blob authenticates nothing and would advertise a property the trust model does not provide. A rogue
+endpoint therefore costs denial of service and the metadata an interceptor already read off the capability; it can
+never impersonate the host, because every subsequent exchange is verified against the pinned `host_fp`. Signing it is
+the tempting wrong answer, which is why the reasoning is recorded here rather than left to be rediscovered.
+
 **Time-rule discipline [added v0.9.32]**: the table's time rules split by *when* an artifact is
 minted, not by *which side* mints it. An artifact issued ahead of use — signed once and presented
 many times — carries `exp` and is checked for expiry alone; an artifact minted at the moment of
@@ -1638,6 +1663,7 @@ Docker is explicitly not the primary dev environment.
 | 43 | Host operating-key custody | **DECIDED 2026-09-12 (user decision):** the operating key is **ephemeral** — generated fresh from the OS CSPRNG and re-certified under the root at **every process start**, never persisted. Exactly one secret has custody: the 32-byte root seed (A10.41). This makes A4's "they need no custody of their own" literally true, and corrects A4's cold enumeration, which said the custody layer loads the root "at enrollment and at restore"; under this decision it loads at every start, so "the root stays cold" means *certifies an operating key, never signs routine traffic* (A10.41, v0.9.36) and nothing more. Rejected: *op key persisted beside the seed* — preserves the narrow "enrollment and restore" reading, but adds a second secret with its own custody and its own rotation ceremony, directly contradicting A4's "need no custody of their own", and buys nothing a restart does not already give. *Root in the keychain, op key in the POSIX seed file* — splits the stores by sensitivity, but then A9c's `0600`/`0700` mode-bit rule guards the op key rather than the root, weakening the thing that rule exists to protect, and a headless host has no keychain to put the root in — which is A10.41's own reason for the seed-file path — so the split collapses exactly where it is needed. Consequence accepted: a long-running host and a frequently-restarted one present certificates of very different ages, and A10.42's bound check is only ever as tight as whichever is on hand. Closes td-448139. **[superseded v0.9.39, A10.44]** The claim above that this makes A4's "they need no custody of their own" literally true was unearned when written: that sentence governs two keys and A10.43 resolved one. A10.44 resolved the other, which is what makes the sentence true now — of A10.43 alone it was not. |
 | 44 | Host envelope `DeviceKey` custody, and op-cert renewal | **DECIDED 2026-09-12 (user decision):** two gaps an independent review found in A10.43. (1) The envelope `DeviceKey` is **ephemeral too** — A4's "they need no custody of their own" governs both keys, and A4's "exactly one of them is persisted" already forces it. Accepted consequence, now stated rather than implied: `device_fp` changes on every restart, so A10.37's `registry.devcert.<hfp>` cache re-publishes each start and per-device certified state is re-certified each start. Rejected: *persist the DeviceKey* — would stabilise `device_fp`, but falsifies "exactly one of them is persisted", gives a second key custody, and buys stability for a cache that is republished on every host connect anyway. (2) The op cert's **`exp` is 90 d (A7b) while A10.43 minted it only at process start**, so a process alive past 90 days would present an expired cert and every capability embedding it would stop verifying. The host therefore **re-certifies mid-process before expiry**, which means the root loads at each renewal as well as at start; the cold enumeration in A4 is extended to say so. Rejected: *a stated maximum process lifetime* — leaves a headless daemon to lock itself out with no mechanism able to prevent it. Closes the review of e25a956. |
 | 45 | Mid-process certificate renewal: scope, cadence, failure | **DECIDED 2026-09-12 (user decision):** A10.44 said the host "re-certifies mid-process before expiry" and specified nothing else. Three gaps an independent review found, closed here. (1) **Scope.** A7b gives the host **device** cert the same 90 d `exp` as the op cert, and the same failure mode — a process alive past 90 days serves an expired device cert from `registry.devcert.<hfp>`, and a client that fetches it cannot construct its first sealed message (§A5b). A renewal therefore re-issues the op cert under the root **and** re-signs the device cert under the new operating key. It does **not** re-mint the `DeviceKey`: that stays ephemeral per *process*, so `device_fp` churns per restart and not per renewal. Rejected: *re-mint the DeviceKey at each renewal* — uniform with "a restart IS the rotation", but it churns `device_fp` mid-process, which breaks §A5b's cached `dev_agree_h` on a live connection rather than only across a restart, for no gain. Rejected: *renew the op cert only* — no reason the device cert is exempt was found, and writing one down would have been writing down something false. (2) **Cadence.** Renewal starts at **two-thirds of `exp`** (60 d of 90 d), leaving a 30 d retry window rather than a deadline. (3) **Failure.** A9c's rule for an absent, locked or unreadable keychain entry is a **refusal to start**, and a mid-process renewal has no start to refuse. On a failed renewal the host **keeps existing sessions alive, refuses to issue new capabilities, logs the reason, and retries**; it stops serving only when the certificate actually expires. Rejected: *mirror the startup rule and shut down* — consistent, but it turns a transiently locked keyring into an outage for every connected member, and the credential is still valid for up to 30 d at the moment the first attempt fails. Closes the review of 0ae2fd5. |
+| 46 | Invite addressing, and where the registry endpoint lives | **DECIDED 2026-09-13 (user decision):** invites are **addressed**, not bearer. The admin obtains the invitee's `root_fp` out of band — a human channel carrying zero packets, the SSH `authorized_keys` shape — creates the member record **with its entitlements** in `invited` status, then mints an invite whose `subject` is that `root_fp`. Forced by a contradiction the document carried since v0.6: A4 called the invite a "bearer token ... shared as QR/link" while A4 step 2's verification list required *every* cap's `subject` to match the presenting `root_fp` with no exception, and the callout implements exactly that, unconditionally (`crates/spindle-helper/src/authz.rs`, `if subject_fp != root_fp`). Both halves could not be true; the bearer half is the one that gives way, because it is the one nothing implements and the one that would require adding a code path whose only purpose is to skip an identity check. The security argument is independent of the contradiction and decided it: A4b attaches entitlements to the account, so under the bearer model an intercepted invite is a working account with files already granted to it, whereas an addressed invite is inert without the invitee's root private key. Rejected: *bearer with post-redemption confirmation* (admin approves the bound `root_fp` before `activate_member`) — genuinely viable, the store already models both halves, and it moves the human step after the network exchange instead of before it; rejected because the human step exists either way and doing it first means an intercepted invite is never live at all, rather than live until someone notices. Rejected: *carrying the endpoint inside the signed capability* — changes `spindle-cap-v1`'s signed preimage, regenerates every capability vector in both languages, and welds a transport hint to a credential that outlives it. **Consequence:** no direct client→host contact exists at any point, in this or any other enrollment path — the host has no listening address, only an outbound registry connection, and the client addresses `host.<hfp>.connect`, a subject scoped by fingerprint rather than by address. This is what lets a host change IP without any member noticing, and it is why the registry endpoint, not a host endpoint, is the thing an invite must carry. **Residual, stated:** ICE candidate exchange discloses the host's address to an *approved* peer once the host answers — inherent to hole-punching; `iceTransportPolicy: relay` (§A6) is the mitigation and is currently a per-session option rather than a host policy. Bears on td-bbb933, td-1dff5e. |
 
 ## A11. Alternatives considered
 
@@ -1837,6 +1863,20 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.44 (2026-09-13)** — One decision (A10.46), one new container, and a contradiction closed that
+  the document had carried since v0.6. A4 called an invite a "**bearer** token ... shared as QR/link";
+  A4 step 2's verification list said the callout checks "each cap's `sig_host`, `exp`, `subject`
+  matches `root_fp`", with no exception for invites — and that is what the callout implements,
+  unconditionally (`crates/spindle-helper/src/authz.rs`, `if subject_fp != root_fp`), so a bearer
+  invite could never have passed. Neither half was wrong in isolation; they were never read against each other, because
+  no production code has ever minted an invite (every `CapKind::Invite` construction site is a test,
+  the vector generator, or the s1-callout spike). Invites are now **addressed**, and A4b's "redemption
+  creates the member" becomes "the member and its entitlements are created up front, and redemption
+  activates" — the ordering the bearer model made impossible. The registry endpoint and TLS pin policy
+  A4 has promised since v0.6, and which `git grep` finds in **zero** files, get a format: an
+  **unsigned** container, with the reasoning for *unsigned* written where someone proposing to sign it
+  will read it. No figure changes: the container's encoded size is deliberately **not** quoted here and
+  is to be pinned at its producer, the way A10.33–35 had to learn to pin the capability's.
 - **v0.9.43 (2026-09-13)** — No figure changes, no decisions. A10.42 read "before minting a
   `SessionAttestation`, a client always runs a local bound check". Present tense, and nothing runs
   it: `diagnose_clock` and `diagnoseClock` are built, tested and exported, but `git grep` finds no
