@@ -1,0 +1,1075 @@
+{
+  "description": "Invite payload container (`spindle-invite-v1`, DESIGN.md §A4 \"Invites\" and A10.46): the pasteable blob that carries a signed `invite`-kind capability together with everything a fresh client needs to reach the registry it names — ordered endpoints and how to authenticate the registry's TLS. Unsigned as a container, like A4's bootstrap bundle: the capability inside carries the signature, so the container has no domain tag and no signing input. Each case pins both the canonical CBOR and the unpadded-base64url transport form.",
+  "cases": [
+    {
+      "name": "web_pki_two_endpoints",
+      "description": "The baseline invite: an `invite`-kind capability naming the invitee's root_fp as `subject` (A10.46 — invites are addressed, not bearer), two registry endpoints in preference order, and public-web-PKI TLS validation.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cap"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "v"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_fp"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "1010101010101010101010101010101010101010101010101010101010101010"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_root_pk"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "1111111111111111111111111111111111111111111111111111111111111111"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "op_cert"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "12121212121212121212121212121212"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 0
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "subject"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "1313131313131313131313131313131313131313131313131313131313131313"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "cap_epoch"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 16
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "exp"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1759017600
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "nonce"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "1414141414141414141414141414141414141414141414141414141414141414"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "sig"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "15151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "endpoints"
+            },
+            "value": {
+              "type": "array",
+              "value": [
+                {
+                  "type": "text",
+                  "value": "wss://registry.example:443"
+                },
+                {
+                  "type": "text",
+                  "value": "nats://registry.example:4222"
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "tls_pin"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 0
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a461760163636170aa617601636578701a68d87a8063736967584015151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515646b696e6400656e6f6e63655820141414141414141414141414141414141414141414141414141414141414141467686f73745f667058201010101010101010101010101010101010101010101010101010101010101010676f705f636572745012121212121212121212121212121212677375626a65637458201313131313131313131313131313131313131313131313131313131313131313696361705f65706f6368106c686f73745f726f6f745f706b5820111111111111111111111111111111111111111111111111111111111111111167746c735f70696ea1646b696e640069656e64706f696e747382781a7773733a2f2f72656769737472792e6578616d706c653a343433781c6e6174733a2f2f72656769737472792e6578616d706c653a34323232",
+      "base64url": "pGF2AWNjYXCqYXYBY2V4cBpo2HqAY3NpZ1hAFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFWRraW5kAGVub25jZVggFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBRnaG9zdF9mcFggEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBBnb3BfY2VydFASEhISEhISEhISEhISEhISZ3N1YmplY3RYIBMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTaWNhcF9lcG9jaBBsaG9zdF9yb290X3BrWCAREREREREREREREREREREREREREREREREREREREREREWd0bHNfcGluoWRraW5kAGllbmRwb2ludHOCeBp3c3M6Ly9yZWdpc3RyeS5leGFtcGxlOjQ0M3gcbmF0czovL3JlZ2lzdHJ5LmV4YW1wbGU6NDIyMg"
+    },
+    {
+      "name": "private_ca_root",
+      "description": "Hardened variant: the registry presents a certificate chaining to exactly this DER-encoded root and nothing else. Pins the `PrivateCaRoot` arm's `{kind: 1, root}` encoding against `WebPki`'s `{kind: 0}` — the `root` key is absent, not null, when the pin is web PKI.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cap"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "v"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_fp"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "2020202020202020202020202020202020202020202020202020202020202020"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_root_pk"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "2121212121212121212121212121212121212121212121212121212121212121"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "op_cert"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "22222222222222222222222222222222"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 0
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "subject"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "2323232323232323232323232323232323232323232323232323232323232323"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "cap_epoch"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 32
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "exp"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1759017600
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "nonce"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "2424242424242424242424242424242424242424242424242424242424242424"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "sig"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "25252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "endpoints"
+            },
+            "value": {
+              "type": "array",
+              "value": [
+                {
+                  "type": "text",
+                  "value": "wss://registry.internal:8443"
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "tls_pin"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "root"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "cacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacaca"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a461760163636170aa617601636578701a68d87a8063736967584025252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525252525646b696e6400656e6f6e63655820242424242424242424242424242424242424242424242424242424242424242467686f73745f667058202020202020202020202020202020202020202020202020202020202020202020676f705f636572745022222222222222222222222222222222677375626a65637458202323232323232323232323232323232323232323232323232323232323232323696361705f65706f636818206c686f73745f726f6f745f706b5820212121212121212121212121212121212121212121212121212121212121212167746c735f70696ea2646b696e640164726f6f74590200cacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacaca69656e64706f696e747381781c7773733a2f2f72656769737472792e696e7465726e616c3a38343433",
+      "base64url": "pGF2AWNjYXCqYXYBY2V4cBpo2HqAY3NpZ1hAJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJWRraW5kAGVub25jZVggJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCRnaG9zdF9mcFggICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBnb3BfY2VydFAiIiIiIiIiIiIiIiIiIiIiZ3N1YmplY3RYICMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjaWNhcF9lcG9jaBggbGhvc3Rfcm9vdF9wa1ggISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISFndGxzX3BpbqJka2luZAFkcm9vdFkCAMrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKysrKaWVuZHBvaW50c4F4HHdzczovL3JlZ2lzdHJ5LmludGVybmFsOjg0NDM"
+    },
+    {
+      "name": "endpoint_boundary_length",
+      "description": "Edge case: one endpoint at exactly the decoder-enforced byte-length cap (MAX_ENDPOINT_LEN = 256). The strict decoder must accept exactly this length and reject one byte more. The cap is on UTF-8 *bytes*, so a TypeScript reader measuring `String.length` (UTF-16 units) would disagree with Rust on non-ASCII input.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cap"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "v"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_fp"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "3030303030303030303030303030303030303030303030303030303030303030"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_root_pk"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "3131313131313131313131313131313131313131313131313131313131313131"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "op_cert"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "32323232323232323232323232323232"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 0
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "subject"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "3333333333333333333333333333333333333333333333333333333333333333"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "cap_epoch"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 48
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "exp"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1759017600
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "nonce"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "3434343434343434343434343434343434343434343434343434343434343434"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "sig"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "35353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "endpoints"
+            },
+            "value": {
+              "type": "array",
+              "value": [
+                {
+                  "type": "text",
+                  "value": "wss://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "tls_pin"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 0
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a461760163636170aa617601636578701a68d87a8063736967584035353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535646b696e6400656e6f6e63655820343434343434343434343434343434343434343434343434343434343434343467686f73745f667058203030303030303030303030303030303030303030303030303030303030303030676f705f636572745032323232323232323232323232323232677375626a65637458203333333333333333333333333333333333333333333333333333333333333333696361705f65706f636818306c686f73745f726f6f745f706b5820313131313131313131313131313131313131313131313131313131313131313167746c735f70696ea1646b696e640069656e64706f696e7473817901007773733a2f2f65656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565",
+      "base64url": "pGF2AWNjYXCqYXYBY2V4cBpo2HqAY3NpZ1hANTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NWRraW5kAGVub25jZVggNDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDRnaG9zdF9mcFggMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBnb3BfY2VydFAyMjIyMjIyMjIyMjIyMjIyZ3N1YmplY3RYIDMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzaWNhcF9lcG9jaBgwbGhvc3Rfcm9vdF9wa1ggMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTFndGxzX3BpbqFka2luZABpZW5kcG9pbnRzgXkBAHdzczovL2VlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWU"
+    },
+    {
+      "name": "max_endpoints",
+      "description": "Edge case: exactly MAX_ENDPOINTS (8) endpoints — the most a decoder accepts. Ordering is meaningful and preserved: a client tries them most-preferred first.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cap"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "v"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_fp"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "4040404040404040404040404040404040404040404040404040404040404040"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_root_pk"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "4141414141414141414141414141414141414141414141414141414141414141"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "op_cert"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "42424242424242424242424242424242"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 0
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "subject"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "4343434343434343434343434343434343434343434343434343434343434343"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "cap_epoch"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 64
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "exp"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1759017600
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "nonce"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "4444444444444444444444444444444444444444444444444444444444444444"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "sig"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "45454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "endpoints"
+            },
+            "value": {
+              "type": "array",
+              "value": [
+                {
+                  "type": "text",
+                  "value": "wss://registry0.example:443"
+                },
+                {
+                  "type": "text",
+                  "value": "wss://registry1.example:443"
+                },
+                {
+                  "type": "text",
+                  "value": "wss://registry2.example:443"
+                },
+                {
+                  "type": "text",
+                  "value": "wss://registry3.example:443"
+                },
+                {
+                  "type": "text",
+                  "value": "wss://registry4.example:443"
+                },
+                {
+                  "type": "text",
+                  "value": "wss://registry5.example:443"
+                },
+                {
+                  "type": "text",
+                  "value": "wss://registry6.example:443"
+                },
+                {
+                  "type": "text",
+                  "value": "wss://registry7.example:443"
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "tls_pin"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 0
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a461760163636170aa617601636578701a68d87a8063736967584045454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545646b696e6400656e6f6e63655820444444444444444444444444444444444444444444444444444444444444444467686f73745f667058204040404040404040404040404040404040404040404040404040404040404040676f705f636572745042424242424242424242424242424242677375626a65637458204343434343434343434343434343434343434343434343434343434343434343696361705f65706f636818406c686f73745f726f6f745f706b5820414141414141414141414141414141414141414141414141414141414141414167746c735f70696ea1646b696e640069656e64706f696e747388781b7773733a2f2f7265676973747279302e6578616d706c653a343433781b7773733a2f2f7265676973747279312e6578616d706c653a343433781b7773733a2f2f7265676973747279322e6578616d706c653a343433781b7773733a2f2f7265676973747279332e6578616d706c653a343433781b7773733a2f2f7265676973747279342e6578616d706c653a343433781b7773733a2f2f7265676973747279352e6578616d706c653a343433781b7773733a2f2f7265676973747279362e6578616d706c653a343433781b7773733a2f2f7265676973747279372e6578616d706c653a343433",
+      "base64url": "pGF2AWNjYXCqYXYBY2V4cBpo2HqAY3NpZ1hARUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRWRraW5kAGVub25jZVggRERERERERERERERERERERERERERERERERERERERERERnaG9zdF9mcFggQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBnb3BfY2VydFBCQkJCQkJCQkJCQkJCQkJCZ3N1YmplY3RYIENDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDaWNhcF9lcG9jaBhAbGhvc3Rfcm9vdF9wa1ggQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFndGxzX3BpbqFka2luZABpZW5kcG9pbnRziHgbd3NzOi8vcmVnaXN0cnkwLmV4YW1wbGU6NDQzeBt3c3M6Ly9yZWdpc3RyeTEuZXhhbXBsZTo0NDN4G3dzczovL3JlZ2lzdHJ5Mi5leGFtcGxlOjQ0M3gbd3NzOi8vcmVnaXN0cnkzLmV4YW1wbGU6NDQzeBt3c3M6Ly9yZWdpc3RyeTQuZXhhbXBsZTo0NDN4G3dzczovL3JlZ2lzdHJ5NS5leGFtcGxlOjQ0M3gbd3NzOi8vcmVnaXN0cnk2LmV4YW1wbGU6NDQzeBt3c3M6Ly9yZWdpc3RyeTcuZXhhbXBsZTo0NDM"
+    },
+    {
+      "name": "private_ca_root_alphabet_edges",
+      "description": "The alphabet case. Its private CA root cycles `fb ff bf`, which encodes to the repeating quad `-_-_` — base64 indices 62 and 63, the only two that differ between RFC 4648's standard (`+`/`/`) and URL-safe (`-`/`_`) alphabets. Every other case here is built from `rep()` runs of one repeated byte, and none of them reaches either index, so without this case the corpus would pin the encoding without ever pinning the alphabet — the one thing the `base64url` field exists to pin. `invite.test.ts` asserts the corpus contains both characters, so deleting this case fails loudly rather than silently narrowing coverage.",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cap"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "v"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_fp"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "6060606060606060606060606060606060606060606060606060606060606060"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_root_pk"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "6161616161616161616161616161616161616161616161616161616161616161"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "op_cert"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "62626262626262626262626262626262"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 0
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "subject"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "6363636363636363636363636363636363636363636363636363636363636363"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "cap_epoch"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 96
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "exp"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1759017600
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "nonce"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "6464646464646464646464646464646464646464646464646464646464646464"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "sig"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "65656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "endpoints"
+            },
+            "value": {
+              "type": "array",
+              "value": [
+                {
+                  "type": "text",
+                  "value": "wss://registry.internal:8443"
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "tls_pin"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "root"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "fbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbf"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a461760163636170aa617601636578701a68d87a8063736967584065656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565646b696e6400656e6f6e63655820646464646464646464646464646464646464646464646464646464646464646467686f73745f667058206060606060606060606060606060606060606060606060606060606060606060676f705f636572745062626262626262626262626262626262677375626a65637458206363636363636363636363636363636363636363636363636363636363636363696361705f65706f636818606c686f73745f726f6f745f706b5820616161616161616161616161616161616161616161616161616161616161616167746c735f70696ea2646b696e640164726f6f745860fbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbffbf69656e64706f696e747381781c7773733a2f2f72656769737472792e696e7465726e616c3a38343433",
+      "base64url": "pGF2AWNjYXCqYXYBY2V4cBpo2HqAY3NpZ1hAZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWRraW5kAGVub25jZVggZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRnaG9zdF9mcFggYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBnb3BfY2VydFBiYmJiYmJiYmJiYmJiYmJiZ3N1YmplY3RYIGNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjaWNhcF9lcG9jaBhgbGhvc3Rfcm9vdF9wa1ggYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFndGxzX3BpbqJka2luZAFkcm9vdFhg-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_aWVuZHBvaW50c4F4HHdzczovL3JlZ2lzdHJ5LmludGVybmFsOjg0NDM"
+    },
+    {
+      "name": "tls_pin_boundary_length",
+      "description": "Edge case: a private CA root at exactly MAX_TLS_PIN_LEN (2048) bytes, the largest the decoder accepts. Also the largest invite this vector set encodes — note its size is NOT a capacity measurement, since the embedded cap's `op_cert` here is a 16-byte dummy pattern rather than a real one (see MEASURED_INVITE_BYTES).",
+      "decoded": {
+        "type": "map",
+        "value": [
+          {
+            "key": {
+              "type": "text",
+              "value": "v"
+            },
+            "value": {
+              "type": "uint",
+              "value": 1
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "cap"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "v"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_fp"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "5050505050505050505050505050505050505050505050505050505050505050"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "host_root_pk"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "5151515151515151515151515151515151515151515151515151515151515151"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "op_cert"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "52525252525252525252525252525252"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 0
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "subject"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "5353535353535353535353535353535353535353535353535353535353535353"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "cap_epoch"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 80
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "exp"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1759017600
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "nonce"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "5454545454545454545454545454545454545454545454545454545454545454"
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "sig"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "55555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "endpoints"
+            },
+            "value": {
+              "type": "array",
+              "value": [
+                {
+                  "type": "text",
+                  "value": "wss://registry.internal:8443"
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "type": "text",
+              "value": "tls_pin"
+            },
+            "value": {
+              "type": "map",
+              "value": [
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "kind"
+                  },
+                  "value": {
+                    "type": "uint",
+                    "value": 1
+                  }
+                },
+                {
+                  "key": {
+                    "type": "text",
+                    "value": "root"
+                  },
+                  "value": {
+                    "type": "bytes",
+                    "value": "cbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcb"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "canonical_cbor_hex": "a461760163636170aa617601636578701a68d87a8063736967584055555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555646b696e6400656e6f6e63655820545454545454545454545454545454545454545454545454545454545454545467686f73745f667058205050505050505050505050505050505050505050505050505050505050505050676f705f636572745052525252525252525252525252525252677375626a65637458205353535353535353535353535353535353535353535353535353535353535353696361705f65706f636818506c686f73745f726f6f745f706b5820515151515151515151515151515151515151515151515151515151515151515167746c735f70696ea2646b696e640164726f6f74590800cbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcb69656e64706f696e747381781c7773733a2f2f72656769737472792e696e7465726e616c3a38343433",
+      "base64url": "pGF2AWNjYXCqYXYBY2V4cBpo2HqAY3NpZ1hAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVWRraW5kAGVub25jZVggVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRnaG9zdF9mcFggUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBnb3BfY2VydFBSUlJSUlJSUlJSUlJSUlJSZ3N1YmplY3RYIFNTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTaWNhcF9lcG9jaBhQbGhvc3Rfcm9vdF9wa1ggUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFndGxzX3BpbqJka2luZAFkcm9vdFkIAMvLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLy8vLaWVuZHBvaW50c4F4HHdzczovL3JlZ2lzdHJ5LmludGVybmFsOjg0NDM"
+    }
+  ]
+}

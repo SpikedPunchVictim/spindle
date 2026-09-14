@@ -19,6 +19,9 @@ use spindle_proto::bootstrap::{
     BundleEntry, DeviceBootstrapBundle, BUNDLE_CURRENT_V, MAX_REGISTRY_LEN,
 };
 use spindle_proto::canonical::{canonical_encode, CborValue};
+use spindle_proto::invite::{
+    InvitePayload, TlsPin, INVITE_CURRENT_V, MAX_ENDPOINTS, MAX_ENDPOINT_LEN, MAX_TLS_PIN_LEN,
+};
 use spindle_proto::signaling::{AnswerPayload, IcePayload, OfferPayload, Transport};
 use spindle_proto::tags;
 use spindle_proto::vfs_rpc::{
@@ -276,6 +279,7 @@ fn main() {
     write_vector_file(&vectors_dir, "vfs-rpc.json", vfs_rpc_vectors());
     write_vector_file(&vectors_dir, "signaling.json", signaling_vectors());
     write_vector_file(&vectors_dir, "bootstrap.json", bootstrap_vectors());
+    write_vector_file(&vectors_dir, "invite.json", invite_vectors());
 }
 
 fn vectors_dir() -> PathBuf {
@@ -1645,6 +1649,157 @@ fn bootstrap_vectors() -> Json {
                  tag, no signing input; see `spindle_proto::bootstrap`'s module doc comment for \
                  why a signature here would have no verifier the QR channel doesn't already \
                  establish."
+                    .to_string(),
+            ),
+        ),
+        ("cases", Json::Arr(cases)),
+    ])
+}
+
+// ---- Invite payload (spindle-invite-v1) ----
+
+/// One `invite`-kind capability, built from `byte` the same way [`bootstrap_entry`] builds its
+/// member cap: every field is `rep()` of a distinct offset so a reader can tell at a glance which
+/// field a byte run belongs to. Not a real signature — see this file's module doc.
+fn invite_capability(byte: u8) -> Capability {
+    Capability {
+        v: 1,
+        host_fp: rep(byte, 32),
+        host_root_pk: rep(byte.wrapping_add(0x01), 32),
+        op_cert: rep(byte.wrapping_add(0x02), 16),
+        kind: CapKind::Invite,
+        subject: rep(byte.wrapping_add(0x03), 32),
+        cap_epoch: byte as u64,
+        exp: 1_759_017_600,
+        nonce: rep(byte.wrapping_add(0x04), 32),
+        sig: rep(byte.wrapping_add(0x05), 64),
+    }
+}
+
+/// Repeats `pattern` until `len` bytes are produced. Unlike [`rep`], which repeats one byte, this
+/// can build a run whose base64url encoding lands on chosen alphabet indices — see the
+/// `private_ca_root_alphabet_edges` case below for why that matters.
+fn cycle(pattern: &[u8], len: usize) -> Vec<u8> {
+    (0..len).map(|i| pattern[i % pattern.len()]).collect()
+}
+
+/// Like [`signaling_case`], plus the `base64url` field. An invite's transport form is the
+/// unpadded base64url text, not raw CBOR — a user pastes it into a client — so pinning only
+/// `canonical_cbor_hex` would leave the alphabet and the no-padding rule untested across
+/// languages, which is exactly where two hand-rolled base64 implementations drift.
+fn invite_case(name: &'static str, description: &'static str, payload: &InvitePayload) -> Json {
+    let bytes = canonical_encode(&payload.to_cbor());
+    Json::Obj(vec![
+        ("name", Json::Str(name.into())),
+        ("description", Json::Str(description.into())),
+        ("decoded", cbor_to_json(&payload.to_cbor())),
+        ("canonical_cbor_hex", Json::hex(&bytes)),
+        ("base64url", Json::Str(payload.to_base64url())),
+    ])
+}
+
+fn invite_vectors() -> Json {
+    let cases = vec![
+        invite_case(
+            "web_pki_two_endpoints",
+            "The baseline invite: an `invite`-kind capability naming the invitee's root_fp as \
+             `subject` (A10.46 — invites are addressed, not bearer), two registry endpoints in \
+             preference order, and public-web-PKI TLS validation.",
+            &InvitePayload {
+                v: INVITE_CURRENT_V,
+                cap: invite_capability(0x10),
+                endpoints: vec![
+                    "wss://registry.example:443".to_string(),
+                    "nats://registry.example:4222".to_string(),
+                ],
+                tls_pin: TlsPin::WebPki,
+            },
+        ),
+        invite_case(
+            "private_ca_root",
+            "Hardened variant: the registry presents a certificate chaining to exactly this \
+             DER-encoded root and nothing else. Pins the `PrivateCaRoot` arm's `{kind: 1, root}` \
+             encoding against `WebPki`'s `{kind: 0}` — the `root` key is absent, not null, when \
+             the pin is web PKI.",
+            &InvitePayload {
+                v: INVITE_CURRENT_V,
+                cap: invite_capability(0x20),
+                endpoints: vec!["wss://registry.internal:8443".to_string()],
+                tls_pin: TlsPin::PrivateCaRoot(rep(0xca, 512)),
+            },
+        ),
+        invite_case(
+            "endpoint_boundary_length",
+            "Edge case: one endpoint at exactly the decoder-enforced byte-length cap \
+             (MAX_ENDPOINT_LEN = 256). The strict decoder must accept exactly this length and \
+             reject one byte more. The cap is on UTF-8 *bytes*, so a TypeScript reader measuring \
+             `String.length` (UTF-16 units) would disagree with Rust on non-ASCII input.",
+            &InvitePayload {
+                v: INVITE_CURRENT_V,
+                cap: invite_capability(0x30),
+                endpoints: vec![format!(
+                    "wss://{}",
+                    "e".repeat(MAX_ENDPOINT_LEN - "wss://".len())
+                )],
+                tls_pin: TlsPin::WebPki,
+            },
+        ),
+        invite_case(
+            "max_endpoints",
+            "Edge case: exactly MAX_ENDPOINTS (8) endpoints — the most a decoder accepts. \
+             Ordering is meaningful and preserved: a client tries them most-preferred first.",
+            &InvitePayload {
+                v: INVITE_CURRENT_V,
+                cap: invite_capability(0x40),
+                endpoints: (0..MAX_ENDPOINTS)
+                    .map(|i| format!("wss://registry{i}.example:443"))
+                    .collect(),
+                tls_pin: TlsPin::WebPki,
+            },
+        ),
+        invite_case(
+            "private_ca_root_alphabet_edges",
+            "The alphabet case. Its private CA root cycles `fb ff bf`, which encodes to the \
+             repeating quad `-_-_` \u{2014} base64 indices 62 and 63, the only two that differ \
+             between RFC 4648's standard (`+`/`/`) and URL-safe (`-`/`_`) alphabets. Every other \
+             case here is built from `rep()` runs of one repeated byte, and none of them reaches \
+             either index, so without this case the corpus would pin the encoding without ever \
+             pinning the alphabet \u{2014} the one thing the `base64url` field exists to pin. \
+             `invite.test.ts` asserts the corpus contains both characters, so deleting this case \
+             fails loudly rather than silently narrowing coverage.",
+            &InvitePayload {
+                v: INVITE_CURRENT_V,
+                cap: invite_capability(0x60),
+                endpoints: vec!["wss://registry.internal:8443".to_string()],
+                tls_pin: TlsPin::PrivateCaRoot(cycle(&[0xfb, 0xff, 0xbf], 96)),
+            },
+        ),
+        invite_case(
+            "tls_pin_boundary_length",
+            "Edge case: a private CA root at exactly MAX_TLS_PIN_LEN (2048) bytes, the largest \
+             the decoder accepts. Also the largest invite this vector set encodes — note its \
+             size is NOT a capacity measurement, since the embedded cap's `op_cert` here is a \
+             16-byte dummy pattern rather than a real one (see MEASURED_INVITE_BYTES).",
+            &InvitePayload {
+                v: INVITE_CURRENT_V,
+                cap: invite_capability(0x50),
+                endpoints: vec!["wss://registry.internal:8443".to_string()],
+                tls_pin: TlsPin::PrivateCaRoot(rep(0xcb, MAX_TLS_PIN_LEN)),
+            },
+        ),
+    ];
+
+    Json::Obj(vec![
+        (
+            "description",
+            Json::Str(
+                "Invite payload container (`spindle-invite-v1`, DESIGN.md \u{a7}A4 \"Invites\" and \
+                 A10.46): the pasteable blob that carries a signed `invite`-kind capability \
+                 together with everything a fresh client needs to reach the registry it names \
+                 \u{2014} ordered endpoints and how to authenticate the registry's TLS. Unsigned \
+                 as a container, like A4's bootstrap bundle: the capability inside carries the \
+                 signature, so the container has no domain tag and no signing input. Each case \
+                 pins both the canonical CBOR and the unpadded-base64url transport form."
                     .to_string(),
             ),
         ),

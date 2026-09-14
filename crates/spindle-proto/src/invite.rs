@@ -402,13 +402,15 @@ impl InvitePayload {
     pub fn select_endpoint(&self, supported: &[&str]) -> Result<&str, InviteWireError> {
         self.endpoints
             .iter()
-            .find(|e| {
-                supported.iter().any(|s| {
-                    e.len() > s.len() + 3 && e.is_char_boundary(s.len()) && {
-                        let (head, rest) = e.split_at(s.len());
-                        head.eq_ignore_ascii_case(s) && rest.starts_with("://")
-                    }
-                })
+            .find(|e| match e.find("://") {
+                // `scheme` is everything before the first `://`. Comparison is
+                // **ASCII**-case-insensitive, per RFC 3986 §3.1 (a scheme is ASCII by
+                // construction). Deliberately not a full Unicode case fold: `@spindle/proto`'s
+                // twin has to match this exactly, and `String.prototype.toLowerCase` folds
+                // characters `eq_ignore_ascii_case` leaves alone (U+212A KELVIN SIGN → `k`), which
+                // would make one implementation accept an endpoint the other refuses.
+                Some(i) if i > 0 => supported.iter().any(|s| e[..i].eq_ignore_ascii_case(s)),
+                _ => false,
             })
             .map(String::as_str)
             .ok_or(InviteWireError::NoSupportedEndpoint {
@@ -698,6 +700,22 @@ mod tests {
                 offered: 2,
                 supported: 1
             }
+        );
+    }
+
+    /// The twin-divergence guard for the rule above. `String.prototype.toLowerCase()` in the
+    /// TypeScript twin folds characters `eq_ignore_ascii_case` leaves alone — U+212A KELVIN SIGN
+    /// lowercases to `k`. If either side reached for a full Unicode fold, this would start
+    /// matching on one side only, and the two would disagree about whether an invite is usable.
+    #[test]
+    fn scheme_matching_does_not_unicode_fold() {
+        let invite = InvitePayload {
+            endpoints: vec!["W\u{212A}\u{212A}://registry.example:443".to_string()],
+            ..sample_invite()
+        };
+        assert!(
+            invite.select_endpoint(&["wkk"]).is_err(),
+            "a KELVIN SIGN must not fold to `k` — the TS twin's toLowerCase() would"
         );
     }
 

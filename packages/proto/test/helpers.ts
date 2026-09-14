@@ -24,6 +24,7 @@ import type {
 } from "../src/artifacts.js";
 import { CapKind } from "../src/artifacts.js";
 import type { BundleEntry, DeviceBootstrapBundle } from "../src/bootstrap.js";
+import type { InvitePayload, TlsPin } from "../src/invite.js";
 
 // ---- vector file loading ----
 
@@ -257,6 +258,36 @@ export function parseBootstrapBundle(d: any): DeviceBootstrapBundle {
     v: Number(rawMapField(d, "v").value),
     registry: rawMapField(d, "registry").value,
     entries: (rawMapField(d, "entries").value as unknown[]).map(bundleEntryFromTree),
+  };
+}
+
+// ---- invite.json: generic CBOR-tree -> InvitePayload ----
+//
+// `vectors/invite.json` uses the same generic `{type, value}` `decoded` shape as `bootstrap.json`,
+// so the same `rawMapField`/`capabilityJsonFromTree` walk applies. The one thing to watch is
+// `tls_pin`: `WebPki` encodes as `{kind: 0}` with the `root` key **absent**, not present-and-null,
+// so this reads `root` only on the `kind: 1` arm — reading it unconditionally would turn a
+// well-formed web-PKI pin into an `undefined` root and quietly pass the round-trip.
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function tlsPinFromTree(node: any): TlsPin {
+  const kind = Number(rawMapField(node, "kind").value);
+  if (kind === 0) return { kind: "WebPki" };
+  if (kind === 1) return { kind: "PrivateCaRoot", root: hexToBytes(rawMapField(node, "root").value) };
+  throw new Error(`tlsPinFromTree: unknown kind ${kind}`);
+}
+
+/** Parses a `vectors/invite.json` case's `decoded` field (generic `{type, value}` CBOR tree) into
+ * an `InvitePayload`. See `parseBootstrapBundle` above for why this shape differs from
+ * `parseCapability` etc.'s flat-JSON convention. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function parseInvitePayload(d: any): InvitePayload {
+  return {
+    v: Number(rawMapField(d, "v").value),
+    cap: parseCapability(capabilityJsonFromTree(rawMapField(d, "cap"))),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    endpoints: (rawMapField(d, "endpoints").value as any[]).map((e: any) => e.value as string),
+    tls_pin: tlsPinFromTree(rawMapField(d, "tls_pin")),
   };
 }
 

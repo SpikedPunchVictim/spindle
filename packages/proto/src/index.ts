@@ -87,3 +87,19 @@ export {
   DeviceBootstrapBundle,
 } from "./bootstrap.js";
 export type { BundleWireErrorKind } from "./bootstrap.js";
+export {
+  INVITE_FORMAT_ID,
+  INVITE_MIN_V,
+  INVITE_CURRENT_V,
+  MAX_ENDPOINT_LEN,
+  MAX_ENDPOINTS,
+  MAX_TLS_PIN_LEN,
+  TLS_PIN_FIELDS,
+  INVITE_FIELDS,
+  InviteWireError,
+  TlsPin,
+  InvitePayload,
+  base64UrlEncode,
+  base64UrlDecode,
+} from "./invite.js";
+export type { InviteWireErrorKind } from "./invite.js";
