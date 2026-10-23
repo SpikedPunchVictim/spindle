@@ -198,13 +198,14 @@ impl HelperView for InMemoryHelperView {
         root_fp: &Fingerprint,
         epoch: u64,
         revoked: &[Fingerprint],
-    ) {
+    ) -> Option<u64> {
         let entry = self
             .self_revoked
             .entry(*root_fp)
             .or_insert_with(|| (0, HashSet::new()));
         entry.0 = entry.0.max(epoch.min(i64::MAX as u64));
         entry.1.extend(revoked.iter().copied());
+        Some(entry.0)
     }
 
     fn is_self_revoked(&mut self, root_fp: &Fingerprint, device_fp: &Fingerprint) -> bool {

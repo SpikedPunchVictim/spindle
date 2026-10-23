@@ -448,19 +448,29 @@ impl PgStore {
         .get::<bool, _>("revoked")
     }
 
+    /// Writes an accepted self-revocation and returns the stored high-water epoch, or `None` if
+    /// anything in the transaction did not persist (the caller replies with an error rather than
+    /// inventing an epoch). The subject set is written in **one statement** — `INSERT ... SELECT
+    /// $1, unnest($2::bytea[]) ON CONFLICT DO NOTHING` — not one round trip per entry, so an
+    /// accepted record's write cost is bounded regardless of how many (deduplicated) entries it
+    /// carries. The epoch upsert and the subject insert are in one transaction, so a record is
+    /// either fully applied or not at all; the high-water mark is read back inside that same
+    /// transaction, so the returned value is what this write actually left stored.
     async fn record_self_revocation_async(
         &self,
         root_fp: &Fingerprint,
         epoch: u64,
         revoked: &[Fingerprint],
-    ) {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .expect("begin self-revocation transaction");
+    ) -> Option<u64> {
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to begin self-revocation transaction");
+                return None;
+            }
+        };
 
-        sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO self_revocation_epochs (root_fp, epoch) VALUES ($1, $2)
              ON CONFLICT (root_fp) DO UPDATE SET
                 epoch = GREATEST(self_revocation_epochs.epoch, excluded.epoch)",
@@ -469,23 +479,48 @@ impl PgStore {
         .bind(epoch.min(i64::MAX as u64) as i64)
         .execute(&mut *tx)
         .await
-        .expect("self_revocation_epochs max-wins upsert");
-
-        for device in revoked {
-            sqlx::query(
-                "INSERT INTO self_revocations (root_fp, device_fp) VALUES ($1, $2)
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(fp_bytes(root_fp))
-            .bind(fp_bytes(device))
-            .execute(&mut *tx)
-            .await
-            .expect("self_revocations insert");
+        {
+            tracing::error!(error = %e, "self_revocation_epochs max-wins upsert failed");
+            return None;
         }
 
-        tx.commit()
-            .await
-            .expect("commit self-revocation transaction");
+        // The whole subject set in one statement. `revoked` is already deduplicated by the
+        // handler, but `ON CONFLICT DO NOTHING` keeps the store idempotent even if a caller
+        // (or a future one) passes duplicates.
+        let entries: Vec<Vec<u8>> = revoked.iter().map(fp_bytes).collect();
+        if let Err(e) = sqlx::query(
+            "INSERT INTO self_revocations (root_fp, device_fp)
+             SELECT $1, unnest($2::bytea[])
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(fp_bytes(root_fp))
+        .bind(entries)
+        .execute(&mut *tx)
+        .await
+        {
+            tracing::error!(error = %e, "self_revocations bulk insert failed");
+            return None;
+        }
+
+        let stored =
+            match sqlx::query("SELECT epoch FROM self_revocation_epochs WHERE root_fp = $1")
+                .bind(fp_bytes(root_fp))
+                .fetch_one(&mut *tx)
+                .await
+            {
+                Ok(row) => row.get::<i64, _>("epoch") as u64,
+                Err(e) => {
+                    tracing::error!(error = %e, "self_revocation_epoch read-back failed");
+                    return None;
+                }
+            };
+
+        if let Err(e) = tx.commit().await {
+            tracing::error!(error = %e, "commit self-revocation transaction failed");
+            return None;
+        }
+
+        Some(stored)
     }
 
     /// Deletes every session record whose `exp` is at or before `now`. Not part of
@@ -577,7 +612,7 @@ impl HelperView for PgStore {
         root_fp: &Fingerprint,
         epoch: u64,
         revoked: &[Fingerprint],
-    ) {
+    ) -> Option<u64> {
         run_blocking(self.record_self_revocation_async(root_fp, epoch, revoked))
     }
 
@@ -881,10 +916,21 @@ mod tests {
             "absence is explicit, not a 0 sentinel"
         );
 
-        store.record_self_revocation(&root, 5, &[device_a]);
+        assert_eq!(
+            store.record_self_revocation(&root, 5, &[device_a]),
+            Some(5),
+            "a persisted write returns the stored high-water epoch"
+        );
+        // The bulk `INSERT ... SELECT unnest(...)` accepts a duplicated entry list idempotently
+        // (`ON CONFLICT DO NOTHING`), even though the handler deduplicates before calling here.
+        assert_eq!(
+            store.record_self_revocation(&root, 5, &[device_a, device_a]),
+            Some(5)
+        );
+        assert!(store.is_self_revoked(&root, &device_a));
         // A stale, NON-empty record: it must still union its subjects while leaving the epoch
         // high-water mark alone ("a replay of an older record can only add subjects").
-        store.record_self_revocation(&root, 2, &[device_b]);
+        assert_eq!(store.record_self_revocation(&root, 2, &[device_b]), Some(5));
         assert!(store.is_self_revoked(&root, &device_a));
         assert!(
             store.is_self_revoked(&root, &device_b),
@@ -896,14 +942,22 @@ mod tests {
             "a lower epoch must never roll the high-water mark backward"
         );
 
-        store.record_self_revocation(&root, 9, &[device_c]);
-        store.record_self_revocation(&root, 9, &[device_a]); // replay is idempotent
+        assert_eq!(store.record_self_revocation(&root, 9, &[device_c]), Some(9));
+        assert_eq!(
+            store.record_self_revocation(&root, 9, &[device_a]),
+            Some(9),
+            "replay is idempotent and reports the same epoch"
+        );
         assert!(store.is_self_revoked(&root, &device_a));
         assert!(store.is_self_revoked(&root, &device_b));
         assert!(store.is_self_revoked(&root, &device_c));
         assert_eq!(store.self_revocation_epoch(&root), Some(9));
 
-        store.record_self_revocation(&root, 10, &[]); // higher epoch, empty list
+        assert_eq!(
+            store.record_self_revocation(&root, 10, &[]),
+            Some(10),
+            "a higher epoch, empty list advances the reported epoch without adding subjects"
+        );
         assert!(
             store.is_self_revoked(&root, &device_a)
                 && store.is_self_revoked(&root, &device_b)
@@ -932,14 +986,20 @@ mod tests {
         };
         let root = fp(b"pg-sr-root-saturate");
         let device = fp(b"pg-sr-device-saturate");
-        store.record_self_revocation(&root, u64::MAX, &[device]);
+        assert_eq!(
+            store.record_self_revocation(&root, u64::MAX, &[device]),
+            Some(i64::MAX as u64)
+        );
         assert_eq!(
             store.self_revocation_epoch(&root),
             Some(i64::MAX as u64),
             "the BIGINT column must saturate, not wrap negative"
         );
         assert!(store.is_self_revoked(&root, &device));
-        store.record_self_revocation(&root, 7, &[]);
+        assert_eq!(
+            store.record_self_revocation(&root, 7, &[]),
+            Some(i64::MAX as u64)
+        );
         assert_eq!(
             store.self_revocation_epoch(&root),
             Some(i64::MAX as u64),

@@ -25,7 +25,9 @@
 //! - `app_client` — on the application account, authenticated with `APP_CONN_SEED` (a second
 //!   exempted nkey, distinct from `APP_ACCOUNT_SEED`, which is the account's own *signing* key
 //!   used to sign User JWTs and is never used to open a connection). Answers `helper.turn.get.
-//!   <nfp>` and `helper.presence.get.<nfp>`, publishes `host.<hfp>.presence` deltas, and ingests
+//!   <nfp>`, `helper.presence.get.<nfp>`, and `helper.revoke.<nfp>` (a request/reply deposit of a
+//!   root-signed `spindle-self-rev-v1` record — see `spindle_helper::self_revoke`), publishes
+//!   `host.<hfp>.presence` deltas, and ingests
 //!   `registry.revoke.<hfp>` publishes (leg 2 of DESIGN.md §A4's revoke -> kick -> reject chain —
 //!   see `spindle_helper::revoke`'s module doc; this subject is publish-only, no reply). The rest
 //!   of `registry.*` request/reply remains later work. Optional: if `APP_CONN_SEED` is unset, this
@@ -92,6 +94,7 @@ use spindle_helper::permissions::{Limits, SubjectPermissions};
 use spindle_helper::pg_store::PgStore;
 use spindle_helper::presence;
 use spindle_helper::revoke;
+use spindle_helper::self_revoke;
 use spindle_helper::session::SessionRecord;
 use spindle_helper::turn::{self, TurnConfig};
 use std::env;
@@ -526,7 +529,7 @@ impl HelperView for Store {
         root_fp: &spindle_core::Fingerprint,
         epoch: u64,
         revoked: &[spindle_core::Fingerprint],
-    ) {
+    ) -> Option<u64> {
         match self {
             Store::Memory(s) => s.record_self_revocation(root_fp, epoch, revoked),
             Store::Pg(s) => s.record_self_revocation(root_fp, epoch, revoked),
@@ -733,6 +736,24 @@ async fn run(config: Config) -> anyhow::Result<()> {
         None => None,
     };
 
+    // `helper.revoke.*` — DESIGN.md §A5's subject table (S14, amended v0.9.47): a request/reply
+    // deposit of a root-signed `spindle-self-rev-v1` record. The subject is parametrized by the
+    // caller's own session-nkey `nats_fp` (the callout only ever grants a member connection `pub
+    // helper.revoke.<own_nats_fp>`, see `permissions::client_member_permissions`), and
+    // `self_revoke::handle_self_revoke` recovers `<nfp>` from `msg.subject` itself, then checks
+    // the record's `root_fp` and signature against the session record's retained `root_pk`. Same
+    // app connection and same "not configured" handling as `helper.turn.get.*` above.
+    let mut self_revoke_sub: Option<async_nats::Subscriber> = match &app_client {
+        Some(client) => Some(client.subscribe("helper.revoke.*").await?),
+        None => None,
+    };
+
+    // Per-device pre-crypto and per-root accepted-write token budgets for `helper.revoke.<nfp>`
+    // (DESIGN.md §A5's subject table). In-memory and therefore per helper instance — see
+    // `self_revoke`'s module doc; they bound abuse of this request/reply path and are not
+    // authorization.
+    let mut self_revoke_limits = self_revoke::SelfRevokeLimits::new();
+
     // Kick relay (DESIGN.md §A3, S9 leg 3 — see `spindle_helper::kick`'s module doc, and this
     // file's own "Kick relay" module-doc section above). `seed_maps` seeds BOTH maps from the same
     // one CONNZ reply now — `kick_map` used to be fed *only* from live
@@ -936,6 +957,61 @@ async fn run(config: Config) -> anyhow::Result<()> {
                             "registry.revoke.<hfp> record rejected"
                         );
                     }
+                }
+            }
+            msg = next_or_pending(&mut self_revoke_sub) => {
+                let Some(msg) = msg else {
+                    tracing::warn!("helper.revoke.* subscription ended unexpectedly");
+                    self_revoke_sub = None;
+                    continue;
+                };
+                let Some(reply) = msg.reply.clone() else {
+                    continue;
+                };
+                let reply_payload = self_revoke::handle_self_revoke(
+                    msg.subject.as_str(),
+                    &msg.payload,
+                    &mut store,
+                    &mut self_revoke_limits,
+                    now_secs(),
+                );
+                // Log an identifier from the subject token, never any payload bytes and never
+                // an endpoint; `redacted()` keeps it to a prefix like every other id in this
+                // file's log lines (a malformed subject has no fingerprint to redact).
+                let nfp = msg
+                    .subject
+                    .strip_prefix("helper.revoke.")
+                    .and_then(|token| token.parse::<spindle_core::Fingerprint>().ok())
+                    .map(|fp| fp.redacted().to_string())
+                    .unwrap_or_else(|| "<malformed subject>".to_string());
+                match serde_json::from_slice::<self_revoke::SelfRevokeReply>(&reply_payload) {
+                    Ok(outcome) if outcome.ok => {
+                        tracing::info!(
+                            nfp = %nfp,
+                            epoch = outcome.epoch.unwrap_or_default(),
+                            "helper.revoke.<nfp> self-revocation accepted"
+                        );
+                    }
+                    Ok(outcome) => {
+                        tracing::warn!(
+                            nfp = %nfp,
+                            reason = %outcome.error.unwrap_or_default(),
+                            "helper.revoke.<nfp> self-revocation rejected"
+                        );
+                    }
+                    Err(_) => {
+                        // The handler always emits its own `SelfRevokeReply` JSON; failing to
+                        // decode it is an internal bug, not a caller error. No payload bytes.
+                        tracing::error!(
+                            "helper.revoke.<nfp> handler produced an undecodable reply"
+                        );
+                    }
+                }
+                if let Some(client) = &app_client {
+                    if let Err(e) = client.publish(reply, reply_payload.into()).await {
+                        tracing::error!(error = %e, "failed to publish helper.revoke.<nfp> response");
+                    }
+                    let _ = client.flush().await;
                 }
             }
             msg = next_or_pending(&mut connect_sub) => {

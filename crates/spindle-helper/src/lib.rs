@@ -64,6 +64,13 @@
 //!   comment for why that equality check — not a signature check — is deliberately the whole of
 //!   this admission rule, and for the per-host token-bucket rate limiting it deliberately leaves
 //!   unimplemented.
+//! - [`self_revoke`] — [`self_revoke::handle_self_revoke`] (DESIGN.md §A4/§A5 subject table and
+//!   §A7b, *[amended v0.9.47]*): `helper.revoke.<nfp>` deposits, where the caller's session
+//!   record retains `root_pk` so a `spindle-self-rev-v1` record can be checked both against the
+//!   session's `root_fp` and against its signature. Applies every signature-valid record
+//!   unconditionally (the revoked set is a monotone union; see that module's doc comment) under
+//!   per-device (pre-crypto) and per-root (accepted-write) token buckets that bound abuse but are
+//!   explicitly not authorization.
 //!
 //! **Still out of scope** (later slices): the admin-command verifier (`registry.admin.>`), the
 //! kick relay, split-brain newest-wins policy, multi-server `CONNZ` aggregation, and leader-only
@@ -92,6 +99,7 @@ pub mod permissions;
 pub mod pg_store;
 pub mod presence;
 pub mod revoke;
+pub mod self_revoke;
 pub mod session;
 pub mod turn;
 

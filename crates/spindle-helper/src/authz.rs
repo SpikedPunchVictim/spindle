@@ -307,16 +307,25 @@ pub trait HelperView {
     // ============================================================================================
     // Self-revocations (DESIGN.md §A4/§A7b, **[amended v0.9.47]**). These are the durable-store
     // contract for accepted root-signed `spindle-self-rev-v1` records deposited via
-    // `helper.revoke.<nfp>`; the NATS handler itself is a later slice.
+    // `helper.revoke.<nfp>`; the handler is [`crate::self_revoke`].
     // ============================================================================================
 
     /// Records an accepted self-revocation for `root_fp` (DESIGN.md §A7b, **[amended
     /// v0.9.47]**). The accepted `revoked` set is the **monotone union** of every accepted
     /// record's entries: each fingerprint in `revoked` is added to the stored set, and an empty
-    /// list adds nothing. The `epoch` is a **max high-water mark only** — it never decreases (a
-    /// lower epoch cannot shrink the set or the number) and it gates record acceptance elsewhere;
-    /// it is not derived from the subject set. A replay of an older record can therefore only add
-    /// subjects, never remove them.
+    /// list adds nothing. The `epoch` **never gates subject storage**: every verified record
+    /// unions its entries, and the epoch is only a **max high-water mark** that never decreases
+    /// (a lower epoch cannot shrink the set or the number), reported by
+    /// [`Self::self_revocation_epoch`]. It is not derived from the subject set, so a replay of an
+    /// older record can only add subjects, never remove them. [`crate::self_revoke`] has no epoch
+    /// gate at all; its only limits are on pre-crypto attempts and on state-changing verified
+    /// writes (see that module's doc comment).
+    ///
+    /// Returns the **stored high-water epoch after the write**, or `None` if the write did not
+    /// persist (a store error). The returned value is the authoritative post-write epoch: callers
+    /// (the `helper.revoke.<nfp>` handler) reply with it instead of re-reading the store and
+    /// unwrapping an `Option` that a non-persisting write would leave absent. An implementation
+    /// whose writes are infallible (the in-memory store) always returns `Some`.
     ///
     /// **Storage bound, not an acceptance gate**: the durable epoch column is a `BIGINT`, so
     /// epochs above `i64::MAX` are saturated to `i64::MAX as u64` identically by every store
@@ -328,7 +337,7 @@ pub trait HelperView {
         root_fp: &Fingerprint,
         epoch: u64,
         revoked: &[Fingerprint],
-    );
+    ) -> Option<u64>;
 
     /// True if `device_fp` has been self-revoked under `root_fp` by an accepted
     /// `spindle-self-rev-v1` record (DESIGN.md §A4/§A7b, **[amended v0.9.47]**). False for a root
@@ -336,8 +345,9 @@ pub trait HelperView {
     fn is_self_revoked(&mut self, root_fp: &Fingerprint, device_fp: &Fingerprint) -> bool;
 
     /// The stored self-revocation epoch high-water mark for `root_fp` (DESIGN.md §A7b,
-    /// **[amended v0.9.47]**) — the value the epoch gate compares against, and the value
-    /// `helper.revoke.<nfp>` will reply with — or `None` if the helper has accepted no
+    /// **[amended v0.9.47]**) — the value `helper.revoke.<nfp>` reports in its success reply and
+    /// the value its already-applied no-op check compares against — or `None` if the helper has
+    /// accepted no
     /// self-revocation for this root. Absence is explicit rather than a sentinel, so "no record"
     /// is never conflated with "an accepted record at epoch 0". Values saturate at `i64::MAX as
     /// u64` (the durable column is a `BIGINT`; see [`Self::record_self_revocation`]); this is the
@@ -950,13 +960,14 @@ mod tests {
             root_fp: &Fingerprint,
             epoch: u64,
             revoked: &[Fingerprint],
-        ) {
+        ) -> Option<u64> {
             let entry = self
                 .self_revoked
                 .entry(*root_fp)
                 .or_insert_with(|| (0, HashSet::new()));
             entry.0 = entry.0.max(epoch.min(i64::MAX as u64));
             entry.1.extend(revoked.iter().copied());
+            Some(entry.0)
         }
 
         fn is_self_revoked(&mut self, root_fp: &Fingerprint, device_fp: &Fingerprint) -> bool {
@@ -1168,7 +1179,7 @@ mod tests {
             session_attest: attest,
         };
         let mut view = MockView::default();
-        view.record_self_revocation(&root_fp, 3, &[device_fp]);
+        let _ = view.record_self_revocation(&root_fp, 3, &[device_fp]);
         let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
         assert_eq!(
             decision,
@@ -1194,7 +1205,7 @@ mod tests {
             session_attest: attest,
         };
         let mut view = MockView::default();
-        view.record_self_revocation(&root_fp, 3, &[device_fp]);
+        let _ = view.record_self_revocation(&root_fp, 3, &[device_fp]);
         let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
         assert_eq!(
             decision,
@@ -1219,7 +1230,7 @@ mod tests {
             session_attest: attest,
         };
         let mut view = MockView::default();
-        view.record_self_revocation(&root_fp, 3, &[device_fp]);
+        let _ = view.record_self_revocation(&root_fp, 3, &[device_fp]);
         let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
         assert_eq!(
             decision,
@@ -1245,7 +1256,7 @@ mod tests {
             session_attest: attest,
         };
         let mut view = MockView::default();
-        view.record_self_revocation(&root_fp, 3, &[device_fp]);
+        let _ = view.record_self_revocation(&root_fp, 3, &[device_fp]);
         let nkey_calls = Cell::new(0u32);
         let decision = decide_device_connect(
             &presented,

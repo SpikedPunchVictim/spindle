@@ -182,13 +182,15 @@ impl HelperView for InMemoryHelperView {
         root_fp: &Fingerprint,
         epoch: u64,
         revoked: &[Fingerprint],
-    ) {
+    ) -> Option<u64> {
         let entry = self
             .self_revoked
             .entry(*root_fp)
             .or_insert_with(|| (0, HashSet::new()));
         entry.0 = entry.0.max(epoch.min(i64::MAX as u64));
         entry.1.extend(revoked.iter().copied());
+        // An in-memory write cannot fail, so the post-write high-water mark is always present.
+        Some(entry.0)
     }
 
     fn is_self_revoked(&mut self, root_fp: &Fingerprint, device_fp: &Fingerprint) -> bool {
@@ -637,8 +639,8 @@ mod tests {
         let root = fp(b"sr-root-union");
         let device_a = fp(b"sr-device-a");
         let device_b = fp(b"sr-device-b");
-        v.record_self_revocation(&root, 1, &[device_a]);
-        v.record_self_revocation(&root, 2, &[device_b]);
+        let _ = v.record_self_revocation(&root, 1, &[device_a]);
+        let _ = v.record_self_revocation(&root, 2, &[device_b]);
         assert!(v.is_self_revoked(&root, &device_a));
         assert!(
             v.is_self_revoked(&root, &device_b),
@@ -652,8 +654,8 @@ mod tests {
         let mut v = view(AdmissionMode::Open);
         let root = fp(b"sr-root-empty");
         let device = fp(b"sr-device-empty");
-        v.record_self_revocation(&root, 5, &[device]);
-        v.record_self_revocation(&root, 9, &[]);
+        let _ = v.record_self_revocation(&root, 5, &[device]);
+        let _ = v.record_self_revocation(&root, 9, &[]);
         assert!(
             v.is_self_revoked(&root, &device),
             "an empty list at a higher epoch must not clear existing subjects"
@@ -672,10 +674,10 @@ mod tests {
         let device_a = fp(b"sr-device-no-shrink-a");
         let device_b = fp(b"sr-device-no-shrink-b");
         let device_c = fp(b"sr-device-no-shrink-c");
-        v.record_self_revocation(&root, 5, &[device_a]);
+        let _ = v.record_self_revocation(&root, 5, &[device_a]);
         // A stale, NON-empty record: it must still union its subjects while leaving the epoch
         // high-water mark alone ("a replay of an older record can only add subjects").
-        v.record_self_revocation(&root, 2, &[device_b]);
+        let _ = v.record_self_revocation(&root, 2, &[device_b]);
         assert!(v.is_self_revoked(&root, &device_a));
         assert!(
             v.is_self_revoked(&root, &device_b),
@@ -686,7 +688,7 @@ mod tests {
             Some(5),
             "a lower epoch must never roll the stored high-water mark backward"
         );
-        v.record_self_revocation(&root, 5, &[device_c]); // equal epoch may still add subjects
+        let _ = v.record_self_revocation(&root, 5, &[device_c]); // equal epoch may still add subjects
         assert!(v.is_self_revoked(&root, &device_a));
         assert!(v.is_self_revoked(&root, &device_b));
         assert!(v.is_self_revoked(&root, &device_c));
@@ -697,14 +699,14 @@ mod tests {
         let mut v = view(AdmissionMode::Open);
         let root = fp(b"sr-root-saturate");
         let device = fp(b"sr-device-saturate");
-        v.record_self_revocation(&root, u64::MAX, &[device]);
+        let _ = v.record_self_revocation(&root, u64::MAX, &[device]);
         assert_eq!(
             v.self_revocation_epoch(&root),
             Some(i64::MAX as u64),
             "the in-memory store must saturate like Postgres's BIGINT column"
         );
         assert!(v.is_self_revoked(&root, &device));
-        v.record_self_revocation(&root, 7, &[]);
+        let _ = v.record_self_revocation(&root, 7, &[]);
         assert_eq!(
             v.self_revocation_epoch(&root),
             Some(i64::MAX as u64),
@@ -717,8 +719,8 @@ mod tests {
         let mut v = view(AdmissionMode::Open);
         let root = fp(b"sr-root-replay");
         let device = fp(b"sr-device-replay");
-        v.record_self_revocation(&root, 4, &[device]);
-        v.record_self_revocation(&root, 4, &[device]);
+        let _ = v.record_self_revocation(&root, 4, &[device]);
+        let _ = v.record_self_revocation(&root, 4, &[device]);
         assert!(v.is_self_revoked(&root, &device));
         assert_eq!(v.self_revocation_epoch(&root), Some(4));
     }
@@ -729,7 +731,7 @@ mod tests {
         let root_a = fp(b"sr-root-scope-a");
         let root_b = fp(b"sr-root-scope-b");
         let device = fp(b"sr-device-scope");
-        v.record_self_revocation(&root_a, 1, &[device]);
+        let _ = v.record_self_revocation(&root_a, 1, &[device]);
         assert!(v.is_self_revoked(&root_a, &device));
         assert!(
             !v.is_self_revoked(&root_b, &device),
@@ -749,7 +751,7 @@ mod tests {
         let revoked_device = fp(b"sr-device-revoked");
         let other_device = fp(b"sr-device-other");
         assert!(!v.is_self_revoked(&root, &revoked_device));
-        v.record_self_revocation(&root, 1, &[revoked_device]);
+        let _ = v.record_self_revocation(&root, 1, &[revoked_device]);
         assert!(!v.is_self_revoked(&root, &other_device));
         assert!(!v.is_self_revoked(&fp(b"sr-root-never-seen"), &revoked_device));
     }

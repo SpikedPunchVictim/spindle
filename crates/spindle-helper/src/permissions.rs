@@ -107,7 +107,7 @@ pub fn host_permissions(own_host_fp: Fingerprint) -> SubjectPermissions {
 /// (DESIGN.md §A5): per host `h`, `pub host.<h>.connect`, `pub host.<h>.sess.<own>.*.c2h`, `sub
 /// host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus, once for the whole connection (not
 /// per host): `sub _INBOX_<own>.>`, `pub helper.presence.get.<own_nats_fp>`, `pub
-/// helper.turn.get.<own_nats_fp>`.
+/// helper.turn.get.<own_nats_fp>`, `pub helper.revoke.<own_nats_fp>`.
 ///
 /// `own_nats_fp` is the connection's session-nkey fingerprint (the callout-verified identity
 /// behind this NATS connection — see [`crate::session::SessionRecord`]), **not** `own_device_fp`.
@@ -116,9 +116,12 @@ pub fn host_permissions(own_host_fp: Fingerprint) -> SubjectPermissions {
 /// publisher, not from a self-declared payload field — the same scoping pattern `registry.
 /// revoke.<hfp>` already uses for hosts; v0.9.8 extends the identical parametrization to
 /// `helper.presence.get` (DESIGN.md §A5/§A6 v0.9.8, A12 #46 — see `presence.rs`'s module
-/// doc). That means both grants must name the one subject token this connection is actually
-/// allowed to publish on, i.e. its own `nats_fp`, the same identity `session_record(nats_fp,
-/// ...)` is keyed by in `turn.rs`/`presence.rs`.
+/// doc), and §A5's subject table/amended permission bullet scope `helper.revoke.<nfp>` the same
+/// way (S14 — see [`crate::self_revoke`]). That means all three grants must name the one subject
+/// token this connection is actually allowed to publish on, i.e. its own `nats_fp`, the same
+/// identity `session_record(nats_fp, ...)` is keyed by in `turn.rs`/`presence.rs`/`self_revoke.rs`;
+/// a grant keyed by `own_device_fp` would let the connection publish on a subject the helper
+/// resolves to a session it never proved it owns.
 ///
 /// `hosts` must be non-empty — a connection with no fully-verified member host has no business
 /// calling this (see [`client_connect_only_permissions`] instead).
@@ -127,7 +130,7 @@ pub fn client_member_permissions(
     own_nats_fp: Fingerprint,
     hosts: &[Fingerprint],
 ) -> SubjectPermissions {
-    let mut publish_allow = Vec::with_capacity(hosts.len() * 2 + 2);
+    let mut publish_allow = Vec::with_capacity(hosts.len() * 2 + 3);
     let mut subscribe_allow = Vec::with_capacity(hosts.len() * 2 + 1);
     subscribe_allow.push(format!("_INBOX_{own_device_fp}.>"));
     for h in hosts {
@@ -138,6 +141,7 @@ pub fn client_member_permissions(
     }
     publish_allow.push(format!("helper.presence.get.{own_nats_fp}"));
     publish_allow.push(format!("helper.turn.get.{own_nats_fp}"));
+    publish_allow.push(format!("helper.revoke.{own_nats_fp}"));
     SubjectPermissions {
         publish_allow,
         subscribe_allow,
@@ -148,9 +152,9 @@ pub fn client_member_permissions(
 
 /// Connect-only permissions for an invite cap or a stale-but-signature-valid member cap
 /// (DESIGN.md §A5: "Invite-only and stale-cap connections get just `pub host.<h>.connect` +
-/// inbox"). No `helper.presence.get.<nfp>`/`helper.turn.get.<nfp>` of any shape, no session
-/// subjects, no presence sub — those are reserved for connections with at least one
-/// fully-verified member host.
+/// inbox"). No `helper.presence.get.<nfp>`/`helper.turn.get.<nfp>`/`helper.revoke.<nfp>` of any
+/// shape, no session subjects, no presence sub — those are reserved for connections with at least
+/// one fully-verified member host.
 pub fn client_connect_only_permissions(
     own_device_fp: Fingerprint,
     hosts: &[Fingerprint],
@@ -268,6 +272,7 @@ mod tests {
                 format!("host.{h}.sess.{own}.*.c2h"),
                 format!("helper.presence.get.{nats_fp}"),
                 format!("helper.turn.get.{nats_fp}"),
+                format!("helper.revoke.{nats_fp}"),
             ]
         );
         assert_eq!(
@@ -316,6 +321,23 @@ mod tests {
     }
 
     #[test]
+    fn client_member_permissions_revoke_is_scoped_to_nats_fp_not_device_fp() {
+        // Same regression as the turn.get/presence.get tests above, for the S14 helper.revoke
+        // grant (DESIGN.md §A5 subject table, amended v0.9.47).
+        let own_device_fp = fp(b"device-distinct-revoke");
+        let own_nats_fp = fp(b"nats-distinct-revoke");
+        assert_ne!(own_device_fp, own_nats_fp);
+        let h = fp(b"host-e");
+        let perms = client_member_permissions(own_device_fp, own_nats_fp, &[h]);
+        assert!(perms
+            .publish_allow
+            .contains(&format!("helper.revoke.{own_nats_fp}")));
+        assert!(!perms
+            .publish_allow
+            .contains(&format!("helper.revoke.{own_device_fp}")));
+    }
+
+    #[test]
     fn client_member_permissions_scale_per_host() {
         let own = fp(b"device-multi");
         let nats_fp = fp(b"nats-multi");
@@ -324,8 +346,8 @@ mod tests {
         let perms = client_member_permissions(own, nats_fp, &[h1, h2]);
         // One shared inbox sub + 2 subs per host (sess.h2c, presence).
         assert_eq!(perms.subscribe_allow.len(), 1 + 2 * 2);
-        // 2 pubs per host (connect, sess.c2h) + the 2 fixed helper.* pubs.
-        assert_eq!(perms.publish_allow.len(), 2 * 2 + 2);
+        // 2 pubs per host (connect, sess.c2h) + the 3 fixed helper.* pubs.
+        assert_eq!(perms.publish_allow.len(), 2 * 2 + 3);
     }
 
     #[test]
@@ -339,7 +361,14 @@ mod tests {
         assert_eq!(perms.allow_responses, None);
         assert!(
             !perms.publish_allow.iter().any(|s| s.contains("helper.")),
-            "connect-only connections never get helper.presence.get/helper.turn.get.<nfp> of any shape"
+            "connect-only connections never get helper.presence.get/helper.turn.get/helper.revoke.<nfp> of any shape"
+        );
+        assert!(
+            !perms
+                .publish_allow
+                .iter()
+                .any(|s| s.starts_with("helper.revoke.")),
+            "connect-only connections must never get a helper.revoke.<nfp> grant"
         );
         assert!(
             !perms.subscribe_allow.iter().any(|s| s.contains("presence")),
