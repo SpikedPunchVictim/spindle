@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.47) + Execution Plan
+# Spindle — System Design Document (draft v0.9.48) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -214,6 +214,13 @@
 > nothing. (2) The session record did not retain `root_pk`, so `helper.revoke.<nfp>`'s rule
 > "accept only if the signer is the caller's `root_fp`" could not be executed — a fingerprint
 > cannot verify a signature. The record now retains the root public key the caller presented.
+> v0.9.48: one status correction and one decision, no wire change. `helper.revoke.<nfp>` is
+> implemented — handler, permission grant, durable union store, and the pre-crypto callout refusal
+> — but nothing in the workspace produces a `spindle-self-rev-v1` record yet: there is no client,
+> and the TS twin verifies rather than mints because browsers never hold the root. Separately, the
+> per-root bucket as first implemented charged the root **before** verifying the record, which let
+> any compromised device under a root spend that root's budget with unsigned garbage and suppress
+> the owner's genuine revocation. A10.49 records the corrected order.
 
 ---
 
@@ -931,7 +938,7 @@ buckets are an outstanding implementation obligation.
 | `registry.devcert.<hfp>` | host `hfp` only | broker helper | host-signed device certificate (durable; helper asserts subject token == the cert's `host_fp`; per-host token bucket) |
 | `helper.turn.get.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply TURN credentials; caller identity = the subject token (callout-granted), never the payload; helper authorizes via the session record for `nfp` (below) |
 | `helper.devcert.get.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply fetch of a host device certificate; **caller identity = the subject token (callout-granted), never the payload**; the payload names the target `host_fp`, and the helper serves it only if that host is in the caller's session record (`nats_fp → {root_fp, host_fps, ...}`) — so it cannot be used to enumerate hosts the caller holds no cap for. This mirrors the v0.9.7/v0.9.8 parametrization precedent. |
-| `helper.revoke.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply deposit of a **root-signed** `spindle-self-rev-v1` self-revocation (A4/S14); caller identity = the subject token (callout-granted), never the payload; the helper accepts the record only if its signer is the `root_fp` in the caller's session record, so a device can only revoke keys under its own root; durable; per-root token bucket. |
+| `helper.revoke.<nfp>` | device whose session nkey is `nfp` only | broker helper | request/reply deposit of a **root-signed** `spindle-self-rev-v1` self-revocation (A4/S14); caller identity = the subject token (callout-granted), never the payload; the helper accepts the record only if its signer is the `root_fp` in the caller's session record, so a device can only revoke keys under its own root; durable; per-root token bucket. [amended v0.9.48 — the per-root bucket is charged only after verification and only for a state-changing deposit; pre-verification attempts are bounded per device instead, see A10.49] |
 | `registry.admin.>` | operator (mTLS + operator cert) | broker helper | signed admin commands (A3b); replies via `allow_responses` |
 | `_INBOX_<dfp>.>` | host via `allow_responses` after prefix check | owning device | private inbox prefix |
 
@@ -1069,7 +1076,7 @@ that `nfp`.
 | `helper.presence.get.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply presence snapshot for the caller's hosts | ✅ |
 | `helper.turn.get.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply TURN credentials; per-root monthly quota | ✅ |
 | `helper.devcert.get.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply fetch of a host device certificate; payload names the target `host_fp`, served only if that host is in the caller's session record, so it cannot enumerate hosts the caller holds no cap for | ❌ no handler exists |
-| `helper.revoke.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply deposit of a **root-signed** `spindle-self-rev-v1` self-revocation (S14); accepted only if the signer is the `root_fp` in the caller's session record | ❌ no handler exists |
+| `helper.revoke.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply deposit of a **root-signed** `spindle-self-rev-v1` self-revocation (S14); accepted only if the signer is the `root_fp` in the caller's session record | ✅ handler implemented (`spindle_helper::self_revoke`), grant present; **no client producer yet** — see td-a06afc |
 
 **Registry ingest (APP account)**
 
@@ -1120,16 +1127,18 @@ pass to name the SYS connection as primary with this fallback noted.
 3. **Fixed in v0.9.27 (this pass).** CONNZ is issued on the **SYS** connection, not the callout connection A5
    previously described; A5's "Helper account bridging" prose is corrected, and the `SYS_CONN_SEED`-unset fallback
    is recorded as a documented degraded mode (see the footnote above).
-4. **❌ Still open: four specified subjects have no implementation**: `helper.devcert.get.<nfp>`,
-   `registry.devcert.<hfp>`, `registry.admin.>`, and `helper.revoke.<nfp>`. Verification found this is stronger
-   than "missing handlers" for two of the four: `client_member_permissions`
-   (`crates/spindle-helper/src/permissions.rs:112-135`) grants a member connection only
-   `helper.presence.get.<nfp>` and `helper.turn.get.<nfp>` — `helper.devcert.get.<nfp>` and `helper.revoke.<nfp>`
-   are absent from the permission grant itself, not merely unhandled, even though §A5's callout-permissions bullet
-   lists both as granted. Those two are DESIGN-only aspirations end to end: implementing either costs a
-   permission-grant change plus a handler, not a handler alone. The first two subjects in this list are addressed
-   by A10.37 below; `helper.revoke.<nfp>` is S14, tracked as **td-b5d50c**; `registry.admin.>` is the A3b admin
-   plane and needs its own task.
+4. **❌ Still open: three specified subjects have no implementation**: `helper.devcert.get.<nfp>`,
+   `registry.devcert.<hfp>`, and `registry.admin.>`. Verification found this is stronger than "missing
+   handlers" for the first: `client_member_permissions` (`crates/spindle-helper/src/permissions.rs`,
+   `client_member_permissions`) grants a member connection only `helper.presence.get.<nfp>`,
+   `helper.turn.get.<nfp>`, and `helper.revoke.<nfp>` — `helper.devcert.get.<nfp>` is absent from the
+   permission grant itself, not merely unhandled, even though §A5's callout-permissions bullet lists it as
+   granted. That one is a DESIGN-only aspiration end to end: implementing it costs a permission-grant change
+   plus a handler, not a handler alone. `helper.devcert.get.<nfp>` is addressed by A10.37 below;
+   `registry.admin.>` is the A3b admin plane and needs its own task. **`helper.revoke.<nfp>` left this list
+   in v0.9.48**: grant and handler now exist (`spindle_helper::self_revoke`), though nothing produces the
+   records yet — no client mints or deposits a `spindle-self-rev-v1`, tracked as td-a06afc, and S14's
+   host-side delivery/verification has no route at all (td-bdab3a).
 
 **A10.37 — Where the `HostDeviceCert` lives**
 
@@ -1343,7 +1352,7 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 | Admission token | `spindle-adm-v1` | operator key | `exp` days | nonce burn at helper (CAS, idempotent) |
 | Device certificate | `spindle-dev-cert-v2` [amended v0.9.29 — `nats_fp` removed] | identity root | `exp` 1 y; re-sign on contact | n/a (revocable) |
 | Revocation record | `spindle-rev-v1` | host op key [amended v0.9.18] | none (permanent) | **max-wins, never decreases**; old records cannot roll back |
-| Self-revocation record | `spindle-self-rev-v1` | identity root | none (permanent) | **max-wins per root**, never decreases — the accepted `revoked` set is the **monotone union** of every accepted record's entries [amended v0.9.47]: the epoch is a high-water mark that gates acceptance only, so a winning record with an empty `revoked` list revokes nothing and un-revokes nothing |
+| Self-revocation record | `spindle-self-rev-v1` | identity root | none (permanent) | **max-wins per root**, never decreases — the accepted `revoked` set is the **monotone union** of every accepted record's entries [amended v0.9.47]: the epoch is a reported high-water mark that never gates subject storage [amended v0.9.48]: every signature-valid record unions its entries, so a winning record with an empty `revoked` list revokes nothing and un-revokes nothing |
 | Admin command | `spindle-adm-cmd-v1` | operator key | `ts` ±2 min | per-signer monotonic `seq` + nonce; idempotent execution |
 | Host op-key cert | `spindle-host-cert-v2` [amended v0.9.31 — `nats_fp` removed] | host root | `exp` 90 d | n/a (rotation) |
 | Host device cert | `spindle-host-dev-cert-v1` | host op key | `exp` 90 d | n/a (rotation) |
@@ -1698,6 +1707,7 @@ Docker is explicitly not the primary dev environment.
 | 46 | Invite addressing, and where the registry endpoint lives | **DECIDED 2026-09-13 (user decision):** invites are **addressed**, not bearer. The admin obtains the invitee's `root_fp` out of band — a human channel carrying zero packets, the SSH `authorized_keys` shape — creates the member record **with its entitlements** in `invited` status, then mints an invite whose `subject` is that `root_fp`. Forced by a contradiction the document carried since v0.6: A4 called the invite a "bearer token ... shared as QR/link" while A4 step 2's verification list required *every* cap's `subject` to match the presenting `root_fp` with no exception, and the callout implements exactly that, unconditionally (`crates/spindle-helper/src/authz.rs`, `if subject_fp != root_fp`). Both halves could not be true; the bearer half is the one that gives way, because it is the one nothing implements and the one that would require adding a code path whose only purpose is to skip an identity check. The security argument is independent of the contradiction and decided it: A4b attaches entitlements to the account, so under the bearer model an intercepted invite is a working account with files already granted to it, whereas an addressed invite is inert without the invitee's root private key. Rejected: *bearer with post-redemption confirmation* (admin approves the bound `root_fp` before `activate_member`) — genuinely viable, the store already models both halves, and it moves the human step after the network exchange instead of before it; rejected because the human step exists either way and doing it first means an intercepted invite is never live at all, rather than live until someone notices. Rejected: *carrying the endpoint inside the signed capability* — changes `spindle-cap-v1`'s signed preimage, regenerates every capability vector in both languages, and welds a transport hint to a credential that outlives it. **Consequence:** no direct client→host contact exists at any point, in this or any other enrollment path — the host has no listening address, only an outbound registry connection, and the client addresses `host.<hfp>.connect`, a subject scoped by fingerprint rather than by address. This is what lets a host change IP without any member noticing, and it is why the registry endpoint, not a host endpoint, is the thing an invite must carry. **Residual, stated:** ICE candidate exchange discloses the host's address to an *approved* peer once the host answers — inherent to hole-punching; `iceTransportPolicy: relay` (§A6) is the mitigation and is currently a per-session option rather than a host policy. Bears on td-bbb933, td-1dff5e. |
 | 47 | Repeated grants to one entitlement key: replace or union | **DECIDED 2026-09-13:** a repeated grant to an identity-equal `(group, share, fold_key(subpath))` **replaces** `perms`; it does not union them. §A4b's union algebra was silent here — it defines union across *distinct* grants (different groups, different prefixes) and says nothing about re-granting the same key, while `add_entitlement`'s `ON CONFLICT … DO UPDATE SET perms = excluded.perms` has always replaced. Forced onto the record by v0.9.44: A4b now creates a member's entitlements **up front**, at invite time, so the first surface that edits a grant sits on the enrollment path rather than in some later admin tool. Rejected: *union on repeat* — it makes permissions monotonically increasing, so the only way to reduce a grant becomes remove-then-re-add, and an editing surface that round-trips a permission set would silently fail to revoke. That is the failure mode the positive-only algebra deliberately accepts *across* grants and must not accept *within* one. **Fold identity**, decided the same way and for the same reason as the dirent rule: on a collision the pre-existing literal spelling wins and only `perms` is replaced, so a row's name is decided once by whichever spelling created it. **Measured, not assumed:** substituting a bitwise-OR upsert (`perms` OR-ed with `excluded.perms`) for the replace left all 188 `spindle-vfs` tests green — the semantics were pinned by nothing when this row was written, so it ships with a test that discriminates the two. Bears on td-fb40fd, td-bbb933. |
 | 48 | Does an admission token carry the registry endpoint? | **DECIDED 2026-10-23 (user decision):** not in v1. `AdmissionToken` keeps `{nonce, exp, label, quota_profile, sig_operator}`, and the host daemon keeps taking the registry address from its own configuration until a host-onboarding flow exists that consumes a token. A4's old "admission tokens likewise" sentence described a property nothing implemented and no consumer needed. Rejected for now: *adding `endpoints[]` + `tls_pin` to the signed preimage* — this artifact has no `v` field, so a wire-visible change forces a §A7b domain-tag bump (`spindle-adm-v2`) and regenerated vectors in both languages, for a field no caller reads; rejected: *an unsigned wrapper* — unlike the addressed member invite, an admission token is a bearer credential, so an attacker who rewrites the wrapper's endpoint can exfiltrate a token the host would otherwise redeem first. Revisit when host onboarding is built; if the endpoint must travel with the token then, it belongs inside the signed artifact. Bears on td-1dff5e. |
+| 49 | Rate-limiting order for `helper.revoke.<nfp>` | **DECIDED 2026-10-23:** the per-root token bucket is charged **after** signature verification and only for a deposit that changes state; pre-verification attempts are bounded by a separate **per-device** budget. Forced by an adversarial review of the first implementation, which charged the root before verifying: any compromised device under a root (valid certificate, cap, and session — but no root key) could publish unsigned records carrying that root's `root_fp`, which is public, spend the root's ten-token burst, and have the owner's genuinely signed revocation refused `rate limited` before it was ever verified — suppressing the very revocation S14 exists to deliver. The per-root key remains DESIGN's requirement; only the ordering changed. An already-applied record is detected before the charge and costs nothing, so replaying a recorded message cannot drain the bucket. Residual, stated: an observer who captures a *not-yet-applied* valid record can replay it into the bucket — but that observer is the registry itself, which can already drop the record, so this adds no power. Rejected: *keep the pre-verification charge and raise the burst* — any finite burst a compromised device can spend is a suppression budget. Bears on td-b5d50c. |
 
 ## A11. Alternatives considered
 
@@ -1897,6 +1907,15 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.48 (2026-10-23)** — One status correction and one decision, no wire change. `helper.revoke.<nfp>`
+  is implemented: the handler (`spindle_helper::self_revoke`), the member permission grant that was missing, a
+  durable per-root union store, and the pre-crypto callout refusal. Nothing produces the record yet — there is
+  no client, and the TypeScript side verifies rather than mints because browsers never hold the root (td-a06afc);
+  S14's host-side delivery has no route at all (td-bdab3a). The decision (A10.49) is the bucket order: the
+  per-root token is charged only after verification and only for a state-changing deposit, while pre-verification
+  attempts are bounded per device. The first implementation charged the root before verifying, which let a
+  compromised device under a root spend the root's budget with unsigned garbage and suppress its own revocation.
+  An already-applied record is a no-op and costs no token.
 - **v0.9.47 (2026-10-23)** — Two corrections, no wire change. (1) A7b's self-revocation row said max-wins per
   root "never decreases" and left the set operation unstated. The accepted `revoked` set is the **monotone
   union** of every accepted record's entries; the per-root epoch only gates acceptance. Without that, a restored
