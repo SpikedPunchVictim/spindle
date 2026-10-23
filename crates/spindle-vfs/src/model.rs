@@ -311,15 +311,26 @@ pub enum MemberStatus {
     Revoked,
 }
 
-/// A member: `{member_id, root_fp, display_name, status, devices, groups, created}` (§A4b). A
-/// freshly created member (redeemed invite, no group edits yet) starts in the `Members` group
-/// with `groups` containing only that group's id and therefore has **no** grants anywhere —
-/// "secure by default" (§A4b) is a property of there being no entitlements naming that group's
-/// id yet, not of anything special in this struct.
+/// A member: `{member_id, root_fp, root_pk, display_name, status, devices, groups, created}`
+/// (§A4b). A freshly created member (redeemed invite, no group edits yet) starts in the
+/// `Members` group with `groups` containing only that group's id and therefore has **no** grants
+/// anywhere — "secure by default" (§A4b) is a property of there being no entitlements naming that
+/// group's id yet, not of anything special in this struct.
 #[derive(Clone, Debug)]
 pub struct Member {
     pub member_id: MemberId,
     pub root_fp: Fingerprint,
+    /// The member's Ed25519 identity-root public key, added in td-22e12c; `None` until enrollment
+    /// supplies it (pre-V10 rows have none — see `crate::store::schema::SCHEMA_V10`).
+    ///
+    /// [`Member::root_fp`] is `spindle_core::identity::root_fp_of` of this key — the hash of it —
+    /// and that relation is one-way: `root_fp` can be recomputed from `root_pk`, never the reverse.
+    /// `Vec<u8>` rather than `[u8; 32]` deliberately mirrors [`Device::sign_pk`]: both are stored
+    /// as nullable `BLOB` columns, and keeping the in-memory shape byte-oriented avoids a
+    /// conversion at the store boundary while leaving the `Option` to mean "no key on file".
+    /// `None` means a key is missing, never that a check should be skipped; the write path
+    /// (`crate::store::Store::set_member_root_pk`) refuses a key that does not hash to `root_fp`.
+    pub root_pk: Option<Vec<u8>>,
     pub display_name: String,
     pub status: MemberStatus,
     pub devices: Vec<Device>,

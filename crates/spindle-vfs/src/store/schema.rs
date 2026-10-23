@@ -422,6 +422,27 @@ ALTER TABLE devices ADD COLUMN alg_id INTEGER;
 UPDATE devices SET alg_id = 1 WHERE sign_pk IS NOT NULL AND agree_pk IS NOT NULL;
 "#;
 
+/// Version 10 (td-22e12c) — persists `members.root_pk`, the member's Ed25519 identity-root public
+/// key. Until now the store kept only `root_fp`, a one-way hash with no preimage anywhere in this
+/// database, so a host had no way to retain (or later retrieve) the public half of a member's
+/// identity root. Nullable for the same reason `devices.sign_pk`/`agree_pk` are
+/// (`SCHEMA_V3`/`SCHEMA_V4`): `ALTER TABLE ... ADD COLUMN` requires a default for `NOT NULL`, and
+/// there is no sensible default for a key. A `NULL` here means "no key on file", never "skip the
+/// check".
+///
+/// **No backfill, by design, and none is possible**: `root_fp = hash(root_pk)`
+/// (`spindle_core::identity::root_fp_of`) is one-way, so nothing on a pre-V10 row — or anywhere
+/// else in this store — can recover the public key a pre-existing `root_fp` was computed from.
+/// Those rows read `None` until an enrollment path supplies the key.
+///
+/// The write path (`crate::store::Store::set_member_root_pk`) rejects a key whose
+/// `root_fp_of(key)` does not equal the member's stored `root_fp`, so a row that can never verify
+/// cannot be written through this API; see that method's doc comment for why the binding is
+/// checked at write time rather than at verification time.
+const SCHEMA_V10: &str = r#"
+ALTER TABLE members ADD COLUMN root_pk BLOB;
+"#;
+
 /// Every schema version in order, oldest first. Appending a new `(N, SQL)` pair is the only way
 /// to evolve the schema — existing entries are never edited once shipped.
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -434,6 +455,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (7, SCHEMA_V7),
     (8, SCHEMA_V8),
     (9, SCHEMA_V9),
+    (10, SCHEMA_V10),
 ];
 
 /// Applies every migration strictly newer than the connection's current `user_version`, each in
@@ -863,16 +885,71 @@ mod tests {
         );
     }
 
+    /// This ticket's upgrade-path check (persisted `root_pk`, SCHEMA_V10): build a database at
+    /// the OLD (pre-V10) schema by hand — directly from `SCHEMA_V1..V9`, for the same reason
+    /// `migrate_v7_rebuilds_uploaded_files_and_zeroes_both_counters`'s doc comment gives — seed a
+    /// member under the OLD (no `root_pk`) shape, then run [`migrate`] and confirm SCHEMA_V10's
+    /// documented behavior: the column exists, `user_version` reaches 10, and the pre-existing
+    /// member reads `root_pk = NULL` rather than having a key invented for it (there is none to
+    /// backfill from — `root_fp` is one-way).
+    #[test]
+    fn migrate_v10_adds_root_pk_left_null_for_existing_members() {
+        let mut conn = Connection::open_in_memory().expect("open");
+
+        // Hand-roll a database at schema version 9 (pre-V10) by applying V1..V9 directly.
+        conn.execute_batch(SCHEMA_V1).expect("apply V1");
+        conn.execute_batch(SCHEMA_V2).expect("apply V2");
+        conn.execute_batch(SCHEMA_V3).expect("apply V3");
+        conn.execute_batch(SCHEMA_V4).expect("apply V4");
+        conn.execute_batch(SCHEMA_V5).expect("apply V5");
+        conn.execute_batch(SCHEMA_V6).expect("apply V6");
+        conn.execute_batch(SCHEMA_V7).expect("apply V7");
+        conn.execute_batch(SCHEMA_V8).expect("apply V8");
+        conn.execute_batch(SCHEMA_V9).expect("apply V9");
+        conn.execute_batch("PRAGMA user_version = 9")
+            .expect("set user_version to 9");
+
+        conn.execute(
+            "INSERT INTO members (root_fp, display_name, status, created) \
+             VALUES (?1, 'Alex', 'active', 0)",
+            [vec![0x11u8; 32]],
+        )
+        .expect("insert pre-V10 member");
+
+        migrate(&mut conn).expect("migrate old schema up to latest");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, 10, "SCHEMA_V10 must advance user_version to 10");
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
+
+        // Naming `root_pk` would error against the OLD table shape, so this genuinely proves the
+        // column was added rather than merely querying a column-agnostic `SELECT *`.
+        let root_pk: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT root_pk FROM members WHERE display_name = 'Alex'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read root_pk via the new column");
+        assert_eq!(
+            root_pk, None,
+            "a pre-V10 member has no key to backfill (root_fp is a one-way hash of root_pk) and \
+             must read NULL, not a fabricated key"
+        );
+    }
+
     #[test]
     fn migrate_refuses_a_database_from_a_newer_build() {
         let mut conn = Connection::open_in_memory().expect("open");
         migrate(&mut conn).expect("migrate to latest");
         let supported = MIGRATIONS.last().unwrap().0;
 
-        // One past the newest migration this build knows about (SCHEMA_V9, added by this ticket)
+        // One past the newest migration this build knows about (SCHEMA_V10, added by this ticket)
         // — must be bumped again whenever a new migration is appended, or this stops testing a
         // genuinely-too-new version and starts testing a merely-current one.
-        conn.execute_batch("PRAGMA user_version = 10")
+        conn.execute_batch("PRAGMA user_version = 11")
             .expect("simulate a newer-build database");
 
         let err = migrate(&mut conn).expect_err("must refuse a newer schema version");
@@ -881,14 +958,14 @@ mod tests {
                 found,
                 supported: s,
             } => {
-                assert_eq!(found, 10);
+                assert_eq!(found, 11);
                 assert_eq!(s, supported);
             }
             other => panic!("expected StoreError::SchemaTooNew, got {other:?}"),
         }
         let message = err_to_string(&err);
         assert!(
-            message.contains("10"),
+            message.contains("11"),
             "message must mention found version: {message}"
         );
         assert!(

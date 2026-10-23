@@ -175,6 +175,49 @@ pub enum StoreError {
     )]
     UnsupportedAlgId { alg_id: u8 },
 
+    /// [`Store::set_member_root_pk`]'s length check: an Ed25519 public key encoding is exactly 32
+    /// bytes. Carries the supplied `len` so a caller passing the wrong slice sees which size was
+    /// rejected, not just that something was.
+    #[error(
+        "member {member_id:?}'s root_pk must be exactly 32 bytes (got {len}); it is an Ed25519 \
+         public-key encoding"
+    )]
+    MemberRootPkWrongLength { member_id: MemberId, len: usize },
+
+    /// [`Store::set_member_root_pk`]'s encoding check: the 32 bytes are not a canonically encoded
+    /// Ed25519 public key (`spindle_core::checked_verifying_key`, RFC 8032 §5.1.3). A distinct
+    /// variant from [`StoreError::MemberRootPkWrongLength`] because the supplied value is the
+    /// right size but the wrong bytes — a caller that logs only the message can still tell the two
+    /// checks apart.
+    #[error(
+        "member {member_id:?}'s root_pk is not a canonically encoded Ed25519 public key \
+         (RFC 8032 §5.1.3)"
+    )]
+    MemberRootPkNotCanonical { member_id: MemberId },
+
+    /// [`Store::set_member_root_pk`]'s write-time binding check: `root_fp = hash(root_pk)`
+    /// (`spindle_core::identity::root_fp_of`), so a key that does not rehash to the member's
+    /// stored `root_fp` is simply the wrong key for this member (transposed, corrupted, or
+    /// belonging to someone else). Refusing here is what makes a row that can never verify
+    /// impossible to write; the alternative is discovering the mismatch only at connect time.
+    #[error(
+        "supplied root_pk does not hash to member {member_id:?}'s stored root_fp; this is the \
+         wrong key for this member (root_fp = root_fp_of(root_pk), so the key is determined by \
+         the fingerprint)"
+    )]
+    MemberRootPkFingerprintMismatch { member_id: MemberId },
+
+    /// [`Store::set_member_root_pk`]'s write-once guard: the member already has a *different*
+    /// root key on file. Root rotation is a separate, pre-committed operation (DESIGN.md §A4),
+    /// never a side effect of enrollment — silently replacing a member's identity root would
+    /// change who their `root_fp` names. Setting an identical value again is the idempotent
+    /// no-op this guard explicitly permits.
+    #[error(
+        "member {member_id:?} already has a different root_pk; root rotation is a separate, \
+         pre-committed operation and is never a side effect of enrollment"
+    )]
+    MemberRootPkAlreadySet { member_id: MemberId },
+
     /// DESIGN.md §A4b member status: "invited|active|revoked"; revoked is terminal.
     #[error(
         "invalid member status transition {from:?} -> {to:?} (DESIGN.md §A4b: revoked is \
@@ -663,19 +706,21 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT root_fp, display_name, status, created FROM members WHERE member_id = ?1",
+                "SELECT root_fp, root_pk, display_name, status, created FROM members \
+                 WHERE member_id = ?1",
                 params![member_id.0 as i64],
                 |r| {
                     Ok((
                         r.get::<_, Vec<u8>>(0)?,
-                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<Vec<u8>>>(1)?,
                         r.get::<_, String>(2)?,
-                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((root_fp_bytes, display_name, status_str, created)) = row else {
+        let Some((root_fp_bytes, root_pk, display_name, status_str, created)) = row else {
             return Ok(None);
         };
         let root_fp = Fingerprint::from_slice(&root_fp_bytes)?;
@@ -685,12 +730,84 @@ impl Store {
         Ok(Some(Member {
             member_id,
             root_fp,
+            root_pk,
             display_name,
             status,
             devices,
             groups,
             created: created as u64,
         }))
+    }
+
+    /// Records a member's Ed25519 identity-root public key (`members.root_pk`, SCHEMA_V10). The
+    /// member's `root_fp` stays the identifier; this is the preimage it was hashed from, retained
+    /// so the host can retrieve it later (e.g. to verify something signed by the member's root).
+    ///
+    /// **The `root_fp` binding is checked here, at write time, not at verification time.** A row
+    /// whose stored key does not hash to its own `root_fp` can never verify: every verifier that
+    /// recomputes `root_fp_of(root_pk)` and compares it to the stored `root_fp` will reject it.
+    /// This method is the only point at which the host can refuse to create such a row, so it
+    /// fails closed there — checking at the point of use instead would let a bad row persist
+    /// silently and surface only at connect time, as a deny indistinguishable from any other.
+    ///
+    /// Checks, in order, all before any write:
+    /// 1. The member exists ([`StoreError::MemberNotFound`] otherwise).
+    /// 2. `root_pk` is exactly 32 bytes ([`StoreError::MemberRootPkWrongLength`]).
+    /// 3. It is a canonically encoded Ed25519 public key per RFC 8032 §5.1.3, via
+    ///    `spindle_core::checked_verifying_key` ([`StoreError::MemberRootPkNotCanonical`]).
+    /// 4. `spindle_core::identity::root_fp_of(root_pk)` equals the member's stored `root_fp`
+    ///    ([`StoreError::MemberRootPkFingerprintMismatch`]).
+    /// 5. Write-once: if the member already has a key, only an identical value is accepted (an
+    ///    idempotent no-op returning `Ok`); a different value is
+    ///    [`StoreError::MemberRootPkAlreadySet`]. Root rotation is a separate, pre-committed
+    ///    operation, never a side effect of enrollment.
+    pub fn set_member_root_pk(
+        &self,
+        member_id: MemberId,
+        root_pk: &[u8],
+    ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
+
+        // Fetched together with `root_fp`: the existence check and the write-once check both need
+        // this row, and there is no reason to read it twice.
+        let row: Option<(Vec<u8>, Option<Vec<u8>>)> = self
+            .conn
+            .query_row(
+                "SELECT root_fp, root_pk FROM members WHERE member_id = ?1",
+                params![member_id.0 as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((root_fp_bytes, existing_root_pk)) = row else {
+            return Err(StoreError::MemberNotFound(member_id));
+        };
+        let root_fp = Fingerprint::from_slice(&root_fp_bytes)?;
+
+        let root_pk_arr: [u8; 32] =
+            root_pk
+                .try_into()
+                .map_err(|_| StoreError::MemberRootPkWrongLength {
+                    member_id,
+                    len: root_pk.len(),
+                })?;
+        let key = spindle_core::checked_verifying_key(&root_pk_arr)
+            .ok_or(StoreError::MemberRootPkNotCanonical { member_id })?;
+        if spindle_core::identity::root_fp_of(&key) != root_fp {
+            return Err(StoreError::MemberRootPkFingerprintMismatch { member_id });
+        }
+
+        if let Some(existing) = existing_root_pk {
+            if existing.as_slice() == root_pk {
+                return Ok(());
+            }
+            return Err(StoreError::MemberRootPkAlreadySet { member_id });
+        }
+
+        self.conn.execute(
+            "UPDATE members SET root_pk = ?1 WHERE member_id = ?2",
+            params![root_pk, member_id.0 as i64],
+        )?;
+        Ok(())
     }
 
     pub fn list_members(&self) -> Result<Vec<Member>, StoreError> {
@@ -3457,6 +3574,261 @@ mod tests {
             }
             other => panic!("expected StoreError::Sqlite(SqliteFailure), got {other:?}"),
         }
+    }
+
+    // ---- Member identity root key (root_pk, td-22e12c) ----
+
+    /// A fresh identity root plus the member row bound to its fingerprint. Returns the member id
+    /// and the root public-key bytes — `root_fp_of(key) == root.root_fp()`, which is the binding
+    /// `set_member_root_pk` checks.
+    fn member_with_root_key(store: &Store, seed: u8) -> (MemberId, Vec<u8>) {
+        let root = spindle_core::RootKey::from_seed([seed; 32]);
+        let member_id = store
+            .add_member(root.root_fp(), "Alex", 0)
+            .expect("add_member");
+        (member_id, root.public_key().as_bytes().to_vec())
+    }
+
+    #[test]
+    fn set_member_root_pk_round_trips_through_get_member() {
+        let store = Store::open_in_memory().expect("open");
+        let (member_id, root_pk) = member_with_root_key(&store, 0x42);
+
+        store
+            .set_member_root_pk(member_id, &root_pk)
+            .expect("set_member_root_pk");
+
+        let member = store.get_member(member_id).expect("get").expect("exists");
+        assert_eq!(member.root_pk.as_deref(), Some(root_pk.as_slice()));
+
+        // The row's own binding, stated explicitly rather than assumed from the fixture.
+        let arr: [u8; 32] = root_pk.as_slice().try_into().expect("32 bytes");
+        let key = spindle_core::checked_verifying_key(&arr).expect("fixture key is canonical");
+        assert_eq!(
+            spindle_core::identity::root_fp_of(&key),
+            member.root_fp,
+            "the stored root_pk must hash to the member's stored root_fp"
+        );
+    }
+
+    #[test]
+    fn member_without_a_supplied_key_reads_root_pk_none() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+
+        let member = store.get_member(member_id).expect("get").expect("exists");
+        assert_eq!(
+            member.root_pk, None,
+            "a member created before enrollment supplies a key must read None, not a fabricated one"
+        );
+    }
+
+    /// An insert that omits `root_pk` entirely is exactly the shape a pre-SCHEMA_V10 row has.
+    #[test]
+    fn pre_v10_style_member_row_reads_root_pk_none() {
+        let store = Store::open_in_memory().expect("open");
+        store
+            .conn
+            .execute(
+                "INSERT INTO members (root_fp, display_name, status, created) \
+                 VALUES (?1, 'Alex', 'active', 0)",
+                [Fingerprint::of_parts(&[b"pre-v10"]).to_vec()],
+            )
+            .expect("insert pre-V10-shaped member row");
+        let member_id = MemberId(store.conn.last_insert_rowid() as u64);
+
+        let member = store.get_member(member_id).expect("get").expect("exists");
+        assert_eq!(member.root_pk, None, "a pre-V10 row has no key to read");
+    }
+
+    #[test]
+    fn set_member_root_pk_rejects_wrong_lengths() {
+        let store = Store::open_in_memory().expect("open");
+        let (member_id, _root_pk) = member_with_root_key(&store, 0x42);
+
+        for len in [31usize, 33] {
+            let err = store
+                .set_member_root_pk(member_id, &vec![0u8; len])
+                .unwrap_err();
+            match err {
+                StoreError::MemberRootPkWrongLength {
+                    member_id: reported,
+                    len: reported_len,
+                } => {
+                    assert_eq!(reported, member_id);
+                    assert_eq!(reported_len, len);
+                }
+                other => panic!("expected MemberRootPkWrongLength({len}), got {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            store.get_member(member_id).unwrap().unwrap().root_pk,
+            None,
+            "a rejected key must not be written"
+        );
+    }
+
+    #[test]
+    fn set_member_root_pk_rejects_a_non_canonical_ed25519_encoding() {
+        let store = Store::open_in_memory().expect("open");
+        let (member_id, _root_pk) = member_with_root_key(&store, 0x42);
+
+        // `[0xff; 32]` is the non-canonical encoding of `y = 18` (RFC 8032 §5.1.3 requires
+        // `y < p`); pin that claim against the oracle this method actually calls.
+        let non_canonical = [0xffu8; 32];
+        assert!(
+            spindle_core::checked_verifying_key(&non_canonical).is_none(),
+            "fixture sanity: [0xff; 32] must be rejected by checked_verifying_key"
+        );
+
+        let err = store
+            .set_member_root_pk(member_id, &non_canonical)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StoreError::MemberRootPkNotCanonical { member_id: reported } if *reported == member_id
+            ),
+            "expected MemberRootPkNotCanonical, got {err:?}"
+        );
+        assert_eq!(
+            store.get_member(member_id).unwrap().unwrap().root_pk,
+            None,
+            "a rejected key must not be written"
+        );
+    }
+
+    #[test]
+    fn set_member_root_pk_rejects_a_well_formed_key_that_hashes_to_a_different_root_fp() {
+        let store = Store::open_in_memory().expect("open");
+        let (member_id, root_pk) = member_with_root_key(&store, 0x42);
+
+        // A different, perfectly valid identity root: passes length and canonicality, fails only
+        // the write-time `root_fp` binding.
+        let other = spindle_core::RootKey::from_seed([0x43; 32]);
+        let other_pk = other.public_key().as_bytes().to_vec();
+        assert_ne!(
+            other_pk, root_pk,
+            "fixture sanity: two distinct seeds, two distinct keys"
+        );
+
+        let err = store.set_member_root_pk(member_id, &other_pk).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StoreError::MemberRootPkFingerprintMismatch { member_id: reported }
+                    if *reported == member_id
+            ),
+            "expected MemberRootPkFingerprintMismatch, got {err:?}"
+        );
+        assert_eq!(
+            store.get_member(member_id).unwrap().unwrap().root_pk,
+            None,
+            "a mismatched key must not be written"
+        );
+    }
+
+    #[test]
+    fn set_member_root_pk_rejects_a_second_different_key_after_one_is_set() {
+        let store = Store::open_in_memory().expect("open");
+        let (member_id, root_pk) = member_with_root_key(&store, 0x42);
+        store
+            .set_member_root_pk(member_id, &root_pk)
+            .expect("set first key");
+
+        // Any different key is first rejected by the `root_fp` binding (it cannot hash to this
+        // member's fingerprint), and in every case must leave the original key in place.
+        let other = spindle_core::RootKey::from_seed([0x43; 32]);
+        let other_pk = other.public_key().as_bytes().to_vec();
+        store
+            .set_member_root_pk(member_id, &other_pk)
+            .expect_err("a different key must be refused");
+
+        let member = store.get_member(member_id).expect("get").expect("exists");
+        assert_eq!(
+            member.root_pk.as_deref(),
+            Some(root_pk.as_slice()),
+            "a refused replacement must not change the stored key"
+        );
+    }
+
+    #[test]
+    fn set_member_root_pk_refuses_to_replace_a_different_existing_key() {
+        let store = Store::open_in_memory().expect("open");
+        let (member_id, root_pk) = member_with_root_key(&store, 0x42);
+
+        // The write-once guard is reachable only when the stored bytes differ from the supplied
+        // key *and* the supplied key still passes the `root_fp` binding — i.e. the row already
+        // holds bytes inconsistent with `root_fp`, which no API path in this store writes. Seed
+        // that state directly so the guard itself is exercised, rather than letting the binding
+        // check reject the input first and leave this branch untested.
+        let other = spindle_core::RootKey::from_seed([0x43; 32]);
+        let other_pk = other.public_key().as_bytes().to_vec();
+        store
+            .conn
+            .execute(
+                "UPDATE members SET root_pk = ?1 WHERE member_id = ?2",
+                rusqlite::params![other_pk, member_id.0 as i64],
+            )
+            .expect("seed a pre-existing different key");
+
+        let err = store.set_member_root_pk(member_id, &root_pk).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StoreError::MemberRootPkAlreadySet { member_id: reported } if *reported == member_id
+            ),
+            "expected MemberRootPkAlreadySet, got {err:?}"
+        );
+
+        let member = store.get_member(member_id).expect("get").expect("exists");
+        assert_eq!(
+            member.root_pk.as_deref(),
+            Some(other_pk.as_slice()),
+            "a refused replacement must leave the existing row untouched"
+        );
+    }
+
+    #[test]
+    fn set_member_root_pk_rejects_an_unknown_member() {
+        let store = Store::open_in_memory().expect("open");
+        let root = spindle_core::RootKey::from_seed([0x44; 32]);
+        let root_pk = root.public_key().as_bytes().to_vec();
+
+        let missing = MemberId(999);
+        let err = store.set_member_root_pk(missing, &root_pk).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::MemberNotFound(reported) if *reported == missing),
+            "expected MemberNotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn set_member_root_pk_is_idempotent_for_the_same_value() {
+        let store = Store::open_in_memory().expect("open");
+        let (member_id, root_pk) = member_with_root_key(&store, 0x42);
+
+        store
+            .set_member_root_pk(member_id, &root_pk)
+            .expect("set first time");
+        let before = store.get_member(member_id).expect("get").expect("exists");
+
+        store
+            .set_member_root_pk(member_id, &root_pk)
+            .expect("setting the identical key again is an idempotent Ok");
+
+        let after = store.get_member(member_id).expect("get").expect("exists");
+        assert_eq!(
+            after.root_pk, before.root_pk,
+            "an identical re-set must leave the row unchanged"
+        );
+        assert_eq!(
+            after.root_fp, before.root_fp,
+            "an identical re-set must not touch the member's identity"
+        );
     }
 
     // ---- Devices: agree_pk + member_for_device_fp (Stage 6 slice 5) ----

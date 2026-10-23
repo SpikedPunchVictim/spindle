@@ -226,6 +226,7 @@ mod tests {
         Member {
             member_id,
             root_fp: Fingerprint::of_parts(&[b"member"]),
+            root_pk: None,
             display_name: "Alex".to_string(),
             status: MemberStatus::Active,
             devices: vec![],

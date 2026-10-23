@@ -1886,6 +1886,7 @@ mod tests {
         Member {
             member_id: MemberId(1),
             root_fp: Fingerprint::of_parts(&[b"racing-member"]),
+            root_pk: None,
             display_name: "racer".to_string(),
             status: MemberStatus::Active,
             devices: vec![Device {
