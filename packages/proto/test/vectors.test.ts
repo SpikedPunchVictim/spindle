@@ -1,4 +1,4 @@
-// Golden-vector conformance for all ten A7b wire types (vectors/*.json, excluding
+// Golden-vector conformance for all A7b wire types (vectors/*.json, excluding
 // canonical-cbor.json — see canonical.test.ts for that one) plus negative mutation tests: swap
 // key order, lengthen an integer's encoding, and add an unrecognized field, each asserted to be
 // rejected by the strict decoder / closed-schema artifact reader.
@@ -21,6 +21,7 @@ import {
   HostSessionAttestation,
   ProtoError,
   RevocationRecord,
+  SelfRevocationRecord,
   SessionAttestation,
 } from "../src/artifacts.js";
 import {
@@ -37,6 +38,7 @@ import {
   parseHostOpKeyCert,
   parseHostSessionAttestation,
   parseRevocationRecord,
+  parseSelfRevocation,
   parseSessionAttestation,
   swapFirstTwoEntries,
 } from "./helpers.js";
@@ -200,6 +202,14 @@ runArtifactSuite({
 });
 
 runArtifactSuite({
+  fileName: "self-revocation.json",
+  parse: parseSelfRevocation,
+  toCanonicalBytes: SelfRevocationRecord.toCanonicalBytes,
+  fromCanonicalBytes: SelfRevocationRecord.fromCanonicalBytes,
+  signingInput: SelfRevocationRecord.signingInput,
+});
+
+runArtifactSuite({
   fileName: "admin-command.json",
   parse: parseAdminCommand,
   toCanonicalBytes: AdminCommand.toCanonicalBytes,
@@ -229,6 +239,20 @@ runArtifactSuite({
   toCanonicalBytes: HostDeviceCert.toCanonicalBytes,
   fromCanonicalBytes: HostDeviceCert.fromCanonicalBytes,
   signingInput: HostDeviceCert.signingInput,
+});
+
+describe("self-revocation.json: closed schema", () => {
+  // Mirrors `self_revocation_record_round_trip` in
+  // crates/spindle-proto/src/artifacts.rs: `host_fp` belongs to the host-scoped
+  // `RevocationRecord`, not to this root-scoped artifact, and must be rejected outright.
+  it("rejects a `host_fp` field", () => {
+    const doc = loadVectorFile("self-revocation.json") as ArtifactDoc;
+    const mapValue = canonicalDecode(hexToBytes(doc.cases[0].canonical_cbor_hex));
+    const mutated = addUnknownKey(mapValue, "host_fp", CborValue.bytes(new Uint8Array(32)));
+    const err = expectThrows(ProtoError, () => SelfRevocationRecord.fromCanonicalBytes(mutated));
+    expect(err.kind).toBe("UnknownField");
+    expect(err.field).toBe("host_fp");
+  });
 });
 
 describe("device-certificate.json: label field", () => {

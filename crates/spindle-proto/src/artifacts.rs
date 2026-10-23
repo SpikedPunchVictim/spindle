@@ -1,4 +1,4 @@
-//! Wire types for the A7 envelope and the seven other A7b signed-artifact kinds.
+//! Wire types for the A7 envelope and every other A7b signed-artifact kind.
 //!
 //! Every type here is a thin, lossless mapping to/from [`CborValue`] plus a canonical-bytes
 //! convenience wrapper. Field *values* are opaque (`Vec<u8>` for fingerprints/keys/signatures,
@@ -837,6 +837,76 @@ impl RevocationRecord {
 }
 
 // ============================================================================================
+// SelfRevocationRecord (A4/A7b)
+// ============================================================================================
+
+/// `SelfRevocationRecord { root_fp, epoch, revoked: [device_fp...], ts, sig_root }` (DESIGN.md
+/// §A4/§A7b). A person's root revokes keys under its own root, with no host scoping — hence
+/// `root_fp` in place of `RevocationRecord`'s `host_fp` and no host-scoped `cap_epoch`.
+/// `revoked` holds `device_fp` fingerprints, opaque to this crate. The signature field is
+/// `sig_root` (DESIGN's notation), naming its signer like `sig_device`/`sig_operator`/`sig_op`
+/// do elsewhere — `RevocationRecord`'s plain `sig` is the exception, not the convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfRevocationRecord {
+    pub root_fp: Vec<u8>,
+    pub epoch: u64,
+    pub revoked: Vec<Vec<u8>>,
+    pub ts: u64,
+    pub sig_root: Vec<u8>,
+}
+
+const SELF_REVOCATION_FIELDS: &[&str] = &["root_fp", "epoch", "revoked", "ts", "sig_root"];
+
+impl SelfRevocationRecord {
+    fn unsigned_entries(&self) -> Vec<(&str, CborValue)> {
+        vec![
+            ("root_fp", CborValue::bytes(self.root_fp.clone())),
+            ("epoch", CborValue::uint(self.epoch)),
+            ("revoked", bytes_array_value(&self.revoked)),
+            ("ts", CborValue::uint(self.ts)),
+        ]
+    }
+
+    pub fn unsigned_cbor(&self) -> CborValue {
+        CborValue::map(self.unsigned_entries())
+    }
+
+    pub fn to_cbor(&self) -> CborValue {
+        let mut entries = self.unsigned_entries();
+        entries.push(("sig_root", CborValue::bytes(self.sig_root.clone())));
+        CborValue::map(entries)
+    }
+
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        canonical_encode(&self.to_cbor())
+    }
+
+    pub fn from_cbor(v: &CborValue) -> Result<Self, ProtoError> {
+        let m = MapReader::new(v)?;
+        m.deny_unknown_fields(SELF_REVOCATION_FIELDS)?;
+        Ok(SelfRevocationRecord {
+            root_fp: m.bytes("root_fp")?,
+            epoch: m.u64("epoch")?,
+            revoked: m.bytes_array("revoked")?,
+            ts: m.u64("ts")?,
+            sig_root: m.bytes("sig_root")?,
+        })
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ProtoError> {
+        Self::from_cbor(&canonical_decode(bytes)?)
+    }
+
+    /// `"spindle-self-rev-v1" || canonical(self minus sig_root)` (A7b).
+    pub fn signing_input(&self) -> Vec<u8> {
+        tags::signing_input(
+            tags::SELF_REVOCATION_V1,
+            &canonical_encode(&self.unsigned_cbor()),
+        )
+    }
+}
+
+// ============================================================================================
 // AdminCommand (A3b/A7b)
 // ============================================================================================
 
@@ -1396,6 +1466,29 @@ mod tests {
     }
 
     #[test]
+    fn self_revocation_record_round_trip() {
+        let rec = SelfRevocationRecord {
+            root_fp: fp(0x41),
+            epoch: 7,
+            revoked: vec![fp(0x51), fp(0x61)],
+            ts: 1_755_910_001,
+            sig_root: sig(0x71),
+        };
+        let bytes = rec.to_canonical_bytes();
+        let decoded = SelfRevocationRecord::from_canonical_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, rec);
+        assert_eq!(decoded.to_canonical_bytes(), bytes);
+
+        // Closed field set: a `host_fp` (the host-scoped revocation's field) must be rejected.
+        let mut entries = rec.unsigned_entries();
+        entries.push(("host_fp", CborValue::bytes(fp(0x42))));
+        entries.push(("sig_root", CborValue::bytes(rec.sig_root.clone())));
+        let bytes_with_host_fp = canonical_encode(&CborValue::map(entries));
+        let err = SelfRevocationRecord::from_canonical_bytes(&bytes_with_host_fp).unwrap_err();
+        assert_eq!(err, ProtoError::UnknownField("host_fp".to_string()));
+    }
+
+    #[test]
     fn admin_command_round_trip() {
         let cmd = AdminCommand {
             v: 1,
@@ -1504,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn all_ten_signing_inputs_start_with_distinct_tags() {
+    fn all_eleven_signing_inputs_start_with_distinct_tags() {
         let env = sample_envelope(true);
         let cap = sample_capability(CapKind::Member);
         let tok = AdmissionToken {
@@ -1568,6 +1661,13 @@ mod tests {
             ts: 1,
             sig_op: sig(1),
         };
+        let self_revocation = SelfRevocationRecord {
+            root_fp: fp(5),
+            epoch: 1,
+            revoked: vec![],
+            ts: 1,
+            sig_root: sig(1),
+        };
 
         let inputs = [
             env.signing_input(),
@@ -1580,6 +1680,7 @@ mod tests {
             host_device_cert.signing_input(),
             session_attestation.signing_input(),
             host_session_attestation.signing_input(),
+            self_revocation.signing_input(),
         ];
         let tags = [
             tags::ENVELOPE_V1,
@@ -1592,6 +1693,7 @@ mod tests {
             tags::HOST_DEVICE_CERT_V1,
             tags::SESSION_ATTESTATION_V1,
             tags::HOST_SESSION_ATTESTATION_V1,
+            tags::SELF_REVOCATION_V1,
         ];
         for (input, tag) in inputs.iter().zip(tags.iter()) {
             assert!(input.starts_with(tag));

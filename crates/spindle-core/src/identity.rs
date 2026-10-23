@@ -91,15 +91,15 @@ pub fn root_fp_of(root_pk: &VerifyingKey) -> Fingerprint {
 
 // ---- Pre-committed root rotation ----
 //
-// Root rotation is *not* one of spindle-proto's eight A7b-cataloged wire artifact types
-// (Envelope, Capability, AdmissionToken, DeviceCertificate, RevocationRecord, AdminCommand,
-// HostOpKeyCert, HostDeviceCert — see spindle_proto::artifacts). DESIGN.md §A4 and ADR-003
-// describe it in prose only (`sig_old_root(new_root_pk)`, `hash(next_root_pk)` pre-committed),
-// with no corresponding struct in spindle-proto's schema-of-record. Rather than inventing an
-// unauthorized addition to spindle-proto's wire types, this module defines its own minimal
-// domain-separated signing input for the rotation signature, kept entirely inside spindle-core.
-
-const ROOT_ROTATION_TAG: &[u8] = b"spindle-root-rotation-v1";
+// Root rotation is *not* one of spindle-proto's A7b-cataloged wire artifact types (Envelope,
+// Capability, AdmissionToken, DeviceCertificate, RevocationRecord, SelfRevocationRecord,
+// AdminCommand, HostOpKeyCert, HostDeviceCert, SessionAttestation, HostSessionAttestation — see
+// spindle_proto::artifacts). DESIGN.md §A4 and ADR-003 describe it in prose only
+// (`sig_old_root(new_root_pk)`, `hash(next_root_pk)` pre-committed), with no corresponding struct
+// in spindle-proto's schema-of-record. Rather than inventing an unauthorized addition to
+// spindle-proto's wire types, this module defines its own minimal signing input for the rotation
+// signature; the domain tag itself lives in `spindle_proto::tags` (ROOT_ROTATION_V1) so it
+// participates in the prefix-free check alongside the other artifacts the root key signs.
 
 /// A freshly generated next-root keypair plus the hash a current root commits to publish now, so
 /// a future rotation to this key can be verified without the new key ever having been exposed
@@ -122,8 +122,9 @@ pub fn generate_next_root() -> NextRoot {
 }
 
 fn rotation_signing_input(new_root_pk: &VerifyingKey) -> Vec<u8> {
-    let mut v = Vec::with_capacity(ROOT_ROTATION_TAG.len() + FINGERPRINT_KEY_LEN);
-    v.extend_from_slice(ROOT_ROTATION_TAG);
+    let tag = spindle_proto::tags::ROOT_ROTATION_V1;
+    let mut v = Vec::with_capacity(tag.len() + FINGERPRINT_KEY_LEN);
+    v.extend_from_slice(tag);
     v.extend_from_slice(new_root_pk.as_bytes());
     v
 }

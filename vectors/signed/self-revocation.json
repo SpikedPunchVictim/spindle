@@ -1,0 +1,167 @@
+{
+  "artifact": "SelfRevocationRecord",
+  "domain_tag": "spindle-self-rev-v1",
+  "signer": {
+    "role": "identity_root",
+    "seed": {
+      "label": "TEST-ONLY",
+      "seed_hex": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+  },
+  "wrong_root_public_key_hex": "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
+  "cases": [
+    {
+      "name": "valid",
+      "description": "Self-revocation signed by the identity root (one device revoked at epoch 12).",
+      "decoded": {
+        "root_fp": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "epoch": 12,
+        "revoked": [
+          "0f3f01ce262f425b2d9140dc37943026333200005c21cfcd982e590034282b61"
+        ],
+        "ts": 1755907200,
+        "sig_root": "f0c9f017e1685befef02dac380d35eb2b1492bfbacc2799ea907ef7c74780b8eb093bdeeac3e708efd5a6d2fc0f3775505265ede2b581fc496daf9d8b27c4303"
+      },
+      "canonical_cbor_hex": "a56274731a68a904806565706f63680c677265766f6b65648158200f3f01ce262f425b2d9140dc37943026333200005c21cfcd982e590034282b6167726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e687369675f726f6f745840f0c9f017e1685befef02dac380d35eb2b1492bfbacc2799ea907ef7c74780b8eb093bdeeac3e708efd5a6d2fc0f3775505265ede2b581fc496daf9d8b27c4303",
+      "signing_input_hex": "7370696e646c652d73656c662d7265762d7631a46274731a68a904806565706f63680c677265766f6b65648158200f3f01ce262f425b2d9140dc37943026333200005c21cfcd982e590034282b6167726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+      "signature_hex": "f0c9f017e1685befef02dac380d35eb2b1492bfbacc2799ea907ef7c74780b8eb093bdeeac3e708efd5a6d2fc0f3775505265ede2b581fc496daf9d8b27c4303",
+      "verify_with": "signer",
+      "expected_error": null,
+      "signature_valid": true
+    },
+    {
+      "name": "tampered_signature_last_byte",
+      "description": "sig_root's last byte flipped; verify_self_revocation must reject with BadSignature.",
+      "decoded": {
+        "root_fp": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "epoch": 12,
+        "revoked": [
+          "0f3f01ce262f425b2d9140dc37943026333200005c21cfcd982e590034282b61"
+        ],
+        "ts": 1755907200,
+        "sig_root": "f0c9f017e1685befef02dac380d35eb2b1492bfbacc2799ea907ef7c74780b8eb093bdeeac3e708efd5a6d2fc0f3775505265ede2b581fc496daf9d8b27c43fc"
+      },
+      "canonical_cbor_hex": "a56274731a68a904806565706f63680c677265766f6b65648158200f3f01ce262f425b2d9140dc37943026333200005c21cfcd982e590034282b6167726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e687369675f726f6f745840f0c9f017e1685befef02dac380d35eb2b1492bfbacc2799ea907ef7c74780b8eb093bdeeac3e708efd5a6d2fc0f3775505265ede2b581fc496daf9d8b27c43fc",
+      "signing_input_hex": "7370696e646c652d73656c662d7265762d7631a46274731a68a904806565706f63680c677265766f6b65648158200f3f01ce262f425b2d9140dc37943026333200005c21cfcd982e590034282b6167726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+      "signature_hex": "f0c9f017e1685befef02dac380d35eb2b1492bfbacc2799ea907ef7c74780b8eb093bdeeac3e708efd5a6d2fc0f3775505265ede2b581fc496daf9d8b27c43fc",
+      "verify_with": "signer",
+      "expected_error": "BadSignature",
+      "signature_valid": false
+    },
+    {
+      "name": "wrong_root_public_key",
+      "description": "A genuine record for the signer root, verified under a different root key; the root_fp check must reject it with RootFingerprintMismatch.",
+      "decoded": {
+        "root_fp": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "epoch": 12,
+        "revoked": [
+          "0f3f01ce262f425b2d9140dc37943026333200005c21cfcd982e590034282b61"
+        ],
+        "ts": 1755907200,
+        "sig_root": "f0c9f017e1685befef02dac380d35eb2b1492bfbacc2799ea907ef7c74780b8eb093bdeeac3e708efd5a6d2fc0f3775505265ede2b581fc496daf9d8b27c4303"
+      },
+      "canonical_cbor_hex": "a56274731a68a904806565706f63680c677265766f6b65648158200f3f01ce262f425b2d9140dc37943026333200005c21cfcd982e590034282b6167726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e687369675f726f6f745840f0c9f017e1685befef02dac380d35eb2b1492bfbacc2799ea907ef7c74780b8eb093bdeeac3e708efd5a6d2fc0f3775505265ede2b581fc496daf9d8b27c4303",
+      "signing_input_hex": "7370696e646c652d73656c662d7265762d7631a46274731a68a904806565706f63680c677265766f6b65648158200f3f01ce262f425b2d9140dc37943026333200005c21cfcd982e590034282b6167726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+      "signature_hex": "f0c9f017e1685befef02dac380d35eb2b1492bfbacc2799ea907ef7c74780b8eb093bdeeac3e708efd5a6d2fc0f3775505265ede2b581fc496daf9d8b27c4303",
+      "verify_with": "wrong_root",
+      "expected_error": "RootFingerprintMismatch",
+      "signature_valid": false
+    },
+    {
+      "name": "root_fp_disagrees_with_key",
+      "description": "A record genuinely minted by the other root, verified under the signer root; root_fp names the other root, so RootFingerprintMismatch fires before the signature.",
+      "decoded": {
+        "root_fp": "5c29b78f10a35a49a6231d08ee840a04bcc3a37a4f9d46df327dec56b8a9b7c9",
+        "epoch": 13,
+        "revoked": [
+          "40f2ba7baa57e4829908a85a5afc9ec496f83bf36945f94b1e8425df4dcafec4"
+        ],
+        "ts": 1755907200,
+        "sig_root": "083493990f1a19697b0639ccb28306ae9309e252bfd93d313489bf4888ab390210ecef0e8baaa62b92135b43af7a02966d5fec1177df2f8d4d6ebc8b3d4b6906"
+      },
+      "canonical_cbor_hex": "a56274731a68a904806565706f63680d677265766f6b656481582040f2ba7baa57e4829908a85a5afc9ec496f83bf36945f94b1e8425df4dcafec467726f6f745f667058205c29b78f10a35a49a6231d08ee840a04bcc3a37a4f9d46df327dec56b8a9b7c9687369675f726f6f745840083493990f1a19697b0639ccb28306ae9309e252bfd93d313489bf4888ab390210ecef0e8baaa62b92135b43af7a02966d5fec1177df2f8d4d6ebc8b3d4b6906",
+      "signing_input_hex": "7370696e646c652d73656c662d7265762d7631a46274731a68a904806565706f63680d677265766f6b656481582040f2ba7baa57e4829908a85a5afc9ec496f83bf36945f94b1e8425df4dcafec467726f6f745f667058205c29b78f10a35a49a6231d08ee840a04bcc3a37a4f9d46df327dec56b8a9b7c9",
+      "signature_hex": "083493990f1a19697b0639ccb28306ae9309e252bfd93d313489bf4888ab390210ecef0e8baaa62b92135b43af7a02966d5fec1177df2f8d4d6ebc8b3d4b6906",
+      "verify_with": "signer",
+      "expected_error": "RootFingerprintMismatch",
+      "signature_valid": false
+    },
+    {
+      "name": "empty_revoked_array",
+      "description": "Zero-length `revoked` array at a higher epoch. Under the monotone-union rule this adds nothing; it is not an un-revoke instruction.",
+      "decoded": {
+        "root_fp": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "epoch": 15,
+        "revoked": [],
+        "ts": 1755907200,
+        "sig_root": "c015c5fcd3fad48aac444c07665ac1876593f15a580a6ceb8bb7f0df2d84f2d1dfab71b11df2b81eb2741ba28df850e063a2bf9bcb1c680f4bff51b69cc5990b"
+      },
+      "canonical_cbor_hex": "a56274731a68a904806565706f63680f677265766f6b65648067726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e687369675f726f6f745840c015c5fcd3fad48aac444c07665ac1876593f15a580a6ceb8bb7f0df2d84f2d1dfab71b11df2b81eb2741ba28df850e063a2bf9bcb1c680f4bff51b69cc5990b",
+      "signing_input_hex": "7370696e646c652d73656c662d7265762d7631a46274731a68a904806565706f63680f677265766f6b65648067726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+      "signature_hex": "c015c5fcd3fad48aac444c07665ac1876593f15a580a6ceb8bb7f0df2d84f2d1dfab71b11df2b81eb2741ba28df850e063a2bf9bcb1c680f4bff51b69cc5990b",
+      "verify_with": "signer",
+      "expected_error": null,
+      "signature_valid": true
+    },
+    {
+      "name": "multiple_fingerprints_revoked",
+      "description": "Three distinct fingerprints in a fixed order — the order is observable on the wire.",
+      "decoded": {
+        "root_fp": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "epoch": 14,
+        "revoked": [
+          "73f718c757aa42e470a22325afcd54618a14fcab79be6f57432c119940393289",
+          "1bec3ea44911b87d69396788d76e046f7933e7b70232c5f79462c3ae5394fc7f",
+          "4ec631d0c979c556acc71f8bd1596acdd1f8d56f2b10d238e22e655b47740a72"
+        ],
+        "ts": 1755907200,
+        "sig_root": "ea36ddc3fea4789837c2d68ab59ebe844b4c4486eea183971a4b0c82f745951b51d149b7dac48f9932a11d83e99a2a9fdd49e2f7e29656d11a19b778c970f20c"
+      },
+      "canonical_cbor_hex": "a56274731a68a904806565706f63680e677265766f6b656483582073f718c757aa42e470a22325afcd54618a14fcab79be6f57432c11994039328958201bec3ea44911b87d69396788d76e046f7933e7b70232c5f79462c3ae5394fc7f58204ec631d0c979c556acc71f8bd1596acdd1f8d56f2b10d238e22e655b47740a7267726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e687369675f726f6f745840ea36ddc3fea4789837c2d68ab59ebe844b4c4486eea183971a4b0c82f745951b51d149b7dac48f9932a11d83e99a2a9fdd49e2f7e29656d11a19b778c970f20c",
+      "signing_input_hex": "7370696e646c652d73656c662d7265762d7631a46274731a68a904806565706f63680e677265766f6b656483582073f718c757aa42e470a22325afcd54618a14fcab79be6f57432c11994039328958201bec3ea44911b87d69396788d76e046f7933e7b70232c5f79462c3ae5394fc7f58204ec631d0c979c556acc71f8bd1596acdd1f8d56f2b10d238e22e655b47740a7267726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+      "signature_hex": "ea36ddc3fea4789837c2d68ab59ebe844b4c4486eea183971a4b0c82f745951b51d149b7dac48f9932a11d83e99a2a9fdd49e2f7e29656d11a19b778c970f20c",
+      "verify_with": "signer",
+      "expected_error": null,
+      "signature_valid": true
+    },
+    {
+      "name": "large_epoch_and_ts",
+      "description": "epoch and ts both above 2^32 - 1 — exercises the 9-byte uint encoding for both.",
+      "decoded": {
+        "root_fp": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "epoch": 4294967297,
+        "revoked": [
+          "45a61896ef2c2250aedc197f5404f334761b437a4b7d1d4a62375adbd1377f54"
+        ],
+        "ts": 4294967297,
+        "sig_root": "ef2e73460de1984172d9cdafe604accbf04d0b715f26c89137c6dca48f79dab979e1e6ffd2a6a07e65f06681e8d7e4bb6639f18283569c307e41862558fc220a"
+      },
+      "canonical_cbor_hex": "a56274731b00000001000000016565706f63681b0000000100000001677265766f6b656481582045a61896ef2c2250aedc197f5404f334761b437a4b7d1d4a62375adbd1377f5467726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e687369675f726f6f745840ef2e73460de1984172d9cdafe604accbf04d0b715f26c89137c6dca48f79dab979e1e6ffd2a6a07e65f06681e8d7e4bb6639f18283569c307e41862558fc220a",
+      "signing_input_hex": "7370696e646c652d73656c662d7265762d7631a46274731b00000001000000016565706f63681b0000000100000001677265766f6b656481582045a61896ef2c2250aedc197f5404f334761b437a4b7d1d4a62375adbd1377f5467726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+      "signature_hex": "ef2e73460de1984172d9cdafe604accbf04d0b715f26c89137c6dca48f79dab979e1e6ffd2a6a07e65f06681e8d7e4bb6639f18283569c307e41862558fc220a",
+      "verify_with": "signer",
+      "expected_error": null,
+      "signature_valid": true
+    },
+    {
+      "name": "old_timestamp_accepted",
+      "description": "ts = 1 (1970). Self-revocations are permanent (A7b: \"none\"), so this verifies.",
+      "decoded": {
+        "root_fp": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "epoch": 16,
+        "revoked": [
+          "a251c174d40ea3124dec93b8858cb9ee9e39430461f2f3c0ce2ace2c214a77ed"
+        ],
+        "ts": 1,
+        "sig_root": "9ec7b95bba78a20c949152d32e91bc6544f03763bd41cc05e305161760800a41ff0becb939c2e4d78c921b9ac1c396bf0a4284398450a734f64ab44eab013b0e"
+      },
+      "canonical_cbor_hex": "a5627473016565706f636810677265766f6b6564815820a251c174d40ea3124dec93b8858cb9ee9e39430461f2f3c0ce2ace2c214a77ed67726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e687369675f726f6f7458409ec7b95bba78a20c949152d32e91bc6544f03763bd41cc05e305161760800a41ff0becb939c2e4d78c921b9ac1c396bf0a4284398450a734f64ab44eab013b0e",
+      "signing_input_hex": "7370696e646c652d73656c662d7265762d7631a4627473016565706f636810677265766f6b6564815820a251c174d40ea3124dec93b8858cb9ee9e39430461f2f3c0ce2ace2c214a77ed67726f6f745f6670582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+      "signature_hex": "9ec7b95bba78a20c949152d32e91bc6544f03763bd41cc05e305161760800a41ff0becb939c2e4d78c921b9ac1c396bf0a4284398450a734f64ab44eab013b0e",
+      "verify_with": "signer",
+      "expected_error": null,
+      "signature_valid": true
+    }
+  ]
+}

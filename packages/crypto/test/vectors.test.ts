@@ -1,6 +1,6 @@
 // Golden-vector conformance against `vectors/signed/*.json` (real Ed25519 signatures, TEST-ONLY
-// seeds — see `crates/spindle-core/src/bin/gen_crypto_vectors.rs`) for the eight non-Envelope A7b
-// signed-artifact types. The Envelope vector (session key, nonce, AAD, ciphertext, seal/open) has
+// seeds — see `crates/spindle-core/src/bin/gen_crypto_vectors.rs`) for every non-Envelope A7b
+// signed-artifact type. The Envelope vector (session key, nonce, AAD, ciphertext, seal/open) has
 // its own suite: `test/envelope-vectors.test.ts`.
 //
 // Each artifact case asserts:
@@ -24,6 +24,7 @@ import {
   HostOpKeyCert,
   HostSessionAttestation,
   RevocationRecord,
+  SelfRevocationRecord,
   SessionAttestation,
 } from "@spindle/proto";
 import { describe, expect, it } from "vitest";
@@ -38,6 +39,7 @@ import {
   verifyHostOpKeyCert,
   verifyHostSessionAttestation,
   verifyRevocationRecord,
+  verifySelfRevocation,
   verifySessionAttestation,
 } from "../src/artifacts.js";
 import { ed25519PublicKeyFromSeed, ed25519Sign, x25519PublicKeyFromSeed } from "../src/backend.js";
@@ -53,6 +55,7 @@ import {
   parseHostOpKeyCert,
   parseHostSessionAttestation,
   parseRevocationRecord,
+  parseSelfRevocation,
   parseSessionAttestation,
 } from "./helpers.js";
 
@@ -964,6 +967,37 @@ describe("revocation-record.json", () => {
       }
     });
   }
+});
+
+describe("self-revocation.json", () => {
+  const doc = loadSignedVectorFile("self-revocation.json");
+  const signerPk = hexToBytes(doc.signer.public_key_hex);
+  const wrongRootPk = hexToBytes(doc.wrong_root_public_key_hex);
+
+  for (const c of doc.cases) {
+    it(`${c.name}: signing input matches`, () => {
+      const rec = parseSelfRevocation(c.decoded);
+      expect(bytesToHex(SelfRevocationRecord.signingInput(rec))).toBe(c.signing_input_hex);
+    });
+
+    it(`${c.name}: canonical bytes round-trip`, () => {
+      const rec = parseSelfRevocation(c.decoded);
+      expect(bytesToHex(SelfRevocationRecord.toCanonicalBytes(rec))).toBe(c.canonical_cbor_hex);
+      const decoded = SelfRevocationRecord.fromCanonicalBytes(hexToBytes(c.canonical_cbor_hex));
+      expect(bytesToHex(SelfRevocationRecord.toCanonicalBytes(decoded))).toBe(c.canonical_cbor_hex);
+    });
+
+    it(`${c.name}: verifySelfRevocation is ${c.expected_error ?? "ok"}`, async () => {
+      const rec = parseSelfRevocation(c.decoded);
+      const pk = c.verify_with === "wrong_root" ? wrongRootPk : signerPk;
+      if (c.expected_error === null) {
+        await expect(verifySelfRevocation(rec, pk)).resolves.toBeUndefined();
+      } else {
+        await expectArtifactError(() => verifySelfRevocation(rec, pk), c.expected_error);
+      }
+    });
+  }
+
 });
 
 describe("admission-token.json", () => {

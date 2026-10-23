@@ -47,6 +47,7 @@ export {
   verifyHostOpKeyCert,
   verifyHostSessionAttestation,
   verifyRevocationRecord,
+  verifySelfRevocation,
   verifySessionAttestation,
 } from "./artifacts.js";
 

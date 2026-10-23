@@ -17,6 +17,7 @@ import type {
   DeviceCertificate,
   SessionAttestation,
   RevocationRecord,
+  SelfRevocationRecord,
   AdminCommand,
   HostOpKeyCert,
   HostSessionAttestation,
@@ -148,6 +149,17 @@ export function parseRevocationRecord(d: any): RevocationRecord {
     revoked: (d.revoked as string[]).map(hexToBytes),
     ts: BigInt(d.ts),
     sig: hexToBytes(d.sig),
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function parseSelfRevocation(d: any): SelfRevocationRecord {
+  return {
+    root_fp: hexToBytes(d.root_fp),
+    epoch: BigInt(d.epoch),
+    revoked: (d.revoked as string[]).map(hexToBytes),
+    ts: BigInt(d.ts),
+    sig_root: hexToBytes(d.sig_root),
   };
 }
 

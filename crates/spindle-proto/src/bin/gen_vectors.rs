@@ -13,7 +13,8 @@
 
 use spindle_proto::artifacts::{
     AdminCommand, AdmissionToken, CapKind, Capability, DeviceCertificate, Envelope, HostDeviceCert,
-    HostOpKeyCert, HostSessionAttestation, RevocationRecord, SessionAttestation,
+    HostOpKeyCert, HostSessionAttestation, RevocationRecord, SelfRevocationRecord,
+    SessionAttestation,
 };
 use spindle_proto::bootstrap::{
     BundleEntry, DeviceBootstrapBundle, BUNDLE_CURRENT_V, MAX_REGISTRY_LEN,
@@ -254,6 +255,11 @@ fn main() {
         &vectors_dir,
         "revocation-record.json",
         revocation_record_vectors(),
+    );
+    write_vector_file(
+        &vectors_dir,
+        "self-revocation.json",
+        self_revocation_vectors(),
     );
     write_vector_file(&vectors_dir, "admin-command.json", admin_command_vectors());
     write_vector_file(
@@ -661,6 +667,84 @@ fn revocation_record_vectors() -> Json {
         ),
     ];
     artifact_file("RevocationRecord", tags::REVOCATION_V1, cases)
+}
+
+// ---- SelfRevocationRecord ----
+
+fn self_revocation_vectors() -> Json {
+    let r1 = SelfRevocationRecord {
+        root_fp: rep(0x91, 32),
+        epoch: 1,
+        revoked: vec![rep(0x92, 32)],
+        ts: 1_755_907_200,
+        sig_root: rep(0x93, 64),
+    };
+    let r2 = SelfRevocationRecord {
+        root_fp: rep(0x94, 32),
+        epoch: 5,
+        revoked: vec![rep(0x95, 32), rep(0x96, 32), rep(0x97, 32)],
+        ts: 1_756_000_000,
+        sig_root: rep(0x98, 64),
+    };
+    let r3 = SelfRevocationRecord {
+        root_fp: rep(0x99, 32),
+        epoch: 0,
+        revoked: vec![],
+        ts: 1_755_800_000,
+        sig_root: rep(0x9a, 64),
+    };
+    // Both counters above 2^32 - 1, forcing the 9-byte uint encoding. The other cases'
+    // timestamps (≈1.75e9) already exercise the 5-byte path.
+    let r4 = SelfRevocationRecord {
+        root_fp: rep(0x9b, 32),
+        epoch: 4_294_967_297,
+        revoked: vec![rep(0x9c, 32)],
+        ts: 4_294_967_297,
+        sig_root: rep(0x9d, 64),
+    };
+
+    fn decoded(r: &SelfRevocationRecord) -> Json {
+        Json::Obj(vec![
+            ("root_fp", Json::hex(&r.root_fp)),
+            ("epoch", Json::UInt(r.epoch)),
+            ("revoked", Json::hex_array(&r.revoked)),
+            ("ts", Json::UInt(r.ts)),
+            ("sig_root", Json::hex(&r.sig_root)),
+        ])
+    }
+
+    let cases = vec![
+        case(
+            "single_device_revoked",
+            "One device fingerprint revoked at epoch 1.",
+            decoded(&r1),
+            &r1.to_canonical_bytes(),
+            &r1.signing_input(),
+        ),
+        case(
+            "multiple_fingerprints_revoked",
+            "Three distinct fingerprints in a fixed order — the order is observable on the wire.",
+            decoded(&r2),
+            &r2.to_canonical_bytes(),
+            &r2.signing_input(),
+        ),
+        case(
+            "empty_revoked_array",
+            "Zero-length `revoked` array — exercises the empty-array canonical encoding. Under the \
+             monotone-union rule this record adds nothing; it is not an un-revoke instruction.",
+            decoded(&r3),
+            &r3.to_canonical_bytes(),
+            &r3.signing_input(),
+        ),
+        case(
+            "large_epoch_and_ts",
+            "epoch and ts both above 2^32 - 1 — exercises the 9-byte uint encoding for both.",
+            decoded(&r4),
+            &r4.to_canonical_bytes(),
+            &r4.signing_input(),
+        ),
+    ];
+    artifact_file("SelfRevocationRecord", tags::SELF_REVOCATION_V1, cases)
 }
 
 // ---- AdminCommand ----
@@ -1544,8 +1628,8 @@ fn signaling_vectors() -> Json {
 
 // ---- Device bootstrap state bundle (DESIGN.md §A4 :317-330) ----
 //
-// Not an A7b signed artifact (see `spindle_proto::bootstrap`'s module doc comment's "Not one of
-// A7b's eight signed artifacts" section) — no domain tag, no signing input, so each case here is
+// Not an A7b signed artifact (see `spindle_proto::bootstrap`'s module doc comment) — no domain
+// tag, no signing input, so each case here is
 // `{name, description, decoded, canonical_cbor_hex}`, exactly mirroring `signaling.json`'s shape.
 //
 // These vectors also pin the canonical key order: a `DeviceBootstrapBundle` map's keys emit as

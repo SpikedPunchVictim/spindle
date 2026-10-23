@@ -2,9 +2,10 @@
 //!
 //! Every signed artifact in Spindle is preceded, in its signature preimage, by a tag string
 //! unique to that artifact type (DESIGN.md §A7b). Because a handful of keys sign more than one
-//! artifact type — root keys sign both device certificates and self-revocations — the tags exist
-//! specifically so a signature valid for one artifact kind can never be replayed as valid for
-//! another kind signed by the same key (ADR-001 §A12 #41; ADR-004).
+//! wire artifact type — root keys sign both device certificates and self-revocations, and also
+//! the root-rotation preimage — the tags exist specifically so a signature valid for one artifact
+//! kind can never be replayed as valid for another kind signed by the same key (ADR-001 §A12 #41;
+//! ADR-004).
 //!
 //! This module owns only the tag bytes and the trivial `tag || bytes` concatenation helper.
 //! **No cryptography lives here or anywhere in `spindle-proto`** (A9c boundary rule 3) — signing
@@ -23,6 +24,18 @@ pub const ADMISSION_TOKEN_V1: &[u8] = b"spindle-adm-v1";
 pub const DEVICE_CERT_V2: &[u8] = b"spindle-dev-cert-v2";
 /// `RevocationRecord` (A4) — signed by the host operating key or an identity root.
 pub const REVOCATION_V1: &[u8] = b"spindle-rev-v1";
+/// `SelfRevocationRecord` (A4/A7b, added v0.9.18) — signed by the identity root. Root keys sign
+/// two **wire** artifact types — `DeviceCertificate` (`spindle-dev-cert-v2`) and
+/// `SelfRevocationRecord` (`spindle-self-rev-v1`) — plus the root-rotation preimage
+/// ([`ROOT_ROTATION_V1`]), so these tags are what prevent cross-artifact signature confusion
+/// between them (DESIGN.md §A7b).
+pub const SELF_REVOCATION_V1: &[u8] = b"spindle-self-rev-v1";
+/// Root-rotation preimage (A4) — signed by the old identity root over the new root's public key.
+/// Not a wire artifact: DESIGN.md and the proto schema-of-record describe rotation in prose only
+/// (`sig_old_root(new_root_pk)`), and this crate deliberately invents no rotation struct. The tag
+/// still lives here because it shares a signer with [`DEVICE_CERT_V2`] and
+/// [`SELF_REVOCATION_V1`], and therefore must participate in the prefix-free check.
+pub const ROOT_ROTATION_V1: &[u8] = b"spindle-root-rotation-v1";
 /// `AdminCommand` (A3b/A7b) — signed by the operator admission key.
 pub const ADMIN_COMMAND_V1: &[u8] = b"spindle-adm-cmd-v1";
 /// `HostOpKeyCert` (A4) — signed by the host root. Bumped to v2 in v0.9.31: this artifact carries
@@ -79,13 +92,15 @@ mod tests {
     // the other's. Prefix-freeness is what rules this out, and it subsumes plain distinctness:
     // two equal tags are trivially prefixes of each other.
     #[test]
-    fn all_ten_tags_are_prefix_free() {
+    fn all_twelve_tags_are_prefix_free() {
         let tags = [
             ENVELOPE_V1,
             CAPABILITY_V1,
             ADMISSION_TOKEN_V1,
             DEVICE_CERT_V2,
             REVOCATION_V1,
+            SELF_REVOCATION_V1,
+            ROOT_ROTATION_V1,
             ADMIN_COMMAND_V1,
             HOST_OP_KEY_CERT_V2,
             HOST_DEVICE_CERT_V1,

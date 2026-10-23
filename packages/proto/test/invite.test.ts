@@ -354,6 +354,8 @@ it("the format id is not usable as a signing tag", () => {
     tags.ADMISSION_TOKEN_V1,
     tags.DEVICE_CERT_V2,
     tags.REVOCATION_V1,
+    tags.SELF_REVOCATION_V1,
+    tags.ROOT_ROTATION_V1,
     tags.ADMIN_COMMAND_V1,
     tags.HOST_OP_KEY_CERT_V2,
     tags.HOST_DEVICE_CERT_V1,

@@ -27,6 +27,7 @@ export {
   DeviceCertificate,
   SessionAttestation,
   RevocationRecord,
+  SelfRevocationRecord,
   AdminCommand,
   HostOpKeyCert,
   HostSessionAttestation,

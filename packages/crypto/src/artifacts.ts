@@ -10,7 +10,8 @@
 // | Capability | host operating key, certified by an embedded op_cert chained to host_root_pk (A10.30) |
 // | HostDeviceCert | host operating key, certified by an embedded op_cert chained to host_root_pk (A10.35) |
 // | HostOpKeyCert | host root |
-// | RevocationRecord | host op key or identity root |
+// | RevocationRecord | host operating key only (A7b amended v0.9.18; a person's root uses SelfRevocationRecord) |
+// | SelfRevocationRecord | identity root (root-scoped, permanent; max-wins reuses `isNewerEpoch`) |
 // | AdmissionToken | operator admission key |
 // | AdminCommand | operator admission key (`verifyAdminCommand` also takes the operator identity it binds to — `expectedSignerFp` — as a required argument, td-0bcab4) |
 // | SessionAttestation | device identity key (`verifySessionAttestation` likewise takes the value it binds — the connecting session's `nats_fp` — as a required argument rather than checking only a signature, td-0bcab4) |
@@ -36,6 +37,7 @@ import {
   HostOpKeyCert,
   HostSessionAttestation,
   RevocationRecord,
+  SelfRevocationRecord,
   SessionAttestation,
 } from "@spindle/proto";
 
@@ -344,20 +346,61 @@ export async function verifyHostOpKeyCert(
   checkExp(now, cert.exp);
 }
 
-/** Verifies `sig` under `signerPk` (host op key or identity root — caller resolves which).
- * Revocation records carry **no expiry** (A7b: "none (permanent)") — only the signature is
- * checked here. The max-wins replay rule is a separate concern: see `isNewerEpoch`. */
+/** Verifies `sig` under `hostOpPk` — the host operating key, the only signer of a
+ * `spindle-rev-v1` record (DESIGN.md §A7b, amended v0.9.18). A person's root signs
+ * `SelfRevocationRecord` instead, verified by `verifySelfRevocation`. Revocation records carry
+ * **no expiry** (A7b: "none (permanent)") — only the signature is checked here. The max-wins
+ * replay rule is a separate concern: see `isNewerEpoch`. */
 export async function verifyRevocationRecord(
   rec: RevocationRecord,
-  signerPk: Uint8Array,
+  hostOpPk: Uint8Array,
   opts?: BackendOption,
 ): Promise<void> {
-  requireEd25519PublicKey(signerPk);
-  await verifySigOrThrow(signerPk, RevocationRecord.signingInput(rec), rec.sig, opts?.backend);
+  requireEd25519PublicKey(hostOpPk);
+  await verifySigOrThrow(hostOpPk, RevocationRecord.signingInput(rec), rec.sig, opts?.backend);
+}
+
+/**
+ * Verifies a self-revocation record (DESIGN.md §A4/§A7b). Mirrors
+ * `spindle-core::artifacts::verify_self_revocation`.
+ *
+ * Checks, in order:
+ * 1. `rootFpOf(rootPk) == rec.root_fp` — the record names the root key it is verified under. A
+ *    record carrying a different root's `root_fp` is rejected even if its signature would verify
+ *    under some other key the caller holds.
+ * 2. `sig_root` is valid under `rootPk` over {@link SelfRevocationRecord.signingInput}.
+ *
+ * Self-revocations carry **no expiry and no `ts` freshness check** (A7b: "none (permanent)").
+ * The max-wins-per-root replay rule is a separate concern: see {@link isNewerEpoch}, shared with
+ * `RevocationRecord` and generic over the epoch pair — callers key the high-water mark by
+ * `root_fp` here, by `host_fp` there; epoch only gates acceptance and the accepted revoked set is
+ * a monotone union that never shrinks.
+ *
+ * `revoked` entries are carried opaquely, exactly like `RevocationRecord`'s: this package neither
+ * requires nor enforces a 32-byte length on them, because `alg_id` governs identity encoding.
+ * Ingestion must not assume a length either.
+ */
+export async function verifySelfRevocation(
+  rec: SelfRevocationRecord,
+  rootPk: Uint8Array,
+  opts?: BackendOption,
+): Promise<void> {
+  requireEd25519PublicKey(rootPk);
+  const expectedFp = await rootFpOf(rootPk);
+  if (!fingerprintsMatch(expectedFp, rec.root_fp)) throw ArtifactError.rootFingerprintMismatch();
+  await verifySigOrThrow(rootPk, SelfRevocationRecord.signingInput(rec), rec.sig_root, opts?.backend);
 }
 
 /** A7b's max-wins replay rule for revocation records: a candidate epoch only takes effect if it is
- * strictly greater than the current high-water mark. Never decreases, never rolls back. */
+ * strictly greater than the current high-water mark. Never decreases, never rolls back. Generic
+ * over the artifact kind and shared by host-scoped `RevocationRecord`s (max-wins) and root-scoped
+ * `SelfRevocationRecord`s (max-wins **per root**, DESIGN.md §A7b) — key the high-water mark by
+ * `host_fp` or `root_fp` respectively.
+ *
+ * The epoch is an **acceptance gate only**, never a replacement instruction. An accepted record's
+ * `revoked` entries are added to the stored set — the accepted set is a monotone union that never
+ * shrinks — so a higher-epoch record with an empty `revoked` list accepts cleanly and changes
+ * nothing, rather than clearing everything revoked earlier. */
 export function isNewerEpoch(candidateEpoch: bigint, currentMaxEpoch: bigint): boolean {
   return candidateEpoch > currentMaxEpoch;
 }

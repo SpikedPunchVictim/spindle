@@ -17,10 +17,10 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use spindle_core::artifacts::{
     issue_admin_command, issue_admission_token, issue_capability, issue_device_certificate,
     issue_host_device_cert, issue_host_op_key_cert, issue_host_session_attestation,
-    issue_revocation_record, issue_session_attestation, verify_admin_command,
-    verify_admission_token, verify_capability, verify_device_certificate, verify_host_device_cert,
-    verify_host_op_key_cert, verify_host_session_attestation, verify_revocation_record,
-    verify_session_attestation,
+    issue_revocation_record, issue_self_revocation, issue_session_attestation,
+    verify_admin_command, verify_admission_token, verify_capability, verify_device_certificate,
+    verify_host_device_cert, verify_host_op_key_cert, verify_host_session_attestation,
+    verify_revocation_record, verify_self_revocation, verify_session_attestation,
 };
 use spindle_core::envelope::{
     derive_bootstrap_key, derive_session_key, open, seal, OpenParams, SealParams,
@@ -43,6 +43,7 @@ enum Json {
     Str(String),
     UInt(u64),
     Bool(bool),
+    Null,
     Arr(Vec<Json>),
     Obj(Vec<(&'static str, Json)>),
 }
@@ -83,6 +84,7 @@ fn write_json(value: &Json, out: &mut String, indent: usize) {
         Json::Str(s) => write_json_string(s, out),
         Json::UInt(v) => out.push_str(&v.to_string()),
         Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Json::Null => out.push_str("null"),
         Json::Arr(items) => {
             if items.is_empty() {
                 out.push_str("[]");
@@ -213,6 +215,7 @@ const PERSON_ROOT_SEED: [u8; 32] = [0x01; 32]; // TEST-ONLY
 const HOST_ROOT_SEED: [u8; 32] = [0x05; 32]; // TEST-ONLY
 const HOST_OP_SEED: [u8; 32] = [0x06; 32]; // TEST-ONLY
 const OPERATOR_SEED: [u8; 32] = [0x07; 32]; // TEST-ONLY
+const WRONG_ROOT_SEED: [u8; 32] = [0x08; 32]; // TEST-ONLY (the "different root key" negative)
 
 const DEVICE_A_SIGN_SEED: [u8; 32] = [0x10; 32]; // TEST-ONLY (client device, "from_fp" role)
 const DEVICE_A_AGREE_SEED: [u8; 32] = [0x11; 32]; // TEST-ONLY
@@ -252,6 +255,7 @@ fn main() {
     );
     write_vector_file(&dir, "host-device-cert.json", host_device_cert_vectors());
     write_vector_file(&dir, "revocation-record.json", revocation_record_vectors());
+    write_vector_file(&dir, "self-revocation.json", self_revocation_vectors());
     write_vector_file(&dir, "admission-token.json", admission_token_vectors());
     write_vector_file(&dir, "admin-command.json", admin_command_vectors());
     write_vector_file(&dir, "envelope.json", envelope_vectors());
@@ -858,6 +862,216 @@ fn revocation_record_vectors() -> Json {
         ]),
         cases,
     )
+}
+
+// ---- SelfRevocationRecord ----
+
+fn self_revocation_vectors() -> Json {
+    let root = RootKey::from_seed(PERSON_ROOT_SEED);
+    let root_signer = SigningKey::from_bytes(&PERSON_ROOT_SEED);
+    let wrong_root = RootKey::from_seed(WRONG_ROOT_SEED);
+    let wrong_signer = SigningKey::from_bytes(&WRONG_ROOT_SEED);
+
+    let revoked = Fingerprint::of_parts(&[b"gen-crypto-vectors:self-revocation:lost-device"]);
+    let ts = 1_755_907_200; // 2025-09-28T00:00:00Z — realistic Unix seconds
+    let epoch = 12; // a per-root monotonic epoch, not a cap_epoch
+
+    let rec = issue_self_revocation(&root_signer, epoch, vec![revoked], ts);
+    assert_eq!(
+        rec.root_fp,
+        root.root_fp().to_vec(),
+        "issue_self_revocation must derive root_fp from the root signer"
+    );
+    assert!(verify_self_revocation(&rec, &root.public_key()).is_ok());
+
+    fn decoded(r: &spindle_proto::artifacts::SelfRevocationRecord) -> Json {
+        Json::Obj(vec![
+            ("root_fp", Json::hex(&r.root_fp)),
+            ("epoch", Json::UInt(r.epoch)),
+            (
+                "revoked",
+                Json::Arr(r.revoked.iter().map(|fp| Json::hex(fp)).collect()),
+            ),
+            ("ts", Json::UInt(r.ts)),
+            ("sig_root", Json::hex(&r.sig_root)),
+        ])
+    }
+
+    fn case_with_expectation(
+        name: &'static str,
+        description: &'static str,
+        rec: &spindle_proto::artifacts::SelfRevocationRecord,
+        verify_with: &'static str,
+        expected_error: Option<&'static str>,
+    ) -> Json {
+        Json::Obj(vec![
+            ("name", Json::Str(name.into())),
+            ("description", Json::Str(description.into())),
+            ("decoded", decoded(rec)),
+            ("canonical_cbor_hex", Json::hex(&rec.to_canonical_bytes())),
+            ("signing_input_hex", Json::hex(&rec.signing_input())),
+            ("signature_hex", Json::hex(&rec.sig_root)),
+            ("verify_with", Json::Str(verify_with.into())),
+            (
+                "expected_error",
+                match expected_error {
+                    Some(e) => Json::Str(e.into()),
+                    None => Json::Null,
+                },
+            ),
+            // Kept for parity with the other signed-vector files: whether the record verifies
+            // under the key this case is checked with.
+            ("signature_valid", Json::Bool(expected_error.is_none())),
+        ])
+    }
+
+    let mut tampered = rec.clone();
+    tampered.sig_root = flip_last_byte(&rec.sig_root);
+    assert_eq!(
+        verify_self_revocation(&tampered, &root.public_key()).unwrap_err(),
+        spindle_core::artifacts::ArtifactError::BadSignature
+    );
+
+    // A genuine record for root A, presented to root B.
+    assert_eq!(
+        verify_self_revocation(&rec, &wrong_root.public_key()).unwrap_err(),
+        spindle_core::artifacts::ArtifactError::RootFingerprintMismatch
+    );
+
+    // A record genuinely minted by root B (its root_fp is B's), presented to root A.
+    let other_root_rec = issue_self_revocation(
+        &wrong_signer,
+        epoch + 1,
+        vec![Fingerprint::of_parts(&[
+            b"gen-crypto-vectors:self-revocation:other-device",
+        ])],
+        ts,
+    );
+    assert!(verify_self_revocation(&other_root_rec, &wrong_root.public_key()).is_ok());
+    assert_eq!(
+        verify_self_revocation(&other_root_rec, &root.public_key()).unwrap_err(),
+        spindle_core::artifacts::ArtifactError::RootFingerprintMismatch
+    );
+
+    // Corpus coverage beyond the single-entry happy path.
+    let multi = issue_self_revocation(
+        &root_signer,
+        epoch + 2,
+        vec![
+            Fingerprint::of_parts(&[b"gen-crypto-vectors:self-revocation:order-a"]),
+            Fingerprint::of_parts(&[b"gen-crypto-vectors:self-revocation:order-b"]),
+            Fingerprint::of_parts(&[b"gen-crypto-vectors:self-revocation:order-c"]),
+        ],
+        ts,
+    );
+    let empty = issue_self_revocation(&root_signer, epoch + 3, vec![], ts);
+    let large = issue_self_revocation(
+        &root_signer,
+        4_294_967_297,
+        vec![Fingerprint::of_parts(&[
+            b"gen-crypto-vectors:self-revocation:large-uint",
+        ])],
+        4_294_967_297,
+    );
+    // ts = 1 (1970): A7b's time rule is "none (permanent)", so this must verify exactly like any
+    // other record. Pinned as a vector because the TS side can no longer construct one itself.
+    let old_timestamp = issue_self_revocation(
+        &root_signer,
+        epoch + 4,
+        vec![Fingerprint::of_parts(&[
+            b"gen-crypto-vectors:self-revocation:old-ts",
+        ])],
+        1,
+    );
+    for extra in [&multi, &empty, &large, &old_timestamp] {
+        assert!(verify_self_revocation(extra, &root.public_key()).is_ok());
+    }
+
+    let cases = vec![
+        case_with_expectation(
+            "valid",
+            "Self-revocation signed by the identity root (one device revoked at epoch 12).",
+            &rec,
+            "signer",
+            None,
+        ),
+        case_with_expectation(
+            "tampered_signature_last_byte",
+            "sig_root's last byte flipped; verify_self_revocation must reject with BadSignature.",
+            &tampered,
+            "signer",
+            Some("BadSignature"),
+        ),
+        case_with_expectation(
+            "wrong_root_public_key",
+            "A genuine record for the signer root, verified under a different root key; the \
+             root_fp check must reject it with RootFingerprintMismatch.",
+            &rec,
+            "wrong_root",
+            Some("RootFingerprintMismatch"),
+        ),
+        case_with_expectation(
+            "root_fp_disagrees_with_key",
+            "A record genuinely minted by the other root, verified under the signer root; \
+             root_fp names the other root, so RootFingerprintMismatch fires before the signature.",
+            &other_root_rec,
+            "signer",
+            Some("RootFingerprintMismatch"),
+        ),
+        case_with_expectation(
+            "empty_revoked_array",
+            "Zero-length `revoked` array at a higher epoch. Under the monotone-union rule this \
+             adds nothing; it is not an un-revoke instruction.",
+            &empty,
+            "signer",
+            None,
+        ),
+        case_with_expectation(
+            "multiple_fingerprints_revoked",
+            "Three distinct fingerprints in a fixed order — the order is observable on the wire.",
+            &multi,
+            "signer",
+            None,
+        ),
+        case_with_expectation(
+            "large_epoch_and_ts",
+            "epoch and ts both above 2^32 - 1 — exercises the 9-byte uint encoding for both.",
+            &large,
+            "signer",
+            None,
+        ),
+        case_with_expectation(
+            "old_timestamp_accepted",
+            "ts = 1 (1970). Self-revocations are permanent (A7b: \"none\"), so this verifies.",
+            &old_timestamp,
+            "signer",
+            None,
+        ),
+    ];
+
+    Json::Obj(vec![
+        ("artifact", Json::Str("SelfRevocationRecord".into())),
+        (
+            "domain_tag",
+            Json::Str(String::from_utf8(spindle_proto::tags::SELF_REVOCATION_V1.to_vec()).unwrap()),
+        ),
+        (
+            "signer",
+            Json::Obj(vec![
+                ("role", Json::Str("identity_root".into())),
+                ("seed", seed_field("TEST-ONLY", &PERSON_ROOT_SEED)),
+                (
+                    "public_key_hex",
+                    Json::hex(root_signer.verifying_key().as_bytes()),
+                ),
+            ]),
+        ),
+        (
+            "wrong_root_public_key_hex",
+            Json::hex(wrong_root.public_key().as_bytes()),
+        ),
+        ("cases", Json::Arr(cases)),
+    ])
 }
 
 // ---- AdmissionToken ----

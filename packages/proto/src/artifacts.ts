@@ -1,5 +1,5 @@
-// Wire types for the A7 envelope and the seven other A7b signed-artifact kinds — the TypeScript
-// twin of `crates/spindle-proto/src/artifacts.rs`.
+// Wire types for the A7 envelope and every other A7b signed-artifact kind — the TypeScript twin
+// of `crates/spindle-proto/src/artifacts.rs`.
 //
 // Every type here is a thin, lossless mapping to/from `CborValue` plus a canonical-bytes
 // convenience wrapper. Field *values* are opaque (`Uint8Array` for fingerprints/keys/signatures,
@@ -790,6 +790,75 @@ export const RevocationRecord = {
     return tags.signingInput(
       tags.REVOCATION_V1,
       canonicalEncode(RevocationRecord.unsignedCbor(rec)),
+    );
+  },
+};
+
+// ============================================================================================
+// SelfRevocationRecord (A4/A7b)
+// ============================================================================================
+
+/** `SelfRevocationRecord { root_fp, epoch, revoked: [device_fp...], ts, sig_root }` (DESIGN.md
+ * §A4/§A7b). A person's root revokes keys under its own root, with no host scoping — hence
+ * `root_fp` in place of `RevocationRecord`'s `host_fp` and no host-scoped `cap_epoch`. `revoked`
+ * holds `device_fp` fingerprints, opaque to this package. The signature field is `sig_root`
+ * (DESIGN's notation), naming its signer like `sig_device`/`sig_operator`/`sig_op` do elsewhere —
+ * `RevocationRecord`'s plain `sig` is the exception, not the convention. */
+export interface SelfRevocationRecord {
+  root_fp: Uint8Array;
+  epoch: bigint;
+  revoked: Uint8Array[];
+  ts: bigint;
+  sig_root: Uint8Array;
+}
+
+const SELF_REVOCATION_FIELDS = ["root_fp", "epoch", "revoked", "ts", "sig_root"] as const;
+
+export const SelfRevocationRecord = {
+  unsignedEntries(rec: SelfRevocationRecord): Array<[string, CborValue]> {
+    return [
+      ["root_fp", CborValue.bytes(rec.root_fp)],
+      ["epoch", CborValue.uint(rec.epoch)],
+      ["revoked", bytesArrayValue(rec.revoked)],
+      ["ts", CborValue.uint(rec.ts)],
+    ];
+  },
+
+  unsignedCbor(rec: SelfRevocationRecord): CborValue {
+    return CborValue.map(SelfRevocationRecord.unsignedEntries(rec));
+  },
+
+  toCbor(rec: SelfRevocationRecord): CborValue {
+    const entries = SelfRevocationRecord.unsignedEntries(rec);
+    entries.push(["sig_root", CborValue.bytes(rec.sig_root)]);
+    return CborValue.map(entries);
+  },
+
+  toCanonicalBytes(rec: SelfRevocationRecord): Uint8Array {
+    return canonicalEncode(SelfRevocationRecord.toCbor(rec));
+  },
+
+  fromCbor(v: CborValue): SelfRevocationRecord {
+    const m = new MapReader(v);
+    m.denyUnknownFields(SELF_REVOCATION_FIELDS);
+    return {
+      root_fp: m.bytes("root_fp"),
+      epoch: m.u64("epoch"),
+      revoked: m.bytesArray("revoked"),
+      ts: m.u64("ts"),
+      sig_root: m.bytes("sig_root"),
+    };
+  },
+
+  fromCanonicalBytes(bytes: Uint8Array): SelfRevocationRecord {
+    return SelfRevocationRecord.fromCbor(decodeCanonicalOrThrow(bytes));
+  },
+
+  /** `"spindle-self-rev-v1" || canonical(self minus sig_root)` (A7b). */
+  signingInput(rec: SelfRevocationRecord): Uint8Array {
+    return tags.signingInput(
+      tags.SELF_REVOCATION_V1,
+      canonicalEncode(SelfRevocationRecord.unsignedCbor(rec)),
     );
   },
 };

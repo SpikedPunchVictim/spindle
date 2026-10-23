@@ -13,13 +13,14 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use spindle_core::artifacts::{
     verify_admin_command, verify_admission_token, verify_capability, verify_device_certificate,
     verify_host_device_cert, verify_host_op_key_cert, verify_host_session_attestation,
-    verify_revocation_record, verify_session_attestation, ArtifactError,
+    verify_revocation_record, verify_self_revocation, verify_session_attestation, ArtifactError,
 };
 use spindle_core::envelope::{open, OpenParams};
 use spindle_core::{root_fp_of, Fingerprint};
 use spindle_proto::artifacts::{
     AdminCommand, AdmissionToken, Capability, DeviceCertificate, Envelope, HostDeviceCert,
-    HostOpKeyCert, HostSessionAttestation, RevocationRecord, SessionAttestation,
+    HostOpKeyCert, HostSessionAttestation, RevocationRecord, SelfRevocationRecord,
+    SessionAttestation,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,7 @@ enum Json {
     Str(String),
     Num(u64),
     Bool(bool),
+    Null,
     Arr(Vec<Json>),
     Obj(Vec<(String, Json)>),
 }
@@ -136,6 +138,7 @@ impl<'a> Parser<'a> {
             b'[' => self.parse_arr(),
             b'"' => Json::Str(self.parse_str()),
             b't' | b'f' => self.parse_bool(),
+            b'n' => self.parse_null(),
             _ => Json::Num(self.parse_num()),
         }
     }
@@ -238,6 +241,16 @@ impl<'a> Parser<'a> {
         } else {
             panic!("invalid literal at byte {}", self.pos);
         }
+    }
+
+    fn parse_null(&mut self) -> Json {
+        assert!(
+            self.bytes[self.pos..].starts_with(b"null"),
+            "invalid literal at byte {}",
+            self.pos
+        );
+        self.pos += 4;
+        Json::Null
     }
 
     fn parse_num(&mut self) -> u64 {
@@ -576,6 +589,78 @@ fn revocation_record_vectors_verify() {
 
         let result = verify_revocation_record(&rec, &signer_pk);
         assert_eq!(result.is_ok(), case.get("signature_valid").as_bool());
+    }
+}
+
+// ================================================================================================
+// SelfRevocationRecord: signer is the identity root; some cases deliberately verify under the
+// wrong root, so both keys and the expected error per case are read from the file.
+// ================================================================================================
+
+fn expected_artifact_error(name: &str) -> ArtifactError {
+    match name {
+        "BadSignature" => ArtifactError::BadSignature,
+        "RootFingerprintMismatch" => ArtifactError::RootFingerprintMismatch,
+        other => panic!("unsupported expected_error `{other}`"),
+    }
+}
+
+#[test]
+fn self_revocation_vectors_verify() {
+    let doc = load("self-revocation.json");
+    let signer_pk = verifying_key_from_hex(doc.get("signer").get("public_key_hex"));
+    let wrong_root_pk = verifying_key_from_hex(doc.get("wrong_root_public_key_hex"));
+
+    for case in doc.get("cases").as_arr() {
+        let name = case.get("name").as_str();
+        let revoked: Vec<Vec<u8>> = case
+            .get("decoded")
+            .get("revoked")
+            .as_arr()
+            .iter()
+            .map(|j| j.hex())
+            .collect();
+        let rec = SelfRevocationRecord {
+            root_fp: case.get("decoded").get("root_fp").hex(),
+            epoch: case.get("decoded").get("epoch").as_u64(),
+            revoked,
+            ts: case.get("decoded").get("ts").as_u64(),
+            sig_root: case.get("decoded").get("sig_root").hex(),
+        };
+        assert_eq!(
+            rec.to_canonical_bytes(),
+            case.get("canonical_cbor_hex").hex(),
+            "case `{name}`"
+        );
+        assert_eq!(
+            rec.signing_input(),
+            case.get("signing_input_hex").hex(),
+            "case `{name}`"
+        );
+
+        let pk = match case.get("verify_with").as_str() {
+            "signer" => &signer_pk,
+            "wrong_root" => &wrong_root_pk,
+            other => panic!("case `{name}`: unsupported verify_with `{other}`"),
+        };
+        let result = verify_self_revocation(&rec, pk);
+        let result_is_ok = result.is_ok();
+
+        match case.get("expected_error") {
+            Json::Null => assert!(result_is_ok, "case `{name}`: expected Ok, got {result:?}"),
+            Json::Str(expected) => assert_eq!(
+                result.unwrap_err(),
+                expected_artifact_error(expected),
+                "case `{name}`"
+            ),
+            other => panic!("case `{name}`: expected_error must be string or null, got {other:?}"),
+        }
+        // Cross-check the parity field the other signed-vector files use.
+        assert_eq!(
+            result_is_ok,
+            case.get("signature_valid").as_bool(),
+            "case `{name}`"
+        );
     }
 }
 
