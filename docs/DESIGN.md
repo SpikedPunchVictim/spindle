@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.46) + Execution Plan
+# Spindle — System Design Document (draft v0.9.47) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -207,6 +207,13 @@
 > artifact with no `v` field, forcing a §A7b domain-tag bump and regenerated vectors in both
 > languages for a field no caller reads; an unsigned wrapper mirrors the invite container but not
 > its trust model, because an admission token is bearer, not addressed.
+> v0.9.47: two corrections, no wire change. (1) `spindle-self-rev-v1`'s replay rule said
+> "max-wins per root, never decreases" but never said whether a winning record's `revoked` list
+> replaces or unions into the stored set. It unions: the epoch is a high-water mark that gates
+> acceptance only, so an empty `revoked` list at a higher epoch revokes nothing and un-revokes
+> nothing. (2) The session record did not retain `root_pk`, so `helper.revoke.<nfp>`'s rule
+> "accept only if the signer is the caller's `root_fp`" could not be executed — a fingerprint
+> cannot verify a signature. The record now retains the root public key the caller presented.
 
 ---
 
@@ -944,9 +951,12 @@ buckets are an outstanding implementation obligation.
   `pub helper.presence.get.<own nfp>`, `pub helper.turn.get.<own nfp>`, `pub helper.devcert.get.<own nfp>`,
   `pub helper.revoke.<own nfp>`. Invite-only and stale-cap connections get just `pub host.<h>.connect` + inbox. Max 32
   hosts per connection (A10.5). **Session record**: on each successful auth the callout writes
-  `nats_fp → {root_fp, device_fp, host_fps, quota_profile, exp}` to the helper store — **[amended v0.9.18]**
+  `nats_fp → {root_fp, root_pk, device_fp, host_fps, quota_profile, exp}` to the helper store — **[amended v0.9.18]**
   `device_fp` is added so the kick relay can resolve a device-scoped revocation to a live connection (§A3 keys it
-  `device_fp -> (server_id, cid)`) — so the helper can authorize non-callout requests (`helper.presence.get.<nfp>`,
+  `device_fp -> (server_id, cid)`) — **[amended v0.9.47]** `root_pk` retains the identity root public key the
+  caller presented in its auth bundle, because `helper.revoke.<nfp>` must check that a self-revocation's signer is
+  the session's `root_fp`, and a fingerprint cannot verify a signature; a host connection carries `None`, having no
+  member root — so the helper can authorize non-callout requests (`helper.presence.get.<nfp>`,
   `helper.turn.get.<nfp>`, `helper.revoke.<nfp>` — keyed by the subject token) — cleaned up on DISCONNECT/expiry.
   **Account topology (A10.15)**: one application account + a dedicated AUTH (callout) account + system account
   **[amended v0.9.9 — the S1-era config already carried the AUTH account; recorded now]**; every cross-boundary
@@ -1333,7 +1343,7 @@ Every signed artifact shares: version byte `v`, **distinct domain-separation tag
 | Admission token | `spindle-adm-v1` | operator key | `exp` days | nonce burn at helper (CAS, idempotent) |
 | Device certificate | `spindle-dev-cert-v2` [amended v0.9.29 — `nats_fp` removed] | identity root | `exp` 1 y; re-sign on contact | n/a (revocable) |
 | Revocation record | `spindle-rev-v1` | host op key [amended v0.9.18] | none (permanent) | **max-wins, never decreases**; old records cannot roll back |
-| Self-revocation record | `spindle-self-rev-v1` | identity root | none (permanent) | **max-wins per root**, never decreases |
+| Self-revocation record | `spindle-self-rev-v1` | identity root | none (permanent) | **max-wins per root**, never decreases — the accepted `revoked` set is the **monotone union** of every accepted record's entries [amended v0.9.47]: the epoch is a high-water mark that gates acceptance only, so a winning record with an empty `revoked` list revokes nothing and un-revokes nothing |
 | Admin command | `spindle-adm-cmd-v1` | operator key | `ts` ±2 min | per-signer monotonic `seq` + nonce; idempotent execution |
 | Host op-key cert | `spindle-host-cert-v2` [amended v0.9.31 — `nats_fp` removed] | host root | `exp` 90 d | n/a (rotation) |
 | Host device cert | `spindle-host-dev-cert-v1` | host op key | `exp` 90 d | n/a (rotation) |
@@ -1887,6 +1897,14 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.47 (2026-10-23)** — Two corrections, no wire change. (1) A7b's self-revocation row said max-wins per
+  root "never decreases" and left the set operation unstated. The accepted `revoked` set is the **monotone
+  union** of every accepted record's entries; the per-root epoch only gates acceptance. Without that, a restored
+  primary depositing a higher epoch with an empty `revoked` list would shrink the set and silently un-revoke
+  every device — a revocation bypass no signature check catches, because the record is genuinely root-signed.
+  (2) A5's session record carried `root_fp` but not `root_pk`, so `helper.revoke.<nfp>`'s "accept only if the
+  signer is the caller's `root_fp`" was unexecutable: a fingerprint cannot verify a signature. The record now
+  retains the root public key presented in the auth bundle (host connections carry `None`). (td-b5d50c)
 - **v0.9.46 (2026-10-23)** — One decision (A10.48), no artifact change. A4's old claim that admission
   tokens carry the registry endpoint, "likewise" an invite, is resolved in the negative for v1:
   `AdmissionToken` keeps its five fields — `{nonce, exp, label, quota_profile, sig_operator}` — and the
