@@ -53,7 +53,7 @@ use spindle_helper::authz::{
 };
 use spindle_helper::permissions::SubjectPermissions;
 use spindle_helper::session::SessionRecord;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -84,6 +84,9 @@ struct InMemoryHelperView {
     burned_nonces: HashMap<(Fingerprint, Vec<u8>), AdmissionRecord>,
     sessions: HashMap<Fingerprint, SessionRecord>,
     turn_usage: HashMap<(Fingerprint, u64), u64>,
+    /// `root_fp -> (high-water epoch, union of self-revoked device_fps)` (DESIGN.md §A7b,
+    /// amended v0.9.47); mirrors the graduated store's own field.
+    self_revoked: HashMap<Fingerprint, (u64, HashSet<Fingerprint>)>,
 }
 
 impl HelperView for InMemoryHelperView {
@@ -189,6 +192,30 @@ impl HelperView for InMemoryHelperView {
             self.revoked.insert((host_fp, *subject), true);
         }
     }
+
+    fn record_self_revocation(
+        &mut self,
+        root_fp: &Fingerprint,
+        epoch: u64,
+        revoked: &[Fingerprint],
+    ) {
+        let entry = self
+            .self_revoked
+            .entry(*root_fp)
+            .or_insert_with(|| (0, HashSet::new()));
+        entry.0 = entry.0.max(epoch.min(i64::MAX as u64));
+        entry.1.extend(revoked.iter().copied());
+    }
+
+    fn is_self_revoked(&mut self, root_fp: &Fingerprint, device_fp: &Fingerprint) -> bool {
+        self.self_revoked
+            .get(root_fp)
+            .is_some_and(|(_, revoked)| revoked.contains(device_fp))
+    }
+
+    fn self_revocation_epoch(&mut self, root_fp: &Fingerprint) -> Option<u64> {
+        self.self_revoked.get(root_fp).map(|(epoch, _)| *epoch)
+    }
 }
 
 fn now_secs() -> u64 {
@@ -247,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
         burned_nonces: HashMap::new(),
         sessions: HashMap::new(),
         turn_usage: HashMap::new(),
+        self_revoked: HashMap::new(),
     };
 
     let client = async_nats::ConnectOptions::with_nkey(callout_seed)

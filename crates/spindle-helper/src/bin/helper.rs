@@ -521,6 +521,36 @@ impl HelperView for Store {
         }
     }
 
+    fn record_self_revocation(
+        &mut self,
+        root_fp: &spindle_core::Fingerprint,
+        epoch: u64,
+        revoked: &[spindle_core::Fingerprint],
+    ) {
+        match self {
+            Store::Memory(s) => s.record_self_revocation(root_fp, epoch, revoked),
+            Store::Pg(s) => s.record_self_revocation(root_fp, epoch, revoked),
+        }
+    }
+
+    fn is_self_revoked(
+        &mut self,
+        root_fp: &spindle_core::Fingerprint,
+        device_fp: &spindle_core::Fingerprint,
+    ) -> bool {
+        match self {
+            Store::Memory(s) => s.is_self_revoked(root_fp, device_fp),
+            Store::Pg(s) => s.is_self_revoked(root_fp, device_fp),
+        }
+    }
+
+    fn self_revocation_epoch(&mut self, root_fp: &spindle_core::Fingerprint) -> Option<u64> {
+        match self {
+            Store::Memory(s) => s.self_revocation_epoch(root_fp),
+            Store::Pg(s) => s.self_revocation_epoch(root_fp),
+        }
+    }
+
     fn purge_expired_sessions(&mut self, now: u64) {
         match self {
             Store::Memory(s) => s.purge_expired_sessions(now),

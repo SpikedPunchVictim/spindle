@@ -22,6 +22,15 @@
 //!   DESIGN.md §A5 v0.9.18 amendment) is nullable and round-trips through the same upsert;
 //!   [`HelperView::sessions_for_subject`] reads it back with `WHERE (root_fp = $1 OR device_fp =
 //!   $1) AND exp > $2`, backed by `0002_*.sql`'s two single-column indexes.
+//! - `session_records.root_pk` (`0003_*.sql`, DESIGN.md §A5 **[amended v0.9.47]**) is nullable
+//!   and round-trips through the same upsert — `None` for host connections (no member root) and
+//!   for rows written before the migration.
+//! - `self_revocation_epochs` — the self-revocation epoch high-water mark per root, max-wins
+//!   upsert (`GREATEST`), never decreases (DESIGN.md §A7b, amended v0.9.47).
+//! - `self_revocations` — the accepted self-revoked subject set, `INSERT ... ON CONFLICT DO
+//!   NOTHING` and no deletes, so it is the monotone union of every accepted record's entries
+//!   (DESIGN.md §A7b, amended v0.9.47: an empty `revoked` list at a higher epoch revokes nothing
+//!   and un-revokes nothing).
 //! - `turn_usage` — a check-and-increment counter keyed by `(root_fp, period)`: an `UPDATE ...
 //!   WHERE count < $quota RETURNING count` either succeeds (admitted, already incremented) or
 //!   returns no row (refused, left unchanged) — a single indexed row's `UPDATE` is atomic under
@@ -85,6 +94,13 @@ fn fp_bytes(fp: &Fingerprint) -> Vec<u8> {
 /// runtime condition — every row this store itself writes is always exactly 32 bytes.
 fn fp_from_row(bytes: &[u8]) -> Fingerprint {
     Fingerprint::from_slice(bytes).expect("stored fingerprint column must be exactly 32 bytes")
+}
+
+/// Decodes the session record's stored `root_pk` column back into a public-key byte array. Same
+/// data-corruption contract as [`fp_from_row`]: every row this store itself writes is exactly 32
+/// bytes, so a wrong-length value is a durable-store bug, not a recoverable runtime condition.
+fn key_from_row(bytes: &[u8]) -> [u8; 32] {
+    <[u8; 32]>::try_from(bytes).expect("stored public-key column must be exactly 32 bytes")
 }
 
 impl PgStore {
@@ -224,10 +240,11 @@ impl PgStore {
     async fn put_session_record_async(&self, record: SessionRecord) {
         let host_fps: Vec<Vec<u8>> = record.host_fps.iter().map(fp_bytes).collect();
         sqlx::query(
-            "INSERT INTO session_records (nats_fp, root_fp, device_fp, host_fps, quota_profile, exp)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO session_records (nats_fp, root_fp, root_pk, device_fp, host_fps, quota_profile, exp)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (nats_fp) DO UPDATE SET
                 root_fp = excluded.root_fp,
+                root_pk = excluded.root_pk,
                 device_fp = excluded.device_fp,
                 host_fps = excluded.host_fps,
                 quota_profile = excluded.quota_profile,
@@ -235,6 +252,7 @@ impl PgStore {
         )
         .bind(fp_bytes(&record.nats_fp))
         .bind(fp_bytes(&record.root_fp))
+        .bind(record.root_pk.map(|key| key.to_vec()))
         .bind(record.device_fp.as_ref().map(fp_bytes))
         .bind(host_fps)
         .bind(&record.quota_profile)
@@ -246,7 +264,7 @@ impl PgStore {
 
     async fn session_record_async(&self, nats_fp: &Fingerprint, now: u64) -> Option<SessionRecord> {
         sqlx::query(
-            "SELECT root_fp, device_fp, host_fps, quota_profile, exp FROM session_records
+            "SELECT root_fp, root_pk, device_fp, host_fps, quota_profile, exp FROM session_records
              WHERE nats_fp = $1 AND exp > $2",
         )
         .bind(fp_bytes(nats_fp))
@@ -259,6 +277,9 @@ impl PgStore {
             SessionRecord::new(
                 *nats_fp,
                 fp_from_row(row.get::<Vec<u8>, _>("root_fp").as_slice()),
+                row.get::<Option<Vec<u8>>, _>("root_pk")
+                    .as_deref()
+                    .map(key_from_row),
                 row.get::<Option<Vec<u8>>, _>("device_fp")
                     .as_deref()
                     .map(fp_from_row),
@@ -279,7 +300,7 @@ impl PgStore {
         now: u64,
     ) -> Vec<SessionRecord> {
         sqlx::query(
-            "SELECT nats_fp, root_fp, device_fp, host_fps, quota_profile, exp FROM session_records
+            "SELECT nats_fp, root_fp, root_pk, device_fp, host_fps, quota_profile, exp FROM session_records
              WHERE (root_fp = $1 OR device_fp = $1) AND exp > $2",
         )
         .bind(fp_bytes(subject))
@@ -293,6 +314,9 @@ impl PgStore {
             SessionRecord::new(
                 fp_from_row(row.get::<Vec<u8>, _>("nats_fp").as_slice()),
                 fp_from_row(row.get::<Vec<u8>, _>("root_fp").as_slice()),
+                row.get::<Option<Vec<u8>>, _>("root_pk")
+                    .as_deref()
+                    .map(key_from_row),
                 row.get::<Option<Vec<u8>>, _>("device_fp")
                     .as_deref()
                     .map(fp_from_row),
@@ -403,6 +427,67 @@ impl PgStore {
         tx.commit().await.expect("commit revocation transaction");
     }
 
+    async fn self_revocation_epoch_async(&self, root_fp: &Fingerprint) -> Option<u64> {
+        sqlx::query("SELECT epoch FROM self_revocation_epochs WHERE root_fp = $1")
+            .bind(fp_bytes(root_fp))
+            .fetch_optional(&self.pool)
+            .await
+            .expect("self_revocation_epoch query")
+            .map(|row| row.get::<i64, _>("epoch") as u64)
+    }
+
+    async fn is_self_revoked_async(&self, root_fp: &Fingerprint, device_fp: &Fingerprint) -> bool {
+        sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM self_revocations WHERE root_fp = $1 AND device_fp = $2) AS revoked",
+        )
+        .bind(fp_bytes(root_fp))
+        .bind(fp_bytes(device_fp))
+        .fetch_one(&self.pool)
+        .await
+        .expect("is_self_revoked query")
+        .get::<bool, _>("revoked")
+    }
+
+    async fn record_self_revocation_async(
+        &self,
+        root_fp: &Fingerprint,
+        epoch: u64,
+        revoked: &[Fingerprint],
+    ) {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .expect("begin self-revocation transaction");
+
+        sqlx::query(
+            "INSERT INTO self_revocation_epochs (root_fp, epoch) VALUES ($1, $2)
+             ON CONFLICT (root_fp) DO UPDATE SET
+                epoch = GREATEST(self_revocation_epochs.epoch, excluded.epoch)",
+        )
+        .bind(fp_bytes(root_fp))
+        .bind(epoch.min(i64::MAX as u64) as i64)
+        .execute(&mut *tx)
+        .await
+        .expect("self_revocation_epochs max-wins upsert");
+
+        for device in revoked {
+            sqlx::query(
+                "INSERT INTO self_revocations (root_fp, device_fp) VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(fp_bytes(root_fp))
+            .bind(fp_bytes(device))
+            .execute(&mut *tx)
+            .await
+            .expect("self_revocations insert");
+        }
+
+        tx.commit()
+            .await
+            .expect("commit self-revocation transaction");
+    }
+
     /// Deletes every session record whose `exp` is at or before `now`. Not part of
     /// [`HelperView`] — `src/bin/helper.rs` calls this directly on a periodic timer (task brief:
     /// "a cleanup path for expired rows (on-read filter + periodic delete — keep simple)").
@@ -485,6 +570,23 @@ impl HelperView for PgStore {
         revoked_subjects: &[Fingerprint],
     ) {
         run_blocking(self.record_revocation_async(host_fp, epoch, revoked_subjects))
+    }
+
+    fn record_self_revocation(
+        &mut self,
+        root_fp: &Fingerprint,
+        epoch: u64,
+        revoked: &[Fingerprint],
+    ) {
+        run_blocking(self.record_self_revocation_async(root_fp, epoch, revoked))
+    }
+
+    fn is_self_revoked(&mut self, root_fp: &Fingerprint, device_fp: &Fingerprint) -> bool {
+        run_blocking(self.is_self_revoked_async(root_fp, device_fp))
+    }
+
+    fn self_revocation_epoch(&mut self, root_fp: &Fingerprint) -> Option<u64> {
+        run_blocking(self.self_revocation_epoch_async(root_fp))
     }
 
     fn purge_expired_sessions(&mut self, now: u64) {
@@ -572,7 +674,8 @@ mod tests {
                 "TEST_DATABASE_URL names database `{name}`, which does not end in `_test` -- \
                  refusing to run pg_store's contract tests against it. Every test in this module \
                  truncates revocation_epochs, revoked_subjects, admission_records, \
-                 burned_admission_nonces, session_records, and turn_usage before it runs; \
+                 burned_admission_nonces, session_records, turn_usage, self_revocation_epochs, \
+                 and self_revocations before it runs; \
                  pointing TEST_DATABASE_URL at a non-test database (e.g. the live compose \
                  stack's `spindle`, deploy/docker-compose.yml's POSTGRES_DB) destroys real data. \
                  Point TEST_DATABASE_URL at a dedicated database whose name ends in `_test` \
@@ -679,7 +782,8 @@ mod tests {
         // IDENTITY`/`CASCADE` are irrelevant here (no serial columns, no FKs) but harmless.
         sqlx::query(
             "TRUNCATE revocation_epochs, revoked_subjects, admission_records, \
-             burned_admission_nonces, session_records, turn_usage",
+             burned_admission_nonces, session_records, turn_usage, \
+             self_revocation_epochs, self_revocations",
         )
         .execute(&store.pool)
         .await
@@ -757,6 +861,92 @@ mod tests {
         assert!(store.is_revoked(&host, &subject));
     }
 
+    /// Mirrors `memory_store`'s self-revocation contract tests (DESIGN.md §A7b, amended
+    /// v0.9.47): the subject set unions monotonically, the epoch is a max-only high-water mark,
+    /// and an empty list at a higher epoch revokes and un-revokes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_revocation_set_unions_and_epoch_is_max_only() {
+        let _guard = TEST_LOCK.lock().await;
+        let Some(mut store) = test_store().await else {
+            return;
+        };
+        let root = fp(b"pg-sr-root");
+        let device_a = fp(b"pg-sr-device-a");
+        let device_b = fp(b"pg-sr-device-b");
+        let device_c = fp(b"pg-sr-device-c");
+        assert!(!store.is_self_revoked(&root, &device_a));
+        assert_eq!(
+            store.self_revocation_epoch(&root),
+            None,
+            "absence is explicit, not a 0 sentinel"
+        );
+
+        store.record_self_revocation(&root, 5, &[device_a]);
+        // A stale, NON-empty record: it must still union its subjects while leaving the epoch
+        // high-water mark alone ("a replay of an older record can only add subjects").
+        store.record_self_revocation(&root, 2, &[device_b]);
+        assert!(store.is_self_revoked(&root, &device_a));
+        assert!(
+            store.is_self_revoked(&root, &device_b),
+            "a lower-epoch record must still union its subjects"
+        );
+        assert_eq!(
+            store.self_revocation_epoch(&root),
+            Some(5),
+            "a lower epoch must never roll the high-water mark backward"
+        );
+
+        store.record_self_revocation(&root, 9, &[device_c]);
+        store.record_self_revocation(&root, 9, &[device_a]); // replay is idempotent
+        assert!(store.is_self_revoked(&root, &device_a));
+        assert!(store.is_self_revoked(&root, &device_b));
+        assert!(store.is_self_revoked(&root, &device_c));
+        assert_eq!(store.self_revocation_epoch(&root), Some(9));
+
+        store.record_self_revocation(&root, 10, &[]); // higher epoch, empty list
+        assert!(
+            store.is_self_revoked(&root, &device_a)
+                && store.is_self_revoked(&root, &device_b)
+                && store.is_self_revoked(&root, &device_c),
+            "an empty list at a higher epoch must not clear existing subjects"
+        );
+        assert_eq!(store.self_revocation_epoch(&root), Some(10));
+
+        let other_root = fp(b"pg-sr-other-root");
+        assert!(
+            !store.is_self_revoked(&other_root, &device_a),
+            "self-revocations are scoped per root"
+        );
+        assert_eq!(store.self_revocation_epoch(&other_root), None);
+        assert!(!store.is_self_revoked(&root, &fp(b"pg-sr-device-other")));
+    }
+
+    /// The durable epoch column is a BIGINT: an epoch above `i64::MAX` must saturate there, not
+    /// wrap negative and lose the `GREATEST` upsert to a later small epoch. This only affects
+    /// what the epoch reader reports — the union of subjects is unconditional.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_revocation_epoch_saturates_at_i64_max() {
+        let _guard = TEST_LOCK.lock().await;
+        let Some(mut store) = test_store().await else {
+            return;
+        };
+        let root = fp(b"pg-sr-root-saturate");
+        let device = fp(b"pg-sr-device-saturate");
+        store.record_self_revocation(&root, u64::MAX, &[device]);
+        assert_eq!(
+            store.self_revocation_epoch(&root),
+            Some(i64::MAX as u64),
+            "the BIGINT column must saturate, not wrap negative"
+        );
+        assert!(store.is_self_revoked(&root, &device));
+        store.record_self_revocation(&root, 7, &[]);
+        assert_eq!(
+            store.self_revocation_epoch(&root),
+            Some(i64::MAX as u64),
+            "a later small epoch must not beat the saturated high-water mark"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn session_record_round_trips_and_respects_expiry() {
         let _guard = TEST_LOCK.lock().await;
@@ -764,11 +954,13 @@ mod tests {
             return;
         };
         let nats_fp = fp(b"pg-nats-a");
+        let root_pk = [0x5A; 32];
         assert!(store.session_record(&nats_fp, 1_000).is_none());
 
         let record = SessionRecord::new(
             nats_fp,
             fp(b"pg-root-a"),
+            Some(root_pk),
             Some(fp(b"pg-device-a")),
             vec![fp(b"pg-host-x"), fp(b"pg-host-y")],
             "member".to_string(),
@@ -777,6 +969,11 @@ mod tests {
         store.put_session_record(record.clone());
         let got = store.session_record(&nats_fp, 1_000);
         assert_eq!(got, Some(record));
+        assert_eq!(
+            got.as_ref().unwrap().root_pk,
+            Some(root_pk),
+            "root_pk must round-trip through Postgres (§A5, amended v0.9.47)"
+        );
         assert_eq!(
             got.unwrap().device_fp,
             Some(fp(b"pg-device-a")),
@@ -799,6 +996,7 @@ mod tests {
             nats_fp,
             fp(b"pg-root-delete"),
             None,
+            None,
             vec![],
             "member".to_string(),
             2_000,
@@ -819,6 +1017,7 @@ mod tests {
             fp(b"pg-nats-live"),
             fp(b"root"),
             None,
+            None,
             vec![],
             "member".to_string(),
             5_000,
@@ -826,6 +1025,7 @@ mod tests {
         let expired = SessionRecord::new(
             fp(b"pg-nats-expired"),
             fp(b"root"),
+            None,
             None,
             vec![],
             "member".to_string(),
@@ -851,9 +1051,11 @@ mod tests {
         let shared_root = fp(b"pg-sfs-shared-root");
         let device_a = fp(b"pg-sfs-device-a");
         let device_b = fp(b"pg-sfs-device-b");
+        let root_pk_a = [0xC3; 32];
         store.put_session_record(SessionRecord::new(
             fp(b"pg-sfs-nats-a"),
             shared_root,
+            Some(root_pk_a),
             Some(device_a),
             vec![],
             "member".to_string(),
@@ -862,6 +1064,7 @@ mod tests {
         store.put_session_record(SessionRecord::new(
             fp(b"pg-sfs-nats-b"),
             shared_root,
+            None,
             Some(device_b),
             vec![],
             "member".to_string(),
@@ -870,6 +1073,7 @@ mod tests {
         store.put_session_record(SessionRecord::new(
             fp(b"pg-sfs-nats-expired"),
             shared_root,
+            None,
             Some(fp(b"pg-sfs-device-expired")),
             vec![],
             "member".to_string(),
@@ -890,6 +1094,11 @@ mod tests {
             "device_fp must match only its own session, not device_b's"
         );
         assert_eq!(by_device[0].device_fp, Some(device_a));
+        assert_eq!(
+            by_device[0].root_pk,
+            Some(root_pk_a),
+            "sessions_for_subject must round-trip the retained root_pk through Postgres"
+        );
 
         assert!(
             store

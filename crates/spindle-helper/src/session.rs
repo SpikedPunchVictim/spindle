@@ -30,6 +30,13 @@ use spindle_core::Fingerprint;
 pub struct SessionRecord {
     pub nats_fp: Fingerprint,
     pub root_fp: Fingerprint,
+    /// The identity root public key the caller presented in its auth bundle (DESIGN.md §A5,
+    /// **[amended v0.9.47]**). Retained so `helper.revoke.<nfp>` can verify a self-revocation
+    /// under the root this session presented — that handler accepts a record only if its signer is
+    /// the session's `root_fp`, and a fingerprint cannot verify a signature. `None` for host
+    /// connections, which have no member root: the same honest-`None` rationale as `device_fp`
+    /// below.
+    pub root_pk: Option<[u8; 32]>,
     /// The presenting device's fingerprint (DESIGN.md §A5, **[amended v0.9.18]**), so a
     /// device-scoped revocation (§A4: "a revocation names `root_fp | device_fp`") can be resolved
     /// to this live session (§A3's kick relay, keyed `device_fp -> (server_id, cid)` — a later
@@ -50,6 +57,7 @@ impl SessionRecord {
     pub fn new(
         nats_fp: Fingerprint,
         root_fp: Fingerprint,
+        root_pk: Option<[u8; 32]>,
         device_fp: Option<Fingerprint>,
         host_fps: Vec<Fingerprint>,
         quota_profile: String,
@@ -58,6 +66,7 @@ impl SessionRecord {
         Self {
             nats_fp,
             root_fp,
+            root_pk,
             device_fp,
             host_fps,
             quota_profile,
@@ -75,10 +84,12 @@ mod tests {
         let nats_fp = Fingerprint::of_parts(&[b"nats"]);
         let root_fp = Fingerprint::of_parts(&[b"root"]);
         let device_fp = Fingerprint::of_parts(&[b"device"]);
+        let root_pk = [0xA5; 32];
         let host_fps = vec![Fingerprint::of_parts(&[b"host-a"])];
         let rec = SessionRecord::new(
             nats_fp,
             root_fp,
+            Some(root_pk),
             Some(device_fp),
             host_fps.clone(),
             "member".to_string(),
@@ -86,6 +97,7 @@ mod tests {
         );
         assert_eq!(rec.nats_fp, nats_fp);
         assert_eq!(rec.root_fp, root_fp);
+        assert_eq!(rec.root_pk, Some(root_pk));
         assert_eq!(rec.device_fp, Some(device_fp));
         assert_eq!(rec.host_fps, host_fps);
         assert_eq!(rec.quota_profile, "member");
@@ -100,10 +112,12 @@ mod tests {
             nats_fp,
             root_fp,
             None,
+            None,
             vec![root_fp],
             "default".to_string(),
             5_678,
         );
         assert_eq!(rec.device_fp, None);
+        assert_eq!(rec.root_pk, None, "a host connection has no member root");
     }
 }

@@ -353,6 +353,7 @@ mod tests {
         s.put_session_record(SessionRecord::new(
             nats_fp,
             root_fp,
+            None,
             device_fp,
             vec![],
             "member".to_string(),

@@ -304,6 +304,46 @@ pub trait HelperView {
         revoked_subjects: &[Fingerprint],
     );
 
+    // ============================================================================================
+    // Self-revocations (DESIGN.md §A4/§A7b, **[amended v0.9.47]**). These are the durable-store
+    // contract for accepted root-signed `spindle-self-rev-v1` records deposited via
+    // `helper.revoke.<nfp>`; the NATS handler itself is a later slice.
+    // ============================================================================================
+
+    /// Records an accepted self-revocation for `root_fp` (DESIGN.md §A7b, **[amended
+    /// v0.9.47]**). The accepted `revoked` set is the **monotone union** of every accepted
+    /// record's entries: each fingerprint in `revoked` is added to the stored set, and an empty
+    /// list adds nothing. The `epoch` is a **max high-water mark only** — it never decreases (a
+    /// lower epoch cannot shrink the set or the number) and it gates record acceptance elsewhere;
+    /// it is not derived from the subject set. A replay of an older record can therefore only add
+    /// subjects, never remove them.
+    ///
+    /// **Storage bound, not an acceptance gate**: the durable epoch column is a `BIGINT`, so
+    /// epochs above `i64::MAX` are saturated to `i64::MAX as u64` identically by every store
+    /// implementation (memory included, for parity). This bound only affects what
+    /// [`Self::self_revocation_epoch`] reports; slice 2b unions every *verified* record's subjects
+    /// regardless of epoch, so saturation can never drop a revocation.
+    fn record_self_revocation(
+        &mut self,
+        root_fp: &Fingerprint,
+        epoch: u64,
+        revoked: &[Fingerprint],
+    );
+
+    /// True if `device_fp` has been self-revoked under `root_fp` by an accepted
+    /// `spindle-self-rev-v1` record (DESIGN.md §A4/§A7b, **[amended v0.9.47]**). False for a root
+    /// with no recorded self-revocation, and for a device not in that root's union set.
+    fn is_self_revoked(&mut self, root_fp: &Fingerprint, device_fp: &Fingerprint) -> bool;
+
+    /// The stored self-revocation epoch high-water mark for `root_fp` (DESIGN.md §A7b,
+    /// **[amended v0.9.47]**) — the value the epoch gate compares against, and the value
+    /// `helper.revoke.<nfp>` will reply with — or `None` if the helper has accepted no
+    /// self-revocation for this root. Absence is explicit rather than a sentinel, so "no record"
+    /// is never conflated with "an accepted record at epoch 0". Values saturate at `i64::MAX as
+    /// u64` (the durable column is a `BIGINT`; see [`Self::record_self_revocation`]); this is the
+    /// stored high-water mark, never derived from the subject set.
+    fn self_revocation_epoch(&mut self, root_fp: &Fingerprint) -> Option<u64>;
+
     /// Best-effort cleanup of session records whose `exp` has already passed. No-op by default
     /// (the on-read `exp` filter in [`session_record`](HelperView::session_record) already hides
     /// expired rows from callers — this is purely about bounding storage growth for a
@@ -422,6 +462,15 @@ pub fn decide_device_connect(
         Ok(fp) => fp,
         Err(_) => return AuthzDecision::Refused(RefusalReason::BadDeviceCertificate),
     };
+
+    // A root-signed self-revocation (§A7b, amended v0.9.47) names this device under this root:
+    // refuse outright, like any other revoked subject, and do it here — before the per-cap loop
+    // and before any signature work — so a self-revoked device never costs the callout an Ed25519
+    // verification. This check is root-scoped rather than host-scoped, so it needs no capability
+    // to have matched a host yet.
+    if view.is_self_revoked(&root_fp, &device_fp) {
+        return AuthzDecision::Refused(RefusalReason::SubjectRevoked);
+    }
 
     // 4. Cheap per-cap subject match, then a store lookup (no crypto) for revocation. A cap
     //    whose subject isn't this root_fp contributes nothing and is dropped silently — it is
@@ -556,6 +605,10 @@ pub fn decide_device_connect(
         session_record: SessionRecord::new(
             presented.nats_fp,
             root_fp,
+            // DESIGN.md §A5, amended v0.9.47: retain the root public key this caller presented,
+            // so `helper.revoke.<nfp>` can verify a self-revocation under the session's root_fp
+            // (a fingerprint cannot verify a signature).
+            Some(presented.root_pk.to_bytes()),
             // DESIGN.md §A5, amended v0.9.18: the device fingerprint, so a device-scoped
             // revocation can resolve back to this live session (see session.rs's
             // SessionRecord::device_fp doc comment).
@@ -752,6 +805,9 @@ pub fn decide_host_connect(
             // See session.rs's doc comment: a host connection's "root_fp" field holds the
             // host's own host_fp, and "host_fps" holds just itself.
             host_fp,
+            // DESIGN.md §A5, amended v0.9.47: a host connection carries `None` — it has no
+            // member root whose key a self-revocation would be verified under.
+            None,
             // A host connection has no client device fingerprint (see session.rs's
             // SessionRecord::device_fp doc comment) — None is the honest value, not a
             // placeholder.
@@ -788,6 +844,7 @@ mod tests {
         burn_calls: u32,
         sessions: HashMap<Fingerprint, SessionRecord>,
         turn_usage: HashMap<(Fingerprint, u64), u64>,
+        self_revoked: HashMap<Fingerprint, (u64, HashSet<Fingerprint>)>,
     }
 
     impl HelperView for MockView {
@@ -886,6 +943,30 @@ mod tests {
             for subject in revoked_subjects {
                 self.revoked.insert((host_fp, *subject));
             }
+        }
+
+        fn record_self_revocation(
+            &mut self,
+            root_fp: &Fingerprint,
+            epoch: u64,
+            revoked: &[Fingerprint],
+        ) {
+            let entry = self
+                .self_revoked
+                .entry(*root_fp)
+                .or_insert_with(|| (0, HashSet::new()));
+            entry.0 = entry.0.max(epoch.min(i64::MAX as u64));
+            entry.1.extend(revoked.iter().copied());
+        }
+
+        fn is_self_revoked(&mut self, root_fp: &Fingerprint, device_fp: &Fingerprint) -> bool {
+            self.self_revoked
+                .get(root_fp)
+                .is_some_and(|(_, revoked)| revoked.contains(device_fp))
+        }
+
+        fn self_revocation_epoch(&mut self, root_fp: &Fingerprint) -> Option<u64> {
+            self.self_revoked.get(root_fp).map(|(epoch, _)| *epoch)
         }
     }
 
@@ -1070,6 +1151,124 @@ mod tests {
         );
     }
 
+    /// §A7b [amended v0.9.47]: a root-signed self-revocation naming this device under this root
+    /// is a revocation like any other — refused outright, never downgraded to connect-only, even
+    /// when the presented member cap is otherwise perfectly valid.
+    #[test]
+    fn self_revoked_device_is_refused_outright_never_connect_only() {
+        let (root, cert, attest, device_fp) = device_setup(fp(b"nats-session"));
+        let root_fp = root.root_fp();
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let cap = member_cap(&host, root_fp, 0, 2_000_000);
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![cap],
+            nats_fp: fp(b"nats-session"),
+            session_attest: attest,
+        };
+        let mut view = MockView::default();
+        view.record_self_revocation(&root_fp, 3, &[device_fp]);
+        let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
+        assert_eq!(
+            decision,
+            AuthzDecision::Refused(RefusalReason::SubjectRevoked),
+            "a self-revoked device must be refused outright, never connect-only"
+        );
+    }
+
+    /// Same refusal must win over the *connect-only* branches, not just over full authorization:
+    /// an expired-but-signature-valid member cap is normally the renewal path (connect-only), but
+    /// a self-revoked device presenting one is refused outright.
+    #[test]
+    fn self_revoked_device_with_an_expired_member_cap_is_refused_not_connect_only() {
+        let (root, cert, attest, device_fp) = device_setup(fp(b"nats-session"));
+        let root_fp = root.root_fp();
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let cap = member_cap(&host, root_fp, 0, 1_000); // expired at now=1_500, sig valid
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![cap],
+            nats_fp: fp(b"nats-session"),
+            session_attest: attest,
+        };
+        let mut view = MockView::default();
+        view.record_self_revocation(&root_fp, 3, &[device_fp]);
+        let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
+        assert_eq!(
+            decision,
+            AuthzDecision::Refused(RefusalReason::SubjectRevoked),
+            "the self-revocation refusal must precede the expired-cap connect-only path"
+        );
+    }
+
+    /// An invite cap is connect-only by kind even when fresh; a self-revoked device presenting one
+    /// is still refused outright.
+    #[test]
+    fn self_revoked_device_with_an_invite_cap_is_refused_not_connect_only() {
+        let (root, cert, attest, device_fp) = device_setup(fp(b"nats-session"));
+        let root_fp = root.root_fp();
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let cap = invite_cap(&host, root_fp, 2_000_000);
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![cap],
+            nats_fp: fp(b"nats-session"),
+            session_attest: attest,
+        };
+        let mut view = MockView::default();
+        view.record_self_revocation(&root_fp, 3, &[device_fp]);
+        let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
+        assert_eq!(
+            decision,
+            AuthzDecision::Refused(RefusalReason::SubjectRevoked),
+            "the self-revocation refusal must precede the invite connect-only path"
+        );
+    }
+
+    /// §A12 #24's cheap-before-expensive discipline: the self-revocation lookup runs before the
+    /// per-cap loop and before any signature work, so a self-revoked device can never cost the
+    /// callout an Ed25519 verification.
+    #[test]
+    fn self_revoked_device_is_refused_before_any_signature_work() {
+        let (root, cert, attest, device_fp) = device_setup(fp(b"nats-session"));
+        let root_fp = root.root_fp();
+        let host = test_host([0x11; 32], [0x12; 32]);
+        let cap = member_cap(&host, root_fp, 0, 2_000_000);
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![cap],
+            nats_fp: fp(b"nats-session"),
+            session_attest: attest,
+        };
+        let mut view = MockView::default();
+        view.record_self_revocation(&root_fp, 3, &[device_fp]);
+        let nkey_calls = Cell::new(0u32);
+        let decision = decide_device_connect(
+            &presented,
+            || {
+                nkey_calls.set(nkey_calls.get() + 1);
+                true
+            },
+            1_500,
+            &mut view,
+            0,
+        );
+        assert_eq!(
+            decision,
+            AuthzDecision::Refused(RefusalReason::SubjectRevoked)
+        );
+        assert_eq!(
+            nkey_calls.get(),
+            0,
+            "the nkey signature must never be checked when the self-revocation lookup already \
+             refuses"
+        );
+    }
+
     #[test]
     fn expired_but_signature_valid_member_cap_is_connect_only() {
         let (root, cert, attest, device_fp) = device_setup(fp(b"nats-session"));
@@ -1235,6 +1434,12 @@ mod tests {
             permissions::max_subscriptions(1)
         );
         assert_eq!(auth.session_record.root_fp, root_fp);
+        assert_eq!(
+            auth.session_record.root_pk,
+            Some(root.public_key().to_bytes()),
+            "decide_device_connect must retain the presented root public key (§A5, amended \
+             v0.9.47) so helper.revoke.<nfp> can verify a self-revocation under it"
+        );
         assert_eq!(auth.session_record.host_fps, vec![host_fp]);
         assert_eq!(
             auth.session_record.device_fp,
@@ -1571,6 +1776,11 @@ mod tests {
             auth.session_record.device_fp, None,
             "a host connection has no client device fingerprint — decide_host_connect must leave \
              device_fp None, not invent a placeholder value"
+        );
+        assert_eq!(
+            auth.session_record.root_pk, None,
+            "a host connection has no member root — decide_host_connect must leave root_pk None \
+             (§A5, amended v0.9.47)"
         );
 
         // Idempotent replay: same nonce, same host, same session, presented again (e.g. a

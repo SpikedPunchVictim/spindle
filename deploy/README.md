@@ -76,11 +76,12 @@ behavior, which is the whole point of the `HelperView` trait boundary.
 To additionally exercise `crates/spindle-helper`'s Postgres-gated store-contract tests against
 this stack's own Postgres server:
 
-**Warning:** these tests `TRUNCATE` every table `pg_store.rs` owns
-(`revocation_epochs`, `revoked_subjects`, `admission_records`, `burned_admission_nonces`,
-`session_records`, `turn_usage`) before each test run. `TEST_DATABASE_URL` must therefore never
-name the live stack's own database (`spindle`, the one `helper`'s `DATABASE_URL` uses) — doing so
-would destroy that stack's revocations, admissions, burned nonces, sessions, and TURN usage.
+**Warning:** these tests `TRUNCATE` every table `pg_store.rs` owns before each test run — see the
+`TRUNCATE` statement in `crates/spindle-helper/src/pg_store.rs`'s test harness for the
+authoritative, current table list (deliberately not enumerated here, so this warning cannot rot as
+tables are added). `TEST_DATABASE_URL` must therefore never name the live stack's own database
+(`spindle`, the one `helper`'s `DATABASE_URL` uses) — doing so would destroy that stack's
+revocations, admissions, burned nonces, sessions, and TURN usage.
 Point it at a dedicated `spindle_test` database on the same server instead; `pg_store.rs` now
 enforces this itself (it panics if the database name doesn't end in `_test`), so a mistake here
 fails loudly rather than truncating live data.

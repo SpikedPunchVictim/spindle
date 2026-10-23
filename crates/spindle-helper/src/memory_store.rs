@@ -15,7 +15,7 @@
 //! admission records to reconnect, but never appropriate for a production deployment.
 
 use spindle_core::{Fingerprint, VerifyingKey};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::authz::{AdmissionMode, AdmissionRecord, HelperView};
 use crate::session::SessionRecord;
@@ -51,6 +51,11 @@ pub struct InMemoryHelperView {
     /// `(root_fp, period) -> mint count`, added in Stage 4 slice 3 — see
     /// [`HelperView::record_turn_issuance`]'s doc comment for the period definition.
     turn_usage: HashMap<(Fingerprint, u64), u64>,
+    /// `root_fp -> (high-water epoch, union of self-revoked device_fps)` (DESIGN.md §A7b,
+    /// **[amended v0.9.47]**). The epoch and the subject set are stored separately on purpose:
+    /// the epoch is a max-only acceptance gate, while the set unions monotonically and is never
+    /// replaced wholesale — see [`HelperView::record_self_revocation`]'s doc comment.
+    self_revoked: HashMap<Fingerprint, (u64, HashSet<Fingerprint>)>,
 }
 
 impl InMemoryHelperView {
@@ -64,6 +69,7 @@ impl InMemoryHelperView {
             burned_nonces: HashMap::new(),
             sessions: HashMap::new(),
             turn_usage: HashMap::new(),
+            self_revoked: HashMap::new(),
         }
     }
 }
@@ -170,6 +176,30 @@ impl HelperView for InMemoryHelperView {
     fn purge_expired_sessions(&mut self, now: u64) {
         self.sessions.retain(|_, r| r.exp > now);
     }
+
+    fn record_self_revocation(
+        &mut self,
+        root_fp: &Fingerprint,
+        epoch: u64,
+        revoked: &[Fingerprint],
+    ) {
+        let entry = self
+            .self_revoked
+            .entry(*root_fp)
+            .or_insert_with(|| (0, HashSet::new()));
+        entry.0 = entry.0.max(epoch.min(i64::MAX as u64));
+        entry.1.extend(revoked.iter().copied());
+    }
+
+    fn is_self_revoked(&mut self, root_fp: &Fingerprint, device_fp: &Fingerprint) -> bool {
+        self.self_revoked
+            .get(root_fp)
+            .is_some_and(|(_, revoked)| revoked.contains(device_fp))
+    }
+
+    fn self_revocation_epoch(&mut self, root_fp: &Fingerprint) -> Option<u64> {
+        self.self_revoked.get(root_fp).map(|(epoch, _)| *epoch)
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +295,7 @@ mod tests {
         let record = SessionRecord::new(
             nats_fp,
             fp(b"root-a"),
+            None,
             Some(fp(b"device-a")),
             vec![fp(b"host-a")],
             "member".to_string(),
@@ -288,6 +319,7 @@ mod tests {
             nats_fp,
             fp(b"root-b"),
             None,
+            None,
             vec![],
             "member".to_string(),
             1_000,
@@ -307,6 +339,7 @@ mod tests {
         v.put_session_record(SessionRecord::new(
             nats_fp,
             fp(b"root-delete"),
+            None,
             None,
             vec![],
             "member".to_string(),
@@ -333,6 +366,7 @@ mod tests {
             nats_fp,
             fp(b"root-old"),
             None,
+            None,
             vec![],
             "member".to_string(),
             1_000,
@@ -340,6 +374,7 @@ mod tests {
         v.put_session_record(SessionRecord::new(
             nats_fp,
             fp(b"root-new"),
+            None,
             None,
             vec![],
             "member".to_string(),
@@ -422,6 +457,7 @@ mod tests {
             live_fp,
             fp(b"root"),
             None,
+            None,
             vec![],
             "member".to_string(),
             5_000,
@@ -429,6 +465,7 @@ mod tests {
         v.put_session_record(SessionRecord::new(
             expired_fp,
             fp(b"root"),
+            None,
             None,
             vec![],
             "member".to_string(),
@@ -445,9 +482,11 @@ mod tests {
     fn sessions_for_subject_matches_on_root_fp() {
         let mut v = view(AdmissionMode::Open);
         let root_fp = fp(b"sfs-root-match");
+        let root_pk = [0xC3; 32];
         v.put_session_record(SessionRecord::new(
             fp(b"sfs-nats-1"),
             root_fp,
+            Some(root_pk),
             Some(fp(b"sfs-device-1")),
             vec![],
             "member".to_string(),
@@ -456,6 +495,11 @@ mod tests {
         let got = v.sessions_for_subject(&root_fp, 1_000);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].root_fp, root_fp);
+        assert_eq!(
+            got[0].root_pk,
+            Some(root_pk),
+            "sessions_for_subject must round-trip the retained root_pk"
+        );
     }
 
     #[test]
@@ -465,6 +509,7 @@ mod tests {
         v.put_session_record(SessionRecord::new(
             fp(b"sfs-nats-2"),
             fp(b"sfs-root-2"),
+            None,
             Some(device_fp),
             vec![],
             "member".to_string(),
@@ -482,6 +527,7 @@ mod tests {
         v.put_session_record(SessionRecord::new(
             fp(b"sfs-nats-3"),
             root_fp,
+            None,
             Some(fp(b"sfs-device-3")),
             vec![],
             "member".to_string(),
@@ -507,6 +553,7 @@ mod tests {
         v.put_session_record(SessionRecord::new(
             nats_a,
             shared_root,
+            None,
             Some(device_a),
             vec![],
             "member".to_string(),
@@ -515,6 +562,7 @@ mod tests {
         v.put_session_record(SessionRecord::new(
             nats_b,
             shared_root,
+            None,
             Some(device_b),
             vec![],
             "member".to_string(),
@@ -539,5 +587,170 @@ mod tests {
         assert!(!v.is_revoked(&host, &subject));
         v.record_revocation(host, 1, &[subject]);
         assert!(v.is_revoked(&host, &subject));
+    }
+
+    // ---- self-revocations (DESIGN.md §A7b, amended v0.9.47) ---------------------------------
+
+    #[test]
+    fn session_record_root_pk_round_trips_for_a_device_and_stays_none_for_a_host() {
+        let mut v = view(AdmissionMode::Open);
+        let root_pk = [0x5A; 32];
+        let device_nats = fp(b"nats-rootpk-device");
+        let host_nats = fp(b"nats-rootpk-host");
+        v.put_session_record(SessionRecord::new(
+            device_nats,
+            fp(b"root-rootpk"),
+            Some(root_pk),
+            Some(fp(b"device-rootpk")),
+            vec![],
+            "member".to_string(),
+            2_000,
+        ));
+        v.put_session_record(SessionRecord::new(
+            host_nats,
+            fp(b"host-rootpk"),
+            None,
+            None,
+            vec![],
+            "default".to_string(),
+            2_000,
+        ));
+        assert_eq!(
+            v.session_record(&device_nats, 1_000)
+                .expect("device record present")
+                .root_pk,
+            Some(root_pk),
+            "a device record keeps the root public key it was constructed with"
+        );
+        assert_eq!(
+            v.session_record(&host_nats, 1_000)
+                .expect("host record present")
+                .root_pk,
+            None,
+            "a host connection has no member root"
+        );
+    }
+
+    #[test]
+    fn self_revocation_subject_set_is_the_union_across_records() {
+        let mut v = view(AdmissionMode::Open);
+        let root = fp(b"sr-root-union");
+        let device_a = fp(b"sr-device-a");
+        let device_b = fp(b"sr-device-b");
+        v.record_self_revocation(&root, 1, &[device_a]);
+        v.record_self_revocation(&root, 2, &[device_b]);
+        assert!(v.is_self_revoked(&root, &device_a));
+        assert!(
+            v.is_self_revoked(&root, &device_b),
+            "a later record must add to the set, not replace it"
+        );
+        assert_eq!(v.self_revocation_epoch(&root), Some(2));
+    }
+
+    #[test]
+    fn a_higher_epoch_with_an_empty_list_revokes_and_un_revokes_nothing() {
+        let mut v = view(AdmissionMode::Open);
+        let root = fp(b"sr-root-empty");
+        let device = fp(b"sr-device-empty");
+        v.record_self_revocation(&root, 5, &[device]);
+        v.record_self_revocation(&root, 9, &[]);
+        assert!(
+            v.is_self_revoked(&root, &device),
+            "an empty list at a higher epoch must not clear existing subjects"
+        );
+        assert_eq!(
+            v.self_revocation_epoch(&root),
+            Some(9),
+            "the epoch is a stored high-water mark, independent of the subject set"
+        );
+    }
+
+    #[test]
+    fn lower_or_equal_epoch_cannot_shrink_the_subject_set() {
+        let mut v = view(AdmissionMode::Open);
+        let root = fp(b"sr-root-no-shrink");
+        let device_a = fp(b"sr-device-no-shrink-a");
+        let device_b = fp(b"sr-device-no-shrink-b");
+        let device_c = fp(b"sr-device-no-shrink-c");
+        v.record_self_revocation(&root, 5, &[device_a]);
+        // A stale, NON-empty record: it must still union its subjects while leaving the epoch
+        // high-water mark alone ("a replay of an older record can only add subjects").
+        v.record_self_revocation(&root, 2, &[device_b]);
+        assert!(v.is_self_revoked(&root, &device_a));
+        assert!(
+            v.is_self_revoked(&root, &device_b),
+            "a lower-epoch record must still union its subjects"
+        );
+        assert_eq!(
+            v.self_revocation_epoch(&root),
+            Some(5),
+            "a lower epoch must never roll the stored high-water mark backward"
+        );
+        v.record_self_revocation(&root, 5, &[device_c]); // equal epoch may still add subjects
+        assert!(v.is_self_revoked(&root, &device_a));
+        assert!(v.is_self_revoked(&root, &device_b));
+        assert!(v.is_self_revoked(&root, &device_c));
+    }
+
+    #[test]
+    fn epochs_above_i64_max_saturate_identically_to_the_durable_column() {
+        let mut v = view(AdmissionMode::Open);
+        let root = fp(b"sr-root-saturate");
+        let device = fp(b"sr-device-saturate");
+        v.record_self_revocation(&root, u64::MAX, &[device]);
+        assert_eq!(
+            v.self_revocation_epoch(&root),
+            Some(i64::MAX as u64),
+            "the in-memory store must saturate like Postgres's BIGINT column"
+        );
+        assert!(v.is_self_revoked(&root, &device));
+        v.record_self_revocation(&root, 7, &[]);
+        assert_eq!(
+            v.self_revocation_epoch(&root),
+            Some(i64::MAX as u64),
+            "a later small epoch must not beat the saturated high-water mark"
+        );
+    }
+
+    #[test]
+    fn replaying_the_same_self_revocation_is_idempotent() {
+        let mut v = view(AdmissionMode::Open);
+        let root = fp(b"sr-root-replay");
+        let device = fp(b"sr-device-replay");
+        v.record_self_revocation(&root, 4, &[device]);
+        v.record_self_revocation(&root, 4, &[device]);
+        assert!(v.is_self_revoked(&root, &device));
+        assert_eq!(v.self_revocation_epoch(&root), Some(4));
+    }
+
+    #[test]
+    fn self_revocations_are_scoped_per_root() {
+        let mut v = view(AdmissionMode::Open);
+        let root_a = fp(b"sr-root-scope-a");
+        let root_b = fp(b"sr-root-scope-b");
+        let device = fp(b"sr-device-scope");
+        v.record_self_revocation(&root_a, 1, &[device]);
+        assert!(v.is_self_revoked(&root_a, &device));
+        assert!(
+            !v.is_self_revoked(&root_b, &device),
+            "one root's self-revocation must not leak into another root's set"
+        );
+        assert_eq!(
+            v.self_revocation_epoch(&root_b),
+            None,
+            "absence is explicit; it is not the same as an accepted epoch 0"
+        );
+    }
+
+    #[test]
+    fn is_self_revoked_is_false_for_an_unrecorded_root_and_for_a_different_device() {
+        let mut v = view(AdmissionMode::Open);
+        let root = fp(b"sr-root-negative");
+        let revoked_device = fp(b"sr-device-revoked");
+        let other_device = fp(b"sr-device-other");
+        assert!(!v.is_self_revoked(&root, &revoked_device));
+        v.record_self_revocation(&root, 1, &[revoked_device]);
+        assert!(!v.is_self_revoked(&root, &other_device));
+        assert!(!v.is_self_revoked(&fp(b"sr-root-never-seen"), &revoked_device));
     }
 }
