@@ -58,6 +58,11 @@
 //!   `registry.revoke.<host_fp>` — everything except the actual NATS publish. See that module's
 //!   doc comment for the store-first ordering rationale and why `cap_epoch` is bumped here rather
 //!   than inside `spindle_vfs::store::Store::revoke_member`/`revoke_device`.
+//! - [`self_revocation`] — [`self_revocation::apply_self_revocation`]: verifies a root-signed
+//!   `spindle-self-rev-v1` record against a member's stored `root_pk` and applies its device
+//!   revocations to this host's store (per-device atomic mutation, no epoch gate, monotone union).
+//!   The host-side counterpart of `spindle_helper::self_revoke`'s NATS handler; it has no
+//!   production caller yet — the delivery route is td-bdab3a.
 //! - [`serve`] (Stage 6 slice 5) — [`serve::serve_control_stream`], the binding loop: reads
 //!   [`spindle_net::framing`] frames off a real duplex stream (production: a
 //!   `spindle_net::quic::ControlStream`'s QUIC control stream), calls
@@ -148,6 +153,7 @@ pub mod limits;
 mod mount;
 mod ratelimit;
 pub mod revoke;
+pub mod self_revocation;
 mod upload;
 
 pub use authorize::{
@@ -158,6 +164,7 @@ pub use invite::{InviteIssuer, INVITE_DEFAULT_TTL_SECS, INVITE_NONCE_LEN};
 pub use revoke::{
     revoke_device_and_mint, revoke_member_and_mint, RevocationPublication, RevokeError,
 };
+pub use self_revocation::{apply_self_revocation, SelfRevocationError, SelfRevocationOutcome};
 pub use serve::{serve_control_stream, ServeError};
 pub use server::{SessionContext, VfsRpcServer};
 pub use session::{
