@@ -18,7 +18,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { CAPABILITY_CURRENT_V, CapKind, type Capability, ProtoError } from "../src/artifacts.js";
+import { CAPABILITY_CURRENT_V, CapKind, Capability, ProtoError } from "../src/artifacts.js";
 import { CborValue, canonicalDecode, type CborValue as CborValueType } from "../src/canonical.js";
 import { QR_V40_L_CAPACITY_BYTES } from "../src/bootstrap.js";
 import { bytesToHex, hexToBytes } from "../src/hex.js";
@@ -77,6 +77,17 @@ function sampleInvite(): InvitePayload {
 }
 
 const utf8 = new TextEncoder();
+
+/** A container map whose `v` and `cap` are valid and whose `endpoints`/`tls_pin` are supplied
+ * raw, so a test can make exactly those two fields invalid at once. */
+function inviteMapWith(endpoints: CborValue, tlsPin: CborValue): CborValue {
+  return CborValue.map([
+    ["v", CborValue.uint(INVITE_CURRENT_V)],
+    ["cap", Capability.toCbor(sampleCapability())],
+    ["endpoints", endpoints],
+    ["tls_pin", tlsPin],
+  ]);
+}
 
 // ------------------------------------------------------------------------------------------------
 // Round-trips
@@ -176,6 +187,51 @@ describe("endpoint rules", () => {
     );
     expect(err.kind).toBe("EndpointTooLong");
     expect(err.actual).toBe(MAX_ENDPOINT_LEN + 2);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// Decode order on multi-invalid input (twin with invite.rs)
+// ------------------------------------------------------------------------------------------------
+
+// Each input below is invalid in two places, so the assertion pins *which* error wins.
+// `readEndpoints` applies the count rules immediately after reading the array and each endpoint's
+// length during the item pass, before `fromCbor` ever looks at `tls_pin`; the Rust twin must do
+// the same. A decoder that reordered those checks would still reject these, but with a different
+// error kind — and two implementations that disagree about the first error will eventually
+// disagree about validity. The corresponding Rust tests are
+// `an_empty_endpoint_list_is_reported_before_an_invalid_tls_pin_kind`,
+// `too_many_endpoints_are_reported_before_an_invalid_tls_pin_kind`, and
+// `an_over_long_endpoint_is_reported_before_a_non_text_sibling`.
+describe("decode order on multi-invalid input", () => {
+  it("reports NoEndpoints before an invalid tls_pin kind", () => {
+    const v = inviteMapWith(
+      CborValue.array([]),
+      CborValue.map([["kind", CborValue.uint(2)]]),
+    );
+    const err = expectThrows(InviteWireError, () => InvitePayload.fromCbor(v));
+    expect(err.kind).toBe("NoEndpoints");
+  });
+
+  it("reports TooManyEndpoints before an invalid tls_pin kind", () => {
+    const endpoints = Array.from({ length: MAX_ENDPOINTS + 1 }, (_, i) =>
+      CborValue.text(`wss://h${i}`),
+    );
+    const v = inviteMapWith(
+      CborValue.array(endpoints),
+      CborValue.map([["kind", CborValue.uint(2)]]),
+    );
+    const err = expectThrows(InviteWireError, () => InvitePayload.fromCbor(v));
+    expect(err.kind).toBe("TooManyEndpoints");
+  });
+
+  it("reports EndpointTooLong before a non-text sibling endpoint", () => {
+    const v = inviteMapWith(
+      CborValue.array([CborValue.text("w".repeat(MAX_ENDPOINT_LEN + 1)), CborValue.uint(42)]),
+      TlsPin.toCbor(TlsPin.webPki()),
+    );
+    const err = expectThrows(InviteWireError, () => InvitePayload.fromCbor(v));
+    expect(err.kind).toBe("EndpointTooLong");
   });
 });
 

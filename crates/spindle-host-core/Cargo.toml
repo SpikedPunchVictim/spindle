@@ -34,6 +34,12 @@ cap-std = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# `rand` backs `invite::InviteIssuer`'s per-call nonce. DESIGN.md §A7b's signed-artifact replay
+# table makes an invite cap's nonce a burn key ("invite: nonce burn"), so it must be a CSPRNG draw
+# rather than the deterministic, explicitly non-security-bearing member-cap derivation — see that
+# module's doc comment. Workspace-pinned to 0.8; `spindle-net` already uses it for the same class
+# of value (session ids and ephemeral keypairs).
+rand = { workspace = true }
 
 # `rustix`/`windows-sys` back `limits::OsFreeSpace` (DESIGN.md §A4b free-space floor; user decision
 # 2026-08-26 — A9c manifest amended). Both are already-transitive dependencies of this crate via

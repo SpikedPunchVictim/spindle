@@ -378,9 +378,11 @@ pub const MEMBER_CAP_DEFAULT_TTL_SECS: u64 = 6 * 7 * 24 * 60 * 60;
 /// truncated to whole seconds since the Unix epoch. Saturates to `0` rather than panicking if the
 /// system clock reads before the epoch — a misconfigured clock should degrade a minted cap's
 /// `exp` (making it trivially expired, which is the fail-closed direction), not crash the connect
-/// path outright. Mirrors `spindle-hostd`'s own `wall_clock_now_secs`
-/// (`crates/spindle-hostd/src/lib.rs:156`) — duplicated rather than imported because
-/// `spindle-hostd` depends on this crate, not the other way around.
+/// path outright. [`crate::invite::InviteIssuer::new`] uses this same function for the same
+/// reason, which is why it is `pub(crate)` rather than private; the duplication would otherwise
+/// give the two issuers two clocks that could drift independently. Mirrors `spindle-hostd`'s own
+/// `wall_clock_now_secs` (`crates/spindle-hostd/src/lib.rs:156`) — duplicated rather than
+/// imported because `spindle-hostd` depends on this crate, not the other way around.
 ///
 /// **[contested — td-331c11]** That mirroring is asserted, not enforced: changing the
 /// `spindle-hostd` copy to milliseconds reddens nothing anywhere in the workspace, because
@@ -389,7 +391,7 @@ pub const MEMBER_CAP_DEFAULT_TTL_SECS: u64 = 6 * 7 * 24 * 60 * 60;
 /// (`crates/spindle-hostd/src/lib.rs:270-283` defers it to Stage 7), so its clock stamps no
 /// measured artifact. When Stage 7 wires the issuer, the two copies must be collapsed or the
 /// guard extended to both.
-fn wall_clock_now_secs() -> u64 {
+pub(crate) fn wall_clock_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

@@ -24,6 +24,12 @@
 //!   [`server::VfsRpcServer::handle`]'s per-request `denied:device_revoked` gate — both enforce
 //!   DESIGN.md §A4's member-active-and-device-not-revoked rule, one at connect time (once per
 //!   session) and one per request.
+//! - [`invite`] — [`invite::InviteIssuer`], the production issuer for `spindle-invite-v1`
+//!   payloads: signs an `invite`-kind capability addressed to the invitee's `root_fp` (DESIGN.md
+//!   A10.46), then wraps it with the registry endpoint list and TLS pin the recipient needs. The
+//!   wire shape and its caps belong to [`spindle_proto::invite`]; the keys, clock, and fresh
+//!   per-call nonce belong here. See that module's doc comment for why its nonce is CSPRNG-drawn
+//!   while [`authorize::RootKeyCapIssuer`]'s is deterministic.
 //! - [`server`] — [`server::VfsRpcServer`], the per-request enforcement pipeline, and
 //!   [`server::SessionContext`] (the trusted, already-authenticated `{member_id, device_fp}}` a
 //!   transport layer hands in per call). This is the crate's whole public surface.
@@ -130,6 +136,7 @@
 //! the consuming binary (`spindle-hostd`), not to add one here.
 
 pub mod authorize;
+pub mod invite;
 pub mod serve;
 pub mod server;
 pub mod session;
@@ -147,6 +154,7 @@ pub use authorize::{
     CapIssuer, DeviceLookup, HostConnectAuthorizer, LookupError, RootKeyCapIssuer,
     SqliteDeviceLookup, MEMBER_CAP_DEFAULT_TTL_SECS,
 };
+pub use invite::{InviteIssuer, INVITE_DEFAULT_TTL_SECS, INVITE_NONCE_LEN};
 pub use revoke::{
     revoke_device_and_mint, revoke_member_and_mint, RevocationPublication, RevokeError,
 };

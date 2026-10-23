@@ -20,12 +20,13 @@
 //!
 //! Session ids are generated via `spindle_core::Fingerprint::of_parts` over the session's
 //! identifying fields plus a monotonic per-server counter and the open timestamp — **not**
-//! cryptographically random, a deliberate, documented choice: `spindle-host-core` has no `rand`
-//! dependency, and every session-scoped call (`upload_chunk`/`upload_commit`/`upload_abort`)
-//! independently re-checks that the caller's `member_id` owns the session before doing anything
-//! with it (see `crate::server::VfsRpcServer`'s upload handlers), so a guessed id alone can never
-//! act on another member's session. Guessability is therefore not this design's security boundary;
-//! a later slice can swap in real randomness (a `rand` dependency) without changing that boundary.
+//! cryptographically random, a deliberate, documented choice: every session-scoped call
+//! (`upload_chunk`/`upload_commit`/`upload_abort`) independently re-checks that the caller's
+//! `member_id` owns the session before doing anything with it (see
+//! `crate::server::VfsRpcServer`'s upload handlers), so a guessed id alone can never act on
+//! another member's session. Guessability is therefore not this design's security boundary, and
+//! deriving the id from data already in hand keeps it reproducible in tests and logs. A CSPRNG
+//! draw would not add a property the ownership re-check does not already provide.
 
 use spindle_core::Fingerprint;
 use spindle_vfs::model::{MemberId, ShareId, VirtualPath};

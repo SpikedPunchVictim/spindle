@@ -3319,6 +3319,7 @@ name = "spindle-host-core"
 version = "0.1.0"
 dependencies = [
  "cap-std",
+ "rand 0.8.7",
  "rustix",
  "spindle-core",
  "spindle-net",

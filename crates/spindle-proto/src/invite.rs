@@ -76,6 +76,23 @@ pub const INVITE_MIN_V: u8 = 1;
 /// The `v` this crate's callers emit when building a container today.
 pub const INVITE_CURRENT_V: u8 = 1;
 
+/// The canonical-CBOR size, in bytes, of a baseline invite payload as emitted by the **production
+/// invite issuer** (`spindle_host_core::invite::InviteIssuer`), not by any fixture of this crate.
+///
+/// Baseline: [`TlsPin::WebPki`], exactly two endpoints — `wss://registry.example:443` and
+/// `tls://registry.example:4222` — a real 90-day `HostOpKeyCert`, an issue timestamp of
+/// `1_755_907_200` (a 5-byte CBOR uint, the band every measured figure in this workspace assumes),
+/// the default 24-hour TTL, the issuer's production 32-byte nonce,
+/// `subject = Fingerprint::of_parts(&[b"invite-measure-subject"])` (32 B), and `cap_epoch = 7`
+/// (a 1-byte CBOR uint). Every one of those widths is part of the measured figure.
+///
+/// This lives here rather than in `spindle-host-core` because it describes the wire container,
+/// but it is pinned by a test in `crates/spindle-host-core/src/invite.rs`
+/// (`production_issuer_mints_invites_at_exactly_measured_invite_bytes`) that mints through
+/// `spindle_host_core::invite::InviteIssuer::issue_invite`. Pinning a fixture's size would pin
+/// the fixture, not the artifact — see [`MAX_TLS_PIN_LEN`]'s note on the same class of mistake.
+pub const MEASURED_INVITE_BYTES: usize = 515;
+
 /// Maximum length, in bytes, of a single endpoint string. Same ceiling as
 /// [`crate::bootstrap::MAX_REGISTRY_LEN`] — the same scale of NATS endpoint text, and no RFC caps
 /// a URL length.
@@ -145,19 +162,36 @@ impl TlsPin {
                 Ok(TlsPin::WebPki)
             }
             1 => {
-                let der = m.bytes("root")?;
+                let pin = TlsPin::PrivateCaRoot(m.bytes("root")?);
+                pin.validate()?;
+                Ok(pin)
+            }
+            other => Err(ProtoError::InvalidEnumValue("tls_pin.kind", other).into()),
+        }
+    }
+
+    /// Enforces this pin's own rules: a [`TlsPin::PrivateCaRoot`] must carry at least one byte and
+    /// at most [`MAX_TLS_PIN_LEN`]. [`TlsPin::WebPki`] carries nothing by construction — its "no
+    /// extra root" rule is a *decode* rule ([`InviteWireError::WebPkiPinCarriesRoot`]), because a
+    /// `WebPki` value with a root can only exist on the wire, never in this enum.
+    ///
+    /// Shared by [`TlsPin::from_cbor`] and [`InvitePayload::validate`] so a producer that
+    /// assembles a pin directly is held to the same limits as a decoder.
+    fn validate(&self) -> Result<(), InviteWireError> {
+        match self {
+            TlsPin::WebPki => Ok(()),
+            TlsPin::PrivateCaRoot(der) => {
+                if der.is_empty() {
+                    return Err(InviteWireError::EmptyPrivateCaRoot);
+                }
                 if der.len() > MAX_TLS_PIN_LEN {
                     return Err(InviteWireError::TlsPinTooLong {
                         max: MAX_TLS_PIN_LEN,
                         actual: der.len(),
                     });
                 }
-                if der.is_empty() {
-                    return Err(InviteWireError::EmptyPrivateCaRoot);
-                }
-                Ok(TlsPin::PrivateCaRoot(der))
+                Ok(())
             }
-            other => Err(ProtoError::InvalidEnumValue("tls_pin.kind", other).into()),
         }
     }
 }
@@ -297,13 +331,48 @@ pub struct InvitePayload {
     pub tls_pin: TlsPin,
 }
 
-/// `InvitePayload`'s closed schema, used by [`MapReader::deny_unknown_fields`].
+/// [`InvitePayload`]'s closed schema, used by [`MapReader::deny_unknown_fields`].
 ///
 /// Deliberately absent: any host display name. Unauthenticated text rendered before trust is
 /// established is a phishing surface — §A4 already bars labels from certificates for exactly this
 /// reason — so the host sends its name over the E2E channel after connect. Adding a key here
 /// breaks `invite_fields_is_exactly_v_cap_endpoints_tls_pin`, which is the point.
 const INVITE_FIELDS: &[&str] = &["v", "cap", "endpoints", "tls_pin"];
+
+/// Enforces the empty/count rules for an endpoint list. Shared by [`InvitePayload::validate`] and
+/// [`InvitePayload::from_cbor`] so there is one rule set, not two.
+///
+/// The decoder calls this **immediately after reading the array**, before inspecting any item or
+/// the pin. That ordering is observable on a multi-invalid invite and is deliberately identical to
+/// the TypeScript twin's `readEndpoints`: an empty list with a bad `tls_pin.kind` must report
+/// `NoEndpoints`, not `InvalidEnumValue`.
+fn check_endpoint_count(n: usize) -> Result<(), InviteWireError> {
+    if n == 0 {
+        return Err(InviteWireError::NoEndpoints);
+    }
+    if n > MAX_ENDPOINTS {
+        return Err(InviteWireError::TooManyEndpoints {
+            max: MAX_ENDPOINTS,
+            actual: n,
+        });
+    }
+    Ok(())
+}
+
+/// Enforces [`MAX_ENDPOINT_LEN`] on one endpoint. Shared by [`InvitePayload::validate`] and
+/// [`InvitePayload::from_cbor`].
+///
+/// `String::len` is UTF-8 *byte* length, which is the unit the cap and its error report use.
+/// Counting chars instead would admit a multibyte endpoint that is over the byte cap.
+fn check_endpoint_len(s: &str) -> Result<(), InviteWireError> {
+    if s.len() > MAX_ENDPOINT_LEN {
+        return Err(InviteWireError::EndpointTooLong {
+            max: MAX_ENDPOINT_LEN,
+            actual: s.len(),
+        });
+    }
+    Ok(())
+}
 
 impl InvitePayload {
     pub fn to_cbor(&self) -> CborValue {
@@ -332,9 +401,32 @@ impl InvitePayload {
         base64url_encode(&self.to_canonical_bytes())
     }
 
-    /// Decodes and applies this module's strictness rules: closed schema on this map and on
+    /// Enforces this module's container rules on an already-assembled payload: at least one
+    /// endpoint, at most [`MAX_ENDPOINTS`], each endpoint at most [`MAX_ENDPOINT_LEN`] **bytes**,
+    /// and a well-formed [`TlsPin`] (see [`TlsPin::validate`]). [`TlsPin::WebPki`]'s "carries no
+    /// root" rule is structural — this enum cannot represent that contradiction, so the rule only
+    /// exists on the decode path ([`TlsPin::from_cbor`]'s `WebPkiPinCarriesRoot` arm) and has
+    /// nothing to enforce here.
+    ///
+    /// [`InvitePayload::from_cbor`] calls this after decoding, so the decoder and a producer that
+    /// assembles a container directly agree on exactly one set of rules. Deliberately does **not**
+    /// enforce a `v` floor — `spindle_core::check_min_v` owns that, per [`INVITE_MIN_V`]'s doc
+    /// comment — and does not verify `cap`'s signature.
+    pub fn validate(&self) -> Result<(), InviteWireError> {
+        check_endpoint_count(self.endpoints.len())?;
+        for endpoint in &self.endpoints {
+            check_endpoint_len(endpoint)?;
+        }
+        self.tls_pin.validate()
+    }
+
+    /// Decodes, then applies [`Self::validate`]'s rules: closed schema on this map and on
     /// `tls_pin`, at least one endpoint, endpoint count and lengths capped, pin well-formed.
     /// Does **not** enforce a `v` floor, and does **not** verify `cap`'s signature.
+    ///
+    /// The checks run in the same order as the TypeScript twin's `fromCbor`/`readEndpoints`, which
+    /// matters only for multi-invalid input but is observable there: count rules before any
+    /// endpoint is inspected, each item's type then length in list order, and `tls_pin` last.
     pub fn from_cbor(v: &CborValue) -> Result<Self, InviteWireError> {
         let m = MapReader::new(v)?;
         m.deny_unknown_fields(INVITE_FIELDS)?;
@@ -345,38 +437,29 @@ impl InvitePayload {
             .require("endpoints")?
             .as_array()
             .ok_or(ProtoError::WrongType("endpoints"))?;
-        if raw.is_empty() {
-            return Err(InviteWireError::NoEndpoints);
-        }
-        if raw.len() > MAX_ENDPOINTS {
-            return Err(InviteWireError::TooManyEndpoints {
-                max: MAX_ENDPOINTS,
-                actual: raw.len(),
-            });
-        }
+        check_endpoint_count(raw.len())?;
         let mut endpoints = Vec::with_capacity(raw.len());
         for item in raw {
             let s = item
                 .as_text()
                 .ok_or(ProtoError::WrongType("endpoints"))?
                 .to_owned();
-            if s.len() > MAX_ENDPOINT_LEN {
-                return Err(InviteWireError::EndpointTooLong {
-                    max: MAX_ENDPOINT_LEN,
-                    actual: s.len(),
-                });
-            }
+            check_endpoint_len(&s)?;
             endpoints.push(s);
         }
 
         let tls_pin = TlsPin::from_cbor(m.require("tls_pin")?)?;
 
-        Ok(InvitePayload {
+        let payload = InvitePayload {
             v: version,
             cap,
             endpoints,
             tls_pin,
-        })
+        };
+        // The helper checks above already ran; this keeps decode and direct construction on the
+        // same method, so a rule added to `validate` cannot silently skip the decode path.
+        payload.validate()?;
+        Ok(payload)
     }
 
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, InviteWireError> {
@@ -540,6 +623,17 @@ mod tests {
         }
     }
 
+    /// A container map whose `v` and `cap` are valid and whose `endpoints`/`tls_pin` are supplied
+    /// raw, so a test can make exactly those two fields invalid at once.
+    fn invite_map_with(endpoints: CborValue, tls_pin: CborValue) -> CborValue {
+        CborValue::map(vec![
+            ("v", CborValue::uint(INVITE_CURRENT_V as u64)),
+            ("cap", sample_capability().to_cbor()),
+            ("endpoints", endpoints),
+            ("tls_pin", tls_pin),
+        ])
+    }
+
     // ---- round trip ----
 
     #[test]
@@ -642,6 +736,62 @@ mod tests {
             InviteWireError::EndpointTooLong {
                 max: MAX_ENDPOINT_LEN,
                 actual: MAX_ENDPOINT_LEN + 1
+            }
+        );
+    }
+
+    // ---- decode order on multi-invalid input (twin with invite.test.ts) ----
+
+    /// Each input below is invalid in two places, so the assertion pins *which* error wins. The
+    /// TypeScript twin applies the count rules immediately after reading the array and each
+    /// endpoint's length during the item pass, before it ever looks at `tls_pin`; a decoder that
+    /// ran the pin first would still reject these, but with a different error kind. Two
+    /// implementations that disagree about the first error are two implementations that will
+    /// eventually disagree about validity.
+    #[test]
+    fn an_empty_endpoint_list_is_reported_before_an_invalid_tls_pin_kind() {
+        let v = invite_map_with(
+            CborValue::array(Vec::new()),
+            CborValue::map(vec![("kind", CborValue::uint(2))]),
+        );
+        assert_eq!(
+            InvitePayload::from_cbor(&v).expect_err("must reject"),
+            InviteWireError::NoEndpoints
+        );
+    }
+
+    #[test]
+    fn too_many_endpoints_are_reported_before_an_invalid_tls_pin_kind() {
+        let endpoints = (0..=MAX_ENDPOINTS)
+            .map(|i| CborValue::text(format!("wss://h{i}")))
+            .collect();
+        let v = invite_map_with(
+            CborValue::array(endpoints),
+            CborValue::map(vec![("kind", CborValue::uint(2))]),
+        );
+        assert_eq!(
+            InvitePayload::from_cbor(&v).expect_err("must reject"),
+            InviteWireError::TooManyEndpoints {
+                max: MAX_ENDPOINTS,
+                actual: MAX_ENDPOINTS + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn an_over_long_endpoint_is_reported_before_a_non_text_sibling() {
+        let v = invite_map_with(
+            CborValue::array(vec![
+                CborValue::text("w".repeat(MAX_ENDPOINT_LEN + 1)),
+                CborValue::uint(42),
+            ]),
+            TlsPin::WebPki.to_cbor(),
+        );
+        assert_eq!(
+            InvitePayload::from_cbor(&v).expect_err("must reject"),
+            InviteWireError::EndpointTooLong {
+                max: MAX_ENDPOINT_LEN,
+                actual: MAX_ENDPOINT_LEN + 1,
             }
         );
     }
