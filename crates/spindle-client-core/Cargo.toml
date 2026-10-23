@@ -3,5 +3,18 @@ name = "spindle-client-core"
 version.workspace = true
 edition.workspace = true
 
-# No dependencies yet.
+# Crate layering law (A9c boundary rule 3): the client library sits above `spindle-core` and
+# `spindle-proto`. `self_revocation` deliberately takes no `async-nats` dependency: its
+# `RevokeTransport` trait is the seam the app's authenticated NATS client implements, which keeps
+# this crate runtime-neutral and lets its tests run with no broker. serde/serde_json are pinned
+# crate-locally (matching spindle-helper's pins — neither is a workspace dependency) because the
+# helper's `helper.revoke.<nfp>` reply is JSON.
 [dependencies]
+spindle-proto = { path = "../spindle-proto" }
+spindle-core = { path = "../spindle-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

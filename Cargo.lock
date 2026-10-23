@@ -3274,6 +3274,14 @@ dependencies = [
 [[package]]
 name = "spindle-client-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "spindle-core",
+ "spindle-proto",
+ "thiserror 1.0.69",
+ "tokio",
+]
 
 [[package]]
 name = "spindle-core"
