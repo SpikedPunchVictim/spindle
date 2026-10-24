@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.52) + Execution Plan
+# Spindle — System Design Document (draft v0.9.53) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -39,7 +39,7 @@
 > v0.9.17: A10.36 decided (2026-08-31; user decision) — the connect offer's `inbox` field is a **binding** of the
 > client's real NATS reply subject into signed material, checked by the host after decryption; deciding it exposed
 > and fixed a latent defect where the signed `inbox` never matched the reply subject the client actually listened on.
-> Remaining **[USER DECISION]** items: A10.6–9, A10.24 (license), and the **[DEFAULT]**-flagged rows in A10.
+> No open **[USER DECISION]** or **[DEFAULT]** items remain in the A10 table (all decided/ratified 2026-10-24).
 > v0.9.18: root-signed self-revocations routed via a new `helper.revoke.<nfp>` subject and a distinct
 > `spindle-self-rev-v1` artifact; session record gains `device_fp`; §A4's kick payload corrected to `{cid}` on live
 > evidence (2026-08-31).
@@ -245,6 +245,8 @@
 > binaries; the helper installs it when `METRICS_ADDR` is set, and host exporter wiring waits for
 > the host binary. Metric names are `helper_`/`host_` snake_case, labels are fixed low-cardinality
 > literals only — no identifier, path, or name may become a label, because cardinality is a leak.
+> v0.9.53: one decision batch, no wire change. A10.6–9 and A10.24 are decided; all nine [DEFAULT]-flagged
+> A10 rows are ratified and their flags removed; the license is MIT.
 
 ---
 
@@ -1710,26 +1712,26 @@ Docker is explicitly not the primary dev environment.
 | 3 | Key introduction & invite UX | **DECIDED 2026-08-23:** invite-carried keys + pinning + key-change wall (mandatory) |
 | 4 | Recovery when all devices lost | **DECIDED 2026-08-23:** root key = recovery phrase shown once; it signs a new device |
 | 4b | Host authorization | **DECIDED 2026-08-23:** positive-only union + share exclusions; uploads on opt-in shares; owner-only admin |
-| 5 | Max hosts per client connection (CONNECT + JWT size) | **[DEFAULT]** 32 (S12 verifies) |
-| 6 | Browser receive ceiling | **[USER DECISION]** FSA API where available; else stated cap (e.g. 2 GB) |
-| 7 | Metadata retention at registry | **[USER DECISION]** connection logs 30 days; no payload logging |
-| 8 | TURN hosting & cost policy | **[USER DECISION]** self-host coturn; per-device monthly relay quota; S4 → cost/GB |
-| 9 | v1 native platforms | **[USER DECISION]** macOS + Windows + Linux; mobile later |
-| 10 | `max_control_line` + cap presentation | **[DEFAULT]** 32 KiB; compact CBOR caps; present only this session's hosts; max 32 |
-| 11 | Admin surface | **[DEFAULT]** local host UI only in v1; remote admin deferred |
-| 12 | Device certification | **[DEFAULT]** root-signed only; root on primary device (OS keystore) + recovery phrase; browsers never primary |
-| 13 | Host identity | **[DEFAULT]** host root (backed up) signs operating key; reinstall from backup keeps identity |
-| 14 | Helper state | **[DEFAULT]** small replicated store: host-signed revocation/epoch records, connection map, TURN counters, metadata retention; no membership data |
-| 15 | NATS account topology | **[DEFAULT]** one application account for all devices + a dedicated AUTH (callout) account + system account for helper; explicit denies on `$SYS.>`, `$JS.>`, `_INBOX.>` **[amended v0.9.9 — three accounts, not two; the AUTH account was already present in the S1-era config]** |
-| 16 | Canonical encoding | **[DEFAULT]** deterministic CBOR (RFC 8949 §4.2.1) for envelopes, caps, VFS RPC; versioned, no downgrade |
+| 5 | Max hosts per client connection (CONNECT + JWT size) | **RATIFIED 2026-10-24:** 32 (S12 verifies) |
+| 6 | Browser receive ceiling | **DECIDED 2026-10-24 (user decision):** File System Access API where available; otherwise a 2 GB receive cap |
+| 7 | Metadata retention at registry | **DECIDED 2026-10-24 (user decision):** connection logs 30 days; no payload logging |
+| 8 | TURN hosting & cost policy | **DECIDED 2026-10-24 (user decision):** self-host coturn; per-device monthly relay quota; S4 → cost/GB |
+| 9 | v1 native platforms | **DECIDED 2026-10-24 (user decision):** macOS + Windows + Linux; mobile later |
+| 10 | `max_control_line` + cap presentation | **RATIFIED 2026-10-24:** 32 KiB; compact CBOR caps; present only this session's hosts; max 32 |
+| 11 | Admin surface | **RATIFIED 2026-10-24:** local host UI only in v1; remote admin deferred |
+| 12 | Device certification | **RATIFIED 2026-10-24:** root-signed only; root on primary device (OS keystore) + recovery phrase; browsers never primary |
+| 13 | Host identity | **RATIFIED 2026-10-24:** host root (backed up) signs operating key; reinstall from backup keeps identity |
+| 14 | Helper state | **RATIFIED 2026-10-24:** small replicated store: host-signed revocation/epoch records, connection map, TURN counters, metadata retention; no membership data |
+| 15 | NATS account topology | **RATIFIED 2026-10-24:** one application account for all devices + a dedicated AUTH (callout) account + system account for helper; explicit denies on `$SYS.>`, `$JS.>`, `_INBOX.>` **[amended v0.9.9 — three accounts, not two; the AUTH account was already present in the S1-era config]** |
+| 16 | Canonical encoding | **RATIFIED 2026-10-24:** deterministic CBOR (RFC 8949 §4.2.1) for envelopes, caps, VFS RPC; versioned, no downgrade |
 | 17 | Host admission default mode | **DECIDED 2026-08-23:** `invite` |
 | 18 | Admission mechanisms | **DECIDED 2026-08-23:** invite tokens **and** fingerprint pre-registration |
 | 19 | Admin surface | **DECIDED 2026-08-23:** TypeScript library (`@spindle/admin`) owning signing/connection logic; CLI as v1 client; future interfaces build on the library and own their security |
 | 20 | Browser client integrity | **DECIDED 2026-08-23:** hardened delivery in v1 — reproducible build, release-key-signed manifest, SRI-pinned immutable bundles, companion verification extension (ADR-008) |
 | 21 | LAN without internet | **DECIDED 2026-08-23:** declared v1 non-goal, stated in UI; mDNS local signaling = v2 candidate |
 | 22 | Abuse posture | **DECIDED 2026-08-23:** report channel + host suspension/eviction as the remedy; no content inspection exists; documented operator policy + in-product "cannot recover / cannot inspect" messaging |
-| 23 | Helper store | **[DEFAULT]** single-writer leader over Postgres; burns = CAS, epochs = max-wins, presence deltas + audit chain leader-only |
-| 24 | License & repo | **[USER DECISION]** license TBD; monorepo (Rust workspace + TS packages) per A9c |
+| 23 | Helper store | **RATIFIED 2026-10-24:** single-writer leader over Postgres; burns = CAS, epochs = max-wins, presence deltas + audit chain leader-only |
+| 24 | License & repo | **DECIDED 2026-10-24 (user decision):** **MIT** license; monorepo (Rust workspace + TS packages) per A9c |
 | 25 | UI framework | **DECIDED 2026-08-23:** React for all three frontends (Tauri client, host admin UI, web), shared via `@spindle/ui` |
 | 26 | Host app shape | **DECIDED 2026-08-23:** one Tauri 2 tray app — daemon in-process, admin window on demand, IPC-only admin surface (no localhost port); headless/NAS mode deferred |
 | 27 | Monorepo tooling | **DECIDED 2026-08-23:** cargo workspace + pnpm workspaces with a top-level `justfile` as the single build/test/dev entry point; CI runs the same `just` targets |
@@ -1956,6 +1958,14 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.53 (2026-10-24)** — One decision batch closing every open A10 item, no wire change. A10.6–9
+  are decided (browser receive uses the File System Access API where available, otherwise a 2 GB
+  cap; registry connection logs are kept 30 days with no payload logging; coturn is self-hosted with a
+  per-device monthly relay quota and cost tracked per GB; v1 platforms are macOS, Windows, and Linux,
+  with mobile later). A10.24 is decided: the license is **MIT**. The nine **[DEFAULT]** rows (5, 10,
+  11, 12, 13, 14, 15, 16, 23) are ratified as written and their flags removed, so no open
+  **[USER DECISION]** or **[DEFAULT]** items remain in the A10 table. The prose **[DEFAULT]** markers
+  elsewhere in Part A were not in scope for this ratification.
 - **v0.9.52 (2026-10-24)** — One decision (A10.51) and one A9c manifest row, no wire change. The
   §A7 observability contract is exported through the `metrics` facade, with
   `metrics-exporter-prometheus` installed only by binaries; libraries record and never install a

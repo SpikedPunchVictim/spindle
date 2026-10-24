@@ -2,6 +2,7 @@
   "name": "spindle-monorepo",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Spindle — P2P file sharing over NATS signaling + WebRTC with a zero-knowledge registry.",
   "engines": {
     "node": ">=22"

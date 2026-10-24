@@ -21,7 +21,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# license = "TBD (A10.24)"
+license = "MIT"
 
 # Dependency pins below are documented per ADR-009 (docs/DESIGN.md §A9c dependency manifest);
 # crates adopt them (add to their own [dependencies] via `workspace = true`) as implementation
