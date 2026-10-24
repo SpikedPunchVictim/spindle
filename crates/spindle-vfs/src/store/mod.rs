@@ -2181,6 +2181,16 @@ impl Store {
     /// members at once. Returns `Ok(vec![])` and changes nothing if no row matches (e.g. the
     /// target was never uploaded through this path).
     ///
+    /// **`""` is the share root**: it removes every `uploaded_files` row for `share_id`, because
+    /// every relative stored subpath is at or beneath the root. This is a purge of the share's
+    /// entire ledger, never a subtree delete of a named path, so it is matched with
+    /// `WHERE share_id = ?1` alone — no fold condition — instead of the usual
+    /// `fold_subpath = "" OR prefix` match. The prefix form would match nothing (`""` folds to
+    /// `""`, making the descendant prefix `"/"`, and no relative stored subpath starts with `/`),
+    /// silently stranding the whole ledger and permanently inflating both counters for a caller
+    /// that intended exactly this removal. The root case returns `Ok(vec![])` only when the share
+    /// genuinely has no ledger rows, never as a way of declining the purge.
+    ///
     /// This must be recursive rather than single-row: `spindle_vfs::confine::remove_confined`
     /// (`crate::confine::listing`) calls `remove_dir_all` when the delete target is a directory,
     /// so one VFS delete can remove many files' worth of real content in a single call. A
@@ -2228,18 +2238,35 @@ impl Store {
             TransactionBehavior::Immediate,
             |_tx| {
                 let fold_subpath = confine::fold_key(subpath);
-                let prefix = format!("{fold_subpath}/");
+                let is_root = fold_subpath.is_empty();
 
-                let mut stmt = self.conn.prepare(
-                    "SELECT member_id, bytes FROM uploaded_files \
-                     WHERE share_id = ?1 AND (fold_subpath = ?2 OR substr(fold_subpath, 1, length(?3)) = ?3)",
-                )?;
-                let matches: Vec<(i64, i64)> = stmt
-                    .query_map(params![share_id.0 as i64, fold_subpath, prefix], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })?
-                    .collect::<Result<_, _>>()?;
-                drop(stmt);
+                // The share root (`""`) matches every row for the share; a named subpath keeps
+                // the exact-or-descendant match. Two fixed statements rather than string-built
+                // SQL, so both arms stay statically checkable.
+                let mut matches: Vec<(i64, i64)> = Vec::new();
+                if is_root {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT member_id, bytes FROM uploaded_files WHERE share_id = ?1",
+                    )?;
+                    matches.extend(
+                        stmt.query_map(params![share_id.0 as i64], |r| {
+                            Ok((r.get(0)?, r.get(1)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?,
+                    );
+                } else {
+                    let prefix = format!("{fold_subpath}/");
+                    let mut stmt = self.conn.prepare(
+                        "SELECT member_id, bytes FROM uploaded_files \
+                         WHERE share_id = ?1 AND (fold_subpath = ?2 OR substr(fold_subpath, 1, length(?3)) = ?3)",
+                    )?;
+                    matches.extend(
+                        stmt.query_map(params![share_id.0 as i64, fold_subpath, prefix], |r| {
+                            Ok((r.get(0)?, r.get(1)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?,
+                    );
+                }
 
                 if matches.is_empty() {
                     // Nothing to remove; `with_transaction`'s single commit at the end still
@@ -2250,11 +2277,19 @@ impl Store {
                     return Ok(Vec::new());
                 }
 
-                self.conn.execute(
-                    "DELETE FROM uploaded_files \
-                     WHERE share_id = ?1 AND (fold_subpath = ?2 OR substr(fold_subpath, 1, length(?3)) = ?3)",
-                    params![share_id.0 as i64, fold_subpath, prefix],
-                )?;
+                if is_root {
+                    self.conn.execute(
+                        "DELETE FROM uploaded_files WHERE share_id = ?1",
+                        params![share_id.0 as i64],
+                    )?;
+                } else {
+                    let prefix = format!("{fold_subpath}/");
+                    self.conn.execute(
+                        "DELETE FROM uploaded_files \
+                         WHERE share_id = ?1 AND (fold_subpath = ?2 OR substr(fold_subpath, 1, length(?3)) = ?3)",
+                        params![share_id.0 as i64, fold_subpath, prefix],
+                    )?;
+                }
 
                 let total_bytes: i64 = matches.iter().map(|(_, bytes)| bytes).sum();
                 self.adjust_share_upload_bytes(share_id, -total_bytes)?;
@@ -5448,6 +5483,160 @@ mod tests {
             60,
             "share counter drops by the sum removed from under d (100 + 250), leaving only e.txt"
         );
+    }
+
+    /// Proves `""` is the share root for [`Store::remove_uploads_under`]: it purges every ledger
+    /// row for that share — root-level files as well as files beneath directories, from both
+    /// members — refunds each uploader, zeroes both counters, and is idempotent on a second call.
+    /// Before this was fixed, the descendant prefix built from `fold_key("")` was `"/"`, which no
+    /// relative stored subpath starts with, so this call matched nothing and stranded the entire
+    /// ledger for the share — permanently inflating both counters once nothing on disk
+    /// corresponded to it.
+    #[test]
+    fn remove_uploads_under_the_empty_subpath_removes_every_row_for_the_share() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "a.txt", 100)
+            .expect("record root-level a.txt");
+        store
+            .record_upload(share_id, member_a, "dir/b.txt", 200)
+            .expect("record dir/b.txt");
+        store
+            .record_upload(share_id, member_b, "c.txt", 300)
+            .expect("record c.txt from member_b");
+
+        let mut removed = store
+            .remove_uploads_under(share_id, "")
+            .expect("remove_uploads_under at the share root");
+        removed.sort_by_key(|(_, bytes)| *bytes);
+        let mut expected = vec![(member_a, 100), (member_a, 200), (member_b, 300)];
+        expected.sort_by_key(|(_, bytes)| *bytes);
+        assert_eq!(
+            removed, expected,
+            "must return one entry per removed row, covering root-level and descendant files"
+        );
+
+        assert!(
+            store.list_uploads(share_id).unwrap().is_empty(),
+            "every ledger row for the share must be gone"
+        );
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
+        assert_eq!(store.member_upload_bytes(member_b).unwrap(), 0);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 0);
+
+        // A purge of an already-empty share is a clean no-op, not an error and not a second
+        // round of counter decrements.
+        let second = store
+            .remove_uploads_under(share_id, "")
+            .expect("second root removal must not error");
+        assert_eq!(second, Vec::new());
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
+        assert_eq!(store.member_upload_bytes(member_b).unwrap(), 0);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 0);
+    }
+
+    /// The root purge is share-scoped: another share's ledger rows and both of its counters must
+    /// be untouched by `remove_uploads_under(share, "")`. Without the `share_id` condition in the
+    /// root DELETE, this is exactly the over-reach that would wipe every share at once.
+    #[test]
+    fn remove_uploads_under_the_empty_subpath_leaves_other_shares_untouched() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+        let other_root = tempdir().expect("tempdir for the other share");
+        let other_share = store
+            .add_share(
+                "Other",
+                "/Other",
+                other_root.path(),
+                ShareFlags {
+                    allow_upload: true,
+                    ..ShareFlags::default()
+                },
+                &[],
+                0,
+            )
+            .expect("add_share for the other share");
+
+        store
+            .record_upload(share_id, member_a, "a.txt", 100)
+            .expect("record a.txt in the purged share");
+        store
+            .record_upload(other_share, member_b, "keep.txt", 700)
+            .expect("record keep.txt in the other share");
+
+        let removed = store
+            .remove_uploads_under(share_id, "")
+            .expect("remove_uploads_under at the share root");
+        assert_eq!(removed, vec![(member_a, 100)]);
+
+        assert!(store.list_uploads(share_id).unwrap().is_empty());
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 0);
+
+        let remaining = store
+            .list_uploads(other_share)
+            .expect("list the other share's ledger");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].subpath, "keep.txt");
+        assert_eq!(remaining[0].bytes, 700);
+        assert_eq!(
+            store.member_upload_bytes(member_b).unwrap(),
+            700,
+            "the other share's uploader must not be refunded"
+        );
+        assert_eq!(
+            store.share_upload_bytes(other_share).unwrap(),
+            700,
+            "the other share's counter must be untouched"
+        );
+    }
+
+    /// The root purge must not change the meaning of a named subpath: `"dir"` still removes only
+    /// that subtree, leaving a root-level sibling row and its uploader's counter alone.
+    #[test]
+    fn remove_uploads_under_a_non_empty_subpath_still_removes_only_that_subtree() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "a.txt", 100)
+            .expect("record root-level a.txt");
+        store
+            .record_upload(share_id, member_b, "dir/b.txt", 200)
+            .expect("record dir/b.txt");
+
+        let removed = store
+            .remove_uploads_under(share_id, "dir")
+            .expect("remove_uploads_under dir");
+        assert_eq!(removed, vec![(member_b, 200)]);
+
+        let remaining = store.list_uploads(share_id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].subpath, "a.txt");
+        assert_eq!(remaining[0].bytes, 100);
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 100);
+        assert_eq!(store.member_upload_bytes(member_b).unwrap(), 0);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 100);
+    }
+
+    /// A share with no ledger rows returns an empty vec for `""` without writing anything: the
+    /// empty-match early return still commits its (write-free) transaction, so neither counter
+    /// gains a zero-valued row and nothing is disturbed.
+    #[test]
+    fn remove_uploads_under_the_empty_subpath_on_a_share_with_no_rows_returns_empty() {
+        let (_sandbox, store, share_id, member_a, _member_b) = upload_ledger_fixture();
+
+        let removed = store
+            .remove_uploads_under(share_id, "")
+            .expect("root removal on an empty share must not error");
+        assert_eq!(removed, Vec::new());
+
+        assert!(store.list_uploads(share_id).unwrap().is_empty());
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 0);
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
+
+        // Reconciling from the still-empty ledger must agree with those zeros.
+        store.reconcile_upload_counters().expect("reconcile");
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 0);
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 0);
     }
 
     /// Regression test for the literal-comparison requirement in [`Store::remove_uploads_under`]'s
