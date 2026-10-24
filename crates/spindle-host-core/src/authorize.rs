@@ -33,6 +33,7 @@ use spindle_net::signaling::authorize::{ConnectAuthorizer, ConnectDecision, Veri
 use spindle_proto::artifacts::{CapKind, Capability, HostOpKeyCert};
 use spindle_vfs::model::{Member, MemberStatus};
 use spindle_vfs::store::{Store, StoreError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, Once};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -209,13 +210,71 @@ impl std::fmt::Display for RedactedLookupError<'_> {
 /// become an `Allow`.
 pub struct SqliteDeviceLookup {
     store: Mutex<Store>,
+    /// One-shot latch for [`Self::fused_read_fallback`]'s log level: `false` until the first
+    /// fused-read failure is logged at `error!`, `true` after. Every later failure logs at
+    /// `debug!` instead, so a persistent fault cannot flood a production log with one `error!` per
+    /// connect while still staying fully diagnosable under `RUST_LOG=debug`.
+    ///
+    /// Per lookup instance, not process-global: `spindle-hostd` constructs the lookup that
+    /// reaches this method once, for its connect path (`connect_lookup` — its session-path lookup
+    /// only ever calls `member_for_device_fp`), so in production there is one latch behind the one
+    /// authorizer. Instance-scoped also keeps the latch testable without a `static` shared by
+    /// unrelated tests. `Ordering::Relaxed` is sufficient — this is a diagnostic rate limiter, not
+    /// a synchronization flag: no other memory access is ordered against it, and two racing first
+    /// failures both logging `error!` (then the loser also flipping the latch) is harmless.
+    fused_read_failure_logged: AtomicBool,
 }
 
 impl SqliteDeviceLookup {
     pub fn new(store: Store) -> Self {
         SqliteDeviceLookup {
             store: Mutex::new(store),
+            fused_read_failure_logged: AtomicBool::new(false),
         }
+    }
+
+    /// Returns `true` for the first call only, then `false` forever after — the latch behind
+    /// [`Self::fused_read_fallback`]'s "first failure at `error!`, subsequent at `debug!`" rule.
+    /// Pulled out as its own method so a test can exercise the flip directly, without a tracing
+    /// subscriber and without having to force a real fused-read failure.
+    fn note_fused_read_failure(&self) -> bool {
+        !self.fused_read_failure_logged.swap(true, Ordering::Relaxed)
+    }
+
+    /// The body of [`DeviceLookup::member_and_cap_epoch`]'s `Err` arm, extracted so it can be
+    /// tested directly: logs the failure (see [`Self::note_fused_read_failure`] for the level) and
+    /// then falls back to the plain, single-statement `member_for_device_fp`.
+    ///
+    /// Preserves the deliberate asymmetry [`DeviceLookup::member_and_cap_epoch`]'s doc comment
+    /// describes: a failed *membership* read still propagates via `?` and denies the connect; a
+    /// failed fused read whose membership half is independently readable returns
+    /// `Ok((member, None))` — the connect proceeds without a freshly minted capability.
+    fn fused_read_fallback(
+        &self,
+        store: &Store,
+        device_fp: Fingerprint,
+        error: &StoreError,
+    ) -> Result<(Option<Member>, Option<u64>), LookupError> {
+        if self.note_fused_read_failure() {
+            tracing::error!(
+                device_fp = %device_fp.redacted(),
+                error = %error.redacted(),
+                "member_and_cap_epoch: fused member+cap_epoch read failed; this connect proceeds \
+                 without a freshly minted capability. A persistent fault will keep every connect \
+                 succeeding while this host stops minting capabilities entirely, surfacing later \
+                 as a fleet-wide lockout once existing member capabilities expire"
+            );
+        } else {
+            tracing::debug!(
+                device_fp = %device_fp.redacted(),
+                error = %error.redacted(),
+                "member_and_cap_epoch: fused member+cap_epoch read failed again; this connect \
+                 proceeds without a freshly minted capability (the first failure was logged at \
+                 error level)"
+            );
+        }
+        let member = store.member_for_device_fp(device_fp)?;
+        Ok((member, None))
     }
 }
 
@@ -254,29 +313,26 @@ impl DeviceLookup for SqliteDeviceLookup {
                 // (`None`); if it can't, `?` propagates and denies, exactly as it would have if
                 // the fused read had never been attempted.
                 //
-                // This single occurrence may well be exactly that transient blip — this call site
-                // cannot tell transient from persistent apart, so this reports what happened, not
-                // what caused it. What makes a *persistent* failure here worth a human's attention:
-                // every connect keeps succeeding (via the fallback below, or via the plain
-                // membership-only path when no issuer is installed), but this host quietly stops
-                // minting fresh member capabilities — a fleet-wide lock-out that only surfaces once
-                // existing caps expire (`MEMBER_CAP_DEFAULT_TTL_SECS`: six weeks), degrees removed
-                // in both time and symptom from this call site.
-                // `error = %e.redacted()`: `LookupError::Store` wraps all of `StoreError`, whose
-                // `Confine`/`Model`/`MountPathCollision`/`DeviceNotFound` variants carry real
-                // paths, virtual paths, and untruncated fingerprints. `RedactedLookupError`'s
-                // exhaustive match enforces the redaction invariant at the type level: widening
-                // what these lookups reach cannot leak through this line without first adding a
-                // `LookupError` variant, which is a compile error at that match.
-                tracing::warn!(
-                    device_fp = %device_fp.redacted(),
-                    error = %e.redacted(),
-                    "member_and_cap_epoch: fused member+cap_epoch read failed; falling back to a \
-                     membership-only read for this connect. A persistent recurrence silently \
-                     degrades this host to never minting fresh member capabilities"
-                );
-                let member = store.member_for_device_fp(device_fp)?;
-                Ok((member, None))
+                // The failure is NOT silent (td-db6541): this call site cannot tell a transient
+                // blip from a persistent fault apart, and a *persistent* fault is the dangerous
+                // one. Every connect keeps succeeding by design, but the host stops minting fresh
+                // member capabilities entirely, and nothing changes observably until existing caps
+                // expire (`MEMBER_CAP_DEFAULT_TTL_SECS`: six weeks) — a fleet-wide lock-out
+                // degrees removed in both time and symptom from this call site. The observable
+                // signal is therefore a log line emitted right here on the first failure, within
+                // the first few connects after the fault begins: `error!` for the first occurrence,
+                // `debug!` for every recurrence, latched per lookup by
+                // [`Self::fused_read_fallback`]/[`Self::note_fused_read_failure`]. One `error!`
+                // line is a bounded false alarm if this was only a transient `SQLITE_BUSY`; the
+                // alternative — one `error!` per connect forever — would flood a production log,
+                // and no line at all is how this exact fault stayed invisible for six weeks.
+                //
+                // Redaction: `error` is a `StoreError`, several of whose variants carry real
+                // filesystem paths, virtual paths, and untruncated fingerprints, so it is
+                // interpolated only through `RedactedStoreError` (`error.redacted()`), and
+                // `device_fp` only through `Fingerprint::redacted()` (td-6c9d95's policy: truncated
+                // IDs, never names or paths).
+                self.fused_read_fallback(&store, device_fp, &e)
             }
         }
     }
@@ -1666,6 +1722,87 @@ mod tests {
                  connect"
             ),
         }
+    }
+
+    /// The latch behind [`SqliteDeviceLookup::fused_read_fallback`]'s log level: the first
+    /// failure reports `true` (the `error!` path), and every later failure reports `false` (the
+    /// `debug!` path). Tested directly because a `tracing` event's contents cannot be observed
+    /// here without adding a subscriber dependency — see
+    /// `fused_read_failure_falls_back_to_a_membership_only_read_returning_no_cap_epoch` below for
+    /// what this test does and does not prove.
+    #[test]
+    fn fused_read_failure_latch_is_set_by_the_first_failure_and_stays_set() {
+        let (store, _member_id) = store_with_active_member("alex");
+        let lookup = SqliteDeviceLookup::new(store);
+
+        assert!(
+            lookup.note_fused_read_failure(),
+            "the first fused-read failure must take the error! path — this is the only signal a \
+             persistent fault gets before existing capabilities start expiring six weeks later"
+        );
+        assert!(
+            !lookup.note_fused_read_failure(),
+            "a second failure must take the debug! path, not emit a second error! line"
+        );
+        assert!(
+            !lookup.note_fused_read_failure(),
+            "the latch must stay set for every subsequent failure, not just the second"
+        );
+        assert!(lookup.fused_read_failure_logged.load(Ordering::Relaxed));
+    }
+
+    /// Proves the transient-failure asymmetry survives (td-db6541's hard constraint): when the
+    /// fused member+cap_epoch read fails but membership alone is readable, the fallback returns
+    /// `Ok((Some(member), None))` — the connect succeeds and merely loses its freshly minted cap.
+    /// It also proves the first failure flips the latch, so the observable-signal path is reached.
+    ///
+    /// **Limitation**: this calls [`SqliteDeviceLookup::fused_read_fallback`] — the exact body of
+    /// `member_and_cap_epoch`'s `Err` arm — with a synthetic [`StoreError`], rather than making a
+    /// real `Store::member_and_cap_epoch` fail through [`DeviceLookup::member_and_cap_epoch`].
+    /// Forcing that specific half-failure with a real `Store` would require a write lock/poison
+    /// state that also breaks the fallback's own membership read, which is precisely what this
+    /// asymmetry is *not*; `spindle-host-core` has no raw-SQLite seam to inject one. The log text
+    /// itself is likewise unobservable without a `tracing` subscriber, which this crate
+    /// deliberately does not install (see `lib.rs`'s crate-root policy). What remains unproven is
+    /// therefore only the wire-up of the `Err(e)` arm to this helper; the fallback behavior, its
+    /// `None` epoch, and the latch are exercised for real.
+    #[test]
+    fn fused_read_failure_falls_back_to_a_membership_only_read_returning_no_cap_epoch() {
+        let (store, member_id) = store_with_active_member("alex");
+        let device = DeviceKey::from_seeds([0x3b; 32], [0x3c; 32]);
+        let device_fp = enroll_device(&store, member_id, "laptop", &device);
+        let lookup = SqliteDeviceLookup::new(store);
+        let guard = lookup.store.lock().expect("lookup lock");
+
+        let (member, cap_epoch) = lookup
+            .fused_read_fallback(&guard, device_fp, &StoreError::ConnectionPoisoned)
+            .expect(
+                "a fused-read failure whose membership half is readable must not become an Err — \
+                 that would turn a transient SQLITE_BUSY into a denied connect",
+            );
+        assert_eq!(
+            member.map(|m| m.status),
+            Some(MemberStatus::Active),
+            "the fallback must return the same member a plain membership read would"
+        );
+        assert_eq!(
+            cap_epoch, None,
+            "there is no cap_epoch from a failed fused read — the connect proceeds with no fresh \
+             capability rather than being denied"
+        );
+        assert!(
+            lookup.fused_read_failure_logged.load(Ordering::Relaxed),
+            "the first failure must flip the latch so the error! line fires exactly once"
+        );
+        drop(guard);
+
+        // A recurring failure keeps the same fallback outcome, at the latched debug! level.
+        let guard = lookup.store.lock().expect("lookup lock");
+        let (member, cap_epoch) = lookup
+            .fused_read_fallback(&guard, device_fp, &StoreError::ConnectionPoisoned)
+            .expect("a recurring fused-read failure must still fall back, never deny");
+        assert!(member.is_some());
+        assert_eq!(cap_epoch, None);
     }
 
     /// The other half of the same discrimination: a genuine [`LookupError`] from
