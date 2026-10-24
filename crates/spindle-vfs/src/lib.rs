@@ -32,6 +32,8 @@
 //!   or an owner editing an uploaded file out of band. See [`reconcile`]'s module doc comment for
 //!   why this is not the rejected directory-walk design and why owner-placed content is left
 //!   alone.
+//! - [`metrics`] — the audit chain's metric name contract (DESIGN.md:707, td-323db0). Recording
+//!   only: this crate never installs a recorder or exporter.
 //!
 //! # Stage 6 slice history
 //!
@@ -95,6 +97,7 @@ pub mod algebra;
 pub mod audit;
 pub mod confine;
 pub mod glob;
+pub mod metrics;
 pub mod model;
 pub mod reconcile;
 pub mod store;

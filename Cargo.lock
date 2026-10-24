@@ -3674,6 +3674,7 @@ version = "0.1.0"
 dependencies = [
  "cap-std",
  "metrics",
+ "metrics-util",
  "rand 0.8.7",
  "rustix",
  "spindle-core",
@@ -3712,6 +3713,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "metrics",
+ "metrics-util",
  "nkeys",
  "quinn",
  "rand 0.8.7",
@@ -3753,6 +3755,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "metrics",
+ "metrics-util",
  "rusqlite",
  "same-file",
  "spindle-core",

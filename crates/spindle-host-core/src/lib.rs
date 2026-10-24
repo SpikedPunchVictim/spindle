@@ -52,6 +52,8 @@
 //! - [`ratelimit`] (crate-private, Stage 6 slice 4) — [`ratelimit::RateLimiter`], the per-caller
 //!   token-bucket limiter DESIGN.md §A5 describes for pre-auth connects, adapted here to the
 //!   post-auth VFS RPC entry point.
+//! - [`metrics`] — the host-side rate-limit/session/transfer metric name and label contract
+//!   (DESIGN.md:707, td-323db0). Recording only: this crate never installs a recorder or exporter.
 //! - [`revoke`] — [`revoke::revoke_member_and_mint`]/[`revoke::revoke_device_and_mint`]: applies a
 //!   revocation to the store, bumps `cap_epoch` (DESIGN.md §A4: only on security events), and
 //!   mints the signed `RevocationRecord` `spindle_helper::revoke::ingest_revocation` admits on
@@ -150,6 +152,7 @@ mod cache;
 mod device_keys;
 mod identity_cache;
 pub mod limits;
+pub mod metrics;
 mod mount;
 mod ratelimit;
 pub mod revoke;

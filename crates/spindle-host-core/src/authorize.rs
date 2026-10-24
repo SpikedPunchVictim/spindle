@@ -957,6 +957,7 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
         //   indistinguishable-looking. Being measurably faster on this path is the correct
         //   trade-off, not a timing leak that needs closing.
         if !self.limiter.try_acquire_global((self.now_fn)()) {
+            crate::metrics::record_ratelimit_hit(crate::metrics::RateLimitScope::Global);
             return ConnectDecision::Deny;
         }
 
@@ -1069,6 +1070,7 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
         //   caller. This caller is known, and the connect is being throttled precisely to make it
         //   cheap. Spending crypto work to disguise a throttle would defeat the throttle.
         if !self.limiter.try_acquire_fp(*from_fp, (self.now_fn)()) {
+            crate::metrics::record_ratelimit_hit(crate::metrics::RateLimitScope::PerFingerprint);
             return VerifiedDecision::Drop;
         }
 

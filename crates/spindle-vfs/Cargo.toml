@@ -63,6 +63,12 @@ test-support = []
 # S11 spike (spikes/s11-vfs-confinement/Cargo.toml) it graduates from: confinement tests need a
 # disposable sandbox directory tree; this never becomes a runtime dependency of spindle-vfs.
 [dev-dependencies]
+# td-323db0: `metrics_util::debugging::DebuggingRecorder` lets tests assert exact metric
+# names/labels through `metrics::with_local_recorder`, without installing a global recorder or
+# exporter. Already a transitive dependency of `spindle-helper`'s exporter at this same 0.20
+# range (locked at 0.20.4), so this adds no new dependency *version* to the tree — only a direct
+# edge, and only for this crate's test targets.
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 tempfile = "3"
 # Same pinned workspace rusqlite, plus the `hooks` feature — enabled HERE (a dev-dependency of
 # this one crate) rather than on the workspace dependency, so it applies only when test/bench

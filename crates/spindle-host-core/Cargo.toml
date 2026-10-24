@@ -78,5 +78,11 @@ windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem"] }
 # anomalous stored rows without this crate opening a second, raw SQLite connection of its own —
 # `spindle-vfs` keeps sole ownership of all real SQLite access per the A9c crate-layering law.
 [dev-dependencies]
+# td-323db0: `metrics_util::debugging::DebuggingRecorder` lets tests assert exact metric
+# names/labels through `metrics::with_local_recorder`, without installing a global recorder or
+# exporter. Already a transitive dependency of `spindle-helper`'s exporter at this same 0.20
+# range (locked at 0.20.4), so this adds no new dependency *version* to the tree — only a direct
+# edge, and only for this crate's test targets.
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 tempfile = "3"
 spindle-vfs = { path = "../spindle-vfs", features = ["test-support"] }

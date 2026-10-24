@@ -257,8 +257,26 @@ pub async fn process_offer<A: ConnectAuthorizer>(
     host_device_fp: Fingerprint,
     authorizer: &A,
 ) -> Result<(OpenedOffer, Option<Capability>), SignalingError> {
-    let env = Envelope::from_canonical_bytes(payload)?;
-    let from_fp = Fingerprint::from_slice(&env.from_fp)?;
+    let env = match Envelope::from_canonical_bytes(payload) {
+        Ok(env) => env,
+        Err(decode_error) => {
+            let error = SignalingError::from(decode_error);
+            crate::metrics::record_envelope_failure(
+                crate::metrics::EnvelopeFailureReason::from_signaling_error(&error),
+            );
+            return Err(error);
+        }
+    };
+    let from_fp = match Fingerprint::from_slice(&env.from_fp) {
+        Ok(from_fp) => from_fp,
+        Err(fingerprint_error) => {
+            let error = SignalingError::from(fingerprint_error);
+            crate::metrics::record_envelope_failure(
+                crate::metrics::EnvelopeFailureReason::from_signaling_error(&error),
+            );
+            return Err(error);
+        }
+    };
 
     if !reply_prefix_ok(reply, &from_fp) {
         return Err(SignalingError::BadReplyPrefix);
@@ -269,7 +287,20 @@ pub async fn process_offer<A: ConnectAuthorizer>(
         ConnectDecision::Deny => return Err(SignalingError::Denied),
     };
 
-    let opened = super::wire::open_offer(&env, host_device, host_device_fp, &sign_pk, &agree_pk)?;
+    let opened =
+        match super::wire::open_offer(&env, host_device, host_device_fp, &sign_pk, &agree_pk) {
+            Ok(opened) => opened,
+            Err(error) => {
+                // DESIGN.md:707's "failed-envelope-verification rate": this is the last point at
+                // which the offer is rejected as an envelope rather than as a policy/routing decision,
+                // so it is the one recording site. The reason is a fixed category derived from the
+                // error's own variant, never anything from the envelope.
+                crate::metrics::record_envelope_failure(
+                    crate::metrics::EnvelopeFailureReason::from_signaling_error(&error),
+                );
+                return Err(error);
+            }
+        };
 
     // DESIGN.md §A6/§A10.36: `inbox` is a *binding* of the reply subject into signed material, not
     // a redundant copy. `reply_prefix_ok` above proved the reply subject is shaped like this

@@ -18,6 +18,8 @@
 //!   `spikes/s2-signaling`: both peer roles' offer/answer/trickle-ICE exchange, wired to
 //!   [`quic::QuicClient::from_socket`]/[`quic::QuicServer::from_socket`] above. See that module's
 //!   own doc comment for its submodule map and the two injected traits its layering requires.
+//! - [`metrics`] — the host-side envelope-verification metric name/label contract
+//!   (DESIGN.md:707, td-323db0). Recording only: this crate never installs a recorder or exporter.
 //!
 //! # Scope
 //!
@@ -38,6 +40,7 @@
 //! transfer manager.
 
 pub mod framing;
+pub mod metrics;
 pub mod quic;
 pub mod signaling;
 

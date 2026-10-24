@@ -326,6 +326,12 @@ where
             RateLimitConfig::default(),
         );
 
+        // The session is authorized and has its own server, so it counts as live from here until
+        // this function returns. The RAII guard covers the serve loop's every exit (clean EOF and
+        // protocol violation both fall through to the same return path). Sessions refused by the
+        // gate above never reach this point and are deliberately not counted as live.
+        let _live_session = crate::metrics::LiveSessionGuard::track();
+
         let ControlStream {
             connection,
             mut send,

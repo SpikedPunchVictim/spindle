@@ -106,6 +106,12 @@ rcgen = "0.13"
 # exactly the thing that cannot be faked without making the test's permission-scoping evidence
 # vacuous.
 [dev-dependencies]
+# td-323db0: `metrics_util::debugging::DebuggingRecorder` lets tests assert exact metric
+# names/labels through `metrics::with_local_recorder`, without installing a global recorder or
+# exporter. Already a transitive dependency of `spindle-helper`'s exporter at this same 0.20
+# range (locked at 0.20.4), so this adds no new dependency *version* to the tree — only a direct
+# edge, and only for this crate's test targets.
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 # `tests/live_signaling.rs`'s own remaining code (outside the fixtures graduated below) still
 # mints session nkeys directly (`assert_revoked_device_cannot_reconnect`, the S9 revocation test's
 # domain-separated identity derivation): generates the per-connection session nkey (ed25519) each

@@ -131,6 +131,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
     /// is application territory, out of scope for this transport-agnostic, pure server.
     pub fn gc_expired_upload_sessions(&self, now: u64) {
         for session in self.upload_sessions.gc_expired(now) {
+            crate::metrics::record_upload_aborted();
             self.discard_staging_bytes(&session);
         }
     }
@@ -209,6 +210,10 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         // `env.request`'s payload beyond what's needed for the audit row).
         let rl_key = rate_limit_key(ctx);
         if !self.rate_limiter.try_acquire(&rl_key, ts) {
+            // td-323db0: a denial is a rate-limit hit. The bucket is keyed by device fingerprint,
+            // but the label stays the fixed bucket-class value — see `crate::metrics`' redaction
+            // note for why the key itself never reaches a label.
+            crate::metrics::record_ratelimit_hit(crate::metrics::RateLimitScope::PerFingerprint);
             self.audit(
                 ts,
                 None,
@@ -1257,6 +1262,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
     /// action DESIGN.md §A8 requires on an entitlement change mid-transfer, factored out since
     /// both `upload_chunk` and `upload_commit` need it.
     fn abort_and_gc(&self, session: &UploadSession) {
+        crate::metrics::record_upload_aborted();
         self.upload_sessions.remove(&session.id);
         self.discard_staging_bytes(session);
     }
@@ -1594,6 +1600,7 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
             can_delete,
         ) {
             Ok(UploadOutcome::Landed(landed_name)) => {
+                crate::metrics::record_upload_completed();
                 self.upload_sessions.remove(&session.id);
                 self.identity_cache
                     .forget(member.member_id, share.share_id, &session.subpath);

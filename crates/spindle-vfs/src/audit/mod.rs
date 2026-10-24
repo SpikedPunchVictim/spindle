@@ -344,6 +344,7 @@ impl<'a> Audit<'a> {
     ///
     pub fn append(&self, entry: AuditEntry) -> Result<AuditRecord, AuditError> {
         if self.poisoned.load(Ordering::SeqCst) {
+            crate::metrics::record_audit_append_failure();
             return Err(AuditError::ConnectionPoisoned);
         }
         if let Err(begin_error) = self.conn.execute_batch("BEGIN IMMEDIATE") {
@@ -354,11 +355,17 @@ impl<'a> Audit<'a> {
             // all: `?` returned immediately with no recovery attempt, so a connection that reached
             // `append` already stranded (but not yet poisoned) could sit that way indefinitely.
             self.recover_from_non_autocommit("a failed BEGIN");
+            crate::metrics::record_audit_append_failure();
             return Err(AuditError::Sqlite(begin_error));
         }
         match self.append_inner(entry) {
             Ok(record) => match self.conn.execute_batch("COMMIT") {
-                Ok(()) => Ok(record),
+                Ok(()) => {
+                    // td-323db0 (DESIGN.md:707 "audit-chain head"): `seq` is the committed row's
+                    // own `audit_log.seq`, so the gauge tracks the head of this store's chain.
+                    crate::metrics::record_audit_head_seq(record.seq);
+                    Ok(record)
+                }
                 Err(commit_error) => {
                     // The append succeeded, but its COMMIT failed: the row is not (yet, or ever)
                     // durable, and the connection may still be sitting inside the transaction
@@ -374,6 +381,7 @@ impl<'a> Audit<'a> {
                          it are not guaranteed durable until this is resolved"
                     );
                     self.recover_from_non_autocommit("a failed COMMIT");
+                    crate::metrics::record_audit_append_failure();
                     Err(AuditError::Sqlite(commit_error))
                 }
             },
@@ -397,6 +405,7 @@ impl<'a> Audit<'a> {
                     );
                 }
                 self.recover_from_non_autocommit("a failed append");
+                crate::metrics::record_audit_append_failure();
                 Err(e)
             }
         }
