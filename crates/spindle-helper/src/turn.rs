@@ -176,11 +176,20 @@ fn handle_turn_get_inner(
         return TurnGetReply::err("no active session");
     };
 
-    if view
-        .record_turn_issuance(&session.root_fp, now, config.monthly_quota)
-        .is_err()
-    {
-        return TurnGetReply::err("TURN quota exceeded");
+    // td-323db0 / DESIGN.md:707 "TURN quota consumption": one labelled counter per issuance
+    // attempt. `Err` is the store's quota-exceeded signal (`record_turn_issuance`'s documented
+    // `Result<u64, u64>`). We deliberately do NOT export the returned per-root usage as a gauge:
+    // the only value available is per-`root_fp`, and a `root_fp` label is forbidden by the
+    // redaction policy. Summing across roots would need a new store method, which this slice must
+    // not add.
+    match view.record_turn_issuance(&session.root_fp, now, config.monthly_quota) {
+        Ok(_) => crate::metrics::record_turn_issuance(crate::metrics::TurnIssuanceOutcome::Success),
+        Err(_) => {
+            crate::metrics::record_turn_issuance(
+                crate::metrics::TurnIssuanceOutcome::QuotaExceeded,
+            );
+            return TurnGetReply::err("TURN quota exceeded");
+        }
     }
 
     let expiry = now + config.ttl_secs;

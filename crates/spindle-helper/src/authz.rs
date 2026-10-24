@@ -800,6 +800,10 @@ pub fn decide_host_connect(
             ) {
                 Some(record) => record.quota_profile,
                 None => {
+                    // td-323db0 / DESIGN.md:707 "nonce-burn conflicts": the token verified but its
+                    // nonce was already burned. The label-free counter is the only metric detail;
+                    // the identity that conflicted is deliberately not a label (see metrics.rs).
+                    crate::metrics::record_nonce_burn_conflict();
                     return AuthzDecision::Refused(RefusalReason::AdmissionTokenAlreadyUsed);
                 }
             }

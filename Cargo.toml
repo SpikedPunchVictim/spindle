@@ -34,6 +34,24 @@ tracing = "0.1"
 thiserror = "1"
 anyhow = "1"
 
+# Observability (td-323db0, owner decision 2026-10-24; DESIGN.md A9c manifest amendment).
+# Library crates may record through the `metrics` facade but must never install a global recorder;
+# only binaries (currently `spindle-helper`) may depend on an exporter and install one.
+#
+# Version pair: `metrics` 0.24 + `metrics-exporter-prometheus` 0.18. The exporter's published
+# 0.18.3 manifest requires `metrics ^0.24.5` (read from its Cargo.toml, not assumed), so pinning
+# the facade to the same 0.24 minor is what keeps the pair mutually compatible; `cargo check`
+# resolves the concrete patch releases.
+#
+# Exporter features: `default-features = false, features = ["http-listener"]` on purpose. The
+# default `push-gateway` feature pulls hyper-rustls with aws-lc-rs, which needs a cmake + C
+# toolchain this workspace avoids everywhere else (see the `rtc-ice` comment below). The helper
+# only needs a pull/scrape endpoint, and `http-listener` supplies that with no TLS backend.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = [
+    "http-listener",
+] }
+
 # NATS
 async-nats = "0.35"
 

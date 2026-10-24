@@ -153,6 +153,22 @@ impl ConnectionMap {
         Self::default()
     }
 
+    /// Number of distinct `host_fp`s this map tracks, whether currently online or offline.
+    ///
+    /// This is the "presence-map size" DESIGN.md:707 asks the helper to export (td-323db0). It
+    /// deliberately counts host identities, not live connections: a host with three connections
+    /// counts once, and a host that went offline stays counted (its `HostState` is retained so
+    /// `snapshot` can report "offline at a known time"). `user_to_host` bindings are not counted
+    /// separately — they are per-connection keys for the `hosts` entries.
+    pub fn len(&self) -> usize {
+        self.hosts.len()
+    }
+
+    /// Whether the map tracks no hosts at all. Pairs with [`len`](Self::len).
+    pub fn is_empty(&self) -> bool {
+        self.hosts.is_empty()
+    }
+
     /// Binds `user_pk` (this connection's session-nkey public-key string) to `host_fp` for the
     /// lifetime of the map (or until re-registered). Called once per successful host-auth
     /// (`decide_host_connect` authorizing a connection) — the callout is the only place that
@@ -328,6 +344,39 @@ mod tests {
     }
 
     // ---- ConnectionMap: count semantics ------------------------------------------------------
+
+    /// `len`/`is_empty` back the `helper_presence_hosts` gauge: one per distinct host identity,
+    /// not per connection, and an offline host remains counted (its state is retained).
+    #[test]
+    fn len_counts_distinct_hosts_not_connections_and_keeps_offline_hosts() {
+        let mut map = ConnectionMap::new();
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+
+        let host_a = fp(b"len-host-a");
+        let host_b = fp(b"len-host-b");
+        map.register_host_user("U-a1", host_a);
+        map.register_host_user("U-a2", host_a);
+        map.register_host_user("U-b1", host_b);
+
+        map.connect("U-a1", 1_000);
+        map.connect("U-a2", 1_001);
+        map.connect("U-b1", 1_002);
+        assert_eq!(map.len(), 2, "three connections, two host identities");
+        assert!(!map.is_empty());
+
+        map.disconnect("U-a1", 1_003);
+        map.disconnect("U-a2", 1_004);
+        assert_eq!(
+            map.len(),
+            2,
+            "an offline host stays counted because its state is retained"
+        );
+
+        // Unregistered users never contribute an entry.
+        map.connect("U-unknown", 1_005);
+        assert_eq!(map.len(), 2);
+    }
 
     #[test]
     fn unregistered_user_is_ignored() {

@@ -317,6 +317,13 @@ pub struct SelfRevokeResult {
     /// Devices this call newly added to the union, in first-seen order. Empty on a no-op, a
     /// rejection, or a store error.
     pub newly_revoked: Vec<Fingerprint>,
+    /// The accepted record's own `ts`, for the revocation-propagation metric (td-323db0 /
+    /// DESIGN.md:707). `Some` only when this call actually wrote to the durable store; a
+    /// replay/no-op, a rejection, and a store error all report `None` because no revocation
+    /// propagated on those paths. Keeping the timestamp out of the wire reply is deliberate —
+    /// the reply shape is unchanged. A record timestamp in the future is preserved here; the
+    /// metric helper clamps the resulting delay to 0.
+    pub accepted_ts: Option<u64>,
 }
 
 /// Parses the caller's `nats_fp` out of a `helper.revoke.<nfp>` subject, via the shared
@@ -345,10 +352,12 @@ pub fn handle_self_revoke(
     limits: &mut SelfRevokeLimits,
     now: u64,
 ) -> SelfRevokeResult {
-    let (reply, newly_revoked) = handle_self_revoke_inner(subject, payload, view, limits, now);
+    let (reply, newly_revoked, accepted_ts) =
+        handle_self_revoke_inner(subject, payload, view, limits, now);
     SelfRevokeResult {
         reply: serde_json::to_vec(&reply).expect("SelfRevokeReply always serializes"),
         newly_revoked,
+        accepted_ts,
     }
 }
 
@@ -358,13 +367,13 @@ fn handle_self_revoke_inner(
     view: &mut impl HelperView,
     limits: &mut SelfRevokeLimits,
     now: u64,
-) -> (SelfRevokeReply, Vec<Fingerprint>) {
+) -> (SelfRevokeReply, Vec<Fingerprint>, Option<u64>) {
     let Some(nats_fp) = parse_subject_nats_fp(subject) else {
-        return (SelfRevokeReply::err("malformed subject"), Vec::new());
+        return (SelfRevokeReply::err("malformed subject"), Vec::new(), None);
     };
 
     let Some(session) = view.session_record(&nats_fp, now) else {
-        return (SelfRevokeReply::err("no active session"), Vec::new());
+        return (SelfRevokeReply::err("no active session"), Vec::new(), None);
     };
 
     // A host connection's session record reuses this shape with `root_pk: None` (see
@@ -374,11 +383,12 @@ fn handle_self_revoke_inner(
         return (
             SelfRevokeReply::err("session has no member root"),
             Vec::new(),
+            None,
         );
     };
 
     let Ok(record) = SelfRevocationRecord::from_canonical_bytes(payload) else {
-        return (SelfRevokeReply::err("malformed record"), Vec::new());
+        return (SelfRevokeReply::err("malformed record"), Vec::new(), None);
     };
 
     // The cheap half of "the signer is the session's root": compare the record's claimed
@@ -387,6 +397,7 @@ fn handle_self_revoke_inner(
         return (
             SelfRevokeReply::err("record root_fp does not match the session's root"),
             Vec::new(),
+            None,
         );
     }
 
@@ -397,17 +408,17 @@ fn handle_self_revoke_inner(
     // cannot starve the root's token budget (which is not charged until verification below).
     let attempt_key = session.device_fp.unwrap_or(session.nats_fp);
     if !limits.allow_attempt(&attempt_key, now) {
-        return (SelfRevokeReply::err("rate limited"), Vec::new());
+        return (SelfRevokeReply::err("rate limited"), Vec::new(), None);
     }
 
     // Rebuild the retained key exactly as every other artifact verifier does — including the
     // RFC 8032 §5.1.3 canonical-encoding round trip — then check the signature. One uniform error
     // for both halves: the wire reply never says which one failed.
     let Some(vk) = checked_verifying_key(&root_pk) else {
-        return (SelfRevokeReply::err(VERIFICATION_FAILED), Vec::new());
+        return (SelfRevokeReply::err(VERIFICATION_FAILED), Vec::new(), None);
     };
     if verify_self_revocation(&record, &vk).is_err() {
-        return (SelfRevokeReply::err(VERIFICATION_FAILED), Vec::new());
+        return (SelfRevokeReply::err(VERIFICATION_FAILED), Vec::new(), None);
     }
 
     // Every entry is covered by the signature, so a single wrong-length entry makes the signed
@@ -424,7 +435,11 @@ fn handle_self_revoke_inner(
     let mut newly_revoked: Vec<Fingerprint> = Vec::new();
     for entry in &record.revoked {
         let Ok(fp) = Fingerprint::from_slice(entry) else {
-            return (SelfRevokeReply::err("malformed revoked entry"), Vec::new());
+            return (
+                SelfRevokeReply::err("malformed revoked entry"),
+                Vec::new(),
+                None,
+            );
         };
         if !seen.insert(fp) {
             continue;
@@ -447,13 +462,14 @@ fn handle_self_revoke_inner(
         return (
             SelfRevokeReply::ok(session.root_fp.to_string(), stored_epoch.unwrap_or(0)),
             Vec::new(),
+            None,
         );
     }
 
     // Per-root budget, charged only now: this record verified under the root's key and changes
     // state, so only the root's own signed records can spend its tokens.
     if !limits.charge_root(&session.root_fp, now) {
-        return (SelfRevokeReply::err("rate limited"), Vec::new());
+        return (SelfRevokeReply::err("rate limited"), Vec::new(), None);
     }
 
     // No epoch gate: every signature-valid, not-already-applied record unions its subjects (see
@@ -462,11 +478,12 @@ fn handle_self_revoke_inner(
     let Some(epoch) = view.record_self_revocation(&session.root_fp, record.epoch, &deduped) else {
         // The store did not persist the write; it cannot report a post-write epoch, and inventing
         // one here would claim state that is not durable.
-        return (SelfRevokeReply::err("record not stored"), Vec::new());
+        return (SelfRevokeReply::err("record not stored"), Vec::new(), None);
     };
     (
         SelfRevokeReply::ok(session.root_fp.to_string(), epoch),
         newly_revoked,
+        Some(record.ts),
     )
 }
 
@@ -587,6 +604,59 @@ mod tests {
         assert_eq!(got.epoch, Some(3));
         assert_eq!(got.error, None);
         assert!(view.is_self_revoked(&root_fp_of(&root.verifying_key()), &lost_device));
+    }
+
+    /// td-323db0: only a call that actually wrote to the store reports the record's `ts` for the
+    /// revocation-propagation metric. A replay (accepted but changes nothing) and a rejected
+    /// record must both report `None` — otherwise an ancient replay would look like a slow
+    /// propagation.
+    #[test]
+    fn accepted_ts_is_reported_only_for_a_state_changing_write() {
+        let mut view = store();
+        let mut limiter = SelfRevokeLimits::new();
+        let root = root_signer();
+        let nats_fp = fp(b"nats-self-rev-ts");
+        put_member_session(&mut view, nats_fp, &root);
+        let device = fp(b"ts-device");
+        let payload = record_bytes(&root, 2, vec![device]);
+
+        let first = deposit_result(
+            &subject_for(&nats_fp),
+            &payload,
+            &mut view,
+            &mut limiter,
+            1_000,
+        );
+        assert!(reply(&first.reply).ok);
+        assert!(!first.newly_revoked.is_empty());
+        assert_eq!(
+            first.accepted_ts,
+            Some(1_000),
+            "the accepted write must carry the record's own ts"
+        );
+
+        let replay = deposit_result(
+            &subject_for(&nats_fp),
+            &payload,
+            &mut view,
+            &mut limiter,
+            1_001,
+        );
+        assert!(reply(&replay.reply).ok, "replay still replies ok");
+        assert!(replay.newly_revoked.is_empty());
+        assert_eq!(
+            replay.accepted_ts, None,
+            "a no-op replay propagated nothing and must not report a delay"
+        );
+
+        let rejected = deposit_result(
+            &subject_for(&nats_fp),
+            b"not a record",
+            &mut view,
+            &mut limiter,
+            1_002,
+        );
+        assert_eq!(rejected.accepted_ts, None);
     }
 
     // ---- handle_self_revoke: rejected paths --------------------------------------------------

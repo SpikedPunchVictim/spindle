@@ -25,6 +25,9 @@ thiserror = { workspace = true }
 rusqlite = { workspace = true }
 unicode-normalization = { workspace = true }
 tracing = { workspace = true }
+# td-323db0: recording-only metrics facade. This crate is a library: it must never install a
+# global recorder or depend on an exporter — see `src/lib.rs`'s doc comment.
+metrics = { workspace = true }
 
 # `std::os::windows::fs::MetadataExt::{volume_serial_number,file_index,number_of_links}` are
 # gated behind the nightly-only `windows_by_handle` feature (rust-lang/rust#63010) — unusable on

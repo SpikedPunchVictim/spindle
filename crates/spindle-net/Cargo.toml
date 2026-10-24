@@ -28,6 +28,9 @@ sha2 = { workspace = true } # cert fingerprint (SHA-256 of the DER) — same der
 # precedent) — `tracing` is this workspace's logging facade everywhere else, so this crate's first
 # use of it follows the same convention rather than inventing its own.
 tracing = { workspace = true }
+# td-323db0: recording-only metrics facade. This crate is a library: it must never install a
+# global recorder or depend on an exporter.
+metrics = { workspace = true }
 
 tokio = { workspace = true } # workspace already declares features = ["full"]
 

@@ -87,9 +87,29 @@
 //! Runs with `spindle_helper::memory_store::InMemoryHelperView` — not durable, dev/demo only (see
 //! that module's docs). A Postgres-backed `HelperView` (Stage 4 slice 3) drops in at the single
 //! construction site below with no change to the rest of this file.
+//!
+//! # Observability metrics (DESIGN.md:707, td-323db0)
+//! The recording contract lives in [`spindle_helper::metrics`]: metric names are constants there,
+//! labels are fixed low-cardinality literals, and no label ever carries a path, group/member name,
+//! subject, endpoint, or fingerprint. This binary records callout latency/decisions, revocation
+//! propagation delay, presence-map size, startup CONNZ divergence, nonce-burn conflicts, and TURN
+//! issuance outcomes.
+//!
+//! The Prometheus exporter is installed **once in `main`**, and only when `METRICS_ADDR` (or
+//! `--metrics-addr`) is set — e.g. `127.0.0.1:9100` for a local scrape or `0.0.0.0:9100` in a
+//! container. Unset means no recorder is installed at all and every `metrics` macro is a no-op.
+//! An invalid/unbindable address warns and disables metrics; it never takes the responder down.
+//! The listener has no authentication or TLS: prefer a loopback bind unless the network is
+//! trusted. No library crate in this workspace may install a global recorder or depend on the
+//! exporter.
+//!
+//! `helper_replica_divergence_rows` is a **startup-only** gauge: it counts CONNZ rows this process
+//! could not reconcile into local presence/kick state during `seed_maps`. True helper-to-helper
+//! replica divergence is not measurable from here until a cross-replica source exists.
 
 use base64::Engine;
 use futures_util::StreamExt;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use nkeys::KeyPair;
 use spindle_helper::auth_token::{self, DecodedAuthToken};
 use spindle_helper::authz::{
@@ -98,6 +118,7 @@ use spindle_helper::authz::{
 };
 use spindle_helper::kick;
 use spindle_helper::memory_store::InMemoryHelperView;
+use spindle_helper::metrics::{self, CalloutOutcome};
 use spindle_helper::natsjwt::{self, NatsJwtError};
 use spindle_helper::permissions::{Limits, SubjectPermissions};
 use spindle_helper::pg_store::{sqlx_error_summary, PgStore};
@@ -107,8 +128,9 @@ use spindle_helper::self_revoke;
 use spindle_helper::session::{self, SessionRecord};
 use spindle_helper::turn::{self, TurnConfig};
 use std::env;
+use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ================================================================================================
 // Config
@@ -153,6 +175,9 @@ struct Config {
     turn_uris: Vec<String>,
     turn_ttl_secs: u64,
     turn_monthly_quota: u64,
+    /// Prometheus scrape listener (td-323db0). `Some` → the process installs the exporter once in
+    /// `main`; `None` → no recorder is installed and every metrics macro is a no-op.
+    metrics_addr: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -213,6 +238,9 @@ Every flag has an env-var equivalent (flags override the env var if both are set
     --turn-uris <a,b,...>       TURN_URIS            (comma-separated; default: empty)
     --turn-ttl-secs <n>         TURN_TTL_SECS         (default: 3600)
     --turn-monthly-quota <n>    TURN_MONTHLY_QUOTA    (default: 1000)
+    --metrics-addr <addr>       METRICS_ADDR          (optional; Prometheus scrape listener, e.g.
+                                                       127.0.0.1:9100 or 0.0.0.0:9100. Unset →
+                                                       no recorder is installed and metrics are no-ops)
     -h, --help                  show this message
 "#;
 
@@ -231,6 +259,7 @@ impl Config {
         let mut turn_uris = env::var("TURN_URIS").ok();
         let mut turn_ttl_secs = env::var("TURN_TTL_SECS").ok();
         let mut turn_monthly_quota = env::var("TURN_MONTHLY_QUOTA").ok();
+        let mut metrics_addr = env::var("METRICS_ADDR").ok();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -309,6 +338,12 @@ impl Config {
                         ConfigError::FlagMissingValue("turn-monthly-quota".to_string())
                     })?)
                 }
+                "--metrics-addr" => {
+                    metrics_addr =
+                        Some(args.next().ok_or_else(|| {
+                            ConfigError::FlagMissingValue("metrics-addr".to_string())
+                        })?)
+                }
                 other => return Err(ConfigError::unknown_arg(other)),
             }
         }
@@ -367,6 +402,7 @@ impl Config {
             turn_uris,
             turn_ttl_secs,
             turn_monthly_quota,
+            metrics_addr,
         })
     }
 }
@@ -391,6 +427,8 @@ async fn main() -> ExitCode {
         }
     };
 
+    init_metrics_exporter(config.metrics_addr.as_deref());
+
     // The generic backstop stays static: `run`'s remaining `?` paths are untyped `anyhow`
     // conversions that can carry operator configuration values (NATS server URLs and other
     // startup wiring), and `anyhow::Error` has no redacted `Display` view. The typed startup
@@ -405,6 +443,44 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Installs the Prometheus exporter once, iff `METRICS_ADDR`/`--metrics-addr` is set (td-323db0).
+///
+/// # Failure and shutdown
+/// - An unparseable address or a bind/set-recorder failure is a **warning**, never fatal: the
+///   responder must keep serving callouts even if the scrape endpoint cannot start. Every metric
+///   macro stays a no-op when no recorder was installed.
+/// - `PrometheusBuilder::install` binds the listener synchronously (so a bad address is reported
+///   here) and spawns the accept loop onto the current tokio runtime. The exporter's accept loop
+///   logs per-connection errors and continues; it has no path that panics. Dropping the process's
+///   runtime at shutdown ends the task with it, so no separate shutdown signal is needed.
+/// - The address is operator configuration, not a member identity/endpoint, so logging it is
+///   safe under td-6c9d95's redaction policy (which governs metric labels and member identifiers).
+fn init_metrics_exporter(metrics_addr: Option<&str>) {
+    let Some(raw_addr) = metrics_addr else {
+        return;
+    };
+    let addr = match raw_addr.parse::<SocketAddr>() {
+        Ok(addr) => addr,
+        Err(e) => {
+            tracing::warn!(
+                error = %e, // redaction-ok: std::net::AddrParseError Display is static text ("invalid socket address syntax"), never the input
+                "invalid METRICS_ADDR/--metrics-addr — metrics exporter disabled"
+            );
+            return;
+        }
+    };
+    match PrometheusBuilder::new().with_http_listener(addr).install() {
+        Ok(()) => tracing::info!(
+            %addr,
+            "metrics exporter listening (Prometheus scrape endpoint)"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e, // redaction-ok: metrics_exporter_prometheus::BuildError Display is static build/bind/recorder text, no member identifiers or payload bytes
+            "metrics exporter could not be installed — metrics disabled"
+        ),
+    }
 }
 
 // ================================================================================================
@@ -838,6 +914,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // until its next CONNECT, and closing it is exactly `kick.rs`'s former "Out of scope" section
     // graduating (see that module doc's current version).
     let (mut presence_map, mut kick_map) = seed_maps(sys_ref, &mut store, now_secs()).await;
+    // td-323db0 / DESIGN.md:707 "presence-map size": set once after startup seeding, then after
+    // every CONNECT/DISCONNECT below.
+    metrics::record_presence_hosts(presence_map.len());
 
     // Delayed kick re-plan channel (see this file's "Kick relay" module-doc section and
     // `KICK_REPLAN_DELAY`'s own doc comment below). The revoke branch pushes
@@ -882,8 +961,13 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 let Some(reply) = msg.reply.clone() else {
                     continue;
                 };
-                let resp = match handle_one(&msg.payload, &config.account_name, &app_kp, &mut store, &mut presence_map) {
-                    Ok(resp) => resp,
+                // td-323db0 / DESIGN.md:707 "callout latency + decision counts": time the pure
+                // decision function itself, and label every request with exactly one outcome.
+                // `HandleError` is `error`; a policy refusal is `deny`; a pre-decision uniform
+                // refusal is `refused`; an authorized response is `allow`.
+                let started = Instant::now();
+                let (resp, outcome) = match handle_one(&msg.payload, &config.account_name, &app_kp, &mut store, &mut presence_map) {
+                    Ok(result) => (result.payload, result.outcome),
                     Err(e) => {
                         tracing::error!(
                             // `redacted()`, not `%e`: `NatsJwtError::Json` can echo peer claim
@@ -891,9 +975,18 @@ async fn run(config: Config) -> anyhow::Result<()> {
                             error = %e.redacted(),
                             "internal error building callout response"
                         );
-                        encode_refusal(&msg.payload, &app_kp)
+                        (encode_refusal(&msg.payload, &app_kp), CalloutOutcome::Error)
                     }
                 };
+                // A decision whose response could not be encoded (`respond_ok`/`respond_err`
+                // return `None`) never reached the server, so it is an `error`, not the decision
+                // it intended to make.
+                let outcome = if resp.is_none() {
+                    CalloutOutcome::Error
+                } else {
+                    outcome
+                };
+                metrics::record_callout(outcome, started.elapsed());
                 if let Some(resp) = resp {
                     // Validation is out of scope here: this reply is the server-issued `$SYS` correlation inbox for nats-server itself, not a member (td-bc9490's documented exception).
                     if let Err(e) = callout_client.publish(reply, resp.into()).await {
@@ -1010,6 +1103,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
                         // this record rather than panicking.
                         match spindle_proto::artifacts::RevocationRecord::from_canonical_bytes(&msg.payload) {
                             Ok(record) => {
+                                // td-323db0 / DESIGN.md:707 "revocation propagation delay": the
+                                // accepted record's own signed `ts` to this helper's acceptance.
+                                metrics::record_revocation_propagation(now_secs(), record.ts);
                                 let revoked_fps: Vec<spindle_core::Fingerprint> = record
                                     .revoked
                                     .iter()
@@ -1096,6 +1192,13 @@ async fn run(config: Config) -> anyhow::Result<()> {
                             epoch = outcome.epoch.unwrap_or_default(),
                             "helper.revoke.<nfp> self-revocation accepted"
                         );
+
+                        // td-323db0 / DESIGN.md:707: only a state-changing write reports a `ts`
+                        // (see `SelfRevokeResult::accepted_ts`); a replay/no-op propagated
+                        // nothing and would otherwise look like a very slow revocation.
+                        if let Some(record_ts) = result.accepted_ts {
+                            metrics::record_revocation_propagation(now_secs(), record_ts);
+                        }
 
                         // Leg 3 (S9): kick the live sessions of the devices this deposit *newly*
                         // added — not the whole post-write union. A replay/no-op reports nothing
@@ -1250,6 +1353,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 if let Some(delta) = presence_map.connect(&user_pk, now_secs()) {
                     publish_presence_delta(&app_client, delta).await;
                 }
+                // Set even when `connect` returned `None` (a second connection for an already
+                // online host): the gauge reports map size, not transition count.
+                metrics::record_presence_hosts(presence_map.len());
             }
             msg = next_or_pending(&mut disconnect_sub) => {
                 let Some(msg) = msg else {
@@ -1331,6 +1437,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 if let Some(delta) = presence_map.disconnect(&user_pk, now_secs()) {
                     publish_presence_delta(&app_client, delta).await;
                 }
+                // td-323db0: set even when `disconnect` returned `None` — a host that stays
+                // online (another connection remains) or an unregistered device does not change
+                // the map's size, but the gauge must still reflect it after every event.
+                metrics::record_presence_hosts(presence_map.len());
             }
             // Test-only delayed `kick_map` arming (see `SPINDLE_HELPER_TEST_ADVISORY_DELAY_MS`'s
             // doc comment in the connect branch above). Declared after the connect/disconnect
@@ -1826,14 +1936,28 @@ async fn seed_maps(
         return (presence_map, kick_map);
     };
 
+    // td-323db0 / DESIGN.md:707 "replica divergence". This process has no cross-replica view:
+    // there is no second helper's state to diff against, and the only source of truth available
+    // is a single server's CONNZ reply. The honest signal therefore is "rows CONNZ reported that
+    // this process could not reconcile into local presence/kick state" — no usable user, an
+    // undecodable nkey, or no live session record. `helper_replica_divergence_rows` is a
+    // startup-only gauge for exactly that; it deliberately does not claim to measure
+    // helper-to-helper divergence, which becomes measurable only once a cross-replica source
+    // exists. Rows that reconcile are not "agreement with another replica", just local
+    // consistency.
+    let mut unreconciled_rows = 0usize;
+
     for conn in connections {
         let Some(user_pk) = connz_row_user_pk(conn) else {
+            unreconciled_rows += 1;
             continue;
         };
         let Ok(nats_fp) = auth_token::nats_fp_of_nkey(user_pk) else {
+            unreconciled_rows += 1;
             continue;
         };
         let Some(session) = store.session_record(&nats_fp, now) else {
+            unreconciled_rows += 1;
             continue;
         };
 
@@ -1853,6 +1977,8 @@ async fn seed_maps(
         // startup, and every seeded connection is by definition not a fresh transition.
         let _ = presence_map.connect(user_pk, now);
     }
+
+    metrics::record_replica_divergence_rows(unreconciled_rows);
 
     (presence_map, kick_map)
 }
@@ -2135,13 +2261,33 @@ fn encode_refusal(request_payload: &[u8], app_kp: &KeyPair) -> Option<String> {
     natsjwt::encode(resp_claims, app_kp).ok()
 }
 
+/// One callout's encoded response plus the decision outcome the metrics counter records.
+/// `handle_one` used to return only the payload, which cannot distinguish an `allow` response
+/// from a `refused` one without re-decoding the JWT it just built; carrying the outcome avoids
+/// that and keeps the decision label tied to the branch that actually decided.
+struct CalloutResult {
+    payload: Option<String>,
+    outcome: CalloutOutcome,
+}
+
+impl CalloutResult {
+    fn new(payload: Option<String>, outcome: CalloutOutcome) -> Self {
+        Self { payload, outcome }
+    }
+}
+
+/// Handles one `$SYS.REQ.USER.AUTH` request. Returns the response payload (if one could be
+/// encoded) together with the decision reached, which the caller records as
+/// `helper_callout_decisions_total{outcome=...}`. Decision logic itself lives in
+/// `spindle_helper::authz`; this function only decodes the envelope and maps the decision to the
+/// wire response.
 fn handle_one(
     request_payload: &[u8],
     account_name: &str,
     app_kp: &KeyPair,
     view: &mut impl HelperView,
     presence_map: &mut presence::ConnectionMap,
-) -> Result<Option<String>, HandleError> {
+) -> Result<CalloutResult, HandleError> {
     let req_str = std::str::from_utf8(request_payload).map_err(|_| HandleError::NonUtf8Payload)?;
     let claims = natsjwt::decode_claims_unverified(req_str)?;
 
@@ -2222,21 +2368,35 @@ fn handle_one(
 
     let Some(auth_token_str) = auth_token_str else {
         // No auth_token at all: uniform refusal (DESIGN.md §A5 Sybil/flood defense).
-        return Ok(respond_err(authz::UNIFORM_REFUSAL_MESSAGE));
+        return Ok(CalloutResult::new(
+            respond_err(authz::UNIFORM_REFUSAL_MESSAGE),
+            CalloutOutcome::Refused,
+        ));
     };
 
     let decoded = match auth_token::decode_auth_token(&auth_token_str) {
         Ok(d) => d,
-        Err(_) => return Ok(respond_err(authz::UNIFORM_REFUSAL_MESSAGE)),
+        Err(_) => {
+            return Ok(CalloutResult::new(
+                respond_err(authz::UNIFORM_REFUSAL_MESSAGE),
+                CalloutOutcome::Refused,
+            ))
+        }
     };
 
     match decoded {
         DecodedAuthToken::Device(d) => {
             let Some(root_pk) = spindle_core::checked_verifying_key(&d.root_pk_bytes) else {
-                return Ok(respond_err(authz::UNIFORM_REFUSAL_MESSAGE));
+                return Ok(CalloutResult::new(
+                    respond_err(authz::UNIFORM_REFUSAL_MESSAGE),
+                    CalloutOutcome::Refused,
+                ));
             };
             let Ok(nats_fp) = auth_token::nats_fp_of_nkey(&connect_nkey) else {
-                return Ok(respond_err(authz::UNIFORM_REFUSAL_MESSAGE));
+                return Ok(CalloutResult::new(
+                    respond_err(authz::UNIFORM_REFUSAL_MESSAGE),
+                    CalloutOutcome::Refused,
+                ));
             };
             let presented = DeviceConnectPresented {
                 root_pk,
@@ -2256,21 +2416,33 @@ fn handle_one(
                     // HelperView::put_session_record's doc comment). Stage 4 slice 3's
                     // helper.turn.get.<nfp> needs it to authorize non-callout requests.
                     view.put_session_record(auth.session_record);
-                    Ok(respond_ok(auth.permissions, auth.limits, host_count))
+                    Ok(CalloutResult::new(
+                        respond_ok(auth.permissions, auth.limits, host_count),
+                        CalloutOutcome::Allow,
+                    ))
                 }
                 AuthzDecision::Refused(reason) => {
                     tracing::debug!(%reason, "device connection refused");
-                    Ok(respond_err(authz::UNIFORM_REFUSAL_MESSAGE))
+                    Ok(CalloutResult::new(
+                        respond_err(authz::UNIFORM_REFUSAL_MESSAGE),
+                        CalloutOutcome::Deny,
+                    ))
                 }
             }
         }
         DecodedAuthToken::Host(h) => {
             let Some(host_root_pk) = spindle_core::checked_verifying_key(&h.host_root_pk_bytes)
             else {
-                return Ok(respond_err(authz::UNIFORM_REFUSAL_MESSAGE));
+                return Ok(CalloutResult::new(
+                    respond_err(authz::UNIFORM_REFUSAL_MESSAGE),
+                    CalloutOutcome::Refused,
+                ));
             };
             let Ok(nats_fp) = auth_token::nats_fp_of_nkey(&connect_nkey) else {
-                return Ok(respond_err(authz::UNIFORM_REFUSAL_MESSAGE));
+                return Ok(CalloutResult::new(
+                    respond_err(authz::UNIFORM_REFUSAL_MESSAGE),
+                    CalloutOutcome::Refused,
+                ));
             };
             let presented = HostConnectPresented {
                 host_root_pk,
@@ -2290,11 +2462,17 @@ fn handle_one(
                     let host_fp = auth.session_record.root_fp;
                     view.put_session_record(auth.session_record);
                     presence_map.register_host_user(connect_nkey, host_fp);
-                    Ok(respond_ok(auth.permissions, auth.limits, 1))
+                    Ok(CalloutResult::new(
+                        respond_ok(auth.permissions, auth.limits, 1),
+                        CalloutOutcome::Allow,
+                    ))
                 }
                 AuthzDecision::Refused(reason) => {
                     tracing::debug!(%reason, "host connection refused");
-                    Ok(respond_err(authz::UNIFORM_REFUSAL_MESSAGE))
+                    Ok(CalloutResult::new(
+                        respond_err(authz::UNIFORM_REFUSAL_MESSAGE),
+                        CalloutOutcome::Deny,
+                    ))
                 }
             }
         }

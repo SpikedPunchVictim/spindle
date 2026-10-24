@@ -34,6 +34,9 @@ cap-std = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# td-323db0: recording-only metrics facade. This crate is a library: it must never install a
+# global recorder or depend on an exporter — see `src/lib.rs`'s doc comment.
+metrics = { workspace = true }
 # `rand` backs `invite::InviteIssuer`'s per-call nonce. DESIGN.md §A7b's signed-artifact replay
 # table makes an invite cap's nonce a burn key ("invite: nonce burn"), so it must be a CSPRNG draw
 # rather than the deterministic, explicitly non-security-bearing member-cap derivation — see that

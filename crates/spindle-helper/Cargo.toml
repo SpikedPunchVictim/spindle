@@ -22,6 +22,13 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 async-nats = { workspace = true }
 tracing = { workspace = true }
+# td-323db0: the metrics facade, for recording sites in this crate's library modules and binary.
+# Recording only — this library never installs a global recorder (the exporter lives in the binary
+# target below and is installed only when METRICS_ADDR is set).
+metrics = { workspace = true }
+# td-323db0: the exporter is the binary target's dependency. Same package/manifest as the library,
+# but it must never be installed by library code — see `src/metrics.rs`'s module doc for the rule.
+metrics-exporter-prometheus = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -68,6 +75,12 @@ hmac = "0.12"
 sha1 = "0.10"
 
 [dev-dependencies]
+# td-323db0: `metrics_util::debugging::DebuggingRecorder` lets tests assert exact metric
+# names/labels through `metrics::with_local_recorder`, without installing a global recorder or
+# exporter. Already a transitive dependency of `metrics-exporter-prometheus` at this same 0.20
+# range, so this adds no new dependency *version* to the tree — only a direct edge, and only for
+# this crate's test targets.
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 # Independent-oracle style HMAC-SHA1 vectors and the pg-gated contract-test harness both need a
 # tokio multi-thread test runtime (see pg_store.rs's module docs on why `PgStore`'s HelperView
 # impl needs `block_in_place`, which panics on the default current-thread `#[tokio::test]` flavor).

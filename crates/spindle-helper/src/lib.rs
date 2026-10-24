@@ -11,6 +11,8 @@
 //!   external fact (current time, a caller-verified nkey signature, a store lookup) is a
 //!   parameter, never read implicitly. This is what makes [`authz::decide_device_connect`]/
 //!   [`authz::decide_host_connect`] exhaustively unit-testable without a running NATS server.
+//!   It may record through the [`metrics`] facade (td-323db0), which does no I/O itself and is a
+//!   no-op when no recorder is installed; the core never installs a recorder.
 //! - [`natsjwt`], [`memory_store`], [`pg_store`], [`turn`], and `src/bin/helper.rs` — **the
 //!   NATS/runtime wiring layer** (Stage 4 slices 2 and 3, graduated from `spikes/s1-callout` — S1
 //!   **PASS**, 19/19 automated checks against a live `nats-server`, 2026-08-24;
@@ -71,6 +73,11 @@
 //!   unconditionally (the revoked set is a monotone union; see that module's doc comment) under
 //!   per-device (pre-crypto) and per-root (accepted-write) token buckets that bound abuse but are
 //!   explicitly not authorization.
+//! - [`metrics`] — [`metrics::CalloutOutcome`] plus the recording helpers and metric-name
+//!   constants for DESIGN.md:707 (td-323db0). The pure decision core and the wiring layer may
+//!   both record through the `metrics` facade; only `src/bin/helper.rs` may install an exporter,
+//!   and only when `METRICS_ADDR` is set. See that module's doc comment for the naming,
+//!   cardinality, and redaction rules.
 //!
 //! **Still out of scope** (later slices): the admin-command verifier (`registry.admin.>`), the
 //! kick relay, split-brain newest-wins policy, multi-server `CONNZ` aggregation, and leader-only
@@ -94,6 +101,7 @@ pub mod auth_token;
 pub mod authz;
 pub mod kick;
 pub mod memory_store;
+pub mod metrics;
 pub mod natsjwt;
 pub mod permissions;
 pub mod pg_store;
