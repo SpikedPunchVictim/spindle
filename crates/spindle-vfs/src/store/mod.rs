@@ -444,8 +444,8 @@ pub struct Store {
     /// runs from several call sites sharing this one connection: [`crate::audit::Audit::append`]'s
     /// three failure branches (a failed `BEGIN`, a failed post-append `ROLLBACK`, and a failed
     /// `COMMIT`), every `&self` write method here via [`Store::with_transaction`], and
-    /// [`Store::burn_invite_nonce`]'s bespoke manual wiring (see that method's doc comment for why
-    /// it cannot use `with_transaction`). `AtomicBool` rather than `Cell<bool>`: every `Store`/
+    /// [`Store::burn_invite_nonce`] via [`Store::with_mut_transaction`]'s delegation to that same
+    /// wrapper. `AtomicBool` rather than `Cell<bool>`: every `Store`/
     /// `Audit` method takes `&self`, and `Store` derives `Debug` (a `Cell<bool>` would also be
     /// `Debug` and `&self`-compatible, but this crate has no other interior-mutability precedent
     /// to match, and `AtomicBool` costs nothing extra here — this flag is never on a hot path —
@@ -561,8 +561,9 @@ impl Store {
     }
 
     /// td-c9b9bd follow-up: the `&self` transaction wrapper every ordinary mutating method below
-    /// uses — every one except [`Store::burn_invite_nonce`], which needs `&mut self` for
-    /// `Connection::transaction` and is wired by hand instead (see its own doc comment for why).
+    /// uses. [`Store::burn_invite_nonce`] reaches it indirectly through
+    /// [`Store::with_mut_transaction`], which delegates to this method (see that wrapper's doc
+    /// comment for what its `&mut self` receiver actually buys).
     ///
     /// **The guarantee this closes**: before this wrapper existed, each of those methods opened
     /// its own transaction and ended with a trailing `tx.commit()?`. If that `commit()` failed, or
@@ -669,30 +670,22 @@ impl Store {
         }
     }
 
-    /// The `&mut self` counterpart to [`Store::with_transaction`], extracted for
-    /// [`Store::burn_invite_nonce`] (round 3 of the independent review of td-c9b9bd): that method
-    /// is the one write path in this file needing `&mut self`, specifically so it can use
-    /// `Connection::transaction()` (the only `Transaction` constructor requiring `&mut Connection`)
-    /// rather than `unchecked_transaction`/`Transaction::new_unchecked` — see
-    /// [`Store::with_transaction`]'s doc comment for why every *other* transaction site in this
-    /// file stays `&self` instead. Before this method existed, `burn_invite_nonce` hand-duplicated
-    /// the identical `catch_unwind`/`recover_from_non_autocommit`/`resume_unwind` shape inline;
-    /// measured (reverting that inline wrapper to a plain immediately-invoked closure left the
-    /// whole `spindle-vfs` suite green), no test exercised the shape through the real call path —
-    /// a test driving a parallel copy of the wrapper would only prove the copy works, not that
-    /// `burn_invite_nonce` itself is protected. Extracting it here — with
-    /// [`Store::with_mut_transaction_for_test`] giving tests the same seam
-    /// [`Store::with_transaction_for_test`] gives `with_transaction` — closes that gap:
-    /// `burn_invite_nonce` now genuinely delegates to this method rather than merely resembling
-    /// it.
+    /// The `&mut self` counterpart to [`Store::with_transaction`], used by
+    /// [`Store::burn_invite_nonce`] (round 3 of the independent review of td-c9b9bd).
     ///
-    /// Holds the identical guarantee as `with_transaction`: the `Transaction` is fully resolved —
-    /// committed, or dropped attempting its own `ROLLBACK` — whether `f` (or `tx.commit()`)
-    /// returns normally or unwinds past it, so [`recover_from_non_autocommit`] always observes the
-    /// connection's truly final autocommit state, and any caught panic is re-raised unchanged via
-    /// [`std::panic::resume_unwind`] afterward. With no borrow held across the `catch_unwind` call,
-    /// `&mut self` and `Connection::transaction()` work exactly as they did in the inline version —
-    /// nothing about the caller's signature or transaction strategy changes.
+    /// Its body is a one-line delegation to `with_transaction` with
+    /// [`TransactionBehavior::Deferred`], so the
+    /// `catch_unwind`/[`recover_from_non_autocommit`]/[`std::panic::resume_unwind`] recovery shape
+    /// has exactly one implementation in this crate and two wrappers cannot drift apart.
+    /// `Deferred` is what `burn_invite_nonce`'s prior direct `Connection::transaction()` call
+    /// began, so the delegation changes the receiver, not the runtime transaction behaviour.
+    ///
+    /// The `&mut self` receiver is therefore a deliberate API constraint, not an implementation
+    /// requirement of the shared body: it is the *static* nesting guard. Borrowing the `Store`
+    /// mutably for the duration of the call makes an overlapping `&mut self` call on the same
+    /// store a compile error, independently of the runtime BEGIN/rollback behaviour the shared
+    /// body implements. Dropping the receiver to `&self` would leave the same mistake to be caught
+    /// only at runtime, by SQLite's "cannot start a transaction within a transaction" error.
     ///
     /// `context` is a short, static, human-readable label passed straight through to
     /// [`recover_from_non_autocommit`] for its log lines only, exactly as in `with_transaction`.
@@ -701,18 +694,7 @@ impl Store {
         context: &'static str,
         f: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        self.check_not_poisoned()?;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let tx = self.conn.transaction()?;
-            let value = f(&tx)?;
-            tx.commit()?;
-            Ok(value)
-        }));
-        recover_from_non_autocommit(&self.conn, &self.poisoned, context);
-        match result {
-            Ok(value) => value,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
+        self.with_transaction(context, TransactionBehavior::Deferred, f)
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2562,6 +2544,13 @@ impl Store {
     /// mint or an earlier one is the one that counts. This is exactly the resolution the task
     /// brief anticipated, and is the only design that keeps `spindle-vfs` free of a
     /// `spindle-core::artifacts`/signing-key dependency it has no other reason to take.
+    ///
+    /// Takes `&mut self` as a static nesting guard (and to keep this method's longstanding public
+    /// shape, not because the transaction body needs a distinct implementation): borrowing the
+    /// `Store` mutably makes an overlapping `&mut self` call on the same store a compile error,
+    /// independently of the runtime transaction behaviour. The transaction itself is opened by
+    /// [`Store::with_mut_transaction`], whose one-line body shares the single recovery
+    /// implementation with [`Store::with_transaction`].
     pub fn burn_invite_nonce(
         &mut self,
         nonce: &[u8],
@@ -2570,17 +2559,8 @@ impl Store {
         now: u64,
     ) -> Result<IssuedCapRecord, StoreError> {
         self.check_not_poisoned()?;
-        // Bespoke, not `Store::with_transaction`: this method is the one write path in this file
-        // that takes `&mut self`, specifically so it can use `Connection::transaction()` (the
-        // only `Transaction` constructor requiring `&mut Connection`) rather than
-        // `unchecked_transaction`/`Transaction::new_unchecked` — see the "Uses `unchecked_
-        // transaction`..." discussion moved to `Store::with_transaction`'s doc comment for why
-        // every *other* transaction site in this file stays `&self` instead. It delegates to
-        // [`Store::with_mut_transaction`] (round 3 of the independent review of td-c9b9bd) for
-        // the identical `catch_unwind`/`recover_from_non_autocommit`/`resume_unwind` guarantee
-        // `with_transaction` gives every other write method — see that method's doc comment for
-        // the full reasoning, and [`Store::with_mut_transaction`]'s doc comment for why the shape
-        // was extracted there rather than left hand-duplicated inline here as it originally was.
+        // `&mut self` above is only the static nesting guard; the recovery shape comes from
+        // `with_transaction` through this delegation (see both doc comments).
         self.with_mut_transaction("burn_invite_nonce", |tx| {
             tx.execute(
                 "INSERT INTO invite_nonces (nonce, member_id, issued_cap, redeemed_at) \
@@ -2728,8 +2708,8 @@ impl Store {
 /// [`Audit::append`]'s three failure branches (a failed `BEGIN`, a failed `ROLLBACK` after a
 /// failed append, and a failed `COMMIT` after a successful one, each via
 /// [`crate::audit::Audit`]'s thin delegating wrapper of the same name), every `&self` write method
-/// in this file via [`Store::with_transaction`], and [`Store::burn_invite_nonce`]'s bespoke manual
-/// wiring (see that method's doc comment for why it cannot use `with_transaction`). `context` is a
+/// in this file via [`Store::with_transaction`], and [`Store::burn_invite_nonce`] via
+/// [`Store::with_mut_transaction`]'s delegation to that same wrapper. `context` is a
 /// short human-readable description of which call site invoked this, for the log lines only.
 ///
 /// Keys the decision on `Connection::is_autocommit()` — the direct, current-state observable
@@ -6358,10 +6338,9 @@ mod tests {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 
         // Same shape as `store_transaction_poisons_when_rollback_cannot_restore_autocommit`
-        // above, but through `burn_invite_nonce`'s bespoke `&mut self`/`self.conn.transaction()`
-        // wiring (it cannot use `Store::with_transaction`, which is `&self`-only — see its own
-        // doc comment) — this is what proves that hand-wired recovery call actually runs, not
-        // only `with_transaction`'s.
+        // above, but through `burn_invite_nonce`'s `&mut self` entry point and its
+        // `with_mut_transaction` delegation to `with_transaction` — this is what proves the shared
+        // recovery body runs for this caller too, not only for the `&self` write methods.
         let mut store = Store::open_in_memory().expect("open");
         let member_id = store
             .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
@@ -6369,7 +6348,7 @@ mod tests {
 
         // Deny the `INSERT` `burn_invite_nonce` needs (forcing it into its failure/rollback
         // branch) and deny every ROLLBACK — the one triggered by the dropped `Transaction`, AND
-        // the single retry the hand-wired `recover_from_non_autocommit` call makes afterward.
+        // the single retry `recover_from_non_autocommit` makes afterward.
         store
             .connection()
             .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
@@ -6402,9 +6381,9 @@ mod tests {
         );
         assert!(
             store.is_poisoned(),
-            "burn_invite_nonce's hand-wired recovery call must poison the store on an \
+            "burn_invite_nonce's delegated recovery path must poison the store on an \
              unrecoverable strand, exactly like `Store::with_transaction` does for every other \
-             write method — this is the manual-wiring counterpart of \
+             write method — this is the `&mut self` entry point's counterpart of \
              `store_transaction_poisons_when_rollback_cannot_restore_autocommit` above"
         );
     }
@@ -6560,9 +6539,9 @@ mod tests {
             .expect("add_member");
 
         // Same seam as `a_panic_inside_a_store_transaction_still_recovers_or_poisons`, but
-        // through `burn_invite_nonce`'s bespoke `with_mut_transaction` wiring instead: deny the
-        // `INSERT` the closure below attempts and deny every `ROLLBACK`, so nothing on this
-        // connection can leave the transaction `with_mut_transaction`'s `Connection::transaction()`
+        // through `burn_invite_nonce`'s `&mut self` entry point and its `with_mut_transaction`
+        // delegation instead: deny the `INSERT` the closure below attempts and deny every
+        // `ROLLBACK`, so nothing on this connection can leave the transaction that delegation
         // opened.
         store
             .connection()
