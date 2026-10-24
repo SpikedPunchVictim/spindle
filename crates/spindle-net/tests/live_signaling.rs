@@ -133,7 +133,7 @@ use spindle_net::framing::{read_frame, write_frame};
 use spindle_net::quic::ControlStream;
 use spindle_net::signaling::{
     ConnectAuthorizer, ConnectDecision, ConnectOptions, HostIdentity, HostOptions, SessionHandler,
-    SignalingClient, SignalingHost, VerifiedDecision,
+    SignalingClient, SignalingError, SignalingHost, VerifiedDecision,
 };
 use spindle_proto::artifacts::{Capability, HostOpKeyCert};
 use x25519_dalek::PublicKey as X25519PublicKey;
@@ -1369,4 +1369,266 @@ async fn live_a_stolen_device_bundle_must_not_authorize_a_connect_from_another_n
          connections. This is td-0bcab4; it must be reported as a genuine finding, not papered \
          over by weakening this assertion."
     );
+}
+
+/// A [`SessionHandler`] whose **first** session blocks until the test releases it, and whose later
+/// sessions return immediately. The first entry is what keeps `max_concurrent_connects: 1`'s only
+/// permit held for as long as the overlapping offer needs to be observed; later entries must not
+/// block, or the post-release offer could never be served either.
+struct GatedHandler {
+    /// Every session the host ever handed to the handler, in entry order.
+    sessions: Arc<AtomicUsize>,
+    /// Notified on the first entry (and only the first) so the test knows the permit is held.
+    first_entered: Arc<tokio::sync::Notify>,
+    /// Awaited on the first entry; notifying it lets the first session end.
+    release_first: Arc<tokio::sync::Notify>,
+}
+
+impl SessionHandler for GatedHandler {
+    async fn handle_session(
+        &self,
+        _peer_device_fp: Fingerprint,
+        control: ControlStream,
+    ) -> ControlStream {
+        let entry = self.sessions.fetch_add(1, Ordering::SeqCst) + 1;
+        if entry == 1 {
+            self.first_entered.notify_one();
+            self.release_first.notified().await;
+        }
+        control
+    }
+}
+
+/// td-fc7542: `SignalingHost::run`'s `max_concurrent_connects` admission check is load-bearing on
+/// the production path, not just a default value plus a unit test of `Semaphore`'s own semantics.
+/// This is the only place the check can be proven: it lives in `run`, which needs a live
+/// `async_nats::Client`, so no in-process unit test observes it (a neuter check proved replacing
+/// `try_acquire_owned` with an always-succeeding binding leaves `cargo test -p spindle-net --lib`
+/// fully green).
+///
+/// The shape deliberately mirrors DESIGN.md §A5's **uniform silent drop**, which the
+/// `max_concurrent_connects` cap follows: with the cap held by a blocked first session, the
+/// overlapping second offer must get no reply at all — not an error reply, not a second handler
+/// entry. The client-visible result is
+/// therefore its own answer-wait timeout, which is exactly what a `ConnectDecision::Deny` or a
+/// malformed envelope looks like from outside. The test then releases the first session and proves
+/// a fresh offer is served, so it pins the permit's *return*, not merely "one connection ever".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live stack required: run `docker compose -f deploy/docker-compose.yml up -d` first, \
+            then `cargo test -p spindle-net --test live_signaling -- --ignored --nocapture`. \
+            When run, an unreachable stack fails loudly — this test never skips."]
+async fn live_max_concurrent_connects_cap_serves_one_offer_and_silently_drops_the_overlapping_one()
+{
+    let url = nats_url();
+    assert_stack_rejects_anonymous(&url).await;
+
+    let exp = fixtures::now() + 3600;
+
+    // Identities not used by any other test in this file.
+    let host_root = HostRootIdentity::new([0x21; 32], [0x22; 32]);
+    let host_device = DeviceKey::from_seeds([0x23; 32], [0x24; 32]);
+    let host_device_fp = host_device.device_fp();
+    let host_device_sign_pk = host_device.sign_public_key();
+    let host_device_agree_pk = host_device.agree_public_key();
+    let client = DeviceIdentity::new([0x31; 32], [0x32; 32], [0x33; 32]);
+    let cap = host_root.member_capability(client.root_fp(), exp, vec![0xE1]);
+
+    let (host_nats, host_events) = connect_host(&url, &host_root, exp).await;
+    let (client_nats, client_events, _client_user_pk) =
+        connect_device(&url, &client, std::slice::from_ref(&cap), exp).await;
+
+    let (authorizer, authorize_calls) = RegistryAuthorizer::new(&[&client]);
+    let sessions = Arc::new(AtomicUsize::new(0));
+    let first_entered = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let host = Arc::new(SignalingHost::new(
+        host_nats,
+        host_device,
+        host_root.host_fp,
+        authorizer,
+        GatedHandler {
+            sessions: sessions.clone(),
+            first_entered: first_entered.clone(),
+            release_first: release_first.clone(),
+        },
+    ));
+    let host_task = tokio::spawn({
+        let host = host.clone();
+        async move {
+            host.run(HostOptions {
+                bind_ip: ICE_BIND_IP,
+                ice_timeout: Duration::from_secs(10),
+                session_close_timeout: Duration::from_secs(5),
+                // The value under test.
+                max_concurrent_connects: 1,
+            })
+            .await
+        }
+    });
+    // Let the host's connect subscription land server-side before the first offer.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_no_permission_violation(&host_events, "host");
+
+    let host_identity = Arc::new(HostIdentity {
+        host_fp: host_root.host_fp,
+        device_fp: host_device_fp,
+        sign_pk: host_device_sign_pk,
+        agree_pk: host_device_agree_pk,
+    });
+
+    // ---- offer 1: admitted, and it holds the only permit while the handler is blocked ----------
+    let first_client = SignalingClient::new(client_nats.clone(), client.device_key());
+    let first_host_identity = host_identity.clone();
+    let mut first = tokio::spawn(async move {
+        let (mut control, timings) = first_client
+            .connect_timed(&first_host_identity, client_opts())
+            .await?;
+        // `QuicServer::accept` awaits `connection.accept_bi()`, and quinn does not make a
+        // freshly `open_bi`'d stream visible to the peer until something is written on it. Without
+        // this probe the host stays blocked in `accept_bi()` and never reaches `handle_session`,
+        // so the "handler entered" signal below would never fire even on a healthy connect.
+        write_frame(&mut control.send, b"first")
+            .await
+            .unwrap_or_else(|e| panic!("writing the first session's probe frame failed: {e}"));
+        Ok::<_, SignalingError>((control, timings))
+    });
+    if tokio::time::timeout(Duration::from_secs(30), first_entered.notified())
+        .await
+        .is_err()
+    {
+        // Report why: if the connect task already finished, its own result is the real cause of
+        // the handler never being entered, and is far more useful than "timed out".
+        match tokio::time::timeout(Duration::from_secs(1), &mut first).await {
+            Ok(Ok(Ok(_))) => panic!(
+                "the first offer's client connected, but the SessionHandler was never entered — \
+                 the host never handed the session to it"
+            ),
+            Ok(Ok(Err(e))) => {
+                panic!("the first offer failed before reaching the SessionHandler: {e}")
+            }
+            Ok(Err(e)) => panic!("the first connect task panicked: {e}"),
+            Err(_) => panic!(
+                "the first offer was never served: the SessionHandler was never entered within \
+                 30s, so it never took the single `max_concurrent_connects: 1` permit"
+            ),
+        }
+    }
+
+    // ---- offer 2: overlapping, while offer 1's permit is held ---------------------------------
+    let second_client = SignalingClient::new(client_nats.clone(), client.device_key());
+    let second_started = Instant::now();
+    let second_result = second_client
+        .connect_timed(
+            &host_identity,
+            ConnectOptions {
+                answer_timeout: Duration::from_secs(2),
+                ..client_opts()
+            },
+        )
+        .await;
+    let second_elapsed = second_started.elapsed();
+
+    match &second_result {
+        Err(SignalingError::Timeout("connect offer/answer")) => println!(
+            "[cap] overlapping offer got no reply at all and timed out after {:.0}ms, as required",
+            second_elapsed.as_secs_f64() * 1000.0
+        ),
+        Ok(_) => panic!(
+            "both overlapping connect offers were served while `max_concurrent_connects: 1` — the \
+             second offer established a session. The cap is not enforced on SignalingHost::run."
+        ),
+        Err(e) => panic!(
+            "the overlapping offer did not receive DESIGN.md §A5's uniform silent drop; it failed \
+             with {e:?} instead of the answer-wait timeout. An error reply — or any observable \
+             outcome distinguishable from 'no reply' — would violate §A5."
+        ),
+    }
+    assert_eq!(
+        sessions.load(Ordering::SeqCst),
+        1,
+        "exactly one of the two overlapping offers may reach the SessionHandler"
+    );
+    assert_eq!(
+        authorize_calls
+            .lock()
+            .expect("authorize call log mutex")
+            .len(),
+        1,
+        "the at-capacity offer must be dropped at admission, before the ConnectAuthorizer is \
+         consulted — reaching the authorizer would mean the cap is checked too late"
+    );
+
+    // ---- release the first, and prove the permit is returned ----------------------------------
+    release_first.notify_one();
+    let (first_control, _) = tokio::time::timeout(Duration::from_secs(30), first)
+        .await
+        .expect("the admitted first connect task did not finish within 30s")
+        .expect("the admitted first connect task panicked")
+        .unwrap_or_else(|e| panic!("the admitted first offer failed to connect: {e}"));
+    first_control.connection.close(0u32.into(), b"done");
+    drop(first_control);
+
+    // A fresh offer after the first session has ended. The permit is released when the spawned
+    // `handle_connect` task returns, which is after the first session's connection closes; the
+    // retry loop absorbs only that small scheduling delay. A permit that was never returned still
+    // fails the test: every attempt times out until `serve_deadline`.
+    let third_client = SignalingClient::new(client_nats.clone(), client.device_key());
+    let serve_deadline = Instant::now() + Duration::from_secs(20);
+    let (mut third_control, _) = loop {
+        let attempt = third_client
+            .connect_timed(
+                &host_identity,
+                ConnectOptions {
+                    answer_timeout: Duration::from_secs(2),
+                    ..client_opts()
+                },
+            )
+            .await;
+        match attempt {
+            Ok(ok) => break ok,
+            Err(SignalingError::Timeout("connect offer/answer"))
+                if Instant::now() < serve_deadline =>
+            {
+                println!(
+                    "[cap] a post-release offer got no answer yet (the first session's permit may \
+                     not have been returned); retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!(
+                "a post-release connect offer was refused rather than served: {e:?}. The permit \
+                 must be returned once the first session's handler returns."
+            ),
+        }
+    };
+
+    // Same stream-visibility requirement as the first session: the host only reaches
+    // `handle_session` once the client actually writes on the opened control stream.
+    write_frame(&mut third_control.send, b"third")
+        .await
+        .unwrap_or_else(|e| panic!("writing the post-release probe frame failed: {e}"));
+
+    // The handler's entry can trail the client's write by a scheduling tick, so poll briefly for
+    // the second entry instead of reading the counter exactly once.
+    let entered_deadline = Instant::now() + Duration::from_secs(5);
+    while sessions.load(Ordering::SeqCst) < 2 {
+        assert!(
+            Instant::now() < entered_deadline,
+            "the post-release offer connected but never reached the SessionHandler — the permit is \
+             not what was returned"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        sessions.load(Ordering::SeqCst),
+        2,
+        "the post-release offer must be served, proving the permit was returned"
+    );
+    third_control.connection.close(0u32.into(), b"done");
+    drop(third_control);
+
+    assert_no_permission_violation(&host_events, "host");
+    assert_no_permission_violation(&client_events, "client");
+
+    host_task.abort();
 }
