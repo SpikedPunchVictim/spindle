@@ -178,28 +178,55 @@ impl RateLimiter {
     }
 }
 
-/// Token-bucket parameters for [`ConnectRateLimiter`], the pre-authentication limiter in front of
-/// `HostConnectAuthorizer` (DESIGN.md §A5: "per-`from_fp` token bucket"). These are, like
-/// [`RateLimitConfig`]'s own defaults, retunable placeholders — DESIGN.md mandates that a token
-/// bucket exist at this layer but specifies no numbers for it.
+/// Token-bucket parameters for [`ConnectRateLimiter`], the connect-path limiter in front of
+/// `HostConnectAuthorizer` (DESIGN.md §A5: "per-`from_fp` token bucket"). DESIGN.md mandates that
+/// a token bucket exist here but specifies no numbers, so these are chosen defaults rather than a
+/// measured deployment tuning. They are **ceilings against amplification, not service levels**:
+/// each sits far above a normal device's connect rate, and exists to bound the CPU work an
+/// adversary can make this host do. The arithmetic below is the justification; if one of these
+/// numbers is retuned, redo it.
 ///
-/// The defaults below are deliberately far tighter than [`RateLimitConfig::default`]'s
-/// 200 burst / 50 per-sec: that limiter guards the post-auth VFS-RPC path, where the caller has
-/// already proven a signature. This one guards a *pre-authentication* path — the connect
-/// authorizer runs before any signature has been checked, so it is the first thing an attacker
-/// with no valid credential at all can reach and hammer.
+/// Since td-fc5a30 the two buckets bound different work, because they are charged at different
+/// stages of the connect flow (see [`ConnectRateLimiter`]'s doc comment for why):
+///
+/// - **`global` — 200 burst / 50 per sec, charged pre-verification on every offer.** It bounds how
+///   much unauthenticated input reaches one membership lookup, plus on a pre-crypto denial one run
+///   of `HostConnectAuthorizer`'s `equalize_denial_work` (measured ≈3.3 µs of crypto work; an
+///   `Allow` pays that same parse-and-rehash cost for real). At the sustained rate that is
+///   50 × 3.3 µs ≈ 0.17 ms of that crypto work per second (≈0.02% of one core); the burst adds at
+///   most 200 × 3.3 µs ≈ 0.66 ms. The SQLite lookup's own cost has not been measured, so this does
+///   not claim a total. The same bucket transitively caps aggregate mint work: every offer spends
+///   a global token before it can reach `on_verified`, so at most 50 offers/sec can be signed —
+///   ≤ 50 × 16.7 µs ≈ 0.84 ms of Ed25519 signing per second (≈0.08% of one core) — with a burst
+///   ceiling of 200 × 16.7 µs ≈ 3.3 ms.
+/// - **`per_fp` — 10 burst / 1 per sec, charged post-verification.** This is the bucket that gates
+///   a mint, so it is the one to compare against the measured ≈16.7 µs Ed25519 signature: one
+///   authenticated device can hold at most 1 mint/sec sustained (16.7 µs/s, ≈0.002% of one core)
+///   or a 10-mint burst (≈167 µs). It bounds what a single compromised device can make the host
+///   sign; it is not a limit on the quality of service that device receives.
+///
+/// These rest on the measured per-operation costs above, not on an observed deployment load
+/// profile — no live host's connect rate has been measured yet. They are retunable, but not
+/// arbitrary: the numbers above are the check any replacement should pass.
+///
+/// Reach: the pre-verification half is reachable by any **NATS-credentialed** device — the broker
+/// requires a credential to publish to `host.<h>.connect`, and there is no anonymous path — so
+/// "unauthenticated" at this layer means only that no Spindle-level signature has been checked
+/// yet, not that the publisher is anonymous.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ConnectRateLimitConfig {
-    /// Per-`from_fp` bucket: bounds how fast one *identified* device (a specific claimed
-    /// `from_fp`) may retry connects. Default: burst 10, refill 1/sec.
+    /// Per-`from_fp` bucket: bounds how fast one device may reconnect. Since td-fc5a30 it is
+    /// charged in the post-verification half, so its key is an **authenticated** `from_fp`, never
+    /// one the caller merely claimed. Default: burst 10, refill 1/sec.
     pub per_fp: RateLimitConfig,
     /// Bucket shared across every `from_fp`: bounds total connect-lookup work regardless of how
     /// many distinct (and, pre-auth, unverified) fingerprints an attacker rotates through.
     /// Default: burst 200, refill 50/sec.
     pub global: RateLimitConfig,
-    /// Upper bound on the number of per-fp buckets tracked at once, so an attacker who fabricates
-    /// unboundedly many `from_fp` values cannot turn the limiter itself into an unbounded
-    /// allocation. Default: 4096.
+    /// Upper bound on the number of per-fp buckets tracked at once, so the limiter's own state
+    /// cannot grow without bound. Since td-fc5a30 only a device that has proven its signature can
+    /// create an entry, so filling this map takes that many distinct real devices; the bound is
+    /// still needed because "authenticated" is not "finite". Default: 4096.
     ///
     /// Deliberately left out of the `sanitized()` treatment [`RateLimitConfig::burst`] and
     /// [`RateLimitConfig::refill_per_sec`] get in [`ConnectRateLimiter::new`]: `0` here already

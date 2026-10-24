@@ -222,6 +222,29 @@ fn build_answer_payload(
 /// See [`ConnectAuthorizer`]'s own doc comment for the rule an implementer must follow, and why
 /// moving a per-identity charge back into `authorize` reintroduces the targeted denial-of-service.
 ///
+/// # How the two MUSTs are met, and what stays open
+///
+/// The paragraph above is an obligation on the implementer. `spindle-host-core`'s
+/// `HostConnectAuthorizer` meets the rate-limit half with a globally-charged bucket in `authorize`
+/// and a per-`from_fp` bucket in `on_verified`, and the timing half with an equalization recompute
+/// on every pre-crypto `Deny` (`equalize_denial_work`). Because the mint now lives behind
+/// `on_verified`, no path through `authorize` signs: an `Allow` there performs the same
+/// parse-and-rehash work the equalization imitates (measured ≈3.3 µs), and the ≈16.7 µs Ed25519
+/// mint that used to distinguish it is off the pre-verification path entirely. The mint asymmetry
+/// was never equalized by signing on every denial — that would hand any peer a free signature per
+/// packet, exactly the CPU amplification the rate limiter exists to deny. What the equalization
+/// still does not close is the store-side hit-vs-miss cost and ordinary page-cache/allocator
+/// jitter; `spindle-host-core`'s `authorize.rs` records that residual honestly under
+/// `equalize_denial_work`'s "What this does NOT close", and it is bounded by the limiter and by
+/// §A5's uniform silent drop rather than eliminated.
+///
+/// One consequence of the nats-server behavior above is worth stating in the post-split world:
+/// because a foreign reply subject is permitted, a credentialed device can still name any
+/// `from_fp` and that device's inbox. What that buys it is one global-bucket token and one
+/// membership lookup charged under someone else's name. It cannot make `authorize` sign, and it
+/// cannot charge the named identity anything: `on_verified` is unreachable without that identity's
+/// signing key, so the per-`from_fp` bucket and the mint are never touched.
+///
 /// `on_verified` is called last, after the `inbox` equality check, so that every routing check has
 /// already passed: an offer that is going to be rejected for *any* reason this function can see is
 /// rejected before the host does per-identity work for it. A [`VerifiedDecision::Drop`] produces
