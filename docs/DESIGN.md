@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.53) + Execution Plan
+# Spindle — System Design Document (draft v0.9.54) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -247,6 +247,10 @@
 > literals only — no identifier, path, or name may become a label, because cardinality is a leak.
 > v0.9.53: one decision batch, no wire change. A10.6–9 and A10.24 are decided; all nine [DEFAULT]-flagged
 > A10 rows are ratified and their flags removed; the license is MIT.
+> v0.9.54: one decision (A10.52), no wire change. A capability whose subject the host revoked is
+> **dropped** from the candidate set rather than refusing the whole connection: the connection
+> proceeds with the surviving caps, and only when none survives is it refused (`SubjectRevoked`).
+> A root-scoped self-revocation still refuses the whole connection.
 
 ---
 
@@ -611,7 +615,11 @@ cap = { v, host_fp, host_root_pk, op_cert, kind: invite|member, subject: root_fp
   successful session). Stored per platform: native → OS keychain; browser → IndexedDB (a cap is host-signed and
   useless without the device key). **Renewal path (no lockout)**: a cap that is expired or stale-epoch but
   signature-valid still earns **connect-only** NATS permissions (same as an invite); the host verifies the device
-  over the E2E channel and re-issues the current cap in the reply. Only *revoked* subjects are refused outright.
+  over the E2E channel and re-issues the current cap in the reply. Revocation is **per capability**: a cap whose
+  subject the host revoked is dropped from the candidate set, and the connection may still proceed for the other
+  hosts it presented; only when no cap survives is the connection refused outright (never downgraded to
+  connect-only). A root-scoped self-revocation — a person revoking their own device under the root — still refuses
+  the whole connection.
 - **Presentation**: caps travel in the CONNECT `auth_token` as compact CBOR (**424 B each, measured**
   **[amended v0.9.33]**, chain-carrying, v0.9.5, base64url). nats-server's default `max_control_line`
   is 4 KiB, so the registry sets it to **32 KiB**
@@ -1759,6 +1767,7 @@ Docker is explicitly not the primary dev environment.
 | 49 | Rate-limiting order for `helper.revoke.<nfp>` | **DECIDED 2026-10-23:** the per-root token bucket is charged **after** signature verification and only for a deposit that changes state; pre-verification attempts are bounded by a separate **per-device** budget. Forced by an adversarial review of the first implementation, which charged the root before verifying: any compromised device under a root (valid certificate, cap, and session — but no root key) could publish unsigned records carrying that root's `root_fp`, which is public, spend the root's ten-token burst, and have the owner's genuinely signed revocation refused `rate limited` before it was ever verified — suppressing the very revocation S14 exists to deliver. The per-root key remains DESIGN's requirement; only the ordering changed. An already-applied record is detected before the charge and costs nothing, so replaying a recorded message cannot drain the bucket. Residual, stated: an observer who captures a *not-yet-applied* valid record can replay it into the bucket — but that observer is the registry itself, which can already drop the record, so this adds no power. Rejected: *keep the pre-verification charge and raise the burst* — any finite burst a compromised device can spend is a suppression budget. Bears on td-b5d50c. |
 | 50 | Which version checks reject an unknown future version? | **DECIDED 2026-10-24:** every signed v-carrying artifact — `Envelope`, `Capability`, `AdminCommand` — enforces a **ceiling** at the build's current version in addition to the existing floor, both before any signature work. Forced because all three checks were floors while A7b says "unknown `v` ⇒ reject": a legitimately signed v2 artifact would otherwise be verified under v1 semantics, and the signature does not save us — it is valid, just under fields this build would misread. The unsigned `VfsRequestEnvelope` and `DeviceBootstrapBundle` keep floor-only checks: forward compatibility with newer clients is a wire policy, and neither is a signed artifact. Rejected: *ceiling on VFS RPC too* — it would reject newer clients on a transport host and client are expected to upgrade independently, turning a version floor into a rollout coupling; rejected: *leaving signed artifacts floor-only* — that is the bug this row closes. Bears on td-bffaac. |
 | 51 | Metrics exporter for the §A7 observability contract | **DECIDED 2026-10-24 (user decision):** `metrics` facade in libraries + `metrics-exporter-prometheus` (http-listener only) in binaries. Libraries record through the facade and never install a global recorder, keeping the A9c layering rule and making recording a no-op in tests and unconfigured deployments. The helper installs a scrape listener only when `METRICS_ADDR` is set; host exporter wiring lands with the host binary. Histograms supply the p99 needed by the callout and revoke-cut-off SLOs. Rejected: *OpenTelemetry/OTLP* — a much heavier dependency and configuration surface plus a collector to be useful, for signals this deployment does not yet need; rejected: *tracing-layer derived counters* — no new dependency, but percentiles require a bespoke aggregation layer and the host libraries must stay subscriber-free anyway; rejected: *hand-rolled registry + text endpoint* — most code to own (buckets, quantiles, encoding) for no capability the facade lacks. Cardinality rule recorded with the decision: labels are fixed literals only; identifiers, paths, and names are never labels. Bears on td-323db0. |
+| 52 | Revoked capability: drop it or refuse the whole connection? | **DECIDED 2026-10-24 (user decision):** a cap whose subject the host revoked is **dropped** from the candidate set; the connection proceeds with the surviving caps, and only when none survives is it refused (`SubjectRevoked`, never connect-only). The root-scoped self-revocation check stays connection-wide. Forced by the asymmetry of the ambiguity: A4's "only revoked subjects are refused outright" did not say per-cap or per-connection, and the whole-connection reading lets any one host operator deny a member access to every other host in the presented set, while the dropped cap is already unusable for the revoking host. The drop stays in the pre-crypto pass, and the wire refusal is uniform either way, so which cap was dropped is never disclosed. Rejected: *keep whole-connection refusal* — a cross-host denial-of-service bought for no security gain; rejected: *downgrade the revoked cap to connect-only* — that path is for capability freshness, not revocation, and A4 forbids it. Bears on td-d5800b. |
 
 ## A11. Alternatives considered
 
@@ -1958,6 +1967,12 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.54 (2026-10-24)** — One decision (A10.52), no wire change. A capability whose subject
+  the host revoked is dropped from the candidate set instead of refusing the connection; the
+  connection proceeds with the surviving caps and is refused (`SubjectRevoked`, never
+  connect-only) only when none survives. The root-scoped self-revocation check remains
+  connection-wide. The drop stays in the pre-crypto pass and the wire refusal is uniform, so a
+  dropped cap is never disclosed.
 - **v0.9.53 (2026-10-24)** — One decision batch closing every open A10 item, no wire change. A10.6–9
   are decided (browser receive uses the File System Access API where available, otherwise a 2 GB
   cap; registry connection logs are kept 30 days with no payload logging; coturn is self-hosted with a

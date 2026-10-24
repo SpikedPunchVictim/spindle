@@ -48,9 +48,9 @@ stateDiagram-v2
 
     Kicked --> Disconnected
 
-    Disconnected --> NatsConnected: reconnect, cert/caps re-checked<br/>(is_revoked short-circuits if still revoked)
+    Disconnected --> NatsConnected: reconnect, cert/caps re-checked<br/>host-revoked cap dropped (decide_device_connect);<br/>refused only if no presented cap survives; mixed-cap reconnect proceeds
 
-    SessionEstablished --> Disconnected: is_revoked / SubjectRevoked on<br/>next CONNECT attempt<br/>(authz.rs:414-434)
+    SessionEstablished --> Disconnected: host-revoked cap dropped on next CONNECT<br/>(decide_device_connect); SubjectRevoked refuses only when none survives;<br/>root-scoped self-revocation is connection-wide
 ```
 
 Two things do **not** advance this diagram the way you might expect:
@@ -197,9 +197,12 @@ verification (`authz.rs:410-416` comment):
 4. cheap byte compare `nats_fp` vs `session_attest.nats_fp` → `BadSessionAttestation` — deliberately
    redundant with step 8, purely to reject cheaply before any crypto (`authz.rs:393-407`)
 5. cheap hashes: `root_fp = root_fp_of(root_pk)`, `device_fp` from cert bytes (`authz.rs:409-412`)
-6. per-candidate subject match, then `view.is_revoked(host_fp, root_fp/device_fp)` →
-   `SubjectRevoked` refuses the **whole connection**, before any signature check
-   (`authz.rs:414-434`)
+6. per-candidate subject match, then `view.is_revoked(host_fp, root_fp/device_fp)` → a revoked
+   cap is **dropped** from the candidate set, before any signature check; the connection proceeds
+   with the survivors, and only an empty survivor set is refused with
+   `RefusalReason::SubjectRevoked` (never connect-only). A root-scoped
+   `view.is_self_revoked(root_fp, device_fp)` check runs just before this loop and remains
+   connection-wide (`decide_device_connect`)
 7. `verify_nkey_sig()` (lazy closure — the server-nonce signature) → `BadNkeySignature`
    (`authz.rs:439-441`)
 8. `verify_device_certificate(root_pk, root_fp, now)` → `BadDeviceCertificate`
@@ -436,7 +439,7 @@ sequenceDiagram
     Helper->>Helper: store revocation; compute KickMap targets for now-revoked live sessions
     Helper->>Server: SYS.REQ.SERVER.server_id.KICK with cid
     Server-->>Session: connection forcibly closed
-    Note over Helper,Server: Later reconnect attempt: authz.rs is_revoked step refuses before any signature check is even attempted
+    Note over Helper,Server: Later reconnect attempt: decide_device_connect's host-scoped is_revoked runs pre-crypto; a host-revoked cap is dropped and a survivor may authorize; an all-revoked set or a root-scoped self-revocation refuses with RefusalReason::SubjectRevoked before any signature work
 ```
 
 ### Data carried
@@ -464,9 +467,11 @@ module doc states plainly that DESIGN.md §A4 "got wrong on paper" the existence
 required"* (`crates/spindle-helper/src/kick.rs:4-9`). This document follows the code.
 
 On a live session, revocation force-closes the socket via KICK. On a *future* reconnect attempt,
-no KICK is needed at all — the callout's own `is_revoked` lookup (§4a step 6) refuses the
-connection before any signature work runs, meaning a revoked device/host can never even get far
-enough to cost the callout an Ed25519 verification.
+no KICK is needed at all — the callout's host-scoped `is_revoked` lookup (§4a step 6,
+`decide_device_connect`) runs before any signature work: a host-revoked cap is dropped and a
+surviving cap may still authorize the connection; only an empty survivor set, or a root-scoped
+self-revocation, is refused with `RefusalReason::SubjectRevoked`, still before any Ed25519
+verification.
 
 ---
 
