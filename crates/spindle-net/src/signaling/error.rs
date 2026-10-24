@@ -143,8 +143,8 @@ impl SignalingError {
 /// an untruncated identifier", not "is this a transport error": most of `quinn::ConnectionError`
 /// is exactly that and still safe. [`SignalingError::Ice`] is the one exception to "every other
 /// variant" above: its payload doesn't fit any of those closed categories, and the `Ice` bullet
-/// below states why it is left safe anyway — a traced, present-day fact rather than a type-level
-/// guarantee.
+/// below states why it is left safe anyway — an assumption pinned to the audited dependency
+/// versions by a test, not a type-level guarantee.
 ///
 /// - [`SignalingError::EnvelopeDecode`] and [`SignalingError::Payload`] can reach
 ///   [`ProtoError::UnknownField`], a CBOR map key taken verbatim from the peer's bytes — deferred
@@ -159,33 +159,36 @@ impl SignalingError {
 ///   log-injection surface (arbitrary bytes, including newlines, straight into a
 ///   `tracing::warn!`) the other bullets above exist to close. `error_code` is a number the
 ///   protocol/peer picks from a known space, not free text, so it is rendered, not withheld.
-/// - [`SignalingError::Ice`] wraps `rtc_shared::error::Error`, locked at rtc-shared 0.20.3
-///   (`Cargo.lock`) and declared `#[non_exhaustive]` (`error.rs:31-32`) with dozens of
-///   `String`-carrying variants across the whole WebRTC stack it aggregates — `Other(String)`
-///   (`error.rs:2331`), `OtherIceErr(String)` (`error.rs:2304`), `SdpInvalidSyntax(String)`
-///   (`error.rs:2226-2228`), `ParseExtMap(String)` (`error.rs:2237`), and more this wrapper has not
-///   audited one by one. What is actually reachable *today* is narrower. `ice.rs`'s
-///   `drive_ice_agent_trickle` is the only place a `SignalingError::Ice` can be produced, converted
-///   via `#[from]` from `agent.handle_read(..)` on bytes taken straight off `socket.recv_from`
-///   (`ice.rs:178-189`) — attacker-addressable UDP, ahead of any envelope verification. Traced
-///   through rtc-ice 0.20.3's `handle_inbound_candidate_msg` (`src/agent/mod.rs:1438-1460`, which
-///   STUN-decodes the datagram via rtc-stun's `Message::decode` at `mod.rs:1449` and returns any
-///   decode error unchanged) into rtc-stun 0.20.3's `Message::decode` (`src/message.rs:332-405`),
-///   the only `Error::Other` this path can produce today comes from four sites
+/// - [`SignalingError::Ice`] wraps `rtc_shared::error::Error`, declared `#[non_exhaustive]`
+///   (`error.rs:31-32`) with dozens of `String`-carrying variants across the whole WebRTC stack it
+///   aggregates — `Other(String)` (`error.rs:2331`), `OtherIceErr(String)` (`error.rs:2304`),
+///   `SdpInvalidSyntax(String)` (`error.rs:2226-2228`), `ParseExtMap(String)` (`error.rs:2237`), and
+///   more this wrapper has not audited one by one. It is passed through because the content
+///   reachable on the one producing call path is numeric/hex only — but that is a property of the
+///   exact dependencies whose decode path was audited, **not of the type**. That path:
+///   `ice.rs`'s `drive_ice_agent_trickle` is the only place a `SignalingError::Ice` can be
+///   produced, converted via `#[from]` from `agent.handle_read(..)` on bytes taken straight off
+///   `socket.recv_from` (`ice.rs:178-189`) — attacker-addressable UDP, ahead of any envelope
+///   verification. In rtc-ice 0.20.3 its `handle_inbound_candidate_msg`
+///   (`src/agent/mod.rs:1438-1460`) STUN-decodes the datagram via rtc-stun 0.20.3's
+///   `Message::decode` (`src/message.rs:332-405`, reached at `mod.rs:1449`, returning any decode
+///   error unchanged), and the only `Error::Other` that decode can produce comes from four sites
 ///   (`message.rs:345-347`, `350-354`, `371-375`, `390-395`) that format nothing but a peer-chosen
 ///   4-byte magic-cookie value as hex, buffer-length integers, and an attribute-type code rendered
 ///   through `AttrType`'s `Display` (`rtc-stun-0.20.3/src/attributes.rs:48-89`), which either prints
-///   a fixed name from a static table or falls back to `0x{:x}` — never free-form peer text. So
-///   today's reachable `Ice` content is numeric/hex only. But the enum's `#[non_exhaustive]` real
-///   `String` variants sit elsewhere in a surface this wrapper cannot enumerate or gate at the
-///   source the way `quic.rs`'s verifiers do for the `TransportError` hazard below — a future
-///   rtc-ice/rtc-stun release, or some other call path into the same `SignalingError::Ice` variant,
-///   could start carrying one of those `String`s here without this file changing at all. Leaving it
-///   rendering through the `safe` arm is a deliberate decision, not an oversight: the numeric
-///   ICE-failure detail reachable today is genuinely useful for diagnosing connectivity problems,
-///   and blanket-withholding it would cost real diagnosability for no present gain — but unlike
-///   every bullet above, this one is a standing hazard checked against what is reachable *right
-///   now*, not a closed proof.
+///   a fixed name from a static table or falls back to `0x{:x}` — never free-form peer text.
+///
+///   The unit test `ice_error_assumption_is_pinned_to_the_audited_rtc_versions` asserts that the
+///   workspace `Cargo.lock` still resolves rtc-shared, rtc-ice and rtc-stun to exactly 0.20.3.
+///   Moving any of them fails that test rather than silently inheriting this assumption: updating
+///   the pin obliges re-auditing every `rtc_shared::error::Error` variant `SignalingError::Ice` can
+///   carry for peer-controlled strings, and tracing the new decode paths.
+///
+///   Leaving it rendering through the `safe` arm is a deliberate decision, not an oversight: the
+///   numeric ICE-failure detail is genuinely useful for diagnosing connectivity problems, and
+///   blanket-withholding it would cost real diagnosability for no present gain. A redaction arm is
+///   not available anyway — `rtc_shared::error::Error` is `#[non_exhaustive]`, so matching it here
+///   would need a catch-all that defeats the point of redacting it.
 /// - Every other `quinn::ConnectionError` — including `TransportError` — is left alone, but not
 ///   because it is unconditionally safe. `quinn_proto::TransportError::reason` is never built from
 ///   bytes the *peer* put on the wire — checked against every construction site in quinn-proto
@@ -267,8 +270,9 @@ mod tests {
     /// above and the `Quic(ApplicationClosed)`/`Quic(ConnectionClosed)` shapes, which
     /// `redacted_display_withholds_quic_close_reasons_but_keeps_the_code` exercises separately —
     /// including [`SignalingError::Ice`] (see the `Ice` bullet on
-    /// [`RedactedSignalingError`]'s doc comment: numeric/hex content only, reachable today, but a
-    /// standing hazard because `rtc_shared::error::Error` is `#[non_exhaustive]`) and a
+    /// [`RedactedSignalingError`]'s doc comment: its numeric/hex content is passed through, an
+    /// assumption pinned to rtc-shared/rtc-ice/rtc-stun 0.20.3 by
+    /// `ice_error_assumption_is_pinned_to_the_audited_rtc_versions`) and a
     /// `Quic` shape that isn't either rewritten `ConnectionError`, to prove the fallback `safe`
     /// arm covers `Quic` too, not just the two explicit `ConnectionError` shapes. Every variant
     /// here has a real public constructor, so none had to be skipped.
@@ -309,9 +313,9 @@ mod tests {
             SignalingError::Denied,
             SignalingError::UnsupportedTransport(Transport::WebRtc),
             SignalingError::IceFailed,
-            // Numeric-only today (see the `Ice` bullet above `RedactedSignalingError`) — but the
-            // point of this entry is that it renders unchanged like the rest, not that its content
-            // is unconditionally trustworthy.
+            // Numeric-only on the audited decode path (see the `Ice` bullet above
+            // `RedactedSignalingError`) — but the point of this entry is that it renders unchanged
+            // like the rest, not that its content is unconditionally trustworthy.
             SignalingError::Ice(rtc_shared::error::Error::ErrTimeout),
             SignalingError::Timeout("ICE trickle"),
             // A `Quic` shape that is neither `ApplicationClosed` nor `ConnectionClosed` — proves
@@ -362,5 +366,64 @@ mod tests {
             .redacted()
             .to_string()
             .contains("protocol compliance"));
+    }
+
+    /// The `Ice` pass-through assumption (the `Ice` bullet above `RedactedSignalingError`) is a
+    /// fact about specific dependency versions, not about `rtc_shared::error::Error`: a bump can
+    /// change what that variant's `Display` emits without a line of this crate changing. Pin the
+    /// assumption to the audited versions and fail loudly on any move, so re-auditing is forced
+    /// rather than assumed.
+    #[test]
+    fn ice_error_assumption_is_pinned_to_the_audited_rtc_versions() {
+        const AUDITED_VERSION: &str = "0.20.3";
+        const AUDITED_CRATES: [&str; 3] = ["rtc-shared", "rtc-ice", "rtc-stun"];
+
+        let lockfile_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+        let lockfile = std::fs::read_to_string(&lockfile_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to read workspace lockfile {}: {e}",
+                lockfile_path.display()
+            )
+        });
+
+        for crate_name in AUDITED_CRATES {
+            let locked = locked_version(&lockfile, crate_name).unwrap_or_else(|| {
+                panic!(
+                    "no `[[package]]` entry for `{crate_name}` in {}",
+                    lockfile_path.display()
+                )
+            });
+            assert_eq!(
+                locked,
+                AUDITED_VERSION,
+                "`{crate_name}` moved off the audited {AUDITED_VERSION} in {}; a version change \
+                 requires re-auditing every `rtc_shared::error::Error` variant that \
+                 `SignalingError::Ice` can carry for peer-controlled strings before updating the \
+                 pin in `ice_error_assumption_is_pinned_to_the_audited_rtc_versions`",
+                lockfile_path.display()
+            );
+        }
+    }
+
+    /// Returns the `version` of the `[[package]]` block whose `name` is `crate_name` in a
+    /// `Cargo.lock`, scanning lines rather than pulling in a TOML dependency for one assertion.
+    /// Cargo writes `name` before `version` within each block; the lockfile-format `version = N`
+    /// header precedes any `[[package]]`, when no name is current, so it cannot be matched.
+    fn locked_version(lockfile: &str, crate_name: &str) -> Option<String> {
+        let mut current_name: Option<&str> = None;
+        for line in lockfile.lines() {
+            let line = line.trim();
+            if line == "[[package]]" {
+                current_name = None;
+            } else if let Some(rest) = line.strip_prefix("name = ") {
+                current_name = Some(rest.trim_matches('"'));
+            } else if current_name == Some(crate_name) {
+                if let Some(rest) = line.strip_prefix("version = ") {
+                    return Some(rest.trim_matches('"').to_string());
+                }
+            }
+        }
+        None
     }
 }
