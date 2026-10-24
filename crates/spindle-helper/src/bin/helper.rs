@@ -1094,21 +1094,33 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     connect_sub = None;
                     continue;
                 };
-                // Raw-sample capture for spikes/s5-presence's RESULTS.md (docs/SPIKES.md §S5,
-                // task g): the exact shape of a real $SYS.ACCOUNT.*.CONNECT event, ground truth
-                // for user_from_sys_event's doc comment's assumption. Debug-level only.
-                tracing::debug!(
-                    subject = %msg.subject,
-                    payload = %String::from_utf8_lossy(&msg.payload),
-                    "raw $SYS.ACCOUNT.*.CONNECT event"
-                );
+                // Identity only, never the event body: it carries the full NATS user public key
+                // and usually the client host/IP. `client.user` is truncated via
+                // `Fingerprint::redacted()`; only the already-parsed coordinates are logged.
                 let Some(user_pk) = user_from_sys_event(&msg.payload) else {
                     tracing::warn!(
-                        payload = %String::from_utf8_lossy(&msg.payload),
+                        subject = %msg.subject,
+                        shape = %sys_event_shape(&msg.payload),
                         "CONNECT event had no recognizable client.user — ignoring"
                     );
                     continue;
                 };
+                let nats_fp = redacted_nats_fp(&user_pk).unwrap_or_else(|| "unparseable".into());
+                match kick_coords_from_sys_event(&msg.payload) {
+                    Some((server_id, cid)) => tracing::debug!(
+                        subject = %msg.subject,
+                        nats_fp = %nats_fp, // redaction-ok: pre-truncated
+                        server_id = %server_id,
+                        cid = cid,
+                        "CONNECT event"
+                    ),
+                    None => tracing::debug!(
+                        subject = %msg.subject,
+                        nats_fp = %nats_fp, // redaction-ok: pre-truncated
+                        shape = %sys_event_shape(&msg.payload),
+                        "CONNECT event without recognizable server.id/client.id"
+                    ),
+                }
                 // Kick-relay feed (DESIGN.md §A3, S9): a malformed/missing server.id or
                 // client.id just means this connection isn't kickable yet — never fatal, and
                 // never blocks presence tracking below.
@@ -1161,28 +1173,43 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     disconnect_sub = None;
                     continue;
                 };
-                tracing::debug!(
-                    subject = %msg.subject,
-                    payload = %String::from_utf8_lossy(&msg.payload),
-                    "raw $SYS.ACCOUNT.*.DISCONNECT event"
-                );
+                // Identity only, never the event body: see the CONNECT branch above.
                 let Some(user_pk) = user_from_sys_event(&msg.payload) else {
                     tracing::warn!(
-                        payload = %String::from_utf8_lossy(&msg.payload),
+                        subject = %msg.subject,
+                        shape = %sys_event_shape(&msg.payload),
                         "DISCONNECT event had no recognizable client.user — ignoring"
                     );
                     continue;
                 };
+                let nats_fp = redacted_nats_fp(&user_pk).unwrap_or_else(|| "unparseable".into());
+                let coords = kick_coords_from_sys_event(&msg.payload);
+                match &coords {
+                    Some((server_id, cid)) => tracing::debug!(
+                        subject = %msg.subject,
+                        nats_fp = %nats_fp, // redaction-ok: pre-truncated
+                        server_id = %server_id,
+                        cid = cid,
+                        "DISCONNECT event"
+                    ),
+                    None => tracing::debug!(
+                        subject = %msg.subject,
+                        nats_fp = %nats_fp, // redaction-ok: pre-truncated
+                        "DISCONNECT event without recognizable server.id/client.id"
+                    ),
+                }
                 // Kick-relay feed first: it owns the only authoritative record of which `cid` is currently
                 // live for this `nats_fp`, and its verdict gates the session-record delete below. An event
                 // with no parseable `(server.id, client.id)` yields no verdict at all, so it touches neither
                 // the kick map nor the session record — but it must still fall through to the presence
                 // handling below, which needs only the user nkey `user_from_sys_event` already returned.
-                let verdict = match kick_coords_from_sys_event(&msg.payload) {
+                let verdict = match coords {
                     Some((_, cid)) => kick_map.disconnect(&user_pk, cid),
                     None => {
                         tracing::warn!(
-                            payload = %String::from_utf8_lossy(&msg.payload),
+                            subject = %msg.subject,
+                            nats_fp = %nats_fp, // redaction-ok: pre-truncated
+                            shape = %sys_event_shape(&msg.payload),
                             "DISCONNECT event had no recognizable server.id/client.id — cannot tell a live \
                              disconnect from a stale one, so neither the kick map nor the session record is \
                              touched; the record's own `exp` still retires it (DESIGN.md §A5). Presence is \
@@ -1312,6 +1339,71 @@ fn kick_coords_from_sys_event(payload: &[u8]) -> Option<(String, u64)> {
     Some((server_id, cid))
 }
 
+/// The sorted top-level key names of a JSON object — NATS's own wire field names, never a value
+/// drawn from the body. Empty for a non-object or non-JSON value.
+fn sorted_top_level_keys(value: &serde_json::Value) -> Vec<String> {
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = object.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// Diagnostic shape of an unparseable/unrecognized `$SYS` event body: what an operator needs to
+/// tell a NATS format change from a transient anomaly, without any of the body's content. The
+/// body demonstrably carries the full NATS user public key and usually the client host/IP (see
+/// [`user_from_sys_event`]), so this type holds only the byte length, the sorted top-level key
+/// names, and the *type* of `client.user` — never a value from the body.
+#[derive(Debug, PartialEq, Eq)]
+struct SysEventShape {
+    len: usize,
+    keys: Vec<String>,
+    client_is_object: bool,
+    client_user: &'static str,
+}
+
+impl std::fmt::Display for SysEventShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "len={} keys=[{}] client_object={} client_user={}",
+            self.len,
+            self.keys.join(","),
+            self.client_is_object,
+            self.client_user
+        )
+    }
+}
+
+/// Summarizes a `$SYS` event body for logging when the body itself must not be logged. See
+/// [`SysEventShape`] for exactly what is (and is not) retained.
+fn sys_event_shape(payload: &[u8]) -> SysEventShape {
+    let value: Option<serde_json::Value> = serde_json::from_slice(payload).ok();
+    let client = value.as_ref().and_then(|v| v.get("client"));
+    SysEventShape {
+        len: payload.len(),
+        keys: value
+            .as_ref()
+            .map(sorted_top_level_keys)
+            .unwrap_or_default(),
+        client_is_object: client.is_some_and(serde_json::Value::is_object),
+        client_user: match client.and_then(|c| c.get("user")) {
+            None => "absent",
+            Some(serde_json::Value::String(_)) => "string",
+            Some(_) => "non-string",
+        },
+    }
+}
+
+/// The `nats_fp` for a parsed `client.user`, already truncated by [`Fingerprint::redacted`] for
+/// logging. `None` when the string is not a decodable nkey; the raw value is never returned.
+fn redacted_nats_fp(user_pk: &str) -> Option<String> {
+    auth_token::nats_fp_of_nkey(user_pk)
+        .ok()
+        .map(|fp| fp.redacted().to_string())
+}
+
 /// Executes one [`kick::KickPlan`] produced by [`kick::kicks_for_revocation`]: for every
 /// unresolved session it schedules the delayed re-plan described by this file's "Kick relay"
 /// module-doc section (a spawned `KICK_REPLAN_DELAY` sleep, then the unresolved list back into the
@@ -1399,7 +1491,7 @@ async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) 
                 subject = %subject,
                 cid = target.cid,
                 nats_fp = %target.nats_fp.redacted(),
-                reply = %String::from_utf8_lossy(&reply.payload),
+                reply_len = reply.payload.len(),
                 "KICK reply was not valid JSON — treating as failed, not successful"
             );
             return;
@@ -1596,10 +1688,15 @@ async fn seed_maps(
         }
     };
 
-    // Raw-sample capture for spikes/s5-presence's RESULTS.md (docs/SPIKES.md §S5, task g): the
-    // exact shape of a real $SYS.REQ.SERVER.PING.CONNZ reply, ground truth for this function's
-    // doc comment's assumption. Debug-level only.
-    tracing::debug!(reply = %value, "raw $SYS.REQ.SERVER.PING.CONNZ reply");
+    // Shape only, never the reply body: CONNZ rows carry each connection's full user public key
+    // and its host/IP. The key names are NATS's own wire fields; the counts are what diagnose a
+    // server-version format change. Debug-level only.
+    tracing::debug!(
+        keys = ?sorted_top_level_keys(&value),
+        connections = connz_connections(&value).map(Vec::len).unwrap_or(0),
+        server_id_present = connz_server_id(&value).is_some(),
+        "CONNZ reply shape"
+    );
 
     // Missing top-level server.id only sinks kick-map seeding (see kick.rs's module doc: there's
     // no broadcast KICK form, a concrete server_id is always required) — presence has no such
@@ -2152,6 +2249,57 @@ mod tests {
             user_from_sys_event(REAL_DISCONNECT_EVENT_STALE.as_bytes()),
             Some("UB5AUMGSNEAINIEWVEYRRSDD4PX6LUWDNO7OLOFCAJCT7IZLLARZWP6N".to_string())
         );
+    }
+
+    /// The "unrecognized event" warnings must stay diagnosable without emitting what the event
+    /// carried. The real CONNECT fixture contains a full user public key, a client IP, and a
+    /// server id; none may appear in the summary, while the NATS field names and value *types*
+    /// must.
+    #[test]
+    fn sys_event_shape_reports_structure_without_any_body_value() {
+        let shape = sys_event_shape(REAL_CONNECT_EVENT.as_bytes());
+        assert_eq!(shape.len, REAL_CONNECT_EVENT.len());
+        assert_eq!(
+            shape.keys,
+            vec![
+                "client".to_string(),
+                "id".to_string(),
+                "server".to_string(),
+                "timestamp".to_string(),
+                "type".to_string(),
+            ]
+        );
+        assert!(shape.client_is_object);
+        assert_eq!(shape.client_user, "string");
+
+        let rendered = shape.to_string();
+        assert!(
+            !rendered.contains("UCCDYXIJL3ARVUAHY6QMJWI34OI7QL525CQKOOJSPVKW3NZMEKC2VTE3"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("151.101.42.132"), "{rendered}");
+        assert!(
+            !rendered.contains("ND4QZW2IXGFJBFLOVVIDZ4LDNLA3QEBLUXXODP2OAKO2GRCT26GSIJNK"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("client_user=string"), "{rendered}");
+    }
+
+    #[test]
+    fn sys_event_shape_distinguishes_non_string_user_and_malformed_body() {
+        let non_string = sys_event_shape(br#"{"client":{"user":42},"type":"x"}"#);
+        assert!(non_string.client_is_object);
+        assert_eq!(non_string.client_user, "non-string");
+        assert_eq!(
+            non_string.keys,
+            vec!["client".to_string(), "type".to_string()]
+        );
+
+        let malformed = sys_event_shape(b"not json");
+        assert_eq!(malformed.len, 8);
+        assert!(malformed.keys.is_empty());
+        assert!(!malformed.client_is_object);
+        assert_eq!(malformed.client_user, "absent");
     }
 
     /// This parser is space-separated, so `--callout-seed=SUA...` — a spelling every other CLI
