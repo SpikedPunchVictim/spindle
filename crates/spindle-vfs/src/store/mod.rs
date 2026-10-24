@@ -143,15 +143,16 @@ pub enum StoreError {
     #[error("device {0} not found")]
     DeviceNotFound(Fingerprint),
 
-    /// [`Store::repair_device_keys`]'s fail-fast check: `device_fp` is `H(DEVICE_FP_DOMAIN,
-    /// alg_id, sign_pk, agree_pk)` (`spindle_core::identity::device_fp_of`), so a device's keys
-    /// are determined by its fingerprint. If the supplied keys do not rehash to `device_fp`, they
-    /// are simply the wrong keys for this device (transposed, corrupted, or belonging to a
-    /// different device entirely) — not a storage failure, and not something a caller should
-    /// retry against this store. `authorize.rs` performs the identical rehash independently at
-    /// connect time and would have denied the connection anyway; this variant exists so an
-    /// operator learns the mistake at repair time, by name, instead of as an indistinguishable
-    /// silent deny later.
+    /// The fail-fast check both [`Store::add_device`] and [`Store::repair_device_keys`] perform:
+    /// `device_fp` is `H(DEVICE_FP_DOMAIN, alg_id, sign_pk, agree_pk)`
+    /// (`spindle_core::identity::device_fp_of`), so a device's keys are determined by its
+    /// fingerprint. If the supplied keys do not rehash to `device_fp` (or are not 32-byte
+    /// Ed25519/X25519 halves at all), they are simply the wrong keys for this device (transposed,
+    /// corrupted, or belonging to a different device entirely) — not a storage failure, and not
+    /// something a caller should retry against this store. `authorize.rs` performs the identical
+    /// rehash independently at connect time and would have denied the connection anyway; this
+    /// variant exists so an enroller learns the mistake at write time, by name, instead of as an
+    /// indistinguishable silent deny later.
     #[error(
         "supplied keys do not rehash to device {device_fp}'s own device_fp; these are the wrong \
          keys for this device (device_fp = H(DEVICE_FP_DOMAIN, alg_id, sign_pk, agree_pk), so \
@@ -159,9 +160,10 @@ pub enum StoreError {
     )]
     DeviceKeyBindingMismatch { device_fp: Fingerprint },
 
-    /// [`Store::repair_device_keys`]'s alg_id guard: the supplied [`crate::model::DevicePublicKeys`]
-    /// names an algorithm other than `ALG_ID_V1`, which this method cannot verify — it parses
-    /// `sign_pk`/`agree_pk` as Ed25519/X25519 unconditionally, so a different `alg_id` is
+    /// The alg_id guard both [`Store::add_device`] and [`Store::repair_device_keys`] apply: the
+    /// supplied [`crate::model::DevicePublicKeys`] names an algorithm other than `ALG_ID_V1`,
+    /// which these paths cannot verify — they parse `sign_pk`/`agree_pk` as Ed25519/X25519
+    /// unconditionally, so a different `alg_id` is
     /// unverifiable by this code path, not merely unsupported in the sense of "not yet
     /// implemented". Carries ONLY `alg_id`, deliberately no `Fingerprint`: `StoreError`'s
     /// `Display` is logged via `error = %e` at `tracing` call sites in `spindle-host-core`, and
@@ -1020,32 +1022,78 @@ impl Store {
     // Devices
     // ---------------------------------------------------------------------------------------
 
+    /// The fail-fast check both device key write paths
+    /// ([`Store::add_device`] and [`Store::repair_device_keys`]) perform: parse `keys` as an
+    /// Ed25519 signing key and an X25519 agreement key, then require the pair to rehash to
+    /// `device_fp`. Keeping this in one function is deliberate — the two paths write the same
+    /// three columns and must not drift into one enforcing the binding and the other trusting the
+    /// caller.
+    ///
+    /// Malformed key lengths use [`StoreError::DeviceKeyBindingMismatch`] rather than a new
+    /// variant: a key half that is not 32 bytes cannot be the preimage `device_fp` was computed
+    /// from, so it is the same caller mistake as a transposed or corrupted pair, and callers
+    /// already have one named error to handle.
+    fn verify_device_key_binding(
+        device_fp: Fingerprint,
+        keys: &DevicePublicKeys,
+    ) -> Result<(), StoreError> {
+        let sign_pk_arr: [u8; 32] = keys
+            .sign_pk
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::DeviceKeyBindingMismatch { device_fp })?;
+        let sign_pk = spindle_core::checked_verifying_key(&sign_pk_arr)
+            .ok_or(StoreError::DeviceKeyBindingMismatch { device_fp })?;
+        let agree_pk_arr: [u8; 32] = keys
+            .agree_pk
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::DeviceKeyBindingMismatch { device_fp })?;
+        let agree_pk = spindle_core::X25519PublicKey::from(agree_pk_arr);
+
+        if spindle_core::identity::device_fp_of(keys.alg_id, &sign_pk, &agree_pk) != device_fp {
+            return Err(StoreError::DeviceKeyBindingMismatch { device_fp });
+        }
+        Ok(())
+    }
+
     /// `keys` is the device's pinned Ed25519 signing + X25519 agreement public keys, paired in one
     /// [`DevicePublicKeys`] rather than two adjacent `Option<&[u8]>` parameters (see that struct's
     /// doc comment for why: an accidental transposition of two same-typed byte slices is not a
     /// type error, and would silently produce a device whose stored keys never rehash to its own
     /// `device_fp`). DESIGN.md §A4's device certificates already carry both keys; this is where
-    /// the host pins them at enrollment. `None` is accepted (e.g. a test that never needs
-    /// upload-manifest verification or connect-time authorization), but a real enrollment flow
-    /// should always supply both — a device with no keys on file cannot have any upload it signs
-    /// verified later (`crate::model::Device::sign_pk`), nor can it ever be authorized to connect
-    /// (`crate::model::Device::agree_pk`).
+    /// the host pins them at enrollment.
+    ///
+    /// When `keys` is `Some`, this method verifies the `device_fp` binding before writing,
+    /// mirroring [`Store::repair_device_keys`]: it parses `sign_pk` as a canonical Ed25519 public
+    /// key (`spindle_core::checked_verifying_key`, RFC 8032 §5.1.3) and `agree_pk` as an X25519
+    /// public key, recomputes
+    /// `spindle_core::identity::device_fp_of(ALG_ID_V1, &sign_pk, &agree_pk)`, and refuses with
+    /// [`StoreError::DeviceKeyBindingMismatch`] unless that equals `device_fp`. Since `device_fp`
+    /// *determines* the keys (`device_fp_of`'s preimage includes both), this write path is
+    /// structurally incapable of creating a row whose stored keys do not rehash to the fingerprint
+    /// naming it. That closes the write-path half of td-b2c16b's bug class: `authorize.rs` already
+    /// rehashes this binding independently and denies on mismatch (fail-closed, unchanged), but
+    /// without this check `add_device` could still create a row authorization would deny forever —
+    /// a silent deny indistinguishable from a revoked device, with nothing telling the enroller
+    /// they had written it.
+    ///
+    /// `None` remains accepted: a keyless row cannot authenticate and is the documented pre-key
+    /// enrollment/repair state [`Store::repair_device_keys`] exists to fill in. The binding check
+    /// applies only when keys are supplied, because there is no binding to check without them. A
+    /// real enrollment flow should always supply both — a device with no keys on file cannot have
+    /// any upload it signs verified later (`crate::model::Device::sign_pk`), nor can it ever be
+    /// authorized to connect (`crate::model::Device::agree_pk`).
+    ///
     /// Rejects `keys.alg_id != ALG_ID_V1` with [`StoreError::UnsupportedAlgId`] whenever `keys` is
-    /// `Some` — the same guard [`Store::repair_device_keys`] applies to the same column, added so
-    /// the two write paths to `devices.alg_id` agree instead of one enforcing it and the other
-    /// writing whatever a caller supplies verbatim. Every current caller in this repo passes
-    /// `ALG_ID_V1` already (`sign_pk`/`agree_pk` are only ever parsed as Ed25519/X25519, so nothing
-    /// else could be verified anyway), so this is not a behavior change for them; it exists for a
-    /// future enrollment path that constructs `DevicePublicKeys` from wire-supplied data, so an
+    /// `Some` — the same guard [`Store::repair_device_keys`] applies to the same column, so the
+    /// two write paths to `devices.alg_id` agree instead of one enforcing it and the other writing
+    /// whatever a caller supplies verbatim. Every current caller in this repo passes `ALG_ID_V1`
+    /// already (`sign_pk`/`agree_pk` are only ever parsed as Ed25519/X25519, so nothing else could
+    /// be verified anyway), so this is not a behavior change for them; it exists for a future
+    /// enrollment path that constructs `DevicePublicKeys` from wire-supplied data, so an
     /// unsupported `alg_id` is refused at the point it would otherwise be persisted, not silently
     /// accepted and left to `authorize.rs`'s connect-time check to catch later.
-    ///
-    /// Deliberately narrower than what [`Store::repair_device_keys`] additionally checks: this
-    /// guard is only about the algorithm identifier, not the `device_fp` binding (whether
-    /// `sign_pk`/`agree_pk` actually rehash to `device_fp`). That omission is unchanged from before
-    /// and already documented on `repair_device_keys`'s doc comment ("Deliberately out of scope:
-    /// `add_device` is not changed to perform this same binding check") — this fix does not touch
-    /// that decision.
     pub fn add_device(
         &self,
         member_id: MemberId,
@@ -1062,6 +1110,7 @@ impl Store {
             if k.alg_id != spindle_core::ALG_ID_V1 {
                 return Err(StoreError::UnsupportedAlgId { alg_id: k.alg_id });
             }
+            Self::verify_device_key_binding(device_fp, k)?;
         }
         // All three columns are populated from the same `Option<&DevicePublicKeys>`, which is
         // what makes the NULL-iff-no-keys invariant on `alg_id` structural rather than an
@@ -1124,11 +1173,9 @@ impl Store {
     /// so this rejection is the only thing standing between an unverifiable `alg_id` and a written
     /// row — `authorize.rs`'s own connect-time check is the same reasoning applied at read time.
     ///
-    /// Deliberately out of scope: `add_device` is not changed to perform this same binding check.
-    /// A caller can still enroll a device whose stored keys do not rehash to its `device_fp`
-    /// (store/mod.rs's own tests exercise exactly that, storing deliberate junk key bytes to
-    /// verify byte-for-byte round-tripping); closing that mirror-path half of this bug class is
-    /// its own decision, not folded into this repair primitive.
+    /// [`Store::add_device`] performs this same binding check (`verify_device_key_binding`), so
+    /// the enrollment and repair write paths cannot diverge: neither can write a row whose stored
+    /// keys do not rehash to its own `device_fp`.
     pub fn repair_device_keys(
         &self,
         device_fp: Fingerprint,
@@ -1141,23 +1188,7 @@ impl Store {
             });
         }
 
-        let sign_pk_arr: [u8; 32] = keys
-            .sign_pk
-            .as_slice()
-            .try_into()
-            .map_err(|_| StoreError::DeviceKeyBindingMismatch { device_fp })?;
-        let sign_pk = spindle_core::checked_verifying_key(&sign_pk_arr)
-            .ok_or(StoreError::DeviceKeyBindingMismatch { device_fp })?;
-        let agree_pk_arr: [u8; 32] = keys
-            .agree_pk
-            .as_slice()
-            .try_into()
-            .map_err(|_| StoreError::DeviceKeyBindingMismatch { device_fp })?;
-        let agree_pk = spindle_core::X25519PublicKey::from(agree_pk_arr);
-
-        if spindle_core::identity::device_fp_of(keys.alg_id, &sign_pk, &agree_pk) != device_fp {
-            return Err(StoreError::DeviceKeyBindingMismatch { device_fp });
-        }
+        Self::verify_device_key_binding(device_fp, keys)?;
 
         let changed = self.conn.execute(
             "UPDATE devices SET sign_pk = ?1, agree_pk = ?2, alg_id = ?3 WHERE device_fp = ?4",
@@ -2416,12 +2447,13 @@ impl Store {
 /// construct a `devices` row that no real write path can produce: `Store::add_device` always
 /// writes `alg_id` from the very same `Option<&DevicePublicKeys>` that supplies `sign_pk`/
 /// `agree_pk` (see that method's doc comment), so it is structurally incapable of leaving `alg_id`
-/// `NULL` next to present keys, or of writing a value other than `ALG_ID_V1`. The consumer this was
-/// built for is `spindle-host-core`'s `authorize.rs`, whose check-8 tests
-/// (`denies_a_device_whose_stored_alg_id_is_null_despite_both_keys_being_present` and
-/// `denies_a_device_whose_stored_alg_id_names_an_unsupported_algorithm`) need exactly such an
-/// otherwise-unreachable row to prove that check fails closed — if those tests are ever removed,
-/// this method likely has no remaining reason to exist either.
+/// `NULL` next to present keys, of writing a value other than `ALG_ID_V1`, or — since the
+/// `device_fp` binding check was added to that method — of storing keys that do not rehash to the
+/// row's own `device_fp`. The consumer this was built for is `spindle-host-core`'s tests, whose
+/// fail-closed read-path checks (`authorize.rs`'s check 8/check 9 pair and `server.rs`'s
+/// manifest-verification tests) need exactly such otherwise-unreachable rows to prove they refuse
+/// them — if those tests are ever removed, this block likely has no remaining reason to exist
+/// either.
 ///
 /// It lives in this module, not a separate file, because it needs `self.conn`, which is private to
 /// `Store` and only reachable from code inside `store/mod.rs`.
@@ -2459,6 +2491,39 @@ impl Store {
         let changed = self.conn.execute(
             "UPDATE devices SET alg_id = ?1 WHERE device_fp = ?2",
             params![alg_id, device_fp.to_vec()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::DeviceNotFound(device_fp));
+        }
+        Ok(())
+    }
+
+    /// Overwrites a device's stored key halves (and the `alg_id` describing them) directly,
+    /// bypassing `add_device`'s `device_fp`/keys binding check. Like
+    /// [`Store::set_device_alg_id_for_test`] immediately above, its entire job is to write rows
+    /// the real API now structurally cannot produce — a key pair that does not rehash to the row's
+    /// own `device_fp`, which the read-side fail-closed checks must still deny. It deliberately
+    /// validates nothing: `keys` is written verbatim, including a `None` to leave both halves
+    /// `NULL`.
+    ///
+    /// Returns [`StoreError::DeviceNotFound`] if `device_fp` does not name an existing device, for
+    /// the same reason as `set_device_alg_id_for_test`: a silent no-op would let a caller's test
+    /// pass without ever writing the row it thinks it wrote.
+    #[doc(hidden)]
+    pub fn set_device_keys_for_test(
+        &self,
+        device_fp: Fingerprint,
+        keys: Option<&DevicePublicKeys>,
+    ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
+        let changed = self.conn.execute(
+            "UPDATE devices SET sign_pk = ?1, agree_pk = ?2, alg_id = ?3 WHERE device_fp = ?4",
+            params![
+                keys.map(|k| k.sign_pk.clone()),
+                keys.map(|k| k.agree_pk.clone()),
+                keys.map(|k| k.alg_id),
+                device_fp.to_vec(),
+            ],
         )?;
         if changed == 0 {
             return Err(StoreError::DeviceNotFound(device_fp));
@@ -3839,11 +3904,15 @@ mod tests {
         let member_id = store
             .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
             .expect("add_member");
-        let device_fp = Fingerprint::of_parts(&[b"alex-laptop"]);
+        // Real key material, not arbitrary bytes: `add_device` refuses keys that do not rehash
+        // to `device_fp`, so a fixture must use a genuine `DeviceKey` pair to exercise storage
+        // round-tripping at all.
+        let dev = spindle_core::identity::DeviceKey::from_seeds([0x11; 32], [0x12; 32]);
+        let device_fp = dev.device_fp();
         let keys = DevicePublicKeys {
             alg_id: spindle_core::ALG_ID_V1,
-            sign_pk: vec![0x11; 32],
-            agree_pk: vec![0x22; 32],
+            sign_pk: dev.sign_public_key().as_bytes().to_vec(),
+            agree_pk: dev.agree_public_key().as_bytes().to_vec(),
         };
         store
             .add_device(member_id, device_fp, "Laptop", 0, Some(&keys))
@@ -3936,11 +4005,15 @@ mod tests {
         let member_id = store
             .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
             .expect("add_member");
-        let device_fp = Fingerprint::of_parts(&[b"alex-laptop"]);
+        // Real key material, not arbitrary bytes: `add_device` refuses keys that do not rehash
+        // to `device_fp`. The alg_id round-trip is still what this test is about; the real pair
+        // just satisfies the binding check on the way in.
+        let dev = spindle_core::identity::DeviceKey::from_seeds([0x13; 32], [0x14; 32]);
+        let device_fp = dev.device_fp();
         let keys = DevicePublicKeys {
             alg_id: spindle_core::ALG_ID_V1,
-            sign_pk: vec![0x11; 32],
-            agree_pk: vec![0x22; 32],
+            sign_pk: dev.sign_public_key().as_bytes().to_vec(),
+            agree_pk: dev.agree_public_key().as_bytes().to_vec(),
         };
         store
             .add_device(member_id, device_fp, "Laptop", 0, Some(&keys))
@@ -3994,6 +4067,164 @@ mod tests {
             device.alg_id, None,
             "a device with no keys has no algorithm to name — alg_id must stay NULL, matching \
              the NULL-iff-no-keys invariant (see SCHEMA_V9's doc comment)"
+        );
+        assert_eq!(
+            device.sign_pk, None,
+            "keys: None must store a NULL sign_pk, not empty bytes"
+        );
+        assert_eq!(
+            device.agree_pk, None,
+            "keys: None must store a NULL agree_pk, not empty bytes"
+        );
+    }
+
+    // ---- Devices: add_device verifies the device_fp binding (td-70e6ee) ----
+
+    fn keys_of(dev: &spindle_core::identity::DeviceKey) -> DevicePublicKeys {
+        DevicePublicKeys {
+            alg_id: spindle_core::ALG_ID_V1,
+            sign_pk: dev.sign_public_key().as_bytes().to_vec(),
+            agree_pk: dev.agree_public_key().as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn add_device_with_a_real_key_pair_stores_and_reads_back_both_halves_exactly() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let dev = spindle_core::identity::DeviceKey::from_seeds([0xA0; 32], [0xA1; 32]);
+        let device_fp = dev.device_fp();
+        let keys = keys_of(&dev);
+
+        store
+            .add_device(member_id, device_fp, "Laptop", 0, Some(&keys))
+            .expect("a real key pair whose device_fp matches must be accepted");
+
+        let member = store.get_member(member_id).expect("get").expect("exists");
+        let device = member
+            .devices
+            .iter()
+            .find(|d| d.device_fp == device_fp)
+            .expect("member's devices include the added device");
+        assert_eq!(device.sign_pk.as_deref(), Some(keys.sign_pk.as_slice()));
+        assert_eq!(device.agree_pk.as_deref(), Some(keys.agree_pk.as_slice()));
+        assert_eq!(device.alg_id, Some(spindle_core::ALG_ID_V1));
+    }
+
+    #[test]
+    fn add_device_rejects_keys_that_do_not_rehash_to_the_device_fp_and_inserts_no_row() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let dev = spindle_core::identity::DeviceKey::from_seeds([0xA2; 32], [0xA3; 32]);
+        let other = spindle_core::identity::DeviceKey::from_seeds([0xA4; 32], [0xA5; 32]);
+        let device_fp = dev.device_fp();
+        // `other`'s self-consistent key pair, stored under `dev`'s fingerprint: both halves are
+        // valid Ed25519/X25519 keys, so this reaches the rehash rather than a parse failure.
+        let keys = keys_of(&other);
+
+        let err = store
+            .add_device(member_id, device_fp, "Laptop", 0, Some(&keys))
+            .expect_err("keys that do not rehash to device_fp must be rejected");
+        assert!(
+            matches!(err, StoreError::DeviceKeyBindingMismatch { device_fp: fp } if fp == device_fp),
+            "expected DeviceKeyBindingMismatch for {device_fp}, got {err:?}"
+        );
+
+        let member = store.get_member(member_id).expect("get").expect("exists");
+        assert!(
+            member.devices.is_empty(),
+            "a rejected add_device must not insert a row; found {:?}",
+            member.devices
+        );
+        assert!(
+            store
+                .member_for_device_fp(device_fp)
+                .expect("lookup")
+                .is_none(),
+            "a rejected add_device must leave the device_fp unknown"
+        );
+    }
+
+    #[test]
+    fn add_device_rejects_a_transposed_sign_agree_pair_and_inserts_no_row() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let dev = spindle_core::identity::DeviceKey::from_seeds([0xA6; 32], [0xA7; 32]);
+        let device_fp = dev.device_fp();
+        // The exact transposition `DevicePublicKeys`' one-struct shape is meant to make hard to
+        // write: the correct pair for `device_fp`, with its two halves swapped. Whether the
+        // swapped `sign_pk` fails Ed25519 canonicality or survives it and fails the rehash, both
+        // are the same fail-closed refusal.
+        let transposed = DevicePublicKeys {
+            alg_id: spindle_core::ALG_ID_V1,
+            sign_pk: dev.agree_public_key().as_bytes().to_vec(),
+            agree_pk: dev.sign_public_key().as_bytes().to_vec(),
+        };
+
+        let err = store
+            .add_device(member_id, device_fp, "Laptop", 0, Some(&transposed))
+            .expect_err("a transposed sign/agree pair must be rejected");
+        assert!(
+            matches!(err, StoreError::DeviceKeyBindingMismatch { device_fp: fp } if fp == device_fp),
+            "expected DeviceKeyBindingMismatch for {device_fp}, got {err:?}"
+        );
+        assert!(
+            store
+                .get_member(member_id)
+                .expect("get")
+                .expect("exists")
+                .devices
+                .is_empty(),
+            "a rejected add_device must not insert a row"
+        );
+    }
+
+    #[test]
+    fn add_device_rejects_key_halves_that_are_not_32_bytes() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        let dev = spindle_core::identity::DeviceKey::from_seeds([0xA8; 32], [0xA9; 32]);
+        let device_fp = dev.device_fp();
+        let sign_pk = dev.sign_public_key().as_bytes().to_vec();
+        let agree_pk = dev.agree_public_key().as_bytes().to_vec();
+
+        let cases = [
+            ("short sign_pk", vec![0u8; 31], agree_pk.clone()),
+            ("long sign_pk", vec![0u8; 33], agree_pk.clone()),
+            ("short agree_pk", sign_pk.clone(), vec![0u8; 31]),
+            ("long agree_pk", sign_pk.clone(), vec![0u8; 33]),
+        ];
+        for (name, sign_pk, agree_pk) in cases {
+            let keys = DevicePublicKeys {
+                alg_id: spindle_core::ALG_ID_V1,
+                sign_pk,
+                agree_pk,
+            };
+            let err = store
+                .add_device(member_id, device_fp, "Laptop", 0, Some(&keys))
+                .expect_err("a key half that is not 32 bytes must be rejected");
+            assert!(
+                matches!(err, StoreError::DeviceKeyBindingMismatch { device_fp: fp } if fp == device_fp),
+                "{name}: expected DeviceKeyBindingMismatch for {device_fp}, got {err:?}"
+            );
+        }
+
+        assert!(
+            store
+                .get_member(member_id)
+                .expect("get")
+                .expect("exists")
+                .devices
+                .is_empty(),
+            "a rejected add_device must not insert a row"
         );
     }
 
@@ -4142,18 +4373,25 @@ mod tests {
         let dev = spindle_core::identity::DeviceKey::from_seeds([0x60; 32], [0x61; 32]);
         let device_fp = dev.device_fp();
         store
-            .add_device(
-                member_id,
-                device_fp,
-                "Laptop",
-                0,
-                Some(&DevicePublicKeys {
-                    alg_id: spindle_core::ALG_ID_V1,
-                    sign_pk: vec![0xAB; 32],
-                    agree_pk: vec![0xCD; 32],
-                }),
+            .add_device(member_id, device_fp, "Laptop", 0, None)
+            .expect("add_device with no keys");
+        // `add_device` now refuses a key pair that does not rehash to `device_fp`, so the
+        // wrong-bytes-on-file row this test repairs cannot be written through the public API.
+        // Write it directly, simulating a row corrupted by an older build or by tampering — which
+        // is exactly the state `repair_device_keys` exists to fix.
+        let changed = store
+            .conn
+            .execute(
+                "UPDATE devices SET sign_pk = ?1, agree_pk = ?2, alg_id = ?3 WHERE device_fp = ?4",
+                params![
+                    vec![0xABu8; 32],
+                    vec![0xCDu8; 32],
+                    spindle_core::ALG_ID_V1,
+                    device_fp.to_vec()
+                ],
             )
-            .expect("add_device with wrong key bytes on file");
+            .expect("seed wrong key bytes on file");
+        assert_eq!(changed, 1, "fixture must have updated the device row");
 
         let correct_keys = DevicePublicKeys {
             alg_id: spindle_core::ALG_ID_V1,

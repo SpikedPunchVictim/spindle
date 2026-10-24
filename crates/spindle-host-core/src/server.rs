@@ -2122,10 +2122,10 @@ mod tests {
         /// parseable Ed25519/X25519 keys with `alg_id = ALG_ID_V1` — genuinely able to verify a
         /// manifest signature — but which do NOT rehash to the `device_fp` the row is stored
         /// under: the row is stored under "device A"'s fingerprint while its `sign_pk`/`agree_pk`
-        /// columns hold "device B"'s keys instead. `Store::add_device` performs no binding check
-        /// (see its own doc comment: "Deliberately out of scope: `add_device` is not changed to
-        /// perform this same binding check"), so this row is possible to construct even though no
-        /// real enrollment path would ever produce it.
+        /// columns hold "device B"'s keys instead. `Store::add_device` now enforces that binding,
+        /// so the row is written keyless and its mismatched pair installed through the
+        /// `test-support` `set_device_keys_for_test` backdoor — a row no real enrollment path can
+        /// produce, which is exactly what this regression scenario needs.
         ///
         /// Returns device A's `device_fp` (the row's own key) and the `SigningKey` that
         /// genuinely corresponds to the *stored* `sign_pk` (device B's) — so a caller can produce
@@ -2154,18 +2154,18 @@ mod tests {
             let device_fp = device_a.device_fp();
             let signing_key = SigningKey::from_bytes(&seed_for("b-sign"));
             self.store
-                .add_device(
-                    member_id,
+                .add_device(member_id, device_fp, label, 0, None)
+                .expect("add keyless device row");
+            self.store
+                .set_device_keys_for_test(
                     device_fp,
-                    label,
-                    0,
                     Some(&DevicePublicKeys {
                         alg_id: spindle_core::ALG_ID_V1,
                         sign_pk: device_b.sign_public_key().as_bytes().to_vec(),
                         agree_pk: device_b.agree_public_key().as_bytes().to_vec(),
                     }),
                 )
-                .expect("add mismatched signing device");
+                .expect("install mismatched keys via test-support");
             (device_fp, signing_key)
         }
     }
@@ -3131,11 +3131,10 @@ mod tests {
     /// same `verify_manifest_signature` method `handle_upload_open` calls (DESIGN.md §A8:
     /// re-verified "BEFORE move-into-place"), so a session for a mismatched device can never
     /// legitimately exist to commit in the first place — the test above proves `upload_open`
-    /// already refuses to open one, and there is no store-level way to retroactively corrupt an
-    /// already-open session's device keys without also passing through the same binding check
-    /// (`Store::repair_device_keys` re-validates the binding, and no test-support backdoor exists
-    /// for overwriting `sign_pk`/`agree_pk` the way `set_device_alg_id_for_test` does for
-    /// `alg_id`). So instead of driving this through `VfsRequest::UploadCommit` end to end, this
+    /// already refuses to open one. The `test-support` `set_device_keys_for_test` backdoor could
+    /// corrupt such a row after a session had opened, but driving that interleaving through the
+    /// full commit path would mostly test the backdoor rather than the verification both paths
+    /// share. So instead of driving this through `VfsRequest::UploadCommit` end to end, this
     /// calls `verify_manifest_signature` directly — the one function both call sites share —
     /// which is the actual code the commit path would run against a mismatched device mid-session
     /// if one somehow existed, and proves it rejects here exactly as the open path does.
@@ -3284,12 +3283,13 @@ mod tests {
     /// A device whose stored `alg_id` names an algorithm other than v1 must never verify, even
     /// with otherwise-well-formed real keys — `sign_pk`/`agree_pk` are parsed as Ed25519/X25519
     /// unconditionally regardless of what `alg_id` claims (`checked_device_keys`'s doc comment).
-    /// `Store::add_device` rejects a non-v1 `alg_id` up front, so — exactly like
-    /// `authorize.rs`'s `denies_a_device_whose_stored_alg_id_names_an_unsupported_algorithm` —
-    /// this row is written as alg 1 first and then flipped via the `test-support`-gated
-    /// `set_device_alg_id_for_test`, using a `device_fp` genuinely computed under alg 2 so the
-    /// row is self-consistent (a `device_fp` computed under alg 1 sitting next to an `alg_id`
-    /// column claiming 2 would be internally inconsistent, catching a different failure).
+    /// `Store::add_device` rejects a non-v1 `alg_id` up front and requires the pair to rehash to
+    /// the supplied `device_fp`, so it cannot write this row at all. Exactly like
+    /// `authorize.rs`'s `denies_a_device_whose_stored_alg_id_names_an_unsupported_algorithm`, the
+    /// row is written keyless and then given alg-1 keys and `alg_id = 2` through the
+    /// `test-support` backdoors, using a `device_fp` genuinely computed under alg 2 so the row is
+    /// self-consistent (a `device_fp` computed under alg 1 sitting next to an `alg_id` column
+    /// claiming 2 would be internally inconsistent, catching a different failure).
     #[test]
     fn upload_open_with_non_v1_alg_id_device_is_upload_rejected() {
         let h = Harness::new();
@@ -3298,18 +3298,18 @@ mod tests {
         let alg2_fp = device_fp_of(2, &dev.sign_public_key(), &dev.agree_public_key());
         let signing_key = SigningKey::from_bytes(&[0x60; 32]);
         h.store
-            .add_device(
-                member_id,
+            .add_device(member_id, alg2_fp, "alex-alg2", 0, None)
+            .expect("add_device with no keys");
+        h.store
+            .set_device_keys_for_test(
                 alg2_fp,
-                "alex-alg2",
-                0,
                 Some(&DevicePublicKeys {
                     alg_id: spindle_core::ALG_ID_V1,
                     sign_pk: dev.sign_public_key().as_bytes().to_vec(),
                     agree_pk: dev.agree_public_key().as_bytes().to_vec(),
                 }),
             )
-            .expect("add_device");
+            .expect("set_device_keys_for_test");
         h.store
             .set_device_alg_id_for_test(alg2_fp, Some(2))
             .expect("set_device_alg_id_for_test");

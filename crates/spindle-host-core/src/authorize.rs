@@ -1230,8 +1230,10 @@ mod tests {
     #[tokio::test]
     async fn denies_when_the_stored_keys_do_not_rehash_to_the_devices_own_device_fp() {
         let (store, member_id) = store_with_active_member("alex");
-        // Device A's device_fp, but device B's key pair — constructed directly (add_device does
-        // not validate the binding), simulating corrupted/transposed/swapped stored keys.
+        // Device A's device_fp, but device B's key pair — simulating corrupted/transposed/swapped
+        // stored keys. `add_device` now enforces the binding, so the row is written keyless and
+        // then given the mismatched pair through the `test-support` backdoor, the honest way to
+        // reach a row no real write path can produce.
         let device_a = DeviceKey::from_seeds([0x0b; 32], [0x0c; 32]);
         let device_b = DeviceKey::from_seeds([0x0d; 32], [0x0e; 32]);
         let mismatched_keys = DevicePublicKeys {
@@ -1240,14 +1242,11 @@ mod tests {
             agree_pk: device_b.agree_public_key().as_bytes().to_vec(),
         };
         store
-            .add_device(
-                member_id,
-                device_a.device_fp(),
-                "corrupted",
-                0,
-                Some(&mismatched_keys),
-            )
-            .expect("add_device");
+            .add_device(member_id, device_a.device_fp(), "corrupted", 0, None)
+            .expect("add_device with no keys");
+        store
+            .set_device_keys_for_test(device_a.device_fp(), Some(&mismatched_keys))
+            .expect("set_device_keys_for_test");
         let authorizer = HostConnectAuthorizer::new(SqliteDeviceLookup::new(store));
 
         match authorizer.authorize(&device_a.device_fp()).await {
@@ -1321,21 +1320,21 @@ mod tests {
         // broken version this comment describes.
         let alg2_fp = device_fp_of(2, &device.sign_public_key(), &device.agree_public_key());
         let keys = DevicePublicKeys {
-            // `Store::add_device` rejects any `keys.alg_id != ALG_ID_V1` (see its doc comment and
-            // implementation), so the row must be written as alg 1 first and flipped to 2
-            // afterward via `set_device_alg_id_for_test` — `add_device` does not otherwise
-            // validate the `device_fp`/keys binding (see its own doc comment; `store/mod.rs`'s
-            // tests rely on the same non-validation to store deliberately mismatched keys), so
-            // storing `alg2_fp` next to `ALG_ID_V1` keys here is legal.
+            // `Store::add_device` accepts only `keys.alg_id == ALG_ID_V1` AND requires the pair to
+            // rehash to the supplied `device_fp`, so it cannot write a row that genuinely commits
+            // to alg 2. Write the row keyless, then use the `test-support` backdoors to install
+            // the alg-1 keys and claim `alg_id = 2`: exactly the self-consistent alg-2 row this
+            // test needs, which no real write path can produce.
             alg_id: ALG_ID_V1,
             sign_pk: device.sign_public_key().as_bytes().to_vec(),
             agree_pk: device.agree_public_key().as_bytes().to_vec(),
         };
-        // `enroll_device` hardcodes `device.device_fp()` (alg-1) as the stored fingerprint, so it
-        // cannot produce this row — call `Store::add_device` directly with `alg2_fp` instead.
         store
-            .add_device(member_id, alg2_fp, "laptop", 0, Some(&keys))
-            .expect("add_device");
+            .add_device(member_id, alg2_fp, "laptop", 0, None)
+            .expect("add_device with no keys");
+        store
+            .set_device_keys_for_test(alg2_fp, Some(&keys))
+            .expect("set_device_keys_for_test");
         store
             .set_device_alg_id_for_test(alg2_fp, Some(2))
             .expect("set_device_alg_id_for_test");
@@ -2442,17 +2441,21 @@ mod tests {
         let device_b = DeviceKey::from_seeds([0x72; 32], [0x73; 32]);
         let a_fp = device_a.device_fp();
 
-        // Store B's own (self-consistent, validly parsing) keys under A's device_fp -- `Store::
-        // add_device` does not validate the device_fp/keys binding (see its own doc comment), so
-        // this row is legal to write even though it can never rehash back to `a_fp`.
+        // Store B's own (self-consistent, validly parsing) keys under A's device_fp. `add_device`
+        // now refuses that binding, so write the row keyless and install the mismatched pair via
+        // the `test-support` backdoor — the row can never rehash back to `a_fp`, which is the
+        // point.
         let mismatched_keys = DevicePublicKeys {
             alg_id: ALG_ID_V1,
             sign_pk: device_b.sign_public_key().as_bytes().to_vec(),
             agree_pk: device_b.agree_public_key().as_bytes().to_vec(),
         };
         store
-            .add_device(member_id, a_fp, "laptop", 0, Some(&mismatched_keys))
-            .expect("add_device");
+            .add_device(member_id, a_fp, "laptop", 0, None)
+            .expect("add_device with no keys");
+        store
+            .set_device_keys_for_test(a_fp, Some(&mismatched_keys))
+            .expect("set_device_keys_for_test");
 
         let authorizer =
             HostConnectAuthorizer::new(SqliteDeviceLookup::new(store)).with_now_fn(|| 0);
