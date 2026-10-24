@@ -65,6 +65,7 @@ use crate::model::{
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use spindle_core::{Fingerprint, FingerprintError};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
@@ -311,6 +312,99 @@ pub enum StoreError {
          against the same file to recover"
     )]
     ConnectionPoisoned,
+}
+
+/// A log-safe `Display` view of [`StoreError`] — see [`StoreError::redacted`].
+///
+/// [`StoreError`]'s plain `Display` is **not** uniformly safe to log. Several variants carry
+/// real filesystem paths ([`StoreError::Confine`], [`StoreError::OverlappingShareRoot`]),
+/// virtual paths / dirent names ([`StoreError::Model`]'s `InvalidPathComponent`,
+/// [`StoreError::MountPathCollision`]), or a full, untruncated base32 fingerprint
+/// ([`StoreError::DeviceNotFound`], [`StoreError::DeviceKeyBindingMismatch`]). Whether a given
+/// call site can reach one of those arms today is a property of its current call graph, not of
+/// the error type: a method added behind the same lookup can widen the reachable set without
+/// anyone touching the `tracing::` line. This wrapper moves the invariant from "audited by hand"
+/// to "enforced by the type system".
+///
+/// # The match is exhaustive, with no `_` catch-all [deliberate]
+///
+/// Adding a [`StoreError`] variant must fail compilation here (E0004) so its author has to
+/// classify it as log-safe or leaky, rather than silently inheriting a decision. This mirrors
+/// `spindle_proto::bootstrap::RedactedBundleWireError`, whose match is exhaustive for the same
+/// reason. The alternative style — the catch-all arm `RedactedSignalingError` uses — is exactly
+/// how a new leaky variant can ship unreviewed: commit e8480af's hand audit found variants that
+/// the catch-all would have passed straight through, and only a manual read caught them. (The
+/// test module records the development check that temporarily adding a variant does, in fact,
+/// produce E0004 at this match.)
+///
+/// Safe variants render their normal `Display`, because their content is already limited to
+/// numeric row ids, counts, lengths, and enum names. [`StoreError::Sqlite`] is deliberately in
+/// that set: a `rusqlite` error can embed this host's own store path (`unable to open database
+/// file: <path>`), and this repo's **operator-configuration exemption** (this crate's root
+/// `tracing` section, `lib.rs`) permits a daemon to log its own store path, because it is
+/// configuration chosen by the operator, not member content. SQLite's messages name schema
+/// objects, never row values, so no member data can ride along; the exemption is what makes this
+/// arm safe, not a claim that arbitrary `rusqlite` text is content-free.
+///
+/// Leaky variants render the variant's identity plus only non-content facts (row ids, counts,
+/// lengths) — never a `Fingerprint`'s base32, a real path, a virtual path, or a dirent name.
+#[derive(Debug, Clone, Copy)]
+pub struct RedactedStoreError<'a>(pub &'a StoreError);
+
+impl StoreError {
+    /// Wraps `self` in a [`RedactedStoreError`] whose `Display` emits no path, virtual path,
+    /// dirent name, or untruncated fingerprint.
+    ///
+    /// Use this — `error = %e.redacted()` — never the plain `Display`, at any `tracing::` call
+    /// site that interpolates a `StoreError` or a type that wraps one.
+    pub fn redacted(&self) -> RedactedStoreError<'_> {
+        RedactedStoreError(self)
+    }
+}
+
+impl fmt::Display for RedactedStoreError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            // Safe arms: row ids, counts, lengths, enum names, and (under the operator-config
+            // exemption documented above) this host's own SQLite message.
+            safe @ (StoreError::Sqlite(_)
+            | StoreError::CorruptFingerprint(_)
+            | StoreError::BuiltinGroupNotEditable(_)
+            | StoreError::OwnerNotGrantable
+            | StoreError::GroupNotFound(_)
+            | StoreError::ShareNotFound(_)
+            | StoreError::MemberNotFound(_)
+            | StoreError::UnsupportedAlgId { .. }
+            | StoreError::MemberRootPkWrongLength { .. }
+            | StoreError::MemberRootPkNotCanonical { .. }
+            | StoreError::MemberRootPkFingerprintMismatch { .. }
+            | StoreError::MemberRootPkAlreadySet { .. }
+            | StoreError::InvalidStatusTransition { .. }
+            | StoreError::PersistedSharesOverlap { .. }
+            | StoreError::TooManyShares { .. }
+            | StoreError::TooManyExcludeGlobs { .. }
+            | StoreError::SchemaTooNew { .. }
+            | StoreError::ConnectionPoisoned) => write!(f, "{safe}"),
+
+            // Leaky arms. `ModelError` can carry an invalid virtual-path component;
+            // `ConfineError` carries real filesystem paths and upload-relative paths;
+            // `Fingerprint` is a 52-character base32 identifier that must never be logged whole.
+            StoreError::Model(_) => f.write_str("model validation error"),
+            StoreError::Confine(_) => f.write_str("path confinement error"),
+            StoreError::DeviceNotFound(_) => f.write_str("device not found"),
+            StoreError::DeviceKeyBindingMismatch { .. } => {
+                f.write_str("device key binding mismatch")
+            }
+            // Keep the (numeric) existing-share id, drop the real root path.
+            StoreError::OverlappingShareRoot { existing, .. } => {
+                write!(f, "share root overlaps existing share {existing:?}")
+            }
+            // Keep the (numeric) existing-share id, drop the virtual mount path.
+            StoreError::MountPathCollision { existing, .. } => {
+                write!(f, "mount path collides with existing share {existing:?}")
+            }
+        }
+    }
 }
 
 /// The atomically-persisted result of redeeming an invite nonce (DESIGN.md §A4: "the host stores
@@ -6525,5 +6619,127 @@ mod tests {
              the shape; this is the panic-path counterpart of \
              `burn_invite_nonce_poisons_when_rollback_cannot_restore_autocommit` above"
         );
+    }
+
+    // ---- RedactedStoreError (td-0bc380) ----
+    //
+    // There is deliberately no test that adds a `StoreError` variant: that is not expressible as
+    // a test. The exhaustive match in `RedactedStoreError` is the guard instead — adding a
+    // variant without classifying it here is a compile error (E0004: non-exhaustive patterns,
+    // naming the missing variant at the `match self.0` in `impl Display for
+    // RedactedStoreError`). Verified during development by temporarily adding a variant, running
+    // `cargo check -p spindle-vfs`, observing E0004 at that match, and reverting the variant.
+    // These tests cover the classification of the variants that exist today.
+
+    /// A full `Fingerprint` `Display` is 52 base32 characters; the redacted view must contain
+    /// none of it while still naming the variant.
+    #[test]
+    fn redacted_device_not_found_omits_the_full_fingerprint() {
+        let fp = Fingerprint::of_parts(&[b"td-0bc380-device-not-found"]);
+        let full = fp.to_string();
+        assert_eq!(full.len(), 52, "precondition: a full fingerprint's Display");
+
+        let rendered = StoreError::DeviceNotFound(fp).redacted().to_string();
+        assert!(
+            !rendered.contains(&full),
+            "the full base32 fingerprint must not reach a log line, got {rendered:?}"
+        );
+        assert_eq!(rendered, "device not found");
+    }
+
+    #[test]
+    fn redacted_device_key_binding_mismatch_omits_the_full_fingerprint() {
+        let fp = Fingerprint::of_parts(&[b"td-0bc380-key-binding-mismatch"]);
+        let full = fp.to_string();
+
+        let rendered = StoreError::DeviceKeyBindingMismatch { device_fp: fp }
+            .redacted()
+            .to_string();
+        assert!(
+            !rendered.contains(&full),
+            "the full base32 fingerprint must not reach a log line, got {rendered:?}"
+        );
+        assert_eq!(rendered, "device key binding mismatch");
+    }
+
+    /// `ConfineError::Io`'s `Display` interpolates both the path field and the `io::Error`
+    /// source; the redacted view must suppress the path in *both* places.
+    #[test]
+    fn redacted_confine_omits_paths_from_the_variant_and_its_source() {
+        let err = StoreError::Confine(crate::confine::ConfineError::Io {
+            path: "/secret/path".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "opening /secret/path failed: no such file or directory",
+            ),
+        });
+
+        let rendered = err.redacted().to_string();
+        assert!(
+            !rendered.contains("/secret/path"),
+            "no real filesystem path may reach a log line, got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("no such file"),
+            "the `io::Error` source text must not be interpolated either, got {rendered:?}"
+        );
+        assert_eq!(rendered, "path confinement error");
+    }
+
+    /// `MountPathCollision` carries a virtual path, which is a member-visible dirent name.
+    #[test]
+    fn redacted_mount_path_collision_omits_the_virtual_path() {
+        let err = StoreError::MountPathCollision {
+            new_mount_path: "SecretPhotos".to_string(),
+            existing: ShareId(7),
+        };
+
+        let rendered = err.redacted().to_string();
+        assert!(
+            !rendered.contains("SecretPhotos"),
+            "a virtual path / dirent name must not reach a log line, got {rendered:?}"
+        );
+        // A row id is not content and stays available for diagnosis.
+        assert!(rendered.contains("ShareId(7)"), "got {rendered:?}");
+    }
+
+    /// `ModelError::InvalidPathComponent` carries a virtual path component.
+    #[test]
+    fn redacted_model_omits_the_path_component() {
+        let err = StoreError::Model(ModelError::InvalidPathComponent(
+            "SecretComponent".to_string(),
+        ));
+
+        let rendered = err.redacted().to_string();
+        assert!(
+            !rendered.contains("SecretComponent"),
+            "a virtual path component must not reach a log line, got {rendered:?}"
+        );
+        assert_eq!(rendered, "model validation error");
+    }
+
+    /// Found in the same sweep as the variants the ticket named: `OverlappingShareRoot` carries
+    /// a real `PathBuf` root.
+    #[test]
+    fn redacted_overlapping_share_root_omits_the_real_path() {
+        let err = StoreError::OverlappingShareRoot {
+            new_root: PathBuf::from("/secret/path"),
+            existing: ShareId(3),
+        };
+
+        let rendered = err.redacted().to_string();
+        assert!(
+            !rendered.contains("/secret/path"),
+            "no real filesystem path may reach a log line, got {rendered:?}"
+        );
+        assert!(rendered.contains("ShareId(3)"), "got {rendered:?}");
+    }
+
+    /// A safe variant must render exactly as the plain `Display` does.
+    #[test]
+    fn redacted_safe_variant_renders_its_normal_message() {
+        let err = StoreError::MemberNotFound(MemberId(42));
+        assert_eq!(err.redacted().to_string(), err.to_string());
+        assert_eq!(err.redacted().to_string(), "member MemberId(42) not found");
     }
 }

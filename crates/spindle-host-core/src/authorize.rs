@@ -156,6 +156,43 @@ pub enum LookupError {
     LockPoisoned,
 }
 
+/// A log-safe `Display` view of [`LookupError`] — see [`LookupError::redacted`].
+///
+/// `LookupError::Store` wraps the *whole* [`StoreError`] enum, several of whose variants carry
+/// real filesystem paths, virtual paths, or a full, untruncated base32 fingerprint. A call site
+/// that reaches only `StoreError::Sqlite`/`CorruptFingerprint` today can widen to the leaky arms
+/// purely by gaining a new `Store` method call, with no edit to the `tracing::` line — so this
+/// wrapper enforces redaction at the type level instead of relying on the call graph.
+///
+/// The match is **exhaustive with no `_` catch-all**, deliberately (mirroring
+/// `spindle_proto::bootstrap::RedactedBundleWireError` and
+/// `spindle_vfs::store::RedactedStoreError`): a new `LookupError` variant must be a compile error
+/// (E0004) so its author classifies it. Commit e8480af is the cautionary case for the catch-all
+/// style — a catch-all can pass a newly added leaky variant straight through review.
+#[derive(Debug, Clone, Copy)]
+pub struct RedactedLookupError<'a>(pub &'a LookupError);
+
+impl LookupError {
+    /// Wraps `self` in a [`RedactedLookupError`] whose `Display` cannot emit a path, virtual
+    /// path, dirent name, or untruncated fingerprint.
+    ///
+    /// Use this — `error = %e.redacted()` — never the plain `Display`, at any `tracing::` call
+    /// site that interpolates a `LookupError`.
+    pub fn redacted(&self) -> RedactedLookupError<'_> {
+        RedactedLookupError(self)
+    }
+}
+
+impl std::fmt::Display for RedactedLookupError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            // Preserve the existing outer wording; redact the wrapped `StoreError`.
+            LookupError::Store(e) => write!(f, "device lookup store error: {}", e.redacted()),
+            LookupError::LockPoisoned => f.write_str("device lookup mutex poisoned"),
+        }
+    }
+}
+
 /// A [`DeviceLookup`] adapter owning a [`Store`] behind a [`std::sync::Mutex`] — the one place in
 /// this module the `!Sync -> Sync` bridge described in the module doc comment actually happens.
 ///
@@ -225,18 +262,15 @@ impl DeviceLookup for SqliteDeviceLookup {
                 // minting fresh member capabilities — a fleet-wide lock-out that only surfaces once
                 // existing caps expire (`MEMBER_CAP_DEFAULT_TTL_SECS`: six weeks), degrees removed
                 // in both time and symptom from this call site.
-                // Audited 2026-09-07: `%e` is a `LookupError`, whose only reachable content
-                // here is a `rusqlite` message from this host's own store (its path is operator
-                // configuration, exempt — see this crate's `lib.rs` `tracing` section) or a
-                // fingerprint *length* complaint. `LookupError::Store` is typed over all of
-                // `StoreError` though, and that enum's `Confine`/`Model`/`MountPathCollision`/
-                // `DeviceNotFound` variants do carry real paths, virtual paths, and untruncated
-                // fingerprints — so anything that widens what these lookups call must re-check
-                // this line rather than trusting the redaction guard, which only reads binding
-                // names.
+                // `error = %e.redacted()`: `LookupError::Store` wraps all of `StoreError`, whose
+                // `Confine`/`Model`/`MountPathCollision`/`DeviceNotFound` variants carry real
+                // paths, virtual paths, and untruncated fingerprints. `RedactedLookupError`'s
+                // exhaustive match enforces the redaction invariant at the type level: widening
+                // what these lookups reach cannot leak through this line without first adding a
+                // `LookupError` variant, which is a compile error at that match.
                 tracing::warn!(
                     device_fp = %device_fp.redacted(),
-                    error = %e,
+                    error = %e.redacted(),
                     "member_and_cap_epoch: fused member+cap_epoch read failed; falling back to a \
                      membership-only read for this connect. A persistent recurrence silently \
                      degrades this host to never minting fresh member capabilities"
@@ -290,18 +324,14 @@ pub(crate) fn active_member_for_device<L: DeviceLookup + ?Sized>(
             // only so a human can tell "denied, store unreadable" apart from "denied, not a
             // member" after the fact, the same distinction `HostConnectAuthorizer::authorize`
             // makes explicit for its own `Err` arm below.
-            // Audited 2026-09-07: `%e` is a `LookupError`, whose only reachable content
-            // here is a `rusqlite` message from this host's own store (its path is operator
-            // configuration, exempt — see this crate's `lib.rs` `tracing` section) or a
-            // fingerprint *length* complaint. `LookupError::Store` is typed over all of
-            // `StoreError` though, and that enum's `Confine`/`Model`/`MountPathCollision`/
-            // `DeviceNotFound` variants do carry real paths, virtual paths, and untruncated
-            // fingerprints — so anything that widens what these lookups call must re-check
-            // this line rather than trusting the redaction guard, which only reads binding
-            // names.
+            // `error = %e.redacted()`: `LookupError::Store` wraps all of `StoreError`, whose
+            // `Confine`/`Model`/`MountPathCollision`/`DeviceNotFound` variants carry real paths,
+            // virtual paths, and untruncated fingerprints. `RedactedLookupError`'s exhaustive
+            // match enforces the redaction invariant at the type level, so widening what these
+            // lookups reach cannot leak through this line.
             tracing::warn!(
                 device_fp = %device_fp.redacted(),
-                error = %e,
+                error = %e.redacted(),
                 "active_member_for_device: membership lookup failed; failing closed (treated as \
                  not live)"
             );
@@ -1029,18 +1059,15 @@ impl<L: DeviceLookup> ConnectAuthorizer for HostConnectAuthorizer<L> {
                 // file) that has nothing to do with whether this device may connect. That would be
                 // the fleet-wide lockout DESIGN.md:288-290's renewal path exists to prevent.
                 //
-                // Audited 2026-09-08: `%e` is a `LookupError`, whose only reachable content here
-                // is a `rusqlite` message from this host's own store (its path is operator
-                // configuration, exempt — see this crate's `lib.rs` `tracing` section) or a
-                // fingerprint *length* complaint. `LookupError::Store` is typed over all of
-                // `StoreError` though, and that enum's `Confine`/`Model`/`MountPathCollision`/
-                // `DeviceNotFound` variants do carry real paths, virtual paths, and untruncated
-                // fingerprints — so anything that widens what these lookups call must re-check
-                // this line rather than trusting the redaction guard, which only reads binding
-                // names.
+                // `error = %e.redacted()`: `LookupError::Store` wraps all of `StoreError`, whose
+                // `Confine`/`Model`/`MountPathCollision`/`DeviceNotFound` variants carry real
+                // paths, virtual paths, and untruncated fingerprints. `RedactedLookupError`'s
+                // exhaustive match enforces the redaction invariant at the type level: widening
+                // what these lookups reach cannot leak through this line without first adding a
+                // `LookupError` variant, which is a compile error at that match.
                 tracing::warn!(
                     device_fp = %from_fp.redacted(),
-                    error = %e,
+                    error = %e.redacted(),
                     "on_verified: member_and_cap_epoch failed after the offer's signature \
                      verified; proceeding with no freshly-minted member capability. The connect \
                      is NOT denied — an issuance failure must never break an otherwise-valid \

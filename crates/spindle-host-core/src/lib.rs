@@ -157,8 +157,8 @@ pub mod self_revocation;
 mod upload;
 
 pub use authorize::{
-    CapIssuer, DeviceLookup, HostConnectAuthorizer, LookupError, RootKeyCapIssuer,
-    SqliteDeviceLookup, MEMBER_CAP_DEFAULT_TTL_SECS,
+    CapIssuer, DeviceLookup, HostConnectAuthorizer, LookupError, RedactedLookupError,
+    RootKeyCapIssuer, SqliteDeviceLookup, MEMBER_CAP_DEFAULT_TTL_SECS,
 };
 pub use invite::{InviteIssuer, INVITE_DEFAULT_TTL_SECS, INVITE_NONCE_LEN};
 pub use revoke::{

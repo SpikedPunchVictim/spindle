@@ -291,26 +291,15 @@ pub fn revoke_device_and_mint(
             None
         }
         Err(e) => {
-            // `%e` is a `StoreError`, and that enum is not uniformly redaction-safe: e.g.
-            // `DeviceNotFound(Fingerprint)`'s `Display` is the full, untruncated base32
-            // fingerprint; `Confine(#[from] confine::ConfineError)`'s variants interpolate raw
-            // filesystem paths; `DeviceKeyBindingMismatch { device_fp }` echoes the fingerprint
-            // again. It is safe here only because of what `store.member_for_device_fp` can
-            // actually reach: a `query_row` plus `get_member`, and `get_member`/
-            // `devices_for_member`/`groups_for_member` issue plain `SELECT`s plus
-            // `Fingerprint::from_slice`, so the only reachable variants are `StoreError::Sqlite`
-            // and `StoreError::CorruptFingerprint` — and `CorruptFingerprint` wraps
-            // `FingerprintError`, whose variants (`WrongLength(usize)`, `InvalidEncoding`) echo no
-            // bytes. This is the same reasoning `crates/spindle-host-core/src/authorize.rs` already
-            // applies to its own `%e` at the identical `member_for_device_fp` lookup, and that
-            // comment's warning applies here too: anything that widens what this lookup calls must
-            // re-check this line rather than trusting the redaction guard. td-0bc380 tracks
-            // replacing this reachability argument with a `RedactedStoreError` wrapper, on the
-            // pattern `spindle_net::signaling::RedactedSignalingError`/
-            // `spindle_core::RedactedFingerprint` already establish.
+            // `error = %e.redacted()`: `StoreError`'s plain `Display` is not uniformly safe to
+            // log (`DeviceNotFound`/`DeviceKeyBindingMismatch` echo a full untruncated
+            // fingerprint, `Confine`/`OverlappingShareRoot` interpolate real paths,
+            // `Model`/`MountPathCollision` carry virtual paths). `RedactedStoreError`'s
+            // exhaustive match enforces the redaction invariant at the type level, so this line
+            // no longer depends on what `store.member_for_device_fp` happens to reach today.
             tracing::warn!(
                 device_fp = %device_fp.redacted(),
-                error = %e,
+                error = %e.redacted(),
                 "revoke_device_and_mint: owning-member lookup failed; auditing the revocation \
                  without a member column"
             );
