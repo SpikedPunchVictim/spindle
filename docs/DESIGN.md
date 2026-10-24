@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.51) + Execution Plan
+# Spindle — System Design Document (draft v0.9.52) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -240,6 +240,11 @@
 > The measured entry grew 521 → 529 B (the `alg_id` pair is 8 B); the four QR host counts are
 > unchanged (4/5 short registry at EC-M/L, 3/5 at the 256-byte registry), but EC-L at the ceiling
 > now has 27 B of margin.
+> v0.9.52: one decision (A10.51) and one A9c manifest row, no wire change. Metrics use the
+> `metrics` facade in libraries and `metrics-exporter-prometheus` (http-listener only) in
+> binaries; the helper installs it when `METRICS_ADDR` is set, and host exporter wiring waits for
+> the host binary. Metric names are `helper_`/`host_` snake_case, labels are fixed low-cardinality
+> literals only — no identifier, path, or name may become a label, because cardinality is a leak.
 
 ---
 
@@ -1556,6 +1561,16 @@ presence-map size and replica divergence, nonce-burn conflicts, TURN quota consu
 failed-envelope-verification rate, rate-limit hits, session/transfer counts, audit-chain head; clients surface
 "registry degraded" vs "host offline". S8/S9/S12 SLOs (p99 callout < 250 ms, revoke cut-off < 5 s) become
 production alerts, not just spike criteria.
+**[amended v0.9.52]** The exporter is Prometheus via the `metrics` facade; libraries never
+install a recorder, so `spindle-helper`, `spindle-host-core`, `spindle-vfs`, and `spindle-net`
+only record. The helper's series are live behind `METRICS_ADDR` (unset = no recorder, no-ops):
+callout duration/decisions, revocation propagation, presence hosts, a startup-only
+CONNZ-divergence surrogate, nonce-burn conflicts, and TURN issuance/quota. Host series are
+recorded (envelope failures by fixed reason, rate-limit hits by scope, live sessions,
+completed/aborted uploads, audit head and append failures) but their exporter wiring lands with
+the host binary (td-539ffa). Histograms use the exporter's default quantiles, which include p99;
+true helper-to-helper divergence is not measurable from one process and is documented as a
+startup surrogate, not claimed as the SLO.
 
 **Delivery**: monorepo — Rust workspace + TS packages (authoritative layout & dependency manifest: **A9c**).
 **Wire schemas defined once**:
@@ -1661,6 +1676,7 @@ spindle/
 | Concern | Rust | TypeScript |
 |---------|------|------------|
 | Runtime | tokio, tracing, thiserror (libs) / anyhow (bins) | Node 22 LTS (CLI/admin), evergreen browsers per A7 |
+| Observability | `metrics` (facade, libraries record only) + `metrics-exporter-prometheus` (binaries only; `default-features = false`, `http-listener`) | — (client surfaces degrade state, no exporter) |
 | NATS | async-nats | nats.ws |
 | WebRTC | webrtc ≥0.20 (browser peers; ice reused standalone for QUIC punching) + quinn (native↔native QUIC) + rcgen (per-session QUIC certs) | browser RTCPeerConnection |
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
@@ -1740,6 +1756,7 @@ Docker is explicitly not the primary dev environment.
 | 48 | Does an admission token carry the registry endpoint? | **DECIDED 2026-10-23 (user decision):** not in v1. `AdmissionToken` keeps `{nonce, exp, label, quota_profile, sig_operator}`, and the host daemon keeps taking the registry address from its own configuration until a host-onboarding flow exists that consumes a token. A4's old "admission tokens likewise" sentence described a property nothing implemented and no consumer needed. Rejected for now: *adding `endpoints[]` + `tls_pin` to the signed preimage* — this artifact has no `v` field, so a wire-visible change forces a §A7b domain-tag bump (`spindle-adm-v2`) and regenerated vectors in both languages, for a field no caller reads; rejected: *an unsigned wrapper* — unlike the addressed member invite, an admission token is a bearer credential, so an attacker who rewrites the wrapper's endpoint can exfiltrate a token the host would otherwise redeem first. Revisit when host onboarding is built; if the endpoint must travel with the token then, it belongs inside the signed artifact. Bears on td-1dff5e. |
 | 49 | Rate-limiting order for `helper.revoke.<nfp>` | **DECIDED 2026-10-23:** the per-root token bucket is charged **after** signature verification and only for a deposit that changes state; pre-verification attempts are bounded by a separate **per-device** budget. Forced by an adversarial review of the first implementation, which charged the root before verifying: any compromised device under a root (valid certificate, cap, and session — but no root key) could publish unsigned records carrying that root's `root_fp`, which is public, spend the root's ten-token burst, and have the owner's genuinely signed revocation refused `rate limited` before it was ever verified — suppressing the very revocation S14 exists to deliver. The per-root key remains DESIGN's requirement; only the ordering changed. An already-applied record is detected before the charge and costs nothing, so replaying a recorded message cannot drain the bucket. Residual, stated: an observer who captures a *not-yet-applied* valid record can replay it into the bucket — but that observer is the registry itself, which can already drop the record, so this adds no power. Rejected: *keep the pre-verification charge and raise the burst* — any finite burst a compromised device can spend is a suppression budget. Bears on td-b5d50c. |
 | 50 | Which version checks reject an unknown future version? | **DECIDED 2026-10-24:** every signed v-carrying artifact — `Envelope`, `Capability`, `AdminCommand` — enforces a **ceiling** at the build's current version in addition to the existing floor, both before any signature work. Forced because all three checks were floors while A7b says "unknown `v` ⇒ reject": a legitimately signed v2 artifact would otherwise be verified under v1 semantics, and the signature does not save us — it is valid, just under fields this build would misread. The unsigned `VfsRequestEnvelope` and `DeviceBootstrapBundle` keep floor-only checks: forward compatibility with newer clients is a wire policy, and neither is a signed artifact. Rejected: *ceiling on VFS RPC too* — it would reject newer clients on a transport host and client are expected to upgrade independently, turning a version floor into a rollout coupling; rejected: *leaving signed artifacts floor-only* — that is the bug this row closes. Bears on td-bffaac. |
+| 51 | Metrics exporter for the §A7 observability contract | **DECIDED 2026-10-24 (user decision):** `metrics` facade in libraries + `metrics-exporter-prometheus` (http-listener only) in binaries. Libraries record through the facade and never install a global recorder, keeping the A9c layering rule and making recording a no-op in tests and unconfigured deployments. The helper installs a scrape listener only when `METRICS_ADDR` is set; host exporter wiring lands with the host binary. Histograms supply the p99 needed by the callout and revoke-cut-off SLOs. Rejected: *OpenTelemetry/OTLP* — a much heavier dependency and configuration surface plus a collector to be useful, for signals this deployment does not yet need; rejected: *tracing-layer derived counters* — no new dependency, but percentiles require a bespoke aggregation layer and the host libraries must stay subscriber-free anyway; rejected: *hand-rolled registry + text endpoint* — most code to own (buckets, quantiles, encoding) for no capability the facade lacks. Cardinality rule recorded with the decision: labels are fixed literals only; identifiers, paths, and names are never labels. Bears on td-323db0. |
 
 ## A11. Alternatives considered
 
@@ -1939,6 +1956,15 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.52 (2026-10-24)** — One decision (A10.51) and one A9c manifest row, no wire change. The
+  §A7 observability contract is exported through the `metrics` facade, with
+  `metrics-exporter-prometheus` installed only by binaries; libraries record and never install a
+  recorder. Rejected OpenTelemetry (heavyweight for the signals needed), tracing-derived counters
+  (percentiles need a bespoke layer while host libraries must stay subscriber-free), and a
+  hand-rolled registry (most code, least capability). The helper's series are live behind
+  `METRICS_ADDR`; host series are recorded and their exporter wiring waits for the host binary
+  (td-539ffa). Labels are fixed literals only — identifiers, paths, and names never become labels.
+  (td-323db0)
 - **v0.9.51 (2026-10-24)** — One wire change. `BundleEntry` gained `alg_id`, so `verify_bootstrap_bundle`
   rejects a non-v1 suite explicitly instead of hashing it as `ALG_ID_V1`; the bundle version moved to 2,
   while an absent field on decode defaults to v1 so existing bundles keep working (an old decoder rejects
