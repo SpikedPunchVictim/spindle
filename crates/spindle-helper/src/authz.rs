@@ -119,6 +119,12 @@ pub enum RefusalReason {
     BadSessionAttestation,
     #[error("no presented capability's subject matches the presenting identity root")]
     CapabilitySubjectMismatch,
+    /// A subject revoked **for a particular host** makes that host's capability unusable. Since
+    /// td-d5800b such a capability is dropped from the candidate set rather than refusing the
+    /// whole connection, so [`decide_device_connect`] returns this reason only when no candidate
+    /// survives. A root-scoped self-revocation (checked before the per-cap loop) still refuses
+    /// the connection outright and also reports this reason. The wire refusal is uniform either
+    /// way, so which capability was dropped is never disclosed.
     #[error("subject is revoked for this host")]
     SubjectRevoked,
     #[error("nkey signature invalid")]
@@ -195,6 +201,11 @@ pub trait HelperView {
     /// True if `subject` (a `root_fp` or a `device_fp`) is revoked for `host_fp` per the
     /// helper's durable revocation store (DESIGN.md §A4: "best-effort" — the host's per-request
     /// enforcement remains authoritative).
+    ///
+    /// Host-scoped: a `true` result makes only the *presented capability for that host* unusable,
+    /// and [`decide_device_connect`] drops it from the candidate set (td-d5800b) rather than
+    /// refusing the whole connection. A root-signed self-revocation is root-scoped instead — see
+    /// [`Self::is_self_revoked`].
     fn is_revoked(&mut self, host_fp: &Fingerprint, subject: &Fingerprint) -> bool;
 
     /// Current registry admission mode (DESIGN.md §A3b).
@@ -484,12 +495,21 @@ pub fn decide_device_connect(
 
     // 4. Cheap per-cap subject match, then a store lookup (no crypto) for revocation. A cap
     //    whose subject isn't this root_fp contributes nothing and is dropped silently — it is
-    //    not, by itself, a reason to refuse the whole connection. A revoked subject, in
-    //    contrast, refuses the whole connection outright: DESIGN.md §A4 "only revoked subjects
-    //    are refused outright" (never merely downgraded to connect-only), and checking it here —
-    //    before any signature work — also means a revoked device can never cost the callout an
-    //    Ed25519 verification.
+    //    not, by itself, a reason to refuse the whole connection.
+    //
+    //    A cap whose subject the host has revoked is likewise dropped from the candidate set
+    //    (td-d5800b): that cap is unusable for *this* host, but one host's revocation must not
+    //    silently deny every other host in the same presented set. The connection proceeds with
+    //    whatever candidates survive, and the permissions/limits below are computed from those
+    //    survivors alone. Only when nothing survives is the connection refused: `SubjectRevoked`
+    //    if at least one cap was dropped for revocation (preserving the old all-revoked result
+    //    for callers/tests), `CapabilitySubjectMismatch` otherwise. A revoked cap is never merely
+    //    downgraded to connect-only, and because the check still runs here — before any signature
+    //    work — dropping it never costs the callout an Ed25519 verification. The wire refusal is
+    //    uniform either way, so which cap was dropped is not disclosed to the client; a client
+    //    presents only the hosts it actually needs.
     let mut candidates: Vec<&Capability> = Vec::with_capacity(presented.caps.len());
+    let mut saw_revoked = false;
     for cap in &presented.caps {
         let Some(subject_fp) = cap_subject_fp(cap) else {
             continue;
@@ -501,12 +521,17 @@ pub fn decide_device_connect(
             continue;
         };
         if view.is_revoked(&host_fp, &root_fp) || view.is_revoked(&host_fp, &device_fp) {
-            return AuthzDecision::Refused(RefusalReason::SubjectRevoked);
+            saw_revoked = true;
+            continue;
         }
         candidates.push(cap);
     }
     if candidates.is_empty() {
-        return AuthzDecision::Refused(RefusalReason::CapabilitySubjectMismatch);
+        return AuthzDecision::Refused(if saw_revoked {
+            RefusalReason::SubjectRevoked
+        } else {
+            RefusalReason::CapabilitySubjectMismatch
+        });
     }
 
     // 5. Expensive checks from here on: the caller-verified nkey signature (checked lazily —
@@ -844,6 +869,7 @@ mod tests {
     use spindle_core::SigningKey;
     use std::cell::Cell;
     use std::collections::{HashMap, HashSet};
+    use std::rc::Rc;
 
     // ---- test doubles -------------------------------------------------------------------
 
@@ -859,6 +885,10 @@ mod tests {
         sessions: HashMap<Fingerprint, SessionRecord>,
         turn_usage: HashMap<(Fingerprint, u64), u64>,
         self_revoked: HashMap<Fingerprint, (u64, HashSet<Fingerprint>)>,
+        /// Counts `is_revoked` lookups, so an ordering test can prove the per-cap revocation
+        /// drop happens in the pre-crypto pass (td-d5800b). Shared via `Rc` because the
+        /// `verify_nkey_sig` closure needs to observe it while `view` is mutably borrowed.
+        revocation_lookups: Rc<Cell<u32>>,
     }
 
     impl HelperView for MockView {
@@ -867,6 +897,8 @@ mod tests {
         }
 
         fn is_revoked(&mut self, host_fp: &Fingerprint, subject: &Fingerprint) -> bool {
+            self.revocation_lookups
+                .set(self.revocation_lookups.get().saturating_add(1));
             self.revoked.contains(&(*host_fp, *subject))
         }
 
@@ -1141,6 +1173,9 @@ mod tests {
         );
     }
 
+    /// td-d5800b: a revoked subject makes its cap unusable, so the cap is dropped from the
+    /// candidate set. With no other candidate, nothing survives and the connection is refused
+    /// with the pre-existing `SubjectRevoked` reason — never downgraded to connect-only.
     #[test]
     fn revoked_subject_is_refused_outright_never_connect_only() {
         let (root, cert, attest, _dfp) = device_setup(fp(b"nats-session"));
@@ -1162,7 +1197,242 @@ mod tests {
         assert_eq!(
             decision,
             AuthzDecision::Refused(RefusalReason::SubjectRevoked),
-            "revoked subject must be refused outright, never connect-only"
+            "with no surviving candidate, a revoked subject must be refused outright, never \
+             connect-only"
+        );
+    }
+
+    /// td-d5800b: one host's revocation must not deny another host whose cap is still valid. The
+    /// revoked cap is dropped; permissions, limits and the session record are computed from the
+    /// surviving cap alone.
+    #[test]
+    fn revoked_host_cap_is_dropped_while_a_valid_host_survives() {
+        let nats_fp = fp(b"nats-session");
+        let (root, cert, attest, device_fp) = device_setup(nats_fp);
+        let root_fp = root.root_fp();
+        // Distinct roots so the two hosts land in distinct `host.<host_fp>.>` namespaces.
+        let revoked_host = test_host([0x11; 32], [0x12; 32]);
+        let valid_host = test_host([0x21; 32], [0x22; 32]);
+        let revoked_fp = revoked_host.host_fp;
+        let valid_fp = valid_host.host_fp;
+        let revoked_cap = member_cap(&revoked_host, root_fp, 0, 2_000_000);
+        let valid_cap = member_cap(&valid_host, root_fp, 0, 2_000_000);
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![revoked_cap, valid_cap],
+            nats_fp,
+            session_attest: attest,
+        };
+        let mut view = MockView::default();
+        view.revoked.insert((revoked_fp, root_fp));
+        let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
+        let AuthzDecision::Authorized(auth) = decision else {
+            panic!("expected the surviving host to authorize, got {decision:?}");
+        };
+        assert_eq!(
+            auth.permissions,
+            permissions::client_member_permissions(device_fp, nats_fp, &[valid_fp]),
+            "permissions must be computed from the surviving cap alone"
+        );
+        assert_eq!(
+            auth.limits.max_subscriptions,
+            permissions::max_subscriptions(1),
+            "limits must count only the surviving host"
+        );
+        assert_eq!(
+            auth.session_record.host_fps,
+            vec![valid_fp],
+            "the session record must carry only the surviving host"
+        );
+        assert!(
+            !auth.session_record.host_fps.contains(&revoked_fp),
+            "the revoked host must not survive into the session record"
+        );
+    }
+
+    /// td-d5800b: revocation is per `(host, subject)`, and the drop applies to either subject
+    /// kind. Host A revoked this device, host B revoked the identity root; only host C's cap
+    /// survives.
+    #[test]
+    fn device_revocation_of_one_host_and_root_revocation_of_another_leave_only_the_clean_host() {
+        let nats_fp = fp(b"nats-session");
+        let (root, cert, attest, device_fp) = device_setup(nats_fp);
+        let root_fp = root.root_fp();
+        let device_revoked_host = test_host([0x31; 32], [0x32; 32]);
+        let root_revoked_host = test_host([0x41; 32], [0x42; 32]);
+        let valid_host = test_host([0x51; 32], [0x52; 32]);
+        let valid_fp = valid_host.host_fp;
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![
+                member_cap(&device_revoked_host, root_fp, 0, 2_000_000),
+                member_cap(&root_revoked_host, root_fp, 0, 2_000_000),
+                member_cap(&valid_host, root_fp, 0, 2_000_000),
+            ],
+            nats_fp,
+            session_attest: attest,
+        };
+        let mut view = MockView::default();
+        view.revoked
+            .insert((device_revoked_host.host_fp, device_fp));
+        view.revoked.insert((root_revoked_host.host_fp, root_fp));
+        let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
+        let AuthzDecision::Authorized(auth) = decision else {
+            panic!("expected the clean host to authorize, got {decision:?}");
+        };
+        assert_eq!(
+            auth.permissions,
+            permissions::client_member_permissions(device_fp, nats_fp, &[valid_fp]),
+            "only the host with neither a device nor a root revocation may survive"
+        );
+        assert_eq!(auth.session_record.host_fps, vec![valid_fp]);
+    }
+
+    /// td-d5800b: the root-scoped self-revocation check still runs before the per-cap loop and
+    /// refuses the whole connection outright, even when every presented cap is otherwise valid.
+    /// This is deliberately *not* a per-cap drop — a root's own revocation is not host-scoped.
+    #[test]
+    fn self_revoked_device_with_a_valid_cap_set_is_still_refused() {
+        let nats_fp = fp(b"nats-session");
+        let (root, cert, attest, device_fp) = device_setup(nats_fp);
+        let root_fp = root.root_fp();
+        let host_a = test_host([0x11; 32], [0x12; 32]);
+        let host_b = test_host([0x21; 32], [0x22; 32]);
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![
+                member_cap(&host_a, root_fp, 0, 2_000_000),
+                member_cap(&host_b, root_fp, 0, 2_000_000),
+            ],
+            nats_fp,
+            session_attest: attest,
+        };
+        let mut view = MockView::default();
+        let _ = view.record_self_revocation(&root_fp, 3, &[device_fp]);
+        let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
+        assert_eq!(
+            decision,
+            AuthzDecision::Refused(RefusalReason::SubjectRevoked),
+            "a root-scoped self-revocation must refuse the whole connection, not be dropped \
+             per-cap"
+        );
+    }
+
+    /// td-d5800b: "do not invent new reasons." A revoked cap alongside a cap whose subject never
+    /// matched this root leaves no candidate, and the refusal stays the existing
+    /// `SubjectRevoked`.
+    #[test]
+    fn revoked_cap_plus_subject_mismatched_cap_is_refused_subject_revoked() {
+        let nats_fp = fp(b"nats-session");
+        let (root, cert, attest, _dfp) = device_setup(nats_fp);
+        let root_fp = root.root_fp();
+        let revoked_host = test_host([0x11; 32], [0x12; 32]);
+        let other_host = test_host([0x21; 32], [0x22; 32]);
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![
+                member_cap(&revoked_host, root_fp, 0, 2_000_000),
+                member_cap(&other_host, fp(b"someone-else"), 0, 2_000_000),
+            ],
+            nats_fp,
+            session_attest: attest,
+        };
+        let mut view = MockView::default();
+        view.revoked.insert((revoked_host.host_fp, root_fp));
+        let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
+        assert_eq!(
+            decision,
+            AuthzDecision::Refused(RefusalReason::SubjectRevoked),
+            "the all-candidates-dropped reason is the pre-existing SubjectRevoked, not a new one"
+        );
+    }
+
+    /// td-d5800b: dropping revoked caps must not change how other unusable caps are handled. A
+    /// malformed cap (unparseable `host_fp`) and a revoked cap are both skipped; the remaining
+    /// valid cap still authorizes on its own.
+    #[test]
+    fn revoked_and_malformed_caps_do_not_disturb_a_valid_survivor() {
+        let nats_fp = fp(b"nats-session");
+        let (root, cert, attest, device_fp) = device_setup(nats_fp);
+        let root_fp = root.root_fp();
+        let revoked_host = test_host([0x11; 32], [0x12; 32]);
+        let malformed_host = test_host([0x21; 32], [0x22; 32]);
+        let valid_host = test_host([0x31; 32], [0x32; 32]);
+        let valid_fp = valid_host.host_fp;
+        let mut malformed_cap = member_cap(&malformed_host, root_fp, 0, 2_000_000);
+        malformed_cap.host_fp = vec![0xEE; 7]; // not a valid fingerprint length
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![
+                member_cap(&revoked_host, root_fp, 0, 2_000_000),
+                malformed_cap,
+                member_cap(&valid_host, root_fp, 0, 2_000_000),
+            ],
+            nats_fp,
+            session_attest: attest,
+        };
+        let mut view = MockView::default();
+        view.revoked.insert((revoked_host.host_fp, root_fp));
+        let decision = decide_device_connect(&presented, || true, 1_500, &mut view, 0);
+        let AuthzDecision::Authorized(auth) = decision else {
+            panic!("expected the valid cap to authorize, got {decision:?}");
+        };
+        assert_eq!(
+            auth.permissions,
+            permissions::client_member_permissions(device_fp, nats_fp, &[valid_fp])
+        );
+        assert_eq!(auth.session_record.host_fps, vec![valid_fp]);
+    }
+
+    /// td-d5800b §A12 #24: the drop happens in the same pre-crypto candidate pass as before —
+    /// every `is_revoked` lookup for the presented caps has completed before `verify_nkey_sig`
+    /// runs, so a revoked cap can never cost the callout an Ed25519 verification.
+    #[test]
+    fn revoked_host_drop_happens_before_signature_work() {
+        let nats_fp = fp(b"nats-session");
+        let (root, cert, attest, _dfp) = device_setup(nats_fp);
+        let root_fp = root.root_fp();
+        let revoked_host = test_host([0x11; 32], [0x12; 32]);
+        let valid_host = test_host([0x21; 32], [0x22; 32]);
+        let presented = DeviceConnectPresented {
+            root_pk: root.public_key(),
+            device_cert: cert,
+            caps: vec![
+                member_cap(&revoked_host, root_fp, 0, 2_000_000),
+                member_cap(&valid_host, root_fp, 0, 2_000_000),
+            ],
+            nats_fp,
+            session_attest: attest,
+        };
+        let mut view = MockView::default();
+        view.revoked.insert((revoked_host.host_fp, root_fp));
+        let lookups = Rc::clone(&view.revocation_lookups);
+        let nkey_calls = Cell::new(0u32);
+        let decision = decide_device_connect(
+            &presented,
+            || {
+                nkey_calls.set(nkey_calls.get() + 1);
+                assert!(
+                    lookups.get() >= 2,
+                    "every is_revoked lookup (and thus the revoked-cap drop) must run before \
+                     verify_nkey_sig"
+                );
+                true
+            },
+            1_500,
+            &mut view,
+            0,
+        );
+        assert!(decision.is_authorized());
+        assert_eq!(
+            nkey_calls.get(),
+            1,
+            "the surviving cap still needs real crypto"
         );
     }
 
