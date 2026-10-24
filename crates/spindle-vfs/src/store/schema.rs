@@ -689,18 +689,27 @@ mod tests {
             .expect("read user_version");
         assert_eq!(version, MIGRATIONS.last().unwrap().0);
 
-        // The query itself names `fold_subpath` (it would error against the OLD table, which has
-        // no such column, so this genuinely proves the new shape exists rather than merely
-        // querying a column-agnostic `COUNT(*)` that a table recreated without `fold_subpath`
-        // would also pass), and it comes back empty — SCHEMA_V7 discards the ledger rather than
-        // migrating it.
+        // Assert directly that the rebuilt table carries the column this migration exists to add:
+        // `fold_subpath`. A column-agnostic `COUNT(*)` (or even `COUNT(*) ... WHERE fold_subpath
+        // IS NOT NULL`, whose count is 0 for any empty table) cannot tell the new shape from a V7
+        // that recreated `uploaded_files` without the column, so read the actual column list.
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(uploaded_files)")
+            .expect("prepare table_info")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table_info")
+            .collect::<Result<_, _>>()
+            .expect("read column names");
+        assert!(
+            columns.iter().any(|name| name == "fold_subpath"),
+            "SCHEMA_V7 must rebuild uploaded_files with a fold_subpath column; got {columns:?}"
+        );
+
+        // The rebuilt ledger comes back empty — SCHEMA_V7 discards the pre-existing rows rather
+        // than migrating them.
         let row_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM uploaded_files WHERE fold_subpath IS NOT NULL",
-                [],
-                |r| r.get(0),
-            )
-            .expect("count rows via the new fold_subpath-keyed shape");
+            .query_row("SELECT COUNT(*) FROM uploaded_files", [], |r| r.get(0))
+            .expect("count rebuilt ledger rows");
         assert_eq!(
             row_count, 0,
             "SCHEMA_V7 discards the pre-existing ledger outright — see its doc comment"
