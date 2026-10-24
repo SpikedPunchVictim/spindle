@@ -1,7 +1,7 @@
-use super::{check_min_v, check_skew, parse_signature, ArtifactError};
+use super::{check_max_v, check_min_v, check_skew, parse_signature, ArtifactError};
 use crate::fingerprint::Fingerprint;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use spindle_proto::artifacts::{AdminCommand, ADMIN_COMMAND_MIN_V};
+use spindle_proto::artifacts::{AdminCommand, ADMIN_COMMAND_CURRENT_V, ADMIN_COMMAND_MIN_V};
 use spindle_proto::canonical::CborValue;
 
 /// `|ts - now| <= 2 min` (DESIGN.md §A7b), same window as the envelope's clock-skew rule.
@@ -48,8 +48,9 @@ pub fn issue_admin_command(
 /// without the binding, so this API does not offer one.
 ///
 /// Checks run cheap-structural-before-crypto (§A6):
-/// 1. Version floor — cheapest possible rejection, checked before any other work (DESIGN.md §A7b:
-///    "Unknown `v` ⇒ reject").
+/// 1. Version floor and ceiling — cheapest possible rejection, checked before any other work
+///    (DESIGN.md §A7b: "Unknown `v` ⇒ reject"). The floor rejects deprecated versions, the ceiling
+///    a legitimately signed artifact from a future build.
 /// 2. `expected_signer_fp` vs `command.signer_fp` — a byte comparison, cheaper than a signature
 ///    verification and the check this function exists to enforce. On mismatch:
 ///    [`ArtifactError::SignerFingerprintMismatch`].
@@ -63,9 +64,12 @@ pub fn verify_admin_command(
     expected_signer_fp: &Fingerprint,
     now: u64,
 ) -> Result<(), ArtifactError> {
-    // 1. Version floor — cheapest possible rejection, checked before any signature, binding, or
-    // timestamp work (DESIGN.md §A7b: "Unknown `v` ⇒ reject").
+    // 1. Version floor and ceiling — cheapest possible rejection, checked before any signature,
+    // binding, or timestamp work (DESIGN.md §A7b: "Unknown `v` ⇒ reject"). The floor rejects
+    // deprecated versions; the ceiling rejects a legitimately signed artifact from a future build,
+    // which must not be verified against today's v1 field layout.
     check_min_v(command.v, ADMIN_COMMAND_MIN_V)?;
+    check_max_v(command.v, ADMIN_COMMAND_CURRENT_V)?;
 
     // 2. signer_fp binding — the check this function exists to enforce (td-0bcab4's API shape).
     // Must run before the signature check: naming the wrong signer is a structural mismatch,
@@ -178,6 +182,43 @@ mod tests {
         assert_eq!(cmd.v, ADMIN_COMMAND_MIN_V);
         verify_admin_command(&cmd, &op.verifying_key(), &signer_fp(), 1_000)
             .expect("v == floor must verify");
+    }
+
+    #[test]
+    fn rejects_v_above_current_even_when_legitimately_signed() {
+        // A future build's `AdminCommand` with `v = 2`, re-signed by the operator over the v2
+        // signing input. §A7b says "Unknown `v` ⇒ reject": a valid signature over bytes this
+        // build would misread must not make it verify under v1 semantics.
+        let op = operator();
+        let mut cmd = sample(&op, 1_000);
+        cmd.v = 2;
+        cmd.sig = op.sign(&cmd.signing_input()).to_bytes().to_vec();
+        let err = verify_admin_command(&cmd, &op.verifying_key(), &signer_fp(), 1_000).unwrap_err();
+        assert_eq!(
+            err,
+            ArtifactError::VersionTooHigh {
+                found: 2,
+                maximum: ADMIN_COMMAND_CURRENT_V
+            }
+        );
+    }
+
+    #[test]
+    fn version_ceiling_fires_before_signature_check() {
+        // v above the ceiling AND a corrupted signature — the version error must win, pinning
+        // the "cheapest rejection first" ordering against a future refactor.
+        let op = operator();
+        let mut cmd = sample(&op, 1_000);
+        cmd.v = 2;
+        cmd.sig[0] ^= 0xff;
+        let err = verify_admin_command(&cmd, &op.verifying_key(), &signer_fp(), 1_000).unwrap_err();
+        assert_eq!(
+            err,
+            ArtifactError::VersionTooHigh {
+                found: 2,
+                maximum: ADMIN_COMMAND_CURRENT_V
+            }
+        );
     }
 
     #[test]

@@ -15,8 +15,10 @@
 
 import { bytesToHex, hexToBytes } from "@spindle/proto";
 import {
+  ADMIN_COMMAND_CURRENT_V,
   AdminCommand,
   AdmissionToken,
+  CAPABILITY_CURRENT_V,
   Capability,
   CapKind,
   DeviceCertificate,
@@ -475,6 +477,47 @@ describe("capability.json", () => {
     });
     expect(cap.v).toBe(1);
     await expect(verifyCapability(cap, 1_500n)).resolves.toBeUndefined();
+  });
+
+  it("rejects a legitimately signed capability with v above the current version", async () => {
+    // A future build's capability at v = 2 is re-signed with the certified operating key over the
+    // v2 signing input, so this is a legitimately signed artifact, not a tampered v1 one. §A7b
+    // says "Unknown `v` ⇒ reject": it must not verify under v1 semantics.
+    const host = await makeTestHost(0x57, 0x58, 10_000n);
+    const cap = await issueTestCapability({
+      hostRootPk: host.rootPk,
+      opCert: host.opCert,
+      opSignerSeed: host.opSeed,
+      capEpoch: 0n,
+      exp: 2_000n,
+    });
+    cap.v = 2;
+    cap.sig = await ed25519Sign(host.opSeed, Capability.signingInput(cap));
+    await expect(verifyCapability(cap, 1_500n)).rejects.toMatchObject({
+      kind: "VersionTooHigh",
+      found: 2,
+      maximum: CAPABILITY_CURRENT_V,
+    });
+  });
+
+  it("checks the version ceiling before the signature", async () => {
+    // v above the ceiling AND a corrupted signature — the version error must win, pinning the
+    // "cheapest rejection first" ordering against a future refactor.
+    const host = await makeTestHost(0x59, 0x5a, 10_000n);
+    const cap = await issueTestCapability({
+      hostRootPk: host.rootPk,
+      opCert: host.opCert,
+      opSignerSeed: host.opSeed,
+      capEpoch: 0n,
+      exp: 2_000n,
+    });
+    cap.v = 2;
+    cap.sig[0] ^= 0xff;
+    await expect(verifyCapability(cap, 1_500n)).rejects.toMatchObject({
+      kind: "VersionTooHigh",
+      found: 2,
+      maximum: CAPABILITY_CURRENT_V,
+    });
   });
 
   it("checks the version floor before the signature — v below the floor plus a corrupted signature must report VersionTooLow, not BadSignature", async () => {
@@ -1079,6 +1122,23 @@ describe("admin-command.json", () => {
     await expect(
       verifyAdminCommand(cmd, operatorPk, cmd.signer_fp, cmd.ts),
     ).resolves.toBeUndefined();
+  });
+
+  it("rejects an admin command with v above the current version, before the signature", async () => {
+    // The vector's signature covers the v = 1 preimage, so it is invalid over these v = 2 bytes;
+    // asserting VersionTooHigh (rather than BadSignature) is what pins the ceiling's ordering
+    // before signature verification. A future build's legitimately signed v = 2 command would be
+    // rejected by the same check (there is no operator seed here to re-sign one).
+    const args = argsFromCanonicalCbor(doc.cases[0].canonical_cbor_hex);
+    const cmd = parseAdminCommand(doc.cases[0].decoded, args);
+    cmd.v = 2;
+    await expect(
+      verifyAdminCommand(cmd, operatorPk, cmd.signer_fp, cmd.ts),
+    ).rejects.toMatchObject({
+      kind: "VersionTooHigh",
+      found: 2,
+      maximum: ADMIN_COMMAND_CURRENT_V,
+    });
   });
 
   it("checks the version floor before the signature — v below the floor plus a corrupted signature must report VersionTooLow, not BadSignature", async () => {

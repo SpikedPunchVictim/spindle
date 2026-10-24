@@ -295,6 +295,13 @@ export interface Envelope {
   sig: Uint8Array;
 }
 
+/** The only `Envelope` wire version this package understands (DESIGN.md §A7b: "Unknown `v` ⇒
+ * reject"). A future envelope version must bump this constant; `@spindle/crypto`'s `open` rejects
+ * any `v` above it, so it cannot silently verify under v1 semantics. The domain tag remains
+ * `tags.ENVELOPE_V1` (`spindle-env-v1`) *only* if the signed preimage is unchanged: any change to
+ * the preimage requires a new domain tag as well as a bump here. */
+export const ENVELOPE_CURRENT_V = 1;
+
 const ENVELOPE_FIELDS = [
   "v",
   "alg_id",

@@ -27,9 +27,11 @@
 // `authorization_response` JWT addressed to the server, which the client never sees.
 
 import {
+  ADMIN_COMMAND_CURRENT_V,
   ADMIN_COMMAND_MIN_V,
   AdminCommand,
   AdmissionToken,
+  CAPABILITY_CURRENT_V,
   CAPABILITY_MIN_V,
   Capability,
   DeviceCertificate,
@@ -75,26 +77,31 @@ export type ArtifactErrorKind =
   | "DeviceFingerprintMismatch"
   | "UnsupportedAlgId"
   | "VersionTooLow"
+  | "VersionTooHigh"
   | "SessionKeyMismatch"
   | "HostSessionKeyMismatch"
   | "SignerFingerprintMismatch";
 
 export class ArtifactError extends Error {
   readonly kind: ArtifactErrorKind;
-  /** Set for `VersionTooLow`. */
+  /** Set for `VersionTooLow`/`VersionTooHigh`. */
   readonly found?: number;
+  /** Set for `VersionTooLow`. */
   readonly minimum?: number;
+  /** Set for `VersionTooHigh`. */
+  readonly maximum?: number;
 
   private constructor(
     kind: ArtifactErrorKind,
     message: string,
-    extra?: { found?: number; minimum?: number },
+    extra?: { found?: number; minimum?: number; maximum?: number },
   ) {
     super(message);
     this.name = "ArtifactError";
     this.kind = kind;
     this.found = extra?.found;
     this.minimum = extra?.minimum;
+    this.maximum = extra?.maximum;
   }
 
   static badSignature(): ArtifactError {
@@ -141,6 +148,13 @@ export class ArtifactError extends Error {
       "VersionTooLow",
       `artifact version ${found} is below the minimum ${minimum}`,
       { found, minimum },
+    );
+  }
+  static versionTooHigh(found: number, maximum: number): ArtifactError {
+    return new ArtifactError(
+      "VersionTooHigh",
+      `artifact version ${found} is above the known maximum ${maximum}`,
+      { found, maximum },
     );
   }
   static sessionKeyMismatch(): ArtifactError {
@@ -197,9 +211,23 @@ function absDiff(a: bigint, b: bigint): bigint {
 
 /** The version-floor check shared by `verifyCapability` and `verifyAdminCommand` — deliberately
  * the very first check either function runs (cheapest possible rejection, before any signature or
- * expiry work). Mirrors `spindle-core`'s `check_min_v`. */
+ * expiry work). Mirrors `spindle-core`'s `check_min_v`.
+ *
+ * This rejects only *deprecated* versions. DESIGN.md §A7b's "Unknown `v` ⇒ reject" is not
+ * implemented by this function alone: a signed artifact must pair it with `checkMaxV`, or a
+ * legitimately signed artifact from a future `v` would be verified against the current field
+ * layout. The floor remains necessary for a future build that raises its minimum. */
 function checkMinV(found: number, minimum: number): void {
   if (found < minimum) throw ArtifactError.versionTooLow(found, minimum);
+}
+
+/** The version-ceiling check paired with `checkMinV` for §A7b signed artifacts: an artifact whose
+ * `v` is above the only version this package understands is rejected. Deliberately runs
+ * immediately after the floor check and before any signature or expiry work — a future version may
+ * legitimately sign bytes that today's verifier would misread. Mirrors `spindle-core`'s
+ * `check_max_v`. */
+function checkMaxV(found: number, maximum: number): void {
+  if (found > maximum) throw ArtifactError.versionTooHigh(found, maximum);
 }
 
 function checkExp(now: bigint, exp: bigint): void {
@@ -305,9 +333,12 @@ export async function verifyDeviceCertificate(
  * `verifyHostOpKeyCert`'s own variants for its half of the chain).
  */
 export async function verifyCapability(cap: Capability, now: bigint, opts?: BackendOption): Promise<void> {
-  // 0. Version floor — cheapest possible rejection, checked before any signature or expiry work
-  // (DESIGN.md §A7b: "Unknown `v` ⇒ reject").
+  // 0. Version floor and ceiling — cheapest possible rejection, checked before any signature or
+  // expiry work (DESIGN.md §A7b: "Unknown `v` ⇒ reject"). The floor rejects deprecated versions;
+  // the ceiling rejects a legitimately signed artifact from a future build, which must not be
+  // verified against today's v1 field layout.
   checkMinV(cap.v, CAPABILITY_MIN_V);
+  checkMaxV(cap.v, CAPABILITY_CURRENT_V);
 
   // 1. host_fp == SHA-256(host_root_pk) — self-consistency of the capability's own fields.
   requireEd25519PublicKey(cap.host_root_pk);
@@ -434,8 +465,9 @@ export async function verifyAdmissionToken(
  * without the binding, so this API does not offer one.
  *
  * Checks run cheap-structural-before-crypto (§A6), in this order:
- * 1. Version floor — cheapest possible rejection, checked before any other work (DESIGN.md §A7b:
- *    "Unknown `v` ⇒ reject").
+ * 1. Version floor and ceiling — cheapest possible rejection, checked before any other work
+ *    (DESIGN.md §A7b: "Unknown `v` ⇒ reject"). The floor rejects deprecated versions, the ceiling
+ *    a legitimately signed artifact from a future build.
  * 2. `expectedSignerFp` matches `command.signer_fp` — the check this function exists to enforce.
  *    Both sides must be exactly 32 bytes (`fingerprintsMatch`, not bare `bytesEqual`), for the
  *    same reason `verifySessionAttestation`'s `nats_fp` binding does: `bytesEqual([], [])` is
@@ -452,9 +484,12 @@ export async function verifyAdminCommand(
   now: bigint,
   opts?: BackendOption,
 ): Promise<void> {
-  // 1. Version floor — cheapest possible rejection, checked before any signature, binding, or
-  // timestamp work (DESIGN.md §A7b: "Unknown `v` ⇒ reject").
+  // 1. Version floor and ceiling — cheapest possible rejection, checked before any signature,
+  // binding, or timestamp work (DESIGN.md §A7b: "Unknown `v` ⇒ reject"). The floor rejects
+  // deprecated versions; the ceiling rejects a legitimately signed artifact from a future build,
+  // which must not be verified against today's v1 field layout.
   checkMinV(command.v, ADMIN_COMMAND_MIN_V);
+  checkMaxV(command.v, ADMIN_COMMAND_CURRENT_V);
 
   // 2. signer_fp binding — the check this function exists to enforce (td-0bcab4's API shape).
   // Must run before the signature check: naming the wrong signer is a structural mismatch,

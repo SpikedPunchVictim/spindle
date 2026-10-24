@@ -36,6 +36,7 @@ export {
   CAPABILITY_CURRENT_V,
   ADMIN_COMMAND_MIN_V,
   ADMIN_COMMAND_CURRENT_V,
+  ENVELOPE_CURRENT_V,
 } from "./artifacts.js";
 export type { ProtoErrorKind } from "./artifacts.js";
 

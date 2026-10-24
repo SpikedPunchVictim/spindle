@@ -1,10 +1,12 @@
 use super::{
-    check_exp, check_min_v, parse_signature, parse_verifying_key, verify_host_op_key_cert,
-    ArtifactError,
+    check_exp, check_max_v, check_min_v, parse_signature, parse_verifying_key,
+    verify_host_op_key_cert, ArtifactError,
 };
 use crate::fingerprint::Fingerprint;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use spindle_proto::artifacts::{CapKind, Capability, HostOpKeyCert, CAPABILITY_MIN_V};
+use spindle_proto::artifacts::{
+    CapKind, Capability, HostOpKeyCert, CAPABILITY_CURRENT_V, CAPABILITY_MIN_V,
+};
 
 /// Issues a capability chained to the host **root** identity (DESIGN.md §A4's "host-signed,
 /// self-verifying" capability, as revised by decision A10.30, 2026-08-24).
@@ -72,9 +74,12 @@ pub fn issue_capability(
 /// rather than inventing a substitute `nbf` check (e.g. treating `cap_epoch` or `nonce` as a
 /// stand-in).
 pub fn verify_capability(cap: &Capability, now: u64) -> Result<(), ArtifactError> {
-    // 0. Version floor — cheapest possible rejection, checked before any signature or expiry
-    // work (DESIGN.md §A7b: "Unknown `v` ⇒ reject").
+    // 0. Version floor and ceiling — cheapest possible rejection, checked before any signature or
+    // expiry work (DESIGN.md §A7b: "Unknown `v` ⇒ reject"). The floor rejects deprecated versions;
+    // the ceiling rejects a legitimately signed artifact from a future build, which must not be
+    // verified against today's v1 field layout.
     check_min_v(cap.v, CAPABILITY_MIN_V)?;
+    check_max_v(cap.v, CAPABILITY_CURRENT_V)?;
 
     // 1. host_fp == SHA-256(host_root_pk) — self-consistency of the capability's own fields.
     let host_root_pk = parse_verifying_key(&cap.host_root_pk)?;
@@ -316,6 +321,60 @@ mod tests {
         );
         assert_eq!(cap.v, CAPABILITY_MIN_V);
         verify_capability(&cap, 1_500).expect("v == floor must verify");
+    }
+
+    #[test]
+    fn rejects_v_above_current_even_when_legitimately_signed() {
+        // A future build's `Capability` with `v = 2` is re-signed here with the certified
+        // operating key over the v2 signing input, so this is a *legitimately signed* artifact,
+        // not a tampered v1 one. §A7b says "Unknown `v` ⇒ reject": it must not verify under v1
+        // semantics merely because its signature happens to be valid over these bytes.
+        let host = test_host([0x11; 32], [0x12; 32], 10_000);
+        let mut cap = issue(
+            &host,
+            CapKind::Member,
+            Fingerprint::of_parts(&[b"subject"]),
+            0,
+            2_000,
+        );
+        cap.v = 2;
+        cap.sig = host
+            .op_signer
+            .sign(&cap.signing_input())
+            .to_bytes()
+            .to_vec();
+        let err = verify_capability(&cap, 1_500).unwrap_err();
+        assert_eq!(
+            err,
+            ArtifactError::VersionTooHigh {
+                found: 2,
+                maximum: CAPABILITY_CURRENT_V
+            }
+        );
+    }
+
+    #[test]
+    fn version_ceiling_fires_before_signature_check() {
+        // v above the ceiling AND a corrupted signature — the version error must win, pinning
+        // the "cheapest rejection first" ordering against a future refactor.
+        let host = test_host([0x11; 32], [0x12; 32], 10_000);
+        let mut cap = issue(
+            &host,
+            CapKind::Member,
+            Fingerprint::of_parts(&[b"subject"]),
+            0,
+            2_000,
+        );
+        cap.v = 2;
+        cap.sig[0] ^= 0xff;
+        let err = verify_capability(&cap, 1_500).unwrap_err();
+        assert_eq!(
+            err,
+            ArtifactError::VersionTooHigh {
+                found: 2,
+                maximum: CAPABILITY_CURRENT_V
+            }
+        );
     }
 
     // ---- MEASURED_MEMBER_CAP_BYTES stays honest ----

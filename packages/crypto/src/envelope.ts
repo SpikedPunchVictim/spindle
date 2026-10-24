@@ -32,7 +32,7 @@
 // depending on which side is currently sending. Both peers must call `deriveSessionKey` with the
 // *same* `(fromFp, toFp)` pair regardless of which of them is sealing or opening a given message.
 
-import { Envelope, type Envelope as EnvelopeType } from "@spindle/proto";
+import { Envelope, ENVELOPE_CURRENT_V, type Envelope as EnvelopeType } from "@spindle/proto";
 
 import { type BackendOption, ed25519Sign, ed25519Verify } from "./backend.js";
 import { aesGcmOpen, aesGcmSeal, hkdfSha256 } from "./primitives.js";
@@ -163,6 +163,7 @@ function absDiff(a: bigint, b: bigint): bigint {
 export type EnvelopeErrorKind =
   | "BadSignature"
   | "VersionTooLow"
+  | "VersionTooHigh"
   | "AlgIdTooLow"
   | "WrongRecipient"
   | "SenderRevoked"
@@ -177,16 +178,24 @@ export type EnvelopeErrorKind =
 
 export class EnvelopeError extends Error {
   readonly kind: EnvelopeErrorKind;
-  /** Set for `VersionTooLow`/`AlgIdTooLow`. */
+  /** Set for `VersionTooLow`/`VersionTooHigh`/`AlgIdTooLow`. */
   readonly actual?: number;
+  /** Set for `VersionTooLow`/`AlgIdTooLow`. */
   readonly minimum?: number;
+  /** Set for `VersionTooHigh`. */
+  readonly maximum?: number;
 
-  private constructor(kind: EnvelopeErrorKind, message: string, extra?: { actual?: number; minimum?: number }) {
+  private constructor(
+    kind: EnvelopeErrorKind,
+    message: string,
+    extra?: { actual?: number; minimum?: number; maximum?: number },
+  ) {
     super(message);
     this.name = "EnvelopeError";
     this.kind = kind;
     this.actual = extra?.actual;
     this.minimum = extra?.minimum;
+    this.maximum = extra?.maximum;
   }
 
   static badSignature(): EnvelopeError {
@@ -197,6 +206,13 @@ export class EnvelopeError extends Error {
       "VersionTooLow",
       `envelope version ${actual} is below the pinned minimum ${minimum}`,
       { actual, minimum },
+    );
+  }
+  static versionTooHigh(actual: number, maximum: number): EnvelopeError {
+    return new EnvelopeError(
+      "VersionTooHigh",
+      `envelope version ${actual} is above the known maximum ${maximum}`,
+      { actual, maximum },
     );
   }
   static algIdTooLow(actual: number, minimum: number): EnvelopeError {
@@ -318,6 +334,11 @@ export interface OpenParams extends BackendOption {
  * dropped (never given a distinguishable reply — DESIGN.md §A5/§A7). */
 export async function open(params: OpenParams, env: EnvelopeType): Promise<Uint8Array> {
   if (env.v < params.minV) throw EnvelopeError.versionTooLow(env.v, params.minV);
+  // The floor above rejects deprecated versions; this ceiling implements DESIGN.md §A7b's
+  // "Unknown `v` ⇒ reject" for a *future* version. A legitimately signed envelope from a newer
+  // build must not be verified against today's v1 preimage/field layout. Order is deliberate:
+  // below-minimum first, then above-current, both before any signature or AEAD work.
+  if (env.v > ENVELOPE_CURRENT_V) throw EnvelopeError.versionTooHigh(env.v, ENVELOPE_CURRENT_V);
   if (env.alg_id < params.minAlgId) throw EnvelopeError.algIdTooLow(env.alg_id, params.minAlgId);
 
   if (env.sig.length !== 64) throw EnvelopeError.invalidSignatureEncoding();

@@ -6,6 +6,8 @@
 
 import { describe, expect, it } from "vitest";
 
+import { ENVELOPE_CURRENT_V } from "@spindle/proto";
+
 import { ed25519PublicKeyFromSeed, x25519PublicKeyFromSeed, x25519SharedSecret } from "../src/backend.js";
 import {
   CLOCK_SKEW_SECS,
@@ -150,6 +152,70 @@ describe("MUST-check negatives (one per EnvelopeError kind)", () => {
     const env = await sealAToB(fx, 0n, 1000n);
     const params = { ...baseOpenParams(fx, 1000n), minV: 2 };
     await expect(open(params, env)).rejects.toMatchObject({ kind: "VersionTooLow", actual: 1, minimum: 2 });
+  });
+
+  it("rejects_version_zero_as_below_pinned_minimum", async () => {
+    const fx = await buildFixture();
+    // Sealed and signed at v = 0, so the signature is valid over these bytes; the floor must
+    // still reject it before any signature check.
+    const env = await seal({
+      sessionKey: fx.sessionKey,
+      signSeed: fx.devA.signSeed,
+      v: 0,
+      algId: 1,
+      fromFp: fx.devA.fp,
+      toFp: fx.devB.fp,
+      sid: fx.sid,
+      kind: 7,
+      seq: 0n,
+      ts: 1000n,
+      plaintext: new TextEncoder().encode("hello host"),
+    });
+    await expect(open(baseOpenParams(fx, 1000n), env)).rejects.toMatchObject({
+      kind: "VersionTooLow",
+      actual: 0,
+      minimum: 1,
+    });
+  });
+
+  it("rejects_version_above_known_maximum_even_when_legitimately_signed", async () => {
+    // `seal` signs `"spindle-env-v1" || canonical(header) || ciphertext` over whatever `v` the
+    // caller supplies, so this is a legitimately signed future-version envelope. §A7b says
+    // "Unknown `v` ⇒ reject": it must not be opened under v1 semantics.
+    const fx = await buildFixture();
+    const env = await seal({
+      sessionKey: fx.sessionKey,
+      signSeed: fx.devA.signSeed,
+      v: 2,
+      algId: 1,
+      fromFp: fx.devA.fp,
+      toFp: fx.devB.fp,
+      sid: fx.sid,
+      kind: 7,
+      seq: 0n,
+      ts: 1000n,
+      plaintext: new TextEncoder().encode("hello host"),
+    });
+    await expect(open(baseOpenParams(fx, 1000n), env)).rejects.toMatchObject({
+      kind: "VersionTooHigh",
+      actual: 2,
+      maximum: ENVELOPE_CURRENT_V,
+    });
+  });
+
+  it("checks the version ceiling before the signature", async () => {
+    // v above the ceiling AND a corrupted signature — the ceiling error must win, pinning the
+    // ordering "below-minimum, then above-current, then signature" against a refactor.
+    const fx = await buildFixture();
+    const env = await sealAToB(fx, 0n, 1000n);
+    env.v = 2;
+    env.sig = env.sig.slice();
+    env.sig[0] ^= 0xff;
+    await expect(open(baseOpenParams(fx, 1000n), env)).rejects.toMatchObject({
+      kind: "VersionTooHigh",
+      actual: 2,
+      maximum: ENVELOPE_CURRENT_V,
+    });
   });
 
   it("rejects_alg_id_below_pinned_minimum", async () => {

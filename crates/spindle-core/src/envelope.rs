@@ -41,7 +41,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use spindle_proto::artifacts::Envelope;
+use spindle_proto::artifacts::{Envelope, ENVELOPE_CURRENT_V};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -161,6 +161,8 @@ pub enum EnvelopeError {
     BadSignature,
     #[error("envelope version {actual} is below the pinned minimum {minimum}")]
     VersionTooLow { actual: u8, minimum: u8 },
+    #[error("envelope version {actual} is above the known maximum {maximum}")]
+    VersionTooHigh { actual: u8, maximum: u8 },
     #[error("envelope alg_id {actual} is below the pinned minimum {minimum}")]
     AlgIdTooLow { actual: u8, minimum: u8 },
     #[error("to_fp does not match this device (self)")]
@@ -277,6 +279,16 @@ pub fn open(params: OpenParams<'_>, env: &Envelope) -> Result<Vec<u8>, EnvelopeE
         return Err(EnvelopeError::VersionTooLow {
             actual: env.v,
             minimum: params.min_v,
+        });
+    }
+    // The floor above rejects deprecated versions; this ceiling implements DESIGN.md §A7b's
+    // "Unknown `v` ⇒ reject" for a *future* version. A legitimately signed envelope from a newer
+    // build must not be verified against today's v1 preimage/field layout. Order is deliberate:
+    // below-minimum first, then above-current, both before any signature or AEAD work.
+    if env.v > ENVELOPE_CURRENT_V {
+        return Err(EnvelopeError::VersionTooHigh {
+            actual: env.v,
+            maximum: ENVELOPE_CURRENT_V,
         });
     }
     if env.alg_id < params.min_alg_id {
@@ -505,6 +517,83 @@ mod tests {
             EnvelopeError::VersionTooLow {
                 actual: 1,
                 minimum: 2
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_version_zero_as_below_pinned_minimum() {
+        let fx = build_fixture();
+        // Sealed and signed at v = 0, so the signature is valid over these bytes; the floor must
+        // still reject it before any signature check.
+        let env = seal(SealParams {
+            session_key: &fx.session_key,
+            signer: &fx.dev_a,
+            v: 0,
+            alg_id: 1,
+            from_fp: fx.dev_a_fp,
+            to_fp: fx.dev_b_fp,
+            sid: fx.sid.clone(),
+            kind: 7,
+            seq: 0,
+            ts: 1_000,
+            eph_pk: None,
+            plaintext: b"hello host",
+        });
+        let err = open(base_open_params(&fx, 1_000), &env).unwrap_err();
+        assert_eq!(
+            err,
+            EnvelopeError::VersionTooLow {
+                actual: 0,
+                minimum: 1
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_version_above_known_maximum_even_when_legitimately_signed() {
+        // `seal` signs `"spindle-env-v1" || canonical(header) || ciphertext` over whatever `v`
+        // the caller supplies, so this is a legitimately signed future-version envelope. §A7b
+        // says "Unknown `v` ⇒ reject": it must not be opened under v1 semantics.
+        let fx = build_fixture();
+        let env = seal(SealParams {
+            session_key: &fx.session_key,
+            signer: &fx.dev_a,
+            v: 2,
+            alg_id: 1,
+            from_fp: fx.dev_a_fp,
+            to_fp: fx.dev_b_fp,
+            sid: fx.sid.clone(),
+            kind: 7,
+            seq: 0,
+            ts: 1_000,
+            eph_pk: None,
+            plaintext: b"hello host",
+        });
+        let err = open(base_open_params(&fx, 1_000), &env).unwrap_err();
+        assert_eq!(
+            err,
+            EnvelopeError::VersionTooHigh {
+                actual: 2,
+                maximum: ENVELOPE_CURRENT_V
+            }
+        );
+    }
+
+    #[test]
+    fn version_ceiling_fires_before_signature_check() {
+        // v above the ceiling AND a corrupted signature — the ceiling error must win, pinning
+        // the ordering "below-minimum, then above-current, then signature" against a refactor.
+        let fx = build_fixture();
+        let mut env = seal_a_to_b(&fx, 0, 1_000);
+        env.v = 2;
+        env.sig[0] ^= 0xff;
+        let err = open(base_open_params(&fx, 1_000), &env).unwrap_err();
+        assert_eq!(
+            err,
+            EnvelopeError::VersionTooHigh {
+                actual: 2,
+                maximum: ENVELOPE_CURRENT_V
             }
         );
     }

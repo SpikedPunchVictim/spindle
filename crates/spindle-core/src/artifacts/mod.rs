@@ -105,6 +105,15 @@ pub enum ArtifactError {
     /// [`crate::envelope::EnvelopeError::VersionTooLow`]'s ordering.
     #[error("artifact version {found} is below the minimum {minimum}")]
     VersionTooLow { found: u8, minimum: u8 },
+    /// [`capability::verify_capability`] / [`admin_command::verify_admin_command`] (DESIGN.md
+    /// §A7b: "Unknown `v` ⇒ reject"): the artifact's own `v` field is *above* the version this
+    /// build understands (`CAPABILITY_CURRENT_V` / `ADMIN_COMMAND_CURRENT_V`). The floor alone
+    /// cannot implement §A7b — a legitimately signed artifact from a future build would pass a
+    /// floor check and then be verified against today's field layout, which is exactly the
+    /// confusion the version byte exists to prevent. Checked first, paired with
+    /// [`ArtifactError::VersionTooLow`], before any signature or expiry work.
+    #[error("artifact version {found} is above the known maximum {maximum}")]
+    VersionTooHigh { found: u8, maximum: u8 },
     /// [`session_attest::verify_session_attestation`] (td-0bcab4, DESIGN.md §A4 step 2): the
     /// attestation names a different session key than the one presenting it. This is plainly the
     /// check whose absence made `{root_pk, device_cert, caps}` a bearer bundle: `DeviceCertificate`
@@ -144,9 +153,27 @@ pub enum ArtifactError {
 /// The version-floor check shared by [`capability::verify_capability`] and
 /// [`admin_command::verify_admin_command`] — deliberately the very first check either function
 /// runs (cheapest possible rejection, before any signature or expiry work).
+///
+/// This rejects only *deprecated* versions. DESIGN.md §A7b's "Unknown `v` ⇒ reject" is not
+/// implemented by this function alone: a signed artifact must pair it with [`check_max_v`], or a
+/// legitimately signed artifact from a future `v` would be verified against the current field
+/// layout. The floor remains necessary for a future build that raises its minimum, so the two
+/// checks are complements, not alternatives.
 pub(crate) fn check_min_v(found: u8, minimum: u8) -> Result<(), ArtifactError> {
     if found < minimum {
         return Err(ArtifactError::VersionTooLow { found, minimum });
+    }
+    Ok(())
+}
+
+/// The version-ceiling check paired with [`check_min_v`] for §A7b signed artifacts: an artifact
+/// whose `v` is above the only version this build understands is rejected. Deliberately runs
+/// immediately after the floor check and before any signature or expiry work — a future version
+/// may legitimately sign bytes that today's verifier would misread, so the version gate must fire
+/// first (cheapest possible rejection, and the reason this exists at all).
+pub(crate) fn check_max_v(found: u8, maximum: u8) -> Result<(), ArtifactError> {
+    if found > maximum {
+        return Err(ArtifactError::VersionTooHigh { found, maximum });
     }
     Ok(())
 }

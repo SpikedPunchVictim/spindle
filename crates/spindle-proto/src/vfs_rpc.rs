@@ -56,6 +56,11 @@ use crate::canonical::{canonical_decode, canonical_encode, CborValue};
 /// Minimum protocol version this schema's server-side implementations accept (DESIGN.md §A8:
 /// "peers negotiate the highest common version with no downgrade below each side's minimum").
 /// `spindle-host-core` checks incoming [`VfsRequestEnvelope::v`] against this constant.
+///
+/// This is an **unsigned transport envelope** and its version check is deliberately floor-only —
+/// accepting a higher version from a newer client is a wire-compatibility policy, not an unknown-
+/// version rejection. Unlike this, the signed artifacts (`Envelope`, `Capability`, `AdminCommand`)
+/// also reject unknown future versions per DESIGN.md §A7b.
 pub const MIN_PROTOCOL_VERSION: u8 = 1;
 /// The protocol version this schema currently implements/produces.
 pub const CURRENT_PROTOCOL_VERSION: u8 = 1;
