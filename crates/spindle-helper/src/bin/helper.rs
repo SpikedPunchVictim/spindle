@@ -33,6 +33,15 @@
 //!   of `registry.*` request/reply remains later work. Optional: if `APP_CONN_SEED` is unset, this
 //!   binary logs a warning per degraded feature and runs with the callout connection only.
 //!
+//! # Reply-inbox check for the three app-account request/reply subjects
+//! NATS authorizes the **PUB subject**, not the reply field (measured in td-fc5a30: `nats-server`
+//! does not refuse a foreign `msg.reply`), so `helper.turn.get.*`, `helper.presence.get.*`, and
+//! `helper.revoke.*` each validate `msg.reply` against the caller's granted
+//! `_INBOX_<device_fp>.` inbox via `spindle_helper::session::reply_belongs_to_caller` before
+//! publishing. A mismatched reply is dropped with a `tracing::warn!` and no publish. The
+//! `$SYS.REQ.USER.AUTH` callout reply is the server-issued correlation inbox (the requester is
+//! `nats-server`, not a member) and is the documented out-of-scope exception.
+//!
 //! # Presence (DESIGN.md §A3/§A6, subject parametrized in v0.9.8 the same way `helper.turn.get`
 //! was in v0.9.7)
 //! A dedicated `sys_client` (genuine SYS-account connection — see `sys_conn_seed`'s doc comment
@@ -95,7 +104,7 @@ use spindle_helper::pg_store::PgStore;
 use spindle_helper::presence;
 use spindle_helper::revoke;
 use spindle_helper::self_revoke;
-use spindle_helper::session::SessionRecord;
+use spindle_helper::session::{self, SessionRecord};
 use spindle_helper::turn::{self, TurnConfig};
 use std::env;
 use std::process::ExitCode;
@@ -814,6 +823,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     }
                 };
                 if let Some(resp) = resp {
+                    // Validation is out of scope here: this reply is the server-issued `$SYS` correlation inbox for nats-server itself, not a member (td-bc9490's documented exception).
                     if let Err(e) = callout_client.publish(reply, resp.into()).await {
                         tracing::error!(error = %e, "failed to publish callout response");
                     }
@@ -836,7 +846,19 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     &mut store,
                     now_secs(),
                 );
-                if let Some(client) = &app_client {
+                if !session::reply_belongs_to_caller(
+                    reply.as_str(),
+                    msg.subject.as_str(),
+                    "helper.turn.get.",
+                    &mut store,
+                    now_secs(),
+                ) {
+                    tracing::warn!(
+                        nfp = %redacted_subject_token(msg.subject.as_str(), "helper.turn.get."),
+                        "dropping helper.turn.get.<nfp> reply: msg.reply is not the caller's \
+                         granted inbox"
+                    );
+                } else if let Some(client) = &app_client {
                     if let Err(e) = client.publish(reply, reply_payload.into()).await {
                         tracing::error!(error = %e, "failed to publish helper.turn.get.<nfp> response");
                     }
@@ -858,7 +880,22 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     &presence_map,
                     now_secs(),
                 );
-                if let Some(client) = &app_client {
+                if !session::reply_belongs_to_caller(
+                    reply.as_str(),
+                    msg.subject.as_str(),
+                    "helper.presence.get.",
+                    &mut store,
+                    now_secs(),
+                ) {
+                    tracing::warn!(
+                        nfp = %redacted_subject_token(
+                            msg.subject.as_str(),
+                            "helper.presence.get.",
+                        ),
+                        "dropping helper.presence.get.<nfp> reply: msg.reply is not the caller's \
+                         granted inbox"
+                    );
+                } else if let Some(client) = &app_client {
                     if let Err(e) = client.publish(reply, reply_payload.into()).await {
                         tracing::error!(error = %e, "failed to publish helper.presence.get.<nfp> response");
                     }
@@ -970,12 +1007,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 // Log an identifier from the subject token, never any payload bytes and never
                 // an endpoint; `redacted()` keeps it to a prefix like every other id in this
                 // file's log lines (a malformed subject has no fingerprint to redact).
-                let nfp = msg
-                    .subject
-                    .strip_prefix("helper.revoke.")
-                    .and_then(|token| token.parse::<spindle_core::Fingerprint>().ok())
-                    .map(|fp| fp.redacted().to_string())
-                    .unwrap_or_else(|| "<malformed subject>".to_string());
+                let nfp = redacted_subject_token(msg.subject.as_str(), "helper.revoke.");
                 match serde_json::from_slice::<self_revoke::SelfRevokeReply>(&reply_payload) {
                     Ok(outcome) if outcome.ok => {
                         tracing::info!(
@@ -1035,7 +1067,21 @@ async fn run(config: Config) -> anyhow::Result<()> {
                         );
                     }
                 }
-                if let Some(client) = &app_client {
+                if !session::reply_belongs_to_caller(
+                    reply.as_str(),
+                    msg.subject.as_str(),
+                    "helper.revoke.",
+                    &mut store,
+                    now_secs(),
+                ) {
+                    // The deposit has already been applied and its live sessions kicked above;
+                    // only the reply publish is skipped here.
+                    tracing::warn!(
+                        nfp = %nfp,
+                        "dropping helper.revoke.<nfp> reply: msg.reply is not the caller's \
+                         granted inbox"
+                    );
+                } else if let Some(client) = &app_client {
                     if let Err(e) = client.publish(reply, reply_payload.into()).await {
                         tracing::error!(error = %e, "failed to publish helper.revoke.<nfp> response");
                     }
@@ -1772,6 +1818,16 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+/// A redacted identifier derived from a parametrized subject's final token, for log lines about a
+/// dropped reply. Never any payload bytes; a malformed subject has no fingerprint to redact.
+fn redacted_subject_token(subject: &str, prefix: &str) -> String {
+    subject
+        .strip_prefix(prefix)
+        .and_then(|token| token.parse::<spindle_core::Fingerprint>().ok())
+        .map(|fp| fp.redacted().to_string())
+        .unwrap_or_else(|| "<malformed subject>".to_string())
 }
 
 /// A non-cryptographic per-call jitter source (`permissions::Limits` jitters `exp` into a
