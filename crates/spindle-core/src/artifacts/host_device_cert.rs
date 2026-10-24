@@ -2,7 +2,7 @@ use super::{
     check_exp, parse_signature, parse_verifying_key, verify_host_op_key_cert, ArtifactError,
 };
 use crate::fingerprint::Fingerprint;
-use crate::identity::{self, device_fp_of};
+use crate::identity::{self, device_fp_of, root_fp_of};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use spindle_proto::artifacts::{HostDeviceCert, HostOpKeyCert};
 use x25519_dalek::PublicKey as X25519PublicKey;
@@ -105,7 +105,7 @@ pub fn verify_host_device_cert(
 
     // 5. host_fp is self-consistent with the embedded host_root_pk.
     let host_root_pk = parse_verifying_key(&cert.host_root_pk)?;
-    let recomputed_host_fp = Fingerprint::of_parts(&[host_root_pk.as_bytes()]);
+    let recomputed_host_fp = root_fp_of(&host_root_pk);
     if !recomputed_host_fp.matches(&cert.host_fp) {
         return Err(ArtifactError::HostFingerprintMismatch);
     }

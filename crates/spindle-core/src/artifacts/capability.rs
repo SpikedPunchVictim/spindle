@@ -3,6 +3,7 @@ use super::{
     verify_host_op_key_cert, ArtifactError,
 };
 use crate::fingerprint::Fingerprint;
+use crate::identity::root_fp_of;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use spindle_proto::artifacts::{
     CapKind, Capability, HostOpKeyCert, CAPABILITY_CURRENT_V, CAPABILITY_MIN_V,
@@ -34,7 +35,7 @@ pub fn issue_capability(
     exp: u64,
     nonce: Vec<u8>,
 ) -> Capability {
-    let host_fp = Fingerprint::of_parts(&[host_root_pk.as_bytes()]);
+    let host_fp = root_fp_of(host_root_pk);
     let mut cap = Capability {
         v: 1,
         host_fp: host_fp.to_vec(),
@@ -83,7 +84,7 @@ pub fn verify_capability(cap: &Capability, now: u64) -> Result<(), ArtifactError
 
     // 1. host_fp == SHA-256(host_root_pk) — self-consistency of the capability's own fields.
     let host_root_pk = parse_verifying_key(&cap.host_root_pk)?;
-    let expected_fp = Fingerprint::of_parts(&[host_root_pk.as_bytes()]);
+    let expected_fp = root_fp_of(&host_root_pk);
     if !expected_fp.matches(&cap.host_fp) {
         return Err(ArtifactError::HostFingerprintMismatch);
     }
