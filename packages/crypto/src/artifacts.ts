@@ -476,7 +476,15 @@ export async function verifyAdmissionToken(
  *    `expectedSignerFp`.
  * 3. `operatorPk` parses as a valid Ed25519 public key, and `sig` verifies over
  *    `AdminCommand.signingInput(command)`.
- * 4. Clock skew (`ts` ±2 min). */
+ * 4. Clock skew (`ts` ±2 min).
+ *
+ * # No production caller yet
+ *
+ * Every call site of this verifier today is `test/vectors.test.ts`; nothing in production decodes
+ * an `AdminCommand` and acts on it. The caller lands with Stage 9's admin library + CLI
+ * (`@spindle/admin` and `packages/admin-cli` are header-only stubs today). The verifier is built
+ * and tested ahead of that consumer, as this package's other artifacts were — expected, not a
+ * defect (td-f6edb4). */
 export async function verifyAdminCommand(
   command: AdminCommand,
   operatorPk: Uint8Array,

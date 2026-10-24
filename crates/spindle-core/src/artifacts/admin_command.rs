@@ -8,6 +8,12 @@ use spindle_proto::canonical::CborValue;
 pub const ADMIN_COMMAND_CLOCK_SKEW_SECS: u64 = 120;
 
 /// Issues an admin command signed by the operator admission key (DESIGN.md §A3b/§A7b).
+///
+/// # No production caller yet
+///
+/// Only this module's tests and the `gen_crypto_vectors` generator call this today; nothing in
+/// production mints an `AdminCommand`. The producer lands with Stage 9's admin library + CLI,
+/// alongside [`verify_admin_command`]. Expected, not a defect (td-f6edb4).
 #[allow(clippy::too_many_arguments)]
 pub fn issue_admin_command(
     operator: &SigningKey,
@@ -58,6 +64,14 @@ pub fn issue_admin_command(
 /// 4. Clock skew (`ts` ±2 min) — cheaper than the signature check above, but ordered last here
 ///    (unchanged from before this fix) since the signed preimage must already be trusted before
 ///    its own `ts` is worth inspecting.
+///
+/// # No production caller yet
+///
+/// Every call site of this verifier today is a unit test, the `gen_crypto_vectors` vector
+/// generator, or `tests/vectors.rs`; nothing in production decodes an `AdminCommand` and acts on
+/// it. The caller lands with Stage 9's admin library + CLI (`packages/admin` and
+/// `packages/admin-cli` are header-only stubs today). The verifier is built and tested ahead of
+/// that consumer, as this crate's other artifacts were — expected, not a defect (td-f6edb4).
 pub fn verify_admin_command(
     command: &AdminCommand,
     operator_pk: &VerifyingKey,
