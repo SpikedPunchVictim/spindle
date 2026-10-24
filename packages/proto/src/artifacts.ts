@@ -197,6 +197,16 @@ export class MapReader {
     return Number(v);
   }
 
+  /** Like {@link optionalU32}, for a `u8`-range field. `undefined` only when the key is genuinely
+   * absent; a present-but-wrong-type value still throws. Mirrors Rust's `MapReader::optional_u8`. */
+  optionalU8(key: string): number | undefined {
+    const v = this.get(key);
+    if (v === undefined) return undefined;
+    if (v.kind !== "uint") throw ProtoError.wrongType(key);
+    if (v.value > 0xffn) throw ProtoError.intOutOfRange(key);
+    return Number(v.value);
+  }
+
   u16(key: string): number {
     const v = this.u64(key);
     if (v > 0xffffn) throw ProtoError.intOutOfRange(key);

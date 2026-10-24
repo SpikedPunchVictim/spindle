@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 
 import { CAPABILITY_CURRENT_V, CapKind, Capability, ProtoError } from "../src/artifacts.js";
 import {
+  ALG_ID_V1,
   BUNDLE_ENTRY_FIELDS,
   BUNDLE_FIELDS,
   BundleEntry,
@@ -68,6 +69,7 @@ function sampleCapability(seed: number): Capability {
 
 function sampleEntry(seed: number): BundleEntry {
   return {
+    alg_id: ALG_ID_V1,
     sign_pk: new Uint8Array(32).fill(seed + 0x10),
     agree_pk: new Uint8Array(32).fill(seed + 0x20),
     member_cap: sampleCapability(seed),
@@ -103,7 +105,7 @@ describe("canonical key order", () => {
     expect(keys).toEqual(["v", "entries", "registry"]);
   });
 
-  it("entry-level keys emit as sign_pk, agree_pk, member_cap", () => {
+  it("entry-level keys emit as alg_id, sign_pk, agree_pk, member_cap", () => {
     const entry = sampleEntry(0);
     const cbor = BundleEntry.toCbor(entry);
     const bytes = canonicalEncode(cbor);
@@ -113,7 +115,28 @@ describe("canonical key order", () => {
       if (k.kind !== "text") throw new Error("expected a text key");
       return k.value;
     });
-    expect(keys).toEqual(["sign_pk", "agree_pk", "member_cap"]);
+    expect(keys).toEqual(["alg_id", "sign_pk", "agree_pk", "member_cap"]);
+  });
+
+  it("round-trips alg_id, including a non-v1 value", () => {
+    // td-4f520f: the encoder always emits alg_id; the wire type carries any u8 (rejection of
+    // non-v1 is verification's job, in @spindle/crypto).
+    const entry = sampleEntry(0);
+    const decoded = BundleEntry.fromCbor(BundleEntry.toCbor(entry));
+    expect(decoded.alg_id).toBe(ALG_ID_V1);
+
+    const nonV1: BundleEntry = { ...entry, alg_id: 2 };
+    expect(BundleEntry.fromCbor(BundleEntry.toCbor(nonV1)).alg_id).toBe(2);
+  });
+
+  it("decodes an entry without alg_id as ALG_ID_V1", () => {
+    // WIRE COMPATIBILITY: every pre-v2 bundle has no alg_id key and must keep decoding.
+    const withoutAlgId = CborValue.map([
+      ["sign_pk", CborValue.bytes(new Uint8Array(32).fill(0x10))],
+      ["agree_pk", CborValue.bytes(new Uint8Array(32).fill(0x11))],
+      ["member_cap", Capability.toCbor(sampleCapability(0))],
+    ]);
+    expect(BundleEntry.fromCbor(withoutAlgId).alg_id).toBe(ALG_ID_V1);
   });
 });
 
@@ -123,10 +146,10 @@ describe("canonical key order", () => {
 // assertion plus the "extra host_fp key rejected" test below are exactly that pair.
 // ------------------------------------------------------------------------------------------------
 describe("neuter verification: no carried host_fp", () => {
-  it("BUNDLE_ENTRY_FIELDS is exactly [sign_pk, agree_pk, member_cap]", () => {
+  it("BUNDLE_ENTRY_FIELDS is exactly [alg_id, sign_pk, agree_pk, member_cap]", () => {
     // Adding a `host_fp` field to `BundleEntry` (instead of deriving it downstream) would change
     // this constant immediately, breaking this assertion before any decode-side test even runs.
-    expect(BUNDLE_ENTRY_FIELDS).toEqual(["sign_pk", "agree_pk", "member_cap"]);
+    expect(BUNDLE_ENTRY_FIELDS).toEqual(["alg_id", "sign_pk", "agree_pk", "member_cap"]);
   });
 
   it("rejects an entry map carrying an extra host_fp key", () => {

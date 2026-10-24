@@ -10,7 +10,8 @@
 // carried ... so no field of an entry can disagree with another"):
 // - `hostFp = SHA-256(memberCap.host_root_pk)` — the same check `verifyCapability`'s step 1
 //   already performs.
-// - `hostDeviceFp = deviceFpOf(ALG_ID_V1, sign_pk, agree_pk)`.
+// - `hostDeviceFp = deviceFpOf(alg_id, sign_pk, agree_pk)`, with any `alg_id` other than
+//   `ALG_ID_V1` rejected explicitly before derivation.
 //
 // Unlike its Rust twin (which is synchronous throughout), every exported function here is
 // `async`: deriving a fingerprint goes through this package's promise-based crypto backend
@@ -18,6 +19,7 @@
 // `verifyCapability` and friends in `artifacts.ts` are `async`.
 
 import {
+  ALG_ID_V1,
   BUNDLE_CURRENT_V,
   BUNDLE_MIN_V,
   BundleEntry,
@@ -34,16 +36,15 @@ import { ed25519 } from "@noble/curves/ed25519.js";
 import { ArtifactError, verifyCapability } from "./artifacts.js";
 import { deviceFpOf, rootFpOf } from "./fingerprint.js";
 
-/** The `alg_id` suite version byte (DESIGN.md §A4): `1` = Ed25519 / X25519 / AES-256-GCM. Mirrors
- * `spindle-core::identity::ALG_ID_V1` and `artifacts.ts`'s own (unexported) constant of the same
- * name and value — duplicated here rather than imported because `artifacts.ts` does not export
- * it. */
-const ALG_ID_V1 = 1;
+// The `alg_id` suite version byte (DESIGN.md §A4): `1` = Ed25519 / X25519 / AES-256-GCM.
+// `ALG_ID_V1` is imported from `@spindle/proto` (the wire crate's authoritative default and the
+// value a decoded v1 entry is assigned), not re-declared — `spindle-core::identity::ALG_ID_V1`
+// is the Rust twin's source of truth.
 
 /** `pk.length === 32` AND `pk` decodes as a canonically-encoded, valid Ed25519 curve point (RFC
  * 8032 §5.1.3) — the same check `artifacts.ts`'s `requireEd25519PublicKey` applies to Ed25519
  * fields there. Duplicated here rather than imported because `artifacts.ts` does not export its
- * own copy (see this module's other duplicated constant, `ALG_ID_V1`, for the same convention).
+ * own copy.
  *
  * td-b8c68a: this host's envelope sign key is Ed25519, so it gets the canonicality check;
  * `requireX25519PublicKeyLen` below (for `agree_pk`) deliberately does not. */
@@ -267,7 +268,7 @@ export class BundleError extends Error {
  * `MEASURED_ENTRY_BYTES` (the Rust crate).** That constant is documentation for
  * DESIGN.md:328-329's "4 hosts at EC level M, 5 at level L" figures only — it is not a lower bound
  * this function is allowed to trust. A future artifact (e.g. a larger op-cert chain, or a second
- * cap embedded per entry) could grow a single entry's encoding well past 530 B; measuring the real
+ * cap embedded per entry) could grow a single entry's encoding well past 529 B; measuring the real
  * bytes here means such a change is caught by this check automatically, rather than silently
  * producing a bundle that fails to scan once printed.
  *
@@ -366,7 +367,8 @@ export interface VerifiedBundleEntry {
   /** `SHA-256(memberCap.host_root_pk)` — derived, and only reachable after `verifyCapability` has
    * already confirmed this equals `memberCap.host_fp`. */
   hostFp: Uint8Array;
-  /** `deviceFpOf(ALG_ID_V1, signPk, agreePk)` — this host's envelope identity. */
+  /** `deviceFpOf(algId, signPk, agreePk)` — this host's envelope identity. Only `algId ===
+   * ALG_ID_V1` reaches here, so this is always the v1 derivation in practice. */
   hostDeviceFp: Uint8Array;
   /** The host's envelope Ed25519 verifying key. */
   signPk: Uint8Array;
@@ -388,21 +390,30 @@ export interface VerifiedBundle {
  * 0. `BUNDLE_MIN_V` floor on `bundle.v` — once, before touching any entry.
  * 1. `bundle.entries.length <= MAX_BUNDLE_ENTRIES`.
  * 2. Per entry, in order:
- *    - a. `sign_pk`/`agree_pk` are each exactly 32 bytes (the same length-only idiom
+ *    - a. `entry.alg_id === ALG_ID_V1` — rejected before any key parsing, mirroring
+ *      `verifyDeviceCertificate`'s "nothing else can be interpreted if it's wrong" ordering.
+ *    - b. `sign_pk`/`agree_pk` are each exactly 32 bytes (the same length-only idiom
  *      `verifyHostDeviceCert` in `artifacts.ts` uses for the same two fields).
- *    - b. `hostDeviceFp = deviceFpOf(ALG_ID_V1, sign_pk, agree_pk)`.
- *    - c. `verifyCapability` — this is the step this bundle's acceptance criterion names; it
+ *    - c. `hostDeviceFp = deviceFpOf(entry.alg_id, sign_pk, agree_pk)`.
+ *    - d. `verifyCapability` — this is the step this bundle's acceptance criterion names; it
  *      already enforces `host_fp === SHA-256(host_root_pk)`.
- *    - d. `hostFp = member_cap.host_fp` — safe only after (c) has already proven
+ *    - e. `hostFp = member_cap.host_fp` — safe only after (d) has already proven
  *      `member_cap.host_fp` is exactly 32 bytes and self-consistent (a successful
  *      `verifyCapability` call cannot return unless the two already compared byte-equal).
  *
  *    Any per-entry failure surfaces as `BundleError.entry`, carrying that entry's index.
  *
- * **`ALG_ID_V1` is assumed, not read from the wire**: `deviceFpOf` takes an `algId` parameter, but
- * `BundleEntry` carries no `alg_id` field for the host's envelope keys. This is the same
- * assumption `crates/spindle-host-core/src/authorize.rs:652` already makes for the devices
- * table's own `device_fp_of` call — tracked for both call sites by open ticket td-6c01e3. */
+ * **`alg_id` is carried and checked, not assumed (td-4f520f)**: `BundleEntry` has an `alg_id`
+ * field, decoded as `ALG_ID_V1` when a pre-v2 bundle omits it. Step (a) rejects every other value
+ * with `ArtifactError.unsupportedAlgId()`, so an entry naming a suite this package cannot
+ * interpret fails explicitly instead of being hashed (and thereby silently mis-verified) as v1.
+ * This mirrors the Rust twin and closes the second instance of the class td-6c01e3 fixed for the
+ * devices table.
+ *
+ * Carrying `alg_id` does **not** let a second algorithm verify: `deviceFpOf`'s key types pin
+ * Ed25519/X25519, so hashing `alg_id = 2` while still parsing the bytes as Ed25519 would only
+ * manufacture a matching hash for an entry nobody here can verify. The field's deliverable is the
+ * explicit rejection above. */
 export async function verifyBootstrapBundle(
   bundle: DeviceBootstrapBundle,
   now: bigint,
@@ -460,18 +471,23 @@ function cloneCapability(cap: Capability): Capability {
 /** One entry's worth of step 2 in `verifyBootstrapBundle`'s doc comment — pulled out so the loop
  * above can attach the entry's index to whichever `ArtifactError` this produces. */
 async function verifyBundleEntry(entry: BundleEntry, now: bigint): Promise<VerifiedBundleEntry> {
-  // a. sign_pk (Ed25519, canonicality-checked) / agree_pk (X25519, length-only) — same split as
+  // a. Reject an unsupported algorithm suite before parsing anything. Deliberately explicit:
+  // without this, an entry carrying `alg_id = 2` would fall through and be hashed as v1 below.
+  if (entry.alg_id !== ALG_ID_V1) throw ArtifactError.unsupportedAlgId();
+
+  // b. sign_pk (Ed25519, canonicality-checked) / agree_pk (X25519, length-only) — same split as
   // `verifyHostDeviceCert` in artifacts.ts.
   requireEd25519PublicKey(entry.sign_pk);
   requireX25519PublicKeyLen(entry.agree_pk);
 
-  // b. Derive this host's device fingerprint.
-  const hostDeviceFp = await deviceFpOf(ALG_ID_V1, entry.sign_pk, entry.agree_pk);
+  // c. Derive this host's device fingerprint from the entry's carried suite id (equal to v1 by the
+  // check above — not a path to a second algorithm; see `verifyBootstrapBundle`'s doc comment).
+  const hostDeviceFp = await deviceFpOf(entry.alg_id, entry.sign_pk, entry.agree_pk);
 
-  // c. Verify the nested capability — already enforces host_fp === SHA-256(host_root_pk).
+  // d. Verify the nested capability — already enforces host_fp === SHA-256(host_root_pk).
   await verifyCapability(entry.member_cap, now);
 
-  // d. hostFp — safe only now that (c) has proven member_cap.host_fp is exactly 32 bytes and
+  // e. hostFp — safe only now that (d) has proven member_cap.host_fp is exactly 32 bytes and
   // self-consistent with host_root_pk. Copied (not aliased) below, along with every other
   // returned field — see `cloneCapability`'s doc comment for why this package must do explicitly
   // what Rust gets for free from ownership.

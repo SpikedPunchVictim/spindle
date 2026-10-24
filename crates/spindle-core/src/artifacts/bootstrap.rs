@@ -9,7 +9,8 @@
 //! carried ... so no field of an entry can disagree with another"):
 //! - `host_fp = SHA-256(member_cap.host_root_pk)` — the same check [`super::verify_capability`]'s
 //!   step 1 already performs.
-//! - `host_device_fp = device_fp_of(ALG_ID_V1, sign_pk, agree_pk)`.
+//! - `host_device_fp = device_fp_of(alg_id, sign_pk, agree_pk)`, with `alg_id` carried on the
+//!   entry and any value other than `ALG_ID_V1` rejected explicitly.
 
 use super::{parse_verifying_key, ArtifactError};
 use crate::fingerprint::Fingerprint;
@@ -138,7 +139,7 @@ pub enum BundleError {
 /// [`spindle_proto::bootstrap::MEASURED_ENTRY_BYTES`].** That constant is documentation for
 /// DESIGN.md :328-329's "4 hosts at EC level M, 5 at level L" figures only — it is not a lower
 /// bound this function is allowed to trust. A future artifact (e.g. a larger op-cert chain, or a
-/// second cap embedded per entry) could grow a single entry's encoding well past 521 B; measuring
+/// second cap embedded per entry) could grow a single entry's encoding well past 529 B; measuring
 /// the real bytes here means such a change is caught by this check automatically, rather than
 /// silently producing a bundle that fails to scan once printed.
 ///
@@ -266,7 +267,8 @@ pub struct VerifiedBundleEntry {
     /// `SHA-256(member_cap.host_root_pk)` — derived, and only reachable after
     /// [`super::verify_capability`] has already confirmed this equals `member_cap.host_fp`.
     pub host_fp: Fingerprint,
-    /// `device_fp_of(ALG_ID_V1, sign_pk, agree_pk)` — this host's envelope identity.
+    /// `device_fp_of(alg_id, sign_pk, agree_pk)` — this host's envelope identity. Only `alg_id ==
+    /// ALG_ID_V1` reaches here, so this is always the v1 derivation in practice.
     pub host_device_fp: Fingerprint,
     /// The host's envelope Ed25519 verifying key.
     pub sign_pk: VerifyingKey,
@@ -290,32 +292,32 @@ pub struct VerifiedBundle {
 /// 0. [`BUNDLE_MIN_V`] floor on `bundle.v` — once, before touching any entry.
 /// 1. `bundle.entries.len() <= `[`MAX_BUNDLE_ENTRIES`].
 /// 2. Per entry, in order:
-///    - a. `sign_pk` parses as Ed25519 ([`super::parse_verifying_key`]); `agree_pk` parses as a
+///    - a. `entry.alg_id` is [`identity::ALG_ID_V1`] — rejected before any key parsing, mirroring
+///      `verify_device_certificate`'s "nothing else can be interpreted if it's wrong" ordering.
+///    - b. `sign_pk` parses as Ed25519 ([`super::parse_verifying_key`]); `agree_pk` parses as a
 ///      32-byte X25519 key (the exact idiom `host_device_cert.rs` uses for the same two fields).
-///    - b. `host_device_fp = device_fp_of(ALG_ID_V1, sign_pk, agree_pk)`.
-///    - c. [`super::verify_capability`] — this is the step this bundle's acceptance criterion
+///    - c. `host_device_fp = device_fp_of(entry.alg_id, sign_pk, agree_pk)`.
+///    - d. [`super::verify_capability`] — this is the step this bundle's acceptance criterion
 ///      names; it already enforces `host_fp == SHA-256(host_root_pk)`.
-///    - d. `host_fp = Fingerprint::from_slice(member_cap.host_fp)` — safe only after (c) has
+///    - e. `host_fp = Fingerprint::from_slice(member_cap.host_fp)` — safe only after (d) has
 ///      already proven `member_cap.host_fp` is exactly 32 bytes and self-consistent.
 ///
 ///    Any per-entry failure surfaces as [`BundleError::Entry`], carrying that entry's index.
 ///
-/// **`ALG_ID_V1` is assumed, not read from the wire**: [`device_fp_of`] takes an `alg_id`
-/// parameter, but [`BundleEntry`] carries no `alg_id` field for the host's envelope keys, so this
-/// call site still hashes the constant rather than a carried value. The devices table's own
-/// `device_fp_of` call used to share this same assumption, but no longer does: td-6c01e3 landed
-/// `devices.alg_id` as a persisted column (`SCHEMA_V9`), `Device` now carries `alg_id: Option<u8>`,
-/// and `authorize.rs`'s check 8 denies a device outright, before the binding recompute ever runs,
-/// whenever its stored `alg_id` is `None` or anything other than `ALG_ID_V1`. This bundle's
-/// remaining assumption is tracked separately, by open ticket td-4f520f.
+/// **`alg_id` is carried and checked, not assumed (td-4f520f)**: [`BundleEntry`] has an `alg_id`
+/// field, decoded as [`spindle_proto::bootstrap::ALG_ID_V1`] when a v1 bundle omits it. Step (a)
+/// rejects every other value with [`ArtifactError::UnsupportedAlgId`], so an entry naming a suite
+/// this build cannot interpret fails explicitly instead of being hashed (and thereby silently
+/// mis-verified) as v1. This closes the second instance of the class td-6c01e3 fixed for the
+/// devices table, where `authorize.rs` now rejects a stored `alg_id` that is `None` or not
+/// `ALG_ID_V1` before recomputing the binding.
 ///
-/// Carrying `alg_id` on [`BundleEntry`] would not, by itself, let a second algorithm verify:
-/// [`device_fp_of`] takes an [`ed25519_dalek::VerifyingKey`] and an [`x25519_dalek::PublicKey`], so
-/// the algorithm is pinned by the *type* of the parsed keys, not by an integer alongside them.
-/// Hashing a carried `alg_id = 2` while this function still parses `sign_pk`/`agree_pk` as Ed25519
-/// would only manufacture a hash that matches for an entry nobody here can actually verify —
-/// strictly worse than the current assumption. What carrying it *would* buy is the ability to
-/// reject a non-v1 entry explicitly, instead of silently mis-verifying it as v1.
+/// Carrying `alg_id` does **not** let a second algorithm verify: [`device_fp_of`] takes an
+/// [`ed25519_dalek::VerifyingKey`] and an [`x25519_dalek::PublicKey`], so the algorithm is pinned
+/// by the *type* of the parsed keys, not by an integer alongside them. Hashing a carried
+/// `alg_id = 2` while this function still parses `sign_pk`/`agree_pk` as Ed25519 would only
+/// manufacture a hash that matches for an entry nobody here can actually verify — strictly worse
+/// than an assumption. The field's deliverable is the explicit rejection (a), nothing more.
 pub fn verify_bootstrap_bundle(
     bundle: &DeviceBootstrapBundle,
     now: u64,
@@ -356,7 +358,13 @@ fn verify_bundle_entry(
     entry: &BundleEntry,
     now: u64,
 ) -> Result<VerifiedBundleEntry, ArtifactError> {
-    // a. Parse sign_pk (Ed25519) and agree_pk (X25519) — same idiom as `host_device_cert.rs`.
+    // a. Reject an unsupported algorithm suite before parsing anything. Deliberately explicit:
+    // without this, an entry carrying `alg_id = 2` would fall through and be hashed as v1 below.
+    if entry.alg_id != identity::ALG_ID_V1 {
+        return Err(ArtifactError::UnsupportedAlgId);
+    }
+
+    // b. Parse sign_pk (Ed25519) and agree_pk (X25519) — same idiom as `host_device_cert.rs`.
     let sign_pk = parse_verifying_key(&entry.sign_pk)?;
     let agree_pk_bytes: [u8; 32] = entry
         .agree_pk
@@ -365,13 +373,14 @@ fn verify_bundle_entry(
         .map_err(|_| ArtifactError::InvalidPublicKey)?;
     let agree_pk = X25519PublicKey::from(agree_pk_bytes);
 
-    // b. Derive this host's device fingerprint.
-    let host_device_fp = device_fp_of(identity::ALG_ID_V1, &sign_pk, &agree_pk);
+    // c. Derive this host's device fingerprint from the entry's carried suite id (equal to v1 by
+    // the check above — this is not a path to a second algorithm; see this function's doc comment).
+    let host_device_fp = device_fp_of(entry.alg_id, &sign_pk, &agree_pk);
 
-    // c. Verify the nested capability — already enforces host_fp == SHA-256(host_root_pk).
+    // d. Verify the nested capability — already enforces host_fp == SHA-256(host_root_pk).
     super::verify_capability(&entry.member_cap, now)?;
 
-    // d. Derive host_fp — safe only now that (c) has proven member_cap.host_fp is exactly 32
+    // e. Derive host_fp — safe only now that (d) has proven member_cap.host_fp is exactly 32
     // bytes and self-consistent with host_root_pk.
     let host_fp = Fingerprint::from_slice(&entry.member_cap.host_fp)
         .map_err(|_| ArtifactError::HostFingerprintMismatch)?;
@@ -435,6 +444,7 @@ mod tests {
         );
         let envelope = host_envelope(envelope_seed);
         let entry = BundleEntry {
+            alg_id: identity::ALG_ID_V1,
             sign_pk: envelope.sign_public_key().as_bytes().to_vec(),
             agree_pk: envelope.agree_public_key().as_bytes().to_vec(),
             member_cap: cap,
@@ -488,6 +498,32 @@ mod tests {
             BundleError::VersionTooLow {
                 found: 0,
                 minimum: BUNDLE_MIN_V,
+            }
+        );
+    }
+
+    // ---- alg_id: decode accepts, verification rejects (td-4f520f) ----
+
+    #[test]
+    fn rejects_non_v1_alg_id_after_decoding_it() {
+        // The wire type accepts any u8 so an old/new bundle can still be decoded and inspected;
+        // the EXPLICIT rejection belongs to verification. Before td-4f520f this entry was hashed
+        // as v1 and could verify, silently mis-verifying a suite the code does not implement.
+        let (_host, mut entry) = real_entry(0x32, 0x33, 10_000);
+        entry.alg_id = 2;
+        let bundle =
+            build_bootstrap_bundle("nats://x:4222", vec![entry], QrEcLevel::M).expect("fits");
+
+        let decoded = DeviceBootstrapBundle::from_canonical_bytes(&bundle.to_canonical_bytes())
+            .expect("the wire type must decode an entry carrying alg_id = 2");
+        assert_eq!(decoded.entries[0].alg_id, 2);
+
+        let err = verify_bootstrap_bundle(&decoded, 1_500).unwrap_err();
+        assert_eq!(
+            err,
+            BundleError::Entry {
+                index: 0,
+                source: ArtifactError::UnsupportedAlgId,
             }
         );
     }
@@ -559,7 +595,7 @@ mod tests {
         // returning `Ok(bundle)` regardless of encoded size) would make this test fail, since it
         // would never see `TooLargeForQr` at all.
         //
-        // Real entries measure ~521 B each (see `keeps_measured_entry_bytes_honest` below); the
+        // Real entries measure ~529 B each (see `keeps_measured_entry_bytes_honest` below); the
         // EC-M budget is 2331 B. 6 real entries safely exceed it regardless of small per-entry
         // size drift, while staying well under MAX_BUNDLE_ENTRIES (32).
         let entries: Vec<BundleEntry> = (0u8..6)
@@ -673,6 +709,7 @@ mod tests {
         );
         let envelope = host_envelope(envelope_seed);
         BundleEntry {
+            alg_id: identity::ALG_ID_V1,
             sign_pk: envelope.sign_public_key().as_bytes().to_vec(),
             agree_pk: envelope.agree_public_key().as_bytes().to_vec(),
             member_cap: cap,
@@ -762,9 +799,9 @@ mod tests {
 
         // At MAX_REGISTRY_LEN (256 B), EC level M: MEASURED TRUTH is 3 real entries fit, 4 do
         // not — DOWN from 4 (td-331c11: with the production FINGERPRINT_LEN nonce, 4 entries
-        // measure 2365 B, over EC-M's 2331 B budget; DESIGN.md :328-329's previous claim of 4
-        // was measured against a 16-byte nonce no production issuer ever emits). Measured: n=3 is
-        // 1844 B (fits 2331), n=4 is 2365 B (does not).
+        // measure 2397 B, over EC-M's 2331 B budget; DESIGN.md :328-329's previous claim of 4
+        // was measured against a 16-byte nonce no production issuer ever emits). Measured by
+        // td-4f520f: n=3 is 1868 B (fits 2331), n=4 is 2397 B (does not).
         let long_registry = "r".repeat(spindle_proto::bootstrap::MAX_REGISTRY_LEN);
         let three_long_registry = bundle_of(&long_registry, 3).to_canonical_bytes().len();
         assert!(
@@ -782,7 +819,7 @@ mod tests {
         );
 
         // At MAX_REGISTRY_LEN, EC level L: 5 real entries fit, 6 do not — unchanged from the
-        // short-registry case (measured: n=5 is 2886 B, fits L's 2953; n=6 is 3407 B, does not).
+        // short-registry case (measured: n=5 is 2926 B, fits L's 2953; n=6 is 3455 B, does not).
         let five_long_registry = bundle_of(&long_registry, 5).to_canonical_bytes().len();
         assert!(
             five_long_registry <= QR_V40_L_CAPACITY_BYTES,
@@ -794,6 +831,18 @@ mod tests {
             six_long_registry > QR_V40_L_CAPACITY_BYTES,
             "6 real entries with a MAX_REGISTRY_LEN registry ({six_long_registry} B) must NOT \
              fit the EC-L budget ({QR_V40_L_CAPACITY_BYTES} B)"
+        );
+
+        // The four measured figures, printed on demand (`cargo test ... -- --nocapture`) so the
+        // DESIGN.md numbers can be quoted from a real encoding rather than inferred from a
+        // per-entry delta. This is not an assertion; the paired bounds above are.
+        println!(
+            "QR measurements: short registry ({} B): EC-M n=4 {four} B / n=5 {five} B; \
+             EC-L n=5 {five} B / n=6 {six} B. MAX_REGISTRY_LEN registry ({} B): \
+             EC-M n=3 {three_long_registry} B / n=4 {four_long_registry} B; \
+             EC-L n=5 {five_long_registry} B / n=6 {six_long_registry} B.",
+            short_registry.len(),
+            long_registry.len()
         );
     }
 

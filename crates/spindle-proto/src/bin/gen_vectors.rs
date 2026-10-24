@@ -1633,9 +1633,12 @@ fn signaling_vectors() -> Json {
 // `{name, description, decoded, canonical_cbor_hex}`, exactly mirroring `signaling.json`'s shape.
 //
 // These vectors also pin the canonical key order: a `DeviceBootstrapBundle` map's keys emit as
-// `v`, `entries`, `registry`, and a `BundleEntry` map's keys emit as `sign_pk`, `agree_pk`,
-// `member_cap` — canonical CBOR sorts map keys length-first then bytewise, never in
+// `v`, `entries`, `registry`, and a `BundleEntry` map's keys emit as `alg_id`, `sign_pk`,
+// `agree_pk`, `member_cap` — canonical CBOR sorts map keys length-first then bytewise, never in
 // struct-field-declaration order, so a cross-language decoder must reproduce this exact order.
+// Every entry here carries `alg_id` explicitly (the encoder always emits it); the decode-side
+// "absent means ALG_ID_V1" compatibility rule is covered by hand-built tests in `bootstrap.rs` and
+// `bootstrap.test.ts`, not by a vector, because the generator always produces what the encoder does.
 
 /// One bootstrap entry with every dummy byte pattern derived from `byte`, so distinct entries in
 /// the same bundle are trivially distinguishable by eye and an accidental entry-reordering bug is
@@ -1643,6 +1646,7 @@ fn signaling_vectors() -> Json {
 /// consecutive-byte-offset convention above.
 fn bootstrap_entry(byte: u8) -> BundleEntry {
     BundleEntry {
+        alg_id: spindle_proto::bootstrap::ALG_ID_V1,
         sign_pk: rep(byte, 32),
         agree_pk: rep(byte.wrapping_add(0x01), 32),
         member_cap: Capability {
@@ -1666,7 +1670,7 @@ fn bootstrap_vectors() -> Json {
             "one_entry_bundle",
             "The minimal realistic bootstrap: a primary handing a new device state for exactly \
              one host it already belongs to (DESIGN.md :317-318's `{registry, [{sign_pk, \
-             agree_pk, member_cap}...]}`, one entry).",
+             agree_pk, member_cap}...]}` plus this module's `alg_id` field, one entry).",
             DeviceBootstrapBundle {
                 v: BUNDLE_CURRENT_V,
                 registry: "nats://registry.example:4222".to_string(),
@@ -1682,7 +1686,7 @@ fn bootstrap_vectors() -> Json {
              this vector's byte size is NOT a capacity measurement — spindle-proto has no crypto \
              dependency, so its embedded caps are short dummy byte patterns, not a real embedded \
              op_cert (143 B on its own). The real measured figure, with genuine caps and a short \
-             (21-byte) registry endpoint, is 2128 B for four entries against EC-M's 2331 B budget \
+             (21-byte) registry endpoint, is 2160 B for four entries against EC-M's 2331 B budget \
              (see MEASURED_ENTRY_BYTES).",
             DeviceBootstrapBundle {
                 v: BUNDLE_CURRENT_V,

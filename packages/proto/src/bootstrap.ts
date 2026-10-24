@@ -1,8 +1,8 @@
 // Device bootstrap state bundle (DESIGN.md §A4 "Adding a device (device bootstrap)", :317-330) —
 // the TypeScript twin of `crates/spindle-proto/src/bootstrap.rs`. When a primary device enrolls a
 // new device over the QR channel, it signs the new device's certificate *and* hands it this
-// bundle: `{registry endpoint, [{sign_pk, agree_pk, member_cap}...]}` — enough state for the new
-// device to reach every host the primary already belongs to, without a second round trip through
+// bundle: `{registry endpoint, [{alg_id, sign_pk, agree_pk, member_cap}...]}` — enough state for
+// the new device to reach every host the primary already belongs to, without a second round trip through
 // each host to fetch its cap individually.
 //
 // **Deliberately NOT an A7b signed artifact**: no domain-separation tag (see `tags.ts` — there is
@@ -22,7 +22,7 @@
 // `host_fp` and the host's `device_fp` are **derived, never carried** (DESIGN.md:320-322: "so no
 // field of an entry can disagree with another"):
 //   host_fp   = SHA-256(member_cap.host_root_pk)   -- the check `verify_capability` already makes
-//   device_fp = device_fp_of(ALG_ID_V1, sign_pk, agree_pk)
+//   device_fp = device_fp_of(alg_id, sign_pk, agree_pk)   (non-v1 `alg_id` is rejected there)
 // Both the derivation and `verify_capability` itself live in `@spindle/crypto`, never here — this
 // module is wire carriage only (types, canonical CBOR, `deny_unknown_fields`, length/count caps,
 // QR budget constants), matching the A9c boundary rule that `spindle-proto`/`@spindle/proto` carry
@@ -42,8 +42,17 @@ import { CborValue, canonicalEncode } from "./canonical.js";
  * see this file's header comment. Exported so `@spindle/crypto` has a single source of truth for
  * the floor, exactly as `CAPABILITY_MIN_V`/`ADMIN_COMMAND_MIN_V` are for their artifacts. */
 export const BUNDLE_MIN_V = 1;
-/** The `v` this package emits when building a `DeviceBootstrapBundle` today. */
-export const BUNDLE_CURRENT_V = 1;
+/** The `v` this package emits when building a `DeviceBootstrapBundle` today. Bumped 1 -> 2 when
+ * `BundleEntry` gained `alg_id` (td-4f520f). `BUNDLE_MIN_V` stays at 1: a v1 entry without
+ * `alg_id` still decodes (defaulting to {@link ALG_ID_V1}), while a v2 bundle decoded by a v1
+ * reader fails its closed-schema entry check with `UnknownField` — the intended explicit failure. */
+export const BUNDLE_CURRENT_V = 2;
+
+/** Wire default for an omitted `BundleEntry.alg_id`: `1` = Ed25519 / X25519 / AES-256-GCM.
+ * Mirrors `spindle_core::identity::ALG_ID_V1`; it lives here because `@spindle/proto` carries no
+ * crypto dependency. This is a **wire default only** — the algorithm actually verified is pinned
+ * by the key types `@spindle/crypto` parses, not by this integer. */
+export const ALG_ID_V1 = 1;
 
 // Why the bundle carries a wire `v` at all — a deliberate divergence from `lib.rs`'s schema-
 // choices table, which says only `Envelope`/`Capability`/`AdminCommand` need one because the other
@@ -74,7 +83,7 @@ export const QR_V40_L_CAPACITY_BYTES = 2953;
 export const QR_V40_M_CAPACITY_BYTES = 2331;
 
 /* MEASURED_ENTRY_BYTES is deliberately NOT mirrored here. Rust owns the measured bundle-entry
- * size (`crates/spindle-proto/src/bootstrap.rs`, currently 521 B) because a test pins it there --
+ * size (`crates/spindle-proto/src/bootstrap.rs`, currently 529 B) because a test pins it there --
  * `keeps_measured_entry_bytes_honest` in `spindle-core` measures a real entry's canonical
  * encoding and fails when it drifts. This package had a second copy with no such test; it sat
  * stale at 546 B (a pre-`nats_fp`-removal, 16-byte-cap-nonce figure) through a fully green TS
@@ -187,11 +196,15 @@ function checkRegistryLen(registry: string): void {
 // ================================================================================================
 
 /** One host's worth of bootstrap state (DESIGN.md §A4) — mirrors Rust's `BundleEntry`. EXACTLY
- * these three keys, nothing else, ever: there is deliberately no `host_fp` field here (see this
+ * these four keys, nothing else, ever: there is deliberately no `host_fp` field here (see this
  * file's header comment) — a decoded map carrying one is rejected as an unknown field, which is
  * exactly what {@link BUNDLE_ENTRY_FIELDS} and the corresponding test in `bootstrap.test.ts` exist
  * to prove. */
 export interface BundleEntry {
+  /** The algorithm suite `sign_pk`/`agree_pk` are interpreted under, encoded as a CBOR uint.
+   * Always emitted; omitted on decode means {@link ALG_ID_V1}. `@spindle/crypto` rejects any other
+   * value explicitly — this field is not a path to verifying a second algorithm. */
+  alg_id: number;
   /** The host's envelope Ed25519 verifying key (DESIGN.md §A7) — named `sign_pk`, not `host_pk`,
    * because `host_pk` was ambiguous between the host's root key and the envelope key a client
    * actually pins (DESIGN.md v0.9.22 amendment). */
@@ -210,11 +223,12 @@ export interface BundleEntry {
  * acceptance criterion from the settled spec: adding a `host_fp` field to `BundleEntry` (rather
  * than deriving it, as `@spindle/crypto` does) breaks this constant immediately, and the
  * corresponding `bootstrap.test.ts` test asserts its exact contents for this reason. */
-export const BUNDLE_ENTRY_FIELDS = ["sign_pk", "agree_pk", "member_cap"] as const;
+export const BUNDLE_ENTRY_FIELDS = ["alg_id", "sign_pk", "agree_pk", "member_cap"] as const;
 
 export const BundleEntry = {
   toCbor(e: BundleEntry): CborValue {
     return CborValue.map([
+      ["alg_id", CborValue.uint(e.alg_id)],
       ["sign_pk", CborValue.bytes(e.sign_pk)],
       ["agree_pk", CborValue.bytes(e.agree_pk)],
       ["member_cap", Capability.toCbor(e.member_cap)],
@@ -225,7 +239,11 @@ export const BundleEntry = {
     return wrapProtoErrors(() => {
       const m = new MapReader(v);
       m.denyUnknownFields(BUNDLE_ENTRY_FIELDS);
+      // Optional on decode for wire compatibility: a v1 entry carries no `alg_id` and means v1.
+      // The encoder always emits it — see `BUNDLE_CURRENT_V`'s doc comment.
+      const alg_id = m.optionalU8("alg_id") ?? ALG_ID_V1;
       return {
+        alg_id,
         sign_pk: m.bytes("sign_pk"),
         agree_pk: m.bytes("agree_pk"),
         member_cap: Capability.fromCbor(m.require("member_cap")),

@@ -161,6 +161,20 @@ impl<'a> MapReader<'a> {
         u8::try_from(v).map_err(|_| ProtoError::IntOutOfRange(key))
     }
 
+    /// Like [`Self::optional_u32`], for a `u8`-range field. Absent and present-but-wrong-type are
+    /// distinguished the same way: `None` only when the key is genuinely absent.
+    pub(crate) fn optional_u8(&self, key: &'static str) -> Result<Option<u8>, ProtoError> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(v) => {
+                let n = v.as_uint().ok_or(ProtoError::WrongType(key))?;
+                Ok(Some(
+                    u8::try_from(n).map_err(|_| ProtoError::IntOutOfRange(key))?,
+                ))
+            }
+        }
+    }
+
     pub(crate) fn u16(&self, key: &'static str) -> Result<u16, ProtoError> {
         let v = self.u64(key)?;
         u16::try_from(v).map_err(|_| ProtoError::IntOutOfRange(key))

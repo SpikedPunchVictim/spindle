@@ -76,6 +76,7 @@ export {
 export type { SignalingErrorKind } from "./signaling.js";
 
 export {
+  ALG_ID_V1,
   BUNDLE_MIN_V,
   BUNDLE_CURRENT_V,
   MAX_REGISTRY_LEN,

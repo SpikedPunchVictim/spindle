@@ -8,7 +8,7 @@
 // `makeTestHost`/`issueTestCapability`-style helpers (which in turn mirror
 // `crates/spindle-core/src/artifacts/capability.rs`'s `test_host`/`issue`).
 
-import { CapKind, Capability, HostOpKeyCert } from "@spindle/proto";
+import { CapKind, Capability, DeviceBootstrapBundle, HostOpKeyCert } from "@spindle/proto";
 import type { BundleEntry } from "@spindle/proto";
 import { MAX_BUNDLE_ENTRIES, MAX_REGISTRY_LEN, QR_V40_M_CAPACITY_BYTES } from "@spindle/proto";
 import { describe, expect, it } from "vitest";
@@ -99,6 +99,7 @@ async function realEntry(
 
   const envelope = await hostEnvelope(envelopeSeed);
   const entry: BundleEntry = {
+    alg_id: ALG_ID_V1,
     sign_pk: envelope.signPk,
     agree_pk: envelope.agreePk,
     member_cap: cap,
@@ -157,6 +158,29 @@ describe("buildBootstrapBundle / verifyBootstrapBundle", () => {
     expect(err.minimum).toBe(1);
   });
 
+  // ---- alg_id: decode accepts, verification rejects (td-4f520f) ----
+
+  // Rust: rejects_non_v1_alg_id_after_decoding_it
+  it("rejects a non-v1 alg_id explicitly after decoding it", async () => {
+    // The wire type accepts any u8 so an old/new bundle can still be decoded and inspected; the
+    // EXPLICIT rejection belongs to verification. Before td-4f520f this entry was hashed as v1
+    // and could verify, silently mis-verifying a suite the code does not implement.
+    const { entry } = await realEntry(0x32, 0x33, 10_000n);
+    entry.alg_id = 2;
+    const bundle = await buildBootstrapBundle("nats://x:4222", [entry], QrEcLevel.M);
+
+    // Round-trip through the wire type to prove the decode side accepts alg_id = 2.
+    const decoded = DeviceBootstrapBundle.fromCanonicalBytes(
+      DeviceBootstrapBundle.toCanonicalBytes(bundle),
+    );
+    expect(decoded.entries[0].alg_id).toBe(2);
+
+    const err = await expectBundleError(() => verifyBootstrapBundle(decoded, 1_500n));
+    expect(err.kind).toBe("Entry");
+    expect(err.index).toBe(0);
+    expect((err.source as ArtifactError).kind).toBe("UnsupportedAlgId");
+  });
+
   // ---- per-entry failures, with the right index ----
 
   // Rust: rejects_expired_entry_at_the_right_index
@@ -211,7 +235,8 @@ describe("buildBootstrapBundle / verifyBootstrapBundle", () => {
     // the bundle regardless of encoded size) would make this test fail, since it would never see
     // `TooLargeForQr` at all.
     //
-    // Real entries measure 521 B each (measured, td-331c11 — this comment said ~530 B, a
+    // Real entries measure 529 B each (re-measured by td-4f520f, which added alg_id; td-331c11
+    // measured 521 B before that — this comment originally said ~530 B, a
     // pre-measurement estimate); the EC-M budget is 2331 B. 6 real entries safely exceed it
     // regardless of small per-entry size drift, while staying well under MAX_BUNDLE_ENTRIES (32).
     const entries: BundleEntry[] = [];

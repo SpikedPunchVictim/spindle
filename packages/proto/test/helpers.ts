@@ -255,6 +255,7 @@ function capabilityJsonFromTree(node: any): any {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function bundleEntryFromTree(node: any): BundleEntry {
   return {
+    alg_id: Number(rawMapField(node, "alg_id").value),
     sign_pk: hexToBytes(rawMapField(node, "sign_pk").value),
     agree_pk: hexToBytes(rawMapField(node, "agree_pk").value),
     member_cap: parseCapability(capabilityJsonFromTree(rawMapField(node, "member_cap"))),
