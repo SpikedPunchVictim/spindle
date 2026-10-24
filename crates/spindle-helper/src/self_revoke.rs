@@ -121,7 +121,9 @@
 //! reply err: { "ok": false, "error": "<human-readable reason>" }
 //! ```
 //! `src/bin/helper.rs` subscribes `helper.revoke.*`, passes `msg.subject` and `msg.payload` into
-//! [`handle_self_revoke`], and publishes the returned JSON bytes to `msg.reply`.
+//! [`handle_self_revoke`], publishes [`SelfRevokeResult::reply`] to `msg.reply`, and kicks the
+//! sessions of [`SelfRevokeResult::newly_revoked`] — see that type's doc for why only the newly
+//! added set, not the whole union, is what drives kicks.
 
 use serde::{Deserialize, Serialize};
 use spindle_core::artifacts::verify_self_revocation;
@@ -292,6 +294,31 @@ impl SelfRevokeReply {
     }
 }
 
+/// The outcome of one [`handle_self_revoke`] call: the wire reply plus the set of devices this
+/// particular deposit **newly** added to the root's revoked set.
+///
+/// `newly_revoked` is deliberately *not* the whole post-write union. It is the deduplicated,
+/// first-seen-ordered subset of the record's `revoked` entries that were not already
+/// [`HelperView::is_self_revoked`] under the root when this call ran. That is exactly the set
+/// `src/bin/helper.rs` kicks (DESIGN.md §A3's kick relay, S9 leg 3):
+///
+/// - a replay/no-op (or a record whose entries are all already revoked) reports an empty list, so
+///   it kicks nothing — re-kicking sessions on every redelivery would be pointless traffic;
+/// - an entry that was revoked by an earlier deposit is already gone from the live sessions that
+///   matter, and kicking it again is unnecessary;
+/// - and a rejected record reports nothing, because nothing was applied.
+///
+/// The reply bytes are exactly today's wire JSON (see the module doc's wire schema), unchanged by
+/// this addition.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SelfRevokeResult {
+    /// The JSON reply to publish (`SelfRevokeReply` serialized).
+    pub reply: Vec<u8>,
+    /// Devices this call newly added to the union, in first-seen order. Empty on a no-op, a
+    /// rejection, or a store error.
+    pub newly_revoked: Vec<Fingerprint>,
+}
+
 /// Parses the caller's `nats_fp` out of a `helper.revoke.<nfp>` subject, via the shared
 /// [`crate::parse_fp_after_prefix`] helper every `<...fp>` subject parser in this crate uses.
 fn parse_subject_nats_fp(subject: &str) -> Option<Fingerprint> {
@@ -300,7 +327,7 @@ fn parse_subject_nats_fp(subject: &str) -> Option<Fingerprint> {
 
 /// Decodes and admits one `helper.revoke.<nfp>` deposit. Pure with respect to NATS — the caller
 /// (`src/bin/helper.rs`) owns the subscription and the reply publish; this function only computes
-/// the JSON reply bytes, which are [`SelfRevokeReply`].
+/// the JSON reply bytes (which are [`SelfRevokeReply`]) and the newly-added revoked set.
 ///
 /// Checks run in the order the module doc's identity section lists: subject token, live session,
 /// member root present, record decodes, record `root_fp` matches the session's, the caller's
@@ -308,15 +335,21 @@ fn parse_subject_nats_fp(subject: &str) -> Option<Fingerprint> {
 /// entry exactly 32 bytes (deduplicated), the already-applied no-op check, and only then the
 /// per-root token. After all of those it calls [`HelperView::record_self_revocation`] and replies
 /// with the *returned* post-write epoch — never with a re-read or an `expect`.
+///
+/// The returned [`SelfRevokeResult::newly_revoked`] is what the caller kicks: the entries this
+/// deposit added, not the whole union. See that type's doc.
 pub fn handle_self_revoke(
     subject: &str,
     payload: &[u8],
     view: &mut impl HelperView,
     limits: &mut SelfRevokeLimits,
     now: u64,
-) -> Vec<u8> {
-    let reply = handle_self_revoke_inner(subject, payload, view, limits, now);
-    serde_json::to_vec(&reply).expect("SelfRevokeReply always serializes")
+) -> SelfRevokeResult {
+    let (reply, newly_revoked) = handle_self_revoke_inner(subject, payload, view, limits, now);
+    SelfRevokeResult {
+        reply: serde_json::to_vec(&reply).expect("SelfRevokeReply always serializes"),
+        newly_revoked,
+    }
 }
 
 fn handle_self_revoke_inner(
@@ -325,30 +358,36 @@ fn handle_self_revoke_inner(
     view: &mut impl HelperView,
     limits: &mut SelfRevokeLimits,
     now: u64,
-) -> SelfRevokeReply {
+) -> (SelfRevokeReply, Vec<Fingerprint>) {
     let Some(nats_fp) = parse_subject_nats_fp(subject) else {
-        return SelfRevokeReply::err("malformed subject");
+        return (SelfRevokeReply::err("malformed subject"), Vec::new());
     };
 
     let Some(session) = view.session_record(&nats_fp, now) else {
-        return SelfRevokeReply::err("no active session");
+        return (SelfRevokeReply::err("no active session"), Vec::new());
     };
 
     // A host connection's session record reuses this shape with `root_pk: None` (see
     // `session.rs`'s doc comment): a host has no member root, so there is nothing this subject
     // could legitimately revoke under one. Refuse rather than fall back to any other key.
     let Some(root_pk) = session.root_pk else {
-        return SelfRevokeReply::err("session has no member root");
+        return (
+            SelfRevokeReply::err("session has no member root"),
+            Vec::new(),
+        );
     };
 
     let Ok(record) = SelfRevocationRecord::from_canonical_bytes(payload) else {
-        return SelfRevokeReply::err("malformed record");
+        return (SelfRevokeReply::err("malformed record"), Vec::new());
     };
 
     // The cheap half of "the signer is the session's root": compare the record's claimed
     // `root_fp` against the session record before touching any cryptography.
     if !session.root_fp.matches(&record.root_fp) {
-        return SelfRevokeReply::err("record root_fp does not match the session's root");
+        return (
+            SelfRevokeReply::err("record root_fp does not match the session's root"),
+            Vec::new(),
+        );
     }
 
     // Per-device, pre-crypto attempt budget. Keyed by the session's `device_fp` (falling back to
@@ -358,61 +397,77 @@ fn handle_self_revoke_inner(
     // cannot starve the root's token budget (which is not charged until verification below).
     let attempt_key = session.device_fp.unwrap_or(session.nats_fp);
     if !limits.allow_attempt(&attempt_key, now) {
-        return SelfRevokeReply::err("rate limited");
+        return (SelfRevokeReply::err("rate limited"), Vec::new());
     }
 
     // Rebuild the retained key exactly as every other artifact verifier does — including the
     // RFC 8032 §5.1.3 canonical-encoding round trip — then check the signature. One uniform error
     // for both halves: the wire reply never says which one failed.
     let Some(vk) = checked_verifying_key(&root_pk) else {
-        return SelfRevokeReply::err(VERIFICATION_FAILED);
+        return (SelfRevokeReply::err(VERIFICATION_FAILED), Vec::new());
     };
     if verify_self_revocation(&record, &vk).is_err() {
-        return SelfRevokeReply::err(VERIFICATION_FAILED);
+        return (SelfRevokeReply::err(VERIFICATION_FAILED), Vec::new());
     }
 
     // Every entry is covered by the signature, so a single wrong-length entry makes the signed
     // artifact malformed for this ingestion path — reject all of it, never drop an entry. Dedup
     // before the write: the union semantics make duplicate entries meaningless, and one
-    // deduplicated set is what keeps the durable write a single statement (see `pg_store`).
-    let mut deduped: std::collections::HashSet<Fingerprint> =
+    // deduplicated set is what keeps the durable write a single statement (see `pg_store`). The
+    // `HashSet` is membership only; the `Vec` preserves first-seen order, which is the order the
+    // caller kicks in and the order the tests assert. In the same pass, record which entries are
+    // genuinely new to the root's revoked set — that, not the whole union, is what the caller
+    // kicks (see `SelfRevokeResult`'s doc).
+    let mut seen: std::collections::HashSet<Fingerprint> =
         std::collections::HashSet::with_capacity(record.revoked.len());
+    let mut deduped: Vec<Fingerprint> = Vec::with_capacity(record.revoked.len());
+    let mut newly_revoked: Vec<Fingerprint> = Vec::new();
     for entry in &record.revoked {
         let Ok(fp) = Fingerprint::from_slice(entry) else {
-            return SelfRevokeReply::err("malformed revoked entry");
+            return (SelfRevokeReply::err("malformed revoked entry"), Vec::new());
         };
-        deduped.insert(fp);
+        if !seen.insert(fp) {
+            continue;
+        }
+        if !view.is_self_revoked(&session.root_fp, &fp) {
+            newly_revoked.push(fp);
+        }
+        deduped.push(fp);
     }
 
-    // Already-applied check: if every entry is already in the union and the epoch does not
-    // advance the high-water mark, this record would change nothing. Reply with the stored epoch
-    // without writing and, crucially, without charging a root token — otherwise replaying one
-    // recorded message could drain the root's bucket. (`None` means no record yet, i.e. a
-    // high-water mark of 0 for comparison.)
+    // Already-applied check: if this deposit would add nothing to the union and the epoch does not
+    // advance the high-water mark, it would change nothing. Reply with the stored epoch without
+    // writing and, crucially, without charging a root token — otherwise replaying one recorded
+    // message could drain the root's bucket. (`None` means no record yet, i.e. a high-water mark of
+    // 0 for comparison.) `newly_revoked.is_empty()` is exactly "every deduplicated entry is
+    // already in the union".
     let stored_epoch = view.self_revocation_epoch(&session.root_fp);
-    let already_applied = record.epoch <= stored_epoch.unwrap_or(0)
-        && deduped
-            .iter()
-            .all(|device_fp| view.is_self_revoked(&session.root_fp, device_fp));
+    let already_applied = newly_revoked.is_empty() && record.epoch <= stored_epoch.unwrap_or(0);
     if already_applied {
-        return SelfRevokeReply::ok(session.root_fp.to_string(), stored_epoch.unwrap_or(0));
+        return (
+            SelfRevokeReply::ok(session.root_fp.to_string(), stored_epoch.unwrap_or(0)),
+            Vec::new(),
+        );
     }
 
     // Per-root budget, charged only now: this record verified under the root's key and changes
     // state, so only the root's own signed records can spend its tokens.
     if !limits.charge_root(&session.root_fp, now) {
-        return SelfRevokeReply::err("rate limited");
+        return (SelfRevokeReply::err("rate limited"), Vec::new());
     }
 
     // No epoch gate: every signature-valid, not-already-applied record unions its subjects (see
     // the module doc's "No epoch gate" section). The store applies max-wins to the epoch itself.
-    let revoked: Vec<Fingerprint> = deduped.into_iter().collect();
-    let Some(epoch) = view.record_self_revocation(&session.root_fp, record.epoch, &revoked) else {
+    // `deduped` is in first-seen order, so the write and the reported set agree.
+    let Some(epoch) = view.record_self_revocation(&session.root_fp, record.epoch, &deduped) else {
         // The store did not persist the write; it cannot report a post-write epoch, and inventing
         // one here would claim state that is not durable.
-        return SelfRevokeReply::err("record not stored");
+        return (SelfRevokeReply::err("record not stored"), Vec::new());
     };
-    SelfRevokeReply::ok(session.root_fp.to_string(), epoch)
+    (
+        SelfRevokeReply::ok(session.root_fp.to_string(), epoch),
+        newly_revoked,
+    )
 }
 
 #[cfg(test)]
@@ -484,6 +539,16 @@ mod tests {
         serde_json::from_slice(bytes).unwrap()
     }
 
+    fn deposit_result(
+        subject: &str,
+        payload: &[u8],
+        view: &mut InMemoryHelperView,
+        limiter: &mut SelfRevokeLimits,
+        now: u64,
+    ) -> SelfRevokeResult {
+        handle_self_revoke(subject, payload, view, limiter, now)
+    }
+
     fn deposit(
         subject: &str,
         payload: &[u8],
@@ -491,7 +556,7 @@ mod tests {
         limiter: &mut SelfRevokeLimits,
         now: u64,
     ) -> SelfRevokeReply {
-        reply(&handle_self_revoke(subject, payload, view, limiter, now))
+        reply(&deposit_result(subject, payload, view, limiter, now).reply)
     }
 
     // ---- handle_self_revoke: accept ---------------------------------------------------------
@@ -1414,6 +1479,139 @@ mod tests {
         assert_eq!(first, replay);
         assert_eq!(replay.epoch, Some(4));
         assert_eq!(revoke_set(&mut view, &root_fp), HashSet::from([device]));
+    }
+
+    // ---- SelfRevokeResult::newly_revoked (what the caller kicks) ---------------------------
+
+    #[test]
+    fn a_fresh_record_reports_every_deduplicated_entry_in_first_seen_order() {
+        let mut view = store();
+        let mut limiter = SelfRevokeLimits::new();
+        let root = root_signer();
+        let nats_fp = fp(b"nats-newly-revoked-fresh");
+        put_member_session(&mut view, nats_fp, &root);
+        let a = fp(b"device-a");
+        let b = fp(b"device-b");
+
+        // A duplicate is signed into the artifact on purpose: the reported set must be the
+        // deduplicated one, and order must be first-seen, not `HashSet` iteration order.
+        let result = deposit_result(
+            &subject_for(&nats_fp),
+            &record_bytes(&root, 1, vec![b, a, b]),
+            &mut view,
+            &mut limiter,
+            1_000,
+        );
+
+        assert!(reply(&result.reply).ok, "record must be accepted");
+        assert_eq!(result.newly_revoked, vec![b, a]);
+    }
+
+    #[test]
+    fn a_replay_reports_nothing_newly_revoked() {
+        let mut view = store();
+        let mut limiter = SelfRevokeLimits::new();
+        let root = root_signer();
+        let nats_fp = fp(b"nats-newly-revoked-replay");
+        put_member_session(&mut view, nats_fp, &root);
+        let subject = subject_for(&nats_fp);
+        let device = fp(b"device-a");
+        let payload = record_bytes(&root, 1, vec![device]);
+
+        let first = deposit_result(&subject, &payload, &mut view, &mut limiter, 1_000);
+        assert_eq!(first.newly_revoked, vec![device]);
+
+        // The replay is the already-applied no-op branch: it must report nothing to kick, or every
+        // redelivery would re-kick the same sessions.
+        let replay = deposit_result(&subject, &payload, &mut view, &mut limiter, 1_000);
+        assert!(reply(&replay.reply).ok);
+        assert!(
+            replay.newly_revoked.is_empty(),
+            "an already-applied record must not re-report its entries: {replay:?}"
+        );
+    }
+
+    #[test]
+    fn a_partially_applied_record_reports_only_the_new_entries() {
+        let mut view = store();
+        let mut limiter = SelfRevokeLimits::new();
+        let root = root_signer();
+        let nats_fp = fp(b"nats-newly-revoked-partial");
+        put_member_session(&mut view, nats_fp, &root);
+        let subject = subject_for(&nats_fp);
+        let already = fp(b"device-a");
+        let fresh = fp(b"device-b");
+
+        let first = deposit_result(
+            &subject,
+            &record_bytes(&root, 1, vec![already]),
+            &mut view,
+            &mut limiter,
+            1_000,
+        );
+        assert_eq!(first.newly_revoked, vec![already]);
+
+        // `already` is in the union; only `fresh` is new. The union is monotone, so the second
+        // record is still accepted and written — but only `fresh` may be kicked.
+        let second = deposit_result(
+            &subject,
+            &record_bytes(&root, 2, vec![already, fresh]),
+            &mut view,
+            &mut limiter,
+            1_000,
+        );
+        assert!(reply(&second.reply).ok);
+        assert_eq!(second.newly_revoked, vec![fresh]);
+    }
+
+    #[test]
+    fn an_empty_revoked_list_reports_nothing_newly_revoked() {
+        let mut view = store();
+        let mut limiter = SelfRevokeLimits::new();
+        let root = root_signer();
+        let nats_fp = fp(b"nats-newly-revoked-empty");
+        put_member_session(&mut view, nats_fp, &root);
+
+        // Epoch 1 is above the absent high-water mark, so this is a state-changing write (it
+        // charges a root token and writes), not the already-applied no-op — and still adds no
+        // device, so there is nothing to kick.
+        let result = deposit_result(
+            &subject_for(&nats_fp),
+            &record_bytes(&root, 1, vec![]),
+            &mut view,
+            &mut limiter,
+            1_000,
+        );
+
+        let parsed = reply(&result.reply);
+        assert!(parsed.ok);
+        assert_eq!(parsed.epoch, Some(1), "the empty record itself was written");
+        assert!(result.newly_revoked.is_empty());
+    }
+
+    #[test]
+    fn a_rejected_record_reports_nothing_newly_revoked() {
+        let mut view = store();
+        let mut limiter = SelfRevokeLimits::new();
+        let root = root_signer();
+        let nats_fp = fp(b"nats-newly-revoked-rejected");
+        put_member_session(&mut view, nats_fp, &root);
+        let mut tampered = issue_self_revocation(&root, 1, vec![fp(b"victim")], 1_000);
+        tampered.sig_root[0] ^= 0xff;
+
+        let result = deposit_result(
+            &subject_for(&nats_fp),
+            &tampered.to_canonical_bytes(),
+            &mut view,
+            &mut limiter,
+            1_000,
+        );
+
+        assert!(!reply(&result.reply).ok);
+        assert!(
+            result.newly_revoked.is_empty(),
+            "a rejected record applied nothing, so it must kick nothing: {result:?}"
+        );
     }
 
     // ---- parse_subject_nats_fp ---------------------------------------------------------------

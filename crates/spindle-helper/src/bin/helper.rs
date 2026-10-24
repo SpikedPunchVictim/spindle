@@ -918,21 +918,12 @@ async fn run(config: Config) -> anyhow::Result<()> {
                                         "revocation matched live session records with no known \
                                          connection to kick yet — scheduling a delayed re-plan"
                                     );
-                                    // Do NOT sleep inline here: stalling this `select!` loop for
-                                    // `KICK_REPLAN_DELAY` would also stall the very CONNECT
-                                    // advisory the retry is waiting on, defeating the fix. Spawn a
-                                    // separate task that sleeps and then hands the unresolved list
-                                    // back to the loop over `kick_retry_tx`.
-                                    let retry_tx = kick_retry_tx.clone();
-                                    let unresolved = plan.unresolved;
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(KICK_REPLAN_DELAY).await;
-                                        let _ = retry_tx.send(unresolved).await;
-                                    });
                                 }
-                                for target in plan.targets {
-                                    issue_kick(sys_ref, &target).await;
-                                }
+                                // Schedule the delayed re-plan and issue the resolvable targets.
+                                // The spawned `sleep`-then-send inside is load-bearing: an inline
+                                // sleep here would stall the very CONNECT advisory the retry is
+                                // waiting on.
+                                execute_kick_plan(plan, sys_ref, &kick_retry_tx).await;
                             }
                             Err(e) => {
                                 // `e.redacted()`, not `?e`: this is a `spindle_proto::artifacts::
@@ -968,13 +959,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 let Some(reply) = msg.reply.clone() else {
                     continue;
                 };
-                let reply_payload = self_revoke::handle_self_revoke(
+                let result = self_revoke::handle_self_revoke(
                     msg.subject.as_str(),
                     &msg.payload,
                     &mut store,
                     &mut self_revoke_limits,
                     now_secs(),
                 );
+                let reply_payload = result.reply;
                 // Log an identifier from the subject token, never any payload bytes and never
                 // an endpoint; `redacted()` keeps it to a prefix like every other id in this
                 // file's log lines (a malformed subject has no fingerprint to redact).
@@ -991,6 +983,42 @@ async fn run(config: Config) -> anyhow::Result<()> {
                             epoch = outcome.epoch.unwrap_or_default(),
                             "helper.revoke.<nfp> self-revocation accepted"
                         );
+
+                        // Leg 3 (S9): kick the live sessions of the devices this deposit *newly*
+                        // added — not the whole post-write union. A replay/no-op reports nothing
+                        // here (so a redelivery kicks nothing), and an already-revoked entry has
+                        // already been handled by the deposit that added it. The handler computes
+                        // that set; see `SelfRevokeResult`'s doc.
+                        if !result.newly_revoked.is_empty() {
+                            tracing::info!(
+                                nfp = %nfp,
+                                newly_revoked = result.newly_revoked.len(),
+                                "helper.revoke.<nfp> self-revocation newly revoked devices — \
+                                 planning kicks"
+                            );
+                            // Build the plan before awaiting the kick helper: `kicks_for_revocation`
+                            // borrows `store` mutably, and the await below must not hold that
+                            // borrow. `plan` owns its targets, so the borrow ends here.
+                            let plan = kick::kicks_for_revocation(
+                                &result.newly_revoked,
+                                &kick_map,
+                                &mut store,
+                                now_secs(),
+                            );
+                            if !plan.unresolved.is_empty() {
+                                // Same fail-open wording as the `registry.revoke.<hfp>` branch
+                                // above: a revoked session that looked unkickable only because its
+                                // own CONNECT advisory hadn't drained into `kick_map` yet is
+                                // security-relevant and must survive a production `warn` filter.
+                                tracing::warn!(
+                                    nfp = %nfp,
+                                    unresolved = plan.unresolved.len(),
+                                    "revocation matched live session records with no known \
+                                     connection to kick yet — scheduling a delayed re-plan"
+                                );
+                            }
+                            execute_kick_plan(plan, sys_ref, &kick_retry_tx).await;
+                        }
                     }
                     Ok(outcome) => {
                         tracing::warn!(
@@ -1236,6 +1264,34 @@ fn kick_coords_from_sys_event(payload: &[u8]) -> Option<(String, u64)> {
     let server_id = value.get("server")?.get("id")?.as_str()?.to_string();
     let cid = value.get("client")?.get("id")?.as_u64()?;
     Some((server_id, cid))
+}
+
+/// Executes one [`kick::KickPlan`] produced by [`kick::kicks_for_revocation`]: for every
+/// unresolved session it schedules the delayed re-plan described by this file's "Kick relay"
+/// module-doc section (a spawned `KICK_REPLAN_DELAY` sleep, then the unresolved list back into the
+/// loop over `retry_tx` — never an inline sleep, which would stall the very CONNECT advisory the
+/// retry waits on), then issues one KICK per resolvable target.
+///
+/// Logging is the caller's job, not this helper's: both branches warn about unresolved sessions
+/// with fields only they have (a host fingerprint on the `registry.revoke` branch, a session nfp on
+/// the `helper.revoke` branch), and `issue_kick` logs each target's own outcome. The two callers
+/// therefore share the *execution*, not the diagnosis.
+async fn execute_kick_plan(
+    plan: kick::KickPlan,
+    sys_client: &async_nats::Client,
+    retry_tx: &tokio::sync::mpsc::Sender<Vec<kick::UnresolvedSession>>,
+) {
+    if !plan.unresolved.is_empty() {
+        let retry_tx = retry_tx.clone();
+        let unresolved = plan.unresolved;
+        tokio::spawn(async move {
+            tokio::time::sleep(KICK_REPLAN_DELAY).await;
+            let _ = retry_tx.send(unresolved).await;
+        });
+    }
+    for target in plan.targets {
+        issue_kick(sys_client, &target).await;
+    }
 }
 
 /// Issues one `$SYS.REQ.SERVER.<server_id>.KICK` request for `target` on `sys_client` (the

@@ -110,7 +110,7 @@ fn a_deposited_root_signed_self_revocation_refuses_that_device() {
     let record = issue_self_revocation(&signing, 1, vec![device_fp], now);
     let mut tampered = record.clone();
     tampered.epoch = 2; // fields changed, `sig_root` retained from the genuine record
-    let tampered_reply = handle_self_revoke(
+    let tampered_result = handle_self_revoke(
         &format!("helper.revoke.{session_fp}"),
         &tampered.to_canonical_bytes(),
         &mut view,
@@ -118,10 +118,14 @@ fn a_deposited_root_signed_self_revocation_refuses_that_device() {
         now,
     );
     let tampered_reply: serde_json::Value =
-        serde_json::from_slice(&tampered_reply).expect("reply is JSON");
+        serde_json::from_slice(&tampered_result.reply).expect("reply is JSON");
     assert_eq!(
         tampered_reply["ok"], false,
         "a record whose signature does not cover its fields must be refused"
+    );
+    assert!(
+        tampered_result.newly_revoked.is_empty(),
+        "a rejected record must report nothing to kick"
     );
     assert!(
         matches!(
@@ -132,15 +136,21 @@ fn a_deposited_root_signed_self_revocation_refuses_that_device() {
     );
 
     // 3. Deposit the genuine root-signed record through the real handler.
-    let reply = handle_self_revoke(
+    let result = handle_self_revoke(
         &format!("helper.revoke.{session_fp}"),
         &record.to_canonical_bytes(),
         &mut view,
         &mut SelfRevokeLimits::new(),
         now,
     );
-    let reply: serde_json::Value = serde_json::from_slice(&reply).expect("reply is JSON");
+    let reply: serde_json::Value = serde_json::from_slice(&result.reply).expect("reply is JSON");
     assert_eq!(reply["ok"], true, "genuine deposit must be accepted");
+    assert_eq!(
+        result.newly_revoked,
+        vec![device_fp],
+        "the accepted deposit must report exactly the device it newly revoked — that is what \
+         the kick relay acts on"
+    );
     let expected_root_fp = root_fp.to_string();
     assert_eq!(
         reply["root_fp"].as_str(),
