@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.48) + Execution Plan
+# Spindle — System Design Document (draft v0.9.49) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -221,6 +221,13 @@
 > per-root bucket as first implemented charged the root **before** verifying the record, which let
 > any compromised device under a root spend that root's budget with unsigned garbage and suppress
 > the owner's genuine revocation. A10.49 records the corrected order.
+> v0.9.49: one correction, no wire change. NATS authorizes the PUB subject, not the reply field —
+> measured in td-fc5a30, `nats-server` does not refuse a foreign `msg.reply` — so a member could
+> make the helper's privileged app connection publish into another tenant's subject. The helper
+> now answers `helper.turn.get.<nfp>`, `helper.presence.get.<nfp>`, and `helper.revoke.<nfp>` only
+> into the caller's own concrete `_INBOX_<device_fp>.` address; a mismatch is dropped. The
+> `$SYS.REQ.USER.AUTH` callout reply is exempt because the requester is `nats-server` and the
+> reply is its own correlation inbox.
 
 ---
 
@@ -957,7 +964,13 @@ buckets are an outstanding implementation obligation.
   `sub host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus `sub _INBOX_<own>.>`,
   `pub helper.presence.get.<own nfp>`, `pub helper.turn.get.<own nfp>`, `pub helper.devcert.get.<own nfp>`,
   `pub helper.revoke.<own nfp>`. Invite-only and stale-cap connections get just `pub host.<h>.connect` + inbox. Max 32
-  hosts per connection (A10.5). **Session record**: on each successful auth the callout writes
+  hosts per connection (A10.5).
+  **[amended v0.9.49]** The helper publishes a request/reply answer only into the caller's own
+  concrete `_INBOX_<device_fp>.` address; a reply naming any other subject, or a wildcard, is
+  dropped. NATS authorizes the PUB subject and not the reply field (measured, td-fc5a30), so this
+  check is the helper's, not the broker's. The `$SYS.REQ.USER.AUTH` callout reply is exempt: its
+  requester is `nats-server`, and the reply subject is the server's own correlation inbox.
+  **Session record**: on each successful auth the callout writes
   `nats_fp → {root_fp, root_pk, device_fp, host_fps, quota_profile, exp}` to the helper store — **[amended v0.9.18]**
   `device_fp` is added so the kick relay can resolve a device-scoped revocation to a live connection (§A3 keys it
   `device_fp -> (server_id, cid)`) — **[amended v0.9.47]** `root_pk` retains the identity root public key the
@@ -1907,6 +1920,14 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.49 (2026-10-23)** — One correction, no wire change. NATS authorizes the PUB subject, not the
+  reply field: td-fc5a30 measured that `nats-server` does not refuse a foreign `msg.reply`, so a member
+  could make the helper's privileged app connection publish into another tenant's subject. The three
+  app-account request/reply subjects — `helper.turn.get.<nfp>`, `helper.presence.get.<nfp>`, and
+  `helper.revoke.<nfp>` — now publish only into the caller's own concrete `_INBOX_<device_fp>.` address,
+  deriving the device from the session record the subject token names; a mismatched or wildcard reply is
+  logged and dropped. The `$SYS.REQ.USER.AUTH` callout reply is the documented exception — the requester
+  is `nats-server` and the reply is its own correlation inbox, not a member-chosen subject. (td-bc9490)
 - **v0.9.48 (2026-10-23)** — One status correction and one decision, no wire change. `helper.revoke.<nfp>`
   is implemented: the handler (`spindle_helper::self_revoke`), the member permission grant that was missing, a
   durable per-root union store, and the pre-crypto callout refusal. Nothing produces the record yet — there is
