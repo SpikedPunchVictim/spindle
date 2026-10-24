@@ -106,7 +106,7 @@ impl FreeSpaceProbe for OsFreeSpace {
                 // path: `rustix`'s `Errno` display is a bare OS error code/message and never
                 // echoes the path it was called with.
                 tracing::warn!(
-                    error = %e,
+                    error = %e, // redaction-ok: rustix::io::Errno Display is std::io::Error's OS errno text (code + strerror), no path, dirent, or identifier
                     "OsFreeSpace::available_bytes (unix): statvfs probe failed; reporting 0 \
                      bytes available (fail closed) — uploads will be refused as though the disk \
                      were full even though free space is simply unknown"

@@ -228,7 +228,7 @@ pub fn revoke_member_and_mint(
     }) {
         tracing::error!(
             root_fp = %root_fp.redacted(),
-            error = %e,
+            error = %e, // redaction-ok: AuditError Display carries seq/row numbers, static messages, and FingerprintError/IdentityError text (lengths/static only); its rusqlite arm is this host's own store (operator-config exemption, spindle-vfs lib.rs)
             "revoke_member_and_mint: audit append failed; the revocation itself already \
              committed and is already being enforced, proceeding without an audit record"
         );
@@ -321,7 +321,7 @@ pub fn revoke_device_and_mint(
     }) {
         tracing::error!(
             device_fp = %device_fp.redacted(),
-            error = %e,
+            error = %e, // redaction-ok: AuditError Display carries seq/row numbers, static messages, and FingerprintError/IdentityError text (lengths/static only); its rusqlite arm is this host's own store (operator-config exemption, spindle-vfs lib.rs)
             "revoke_device_and_mint: audit append failed; the revocation itself already \
              committed and is already being enforced, proceeding without an audit record"
         );

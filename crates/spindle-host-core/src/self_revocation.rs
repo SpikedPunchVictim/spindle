@@ -262,7 +262,7 @@ pub fn apply_self_revocation(
                     tracing::error!(
                         member_root_fp = %member.root_fp.redacted(),
                         device_fp = %device_fp.redacted(),
-                        error = %e,
+                        error = %e, // redaction-ok: AuditError Display carries seq/row numbers, static messages, and FingerprintError/IdentityError text (lengths/static only); its rusqlite arm is this host's own store (operator-config exemption, spindle-vfs lib.rs)
                         "apply_self_revocation: audit append failed; the device revocation itself \
                          already committed and is already being enforced, proceeding without an \
                          audit record"

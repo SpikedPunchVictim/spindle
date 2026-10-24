@@ -344,7 +344,10 @@ impl HostDaemon {
         let connect_store = match factory.open() {
             Ok(store) => store,
             Err(error) => {
-                tracing::error!(%error, "host daemon failed to open connect-path store connection");
+                tracing::error!(
+                    error = %error.redacted(),
+                    "host daemon failed to open connect-path store connection"
+                );
                 return Err(error.into());
             }
         };
@@ -384,7 +387,10 @@ impl HostDaemon {
         let session_lookup_store = match factory.open() {
             Ok(store) => store,
             Err(error) => {
-                tracing::error!(%error, "host daemon failed to open session-path store connection");
+                tracing::error!(
+                    error = %error.redacted(),
+                    "host daemon failed to open session-path store connection"
+                );
                 return Err(error.into());
             }
         };

@@ -368,7 +368,7 @@ impl<'a> Audit<'a> {
                     // but completely silent. See `recover_from_non_autocommit` for what happens
                     // next.
                     tracing::error!(
-                        %commit_error,
+                        %commit_error, // redaction-ok: rusqlite::Error from this host's own audit connection and a constant COMMIT statement — SQLite/schema text and the constant SQL only, never a path or row value (operator-config exemption, lib.rs)
                         "audit COMMIT failed after a successful append; the row is not durable, \
                          and the connection may be stuck mid-transaction, so subsequent writes on \
                          it are not guaranteed durable until this is resolved"
@@ -390,8 +390,8 @@ impl<'a> Audit<'a> {
                 // `verify_chain`.
                 if let Err(rollback_error) = self.conn.execute_batch("ROLLBACK") {
                     tracing::error!(
-                        %rollback_error,
-                        append_error = %e,
+                        %rollback_error, // redaction-ok: rusqlite::Error from this host's own audit connection and a constant ROLLBACK statement — SQLite/schema text and the constant SQL only, never a path or row value (operator-config exemption, lib.rs)
+                        append_error = %e, // redaction-ok: AuditError Display carries seq/row numbers, static messages, and FingerprintError/IdentityError text (lengths/static only); its rusqlite arm is this host's own store (operator-config exemption, lib.rs)
                         "audit ROLLBACK failed after a failed append; connection may be stuck \
                          mid-transaction, so subsequent writes on it are not guaranteed durable"
                     );

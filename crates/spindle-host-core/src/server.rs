@@ -156,12 +156,12 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                     match redacted_session_id(&session.id) {
                         Some(redacted) => tracing::warn!(
                             session_fp = %redacted,
-                            %remove_error,
+                            %remove_error, // redaction-ok: cap-std Dir::remove_file's io::Error is an OS errno/ErrorKind text, no path or dirent name
                             "discard_staging_bytes: failed to remove an upload session's \
                              staging file; it is leaked on disk"
                         ),
                         None => tracing::warn!(
-                            %remove_error,
+                            %remove_error, // redaction-ok: cap-std Dir::remove_file's io::Error is an OS errno/ErrorKind text, no path or dirent name
                             "discard_staging_bytes: failed to remove an upload session's \
                              staging file; it is leaked on disk"
                         ),

@@ -100,7 +100,7 @@ use spindle_helper::kick;
 use spindle_helper::memory_store::InMemoryHelperView;
 use spindle_helper::natsjwt::{self, NatsJwtError};
 use spindle_helper::permissions::{Limits, SubjectPermissions};
-use spindle_helper::pg_store::PgStore;
+use spindle_helper::pg_store::{sqlx_error_summary, PgStore};
 use spindle_helper::presence;
 use spindle_helper::revoke;
 use spindle_helper::self_revoke;
@@ -390,8 +390,17 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Err(e) = run(config).await {
-        tracing::error!(error = %e, "spindle-helper exiting on fatal error");
+    // The generic backstop stays static: `run`'s remaining `?` paths are untyped `anyhow`
+    // conversions that can carry operator configuration values (NATS server URLs and other
+    // startup wiring), and `anyhow::Error` has no redacted `Display` view. The typed startup
+    // sites below log their own content-free causes, so this line only covers anything they do
+    // not. Note that nkeys seed errors do NOT format the seed — their text is a length, position,
+    // or checksum — so seed material is not the reason for withholding here.
+    if run(config).await.is_err() {
+        tracing::error!(
+            "spindle-helper exiting on fatal error (details withheld: the failure chain can \
+             carry operator configuration and has no redacted view)"
+        );
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -596,13 +605,26 @@ async fn next_or_pending(sub: &mut Option<async_nats::Subscriber>) -> Option<asy
 const KICK_REPLAN_DELAY: Duration = Duration::from_millis(250);
 
 async fn run(config: Config) -> anyhow::Result<()> {
-    let app_kp = KeyPair::from_seed(&config.app_account_seed)
-        .map_err(|e| anyhow::anyhow!("bad APP_ACCOUNT_SEED: {e}"))?;
+    let app_kp = match KeyPair::from_seed(&config.app_account_seed) {
+        Ok(kp) => kp,
+        Err(_) => {
+            // nkeys' seed errors carry a length, position, or checksum, never the seed itself;
+            // the static message keeps that third-party text out of the untyped chain `main`
+            // must withhold.
+            tracing::error!("APP_ACCOUNT_SEED is not a valid nkey seed");
+            return Err(anyhow::anyhow!("APP_ACCOUNT_SEED is not a valid nkey seed"));
+        }
+    };
 
     let operator_pk = match &config.operator_seed {
         Some(seed) => {
-            let (_, raw) =
-                nkeys::decode_seed(seed).map_err(|e| anyhow::anyhow!("bad OPERATOR_SEED: {e}"))?;
+            let (_, raw) = match nkeys::decode_seed(seed) {
+                Ok(decoded) => decoded,
+                Err(_) => {
+                    tracing::error!("OPERATOR_SEED is not a valid nkey seed");
+                    return Err(anyhow::anyhow!("OPERATOR_SEED is not a valid nkey seed"));
+                }
+            };
             verifying_key_from_raw(&raw)?
         }
         None => {
@@ -616,9 +638,22 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     tracing::info!(admission_mode = ?config.admission_mode, "starting spindle-helper");
 
-    let callout_client = async_nats::ConnectOptions::with_nkey(config.callout_user_seed.clone())
-        .connect(&config.nats_url)
-        .await?;
+    let callout_client =
+        match async_nats::ConnectOptions::with_nkey(config.callout_user_seed.clone())
+            .connect(&config.nats_url)
+            .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::error!(
+                    error = %error.kind(), // redaction-ok: async_nats::ConnectErrorKind Display is static text (server parse/DNS/auth/timeout/TLS/IO), no URL, credential, or payload
+                    "failed to connect the callout/system NATS connection"
+                );
+                return Err(anyhow::anyhow!(
+                    "failed to connect the callout/system NATS connection"
+                ));
+            }
+        };
     tracing::info!("callout/system connection established, subscribing to $SYS.REQ.USER.AUTH");
 
     // The application-account connection (DESIGN.md §A5's two-connection bridging — see this
@@ -626,9 +661,21 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // `helper.turn.get.<nfp>` handling needs it — see the `turn_sub` subscription below.
     let app_client = match &config.app_conn_seed {
         Some(seed) => {
-            let client = async_nats::ConnectOptions::with_nkey(seed.clone())
+            let client = match async_nats::ConnectOptions::with_nkey(seed.clone())
                 .connect(&config.nats_url)
-                .await?;
+                .await
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error.kind(), // redaction-ok: async_nats::ConnectErrorKind Display is static text (server parse/DNS/auth/timeout/TLS/IO), no URL, credential, or payload
+                        "failed to connect the application-account NATS connection"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "failed to connect the application-account NATS connection"
+                    ));
+                }
+            };
             tracing::info!("application-account connection established");
             Some(client)
         }
@@ -672,11 +719,18 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let mut store = match &config.database_url {
         Some(url) => {
             tracing::info!("DATABASE_URL set — connecting to Postgres and running migrations");
-            let pg = PgStore::connect(url, config.admission_mode, operator_pk)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("failed to connect to Postgres / run migrations: {e}")
-                })?;
+            let pg = match PgStore::connect(url, config.admission_mode, operator_pk).await {
+                Ok(pg) => pg,
+                Err(error) => {
+                    tracing::error!(
+                        error = %sqlx_error_summary(&error),
+                        "failed to connect to Postgres / run migrations"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "failed to connect to Postgres / run migrations"
+                    ));
+                }
+            };
             tracing::info!("Postgres store ready");
             Store::Pg(pg)
         }
@@ -705,9 +759,21 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // `SYS_CONN_SEED` is unset, matching that pre-S5 (broken) behavior rather than hard-failing.
     let sys_client = match &config.sys_conn_seed {
         Some(seed) => {
-            let client = async_nats::ConnectOptions::with_nkey(seed.clone())
+            let client = match async_nats::ConnectOptions::with_nkey(seed.clone())
                 .connect(&config.nats_url)
-                .await?;
+                .await
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error.kind(), // redaction-ok: async_nats::ConnectErrorKind Display is static text (server parse/DNS/auth/timeout/TLS/IO), no URL, credential, or payload
+                        "failed to connect the SYS-account NATS connection"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "failed to connect the SYS-account NATS connection"
+                    ));
+                }
+            };
             tracing::info!("SYS-account connection established");
             Some(client)
         }
@@ -818,14 +884,22 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 let resp = match handle_one(&msg.payload, &config.account_name, &app_kp, &mut store, &mut presence_map) {
                     Ok(resp) => resp,
                     Err(e) => {
-                        tracing::error!(error = %e, "internal error building callout response");
+                        tracing::error!(
+                            // `redacted()`, not `%e`: `NatsJwtError::Json` can echo peer claim
+                            // bytes — see `RedactedHandleError`.
+                            error = %e.redacted(),
+                            "internal error building callout response"
+                        );
                         encode_refusal(&msg.payload, &app_kp)
                     }
                 };
                 if let Some(resp) = resp {
                     // Validation is out of scope here: this reply is the server-issued `$SYS` correlation inbox for nats-server itself, not a member (td-bc9490's documented exception).
                     if let Err(e) = callout_client.publish(reply, resp.into()).await {
-                        tracing::error!(error = %e, "failed to publish callout response");
+                        tracing::error!(
+                            error = %e, // redaction-ok: async_nats::PublishError Display is its static kind (or payload sizes) plus a tokio channel-closed source; no subject or payload bytes
+                            "failed to publish callout response"
+                        );
                     }
                     let _ = callout_client.flush().await;
                 }
@@ -860,7 +934,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     );
                 } else if let Some(client) = &app_client {
                     if let Err(e) = client.publish(reply, reply_payload.into()).await {
-                        tracing::error!(error = %e, "failed to publish helper.turn.get.<nfp> response");
+                        tracing::error!(
+                            error = %e, // redaction-ok: async_nats::PublishError Display is its static kind (or payload sizes) plus a tokio channel-closed source; no subject or payload bytes
+                            "failed to publish helper.turn.get.<nfp> response"
+                        );
                     }
                     let _ = client.flush().await;
                 }
@@ -897,7 +974,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     );
                 } else if let Some(client) = &app_client {
                     if let Err(e) = client.publish(reply, reply_payload.into()).await {
-                        tracing::error!(error = %e, "failed to publish helper.presence.get.<nfp> response");
+                        tracing::error!(
+                            error = %e, // redaction-ok: async_nats::PublishError Display is its static kind (or payload sizes) plus a tokio channel-closed source; no subject or payload bytes
+                            "failed to publish helper.presence.get.<nfp> response"
+                        );
                     }
                     let _ = client.flush().await;
                 }
@@ -980,7 +1060,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     }
                     revoke::RevokeOutcome::Rejected(reason) => {
                         tracing::warn!(
-                            subject = %msg.subject,
+                            subject = %redacted_subject_token(msg.subject.as_str(), "registry.revoke."),
                             reason = %reason,
                             "registry.revoke.<hfp> record rejected"
                         );
@@ -1055,7 +1135,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     Ok(outcome) => {
                         tracing::warn!(
                             nfp = %nfp,
-                            reason = %outcome.error.unwrap_or_default(),
+                            reason = %outcome.error.unwrap_or_default(), // redaction-ok: SelfRevokeReply.error is built only from static literals/VERIFICATION_FAILED by SelfRevokeReply::err; no peer bytes or identifiers
                             "helper.revoke.<nfp> self-revocation rejected"
                         );
                     }
@@ -1083,7 +1163,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     );
                 } else if let Some(client) = &app_client {
                     if let Err(e) = client.publish(reply, reply_payload.into()).await {
-                        tracing::error!(error = %e, "failed to publish helper.revoke.<nfp> response");
+                        tracing::error!(
+                            error = %e, // redaction-ok: async_nats::PublishError Display is its static kind (or payload sizes) plus a tokio channel-closed source; no subject or payload bytes
+                            "failed to publish helper.revoke.<nfp> response"
+                        );
                     }
                     let _ = client.flush().await;
                 }
@@ -1271,7 +1354,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                         Some(target) => {
                             tracing::info!(
                                 nats_fp = %target.nats_fp.redacted(),
-                                matched_subject = %target.matched_subject,
+                                matched_subject = %target.matched_subject.redacted(),
                                 "delayed kick re-plan resolved a session the original plan missed"
                             );
                             issue_kick(sys_ref, &target).await;
@@ -1450,7 +1533,10 @@ async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) 
     let payload = match serde_json::to_vec(&serde_json::json!({ "cid": target.cid })) {
         Ok(p) => p,
         Err(e) => {
-            tracing::error!(error = %e, "failed to serialize a KICK request payload");
+            tracing::error!(
+                error = %e, // redaction-ok: serde_json serialization error over a json! literal with a numeric cid; serde_json's serializer emits only static messages, never the value being serialized
+                "failed to serialize a KICK request payload"
+            );
             return;
         }
     };
@@ -1464,7 +1550,7 @@ async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) 
         Ok(Ok(reply)) => reply,
         Ok(Err(e)) => {
             tracing::error!(
-                error = %e,
+                error = %e, // redaction-ok: async_nats::RequestError Display is its static kind plus a timeout/channel-closed source; no subject or payload bytes
                 subject = %subject,
                 cid = target.cid,
                 nats_fp = %target.nats_fp.redacted(),
@@ -1487,7 +1573,10 @@ async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) 
         Ok(v) => v,
         Err(e) => {
             tracing::error!(
-                error = %e,
+                // serde_json parse errors can echo the offending input (`unknown variant
+                // `...``, `invalid type: string "..."`); the KICK reply is server text. Log only
+                // the content-free category.
+                error = ?e.classify(), // redaction-ok: serde_json::error::Category is a static enum (Io/Syntax/Data/Eof), no reply bytes
                 subject = %subject,
                 cid = target.cid,
                 nats_fp = %target.nats_fp.redacted(),
@@ -1505,8 +1594,8 @@ async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) 
             subject = %subject,
             cid = target.cid,
             nats_fp = %target.nats_fp.redacted(),
-            matched_subject = %target.matched_subject,
-            server_error = %error,
+            matched_subject = %target.matched_subject.redacted(),
+            server_error = %json_value_kind(error),
             "KICK request was answered but failed"
         );
         return;
@@ -1516,7 +1605,7 @@ async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) 
         subject = %subject,
         cid = target.cid,
         nats_fp = %target.nats_fp.redacted(),
-        matched_subject = %target.matched_subject,
+        matched_subject = %target.matched_subject.redacted(),
         "kicked a revoked connection"
     );
 }
@@ -1540,12 +1629,18 @@ async fn publish_presence_delta(
     let payload = match serde_json::to_vec(&delta.entry) {
         Ok(p) => p,
         Err(e) => {
-            tracing::error!(error = %e, "failed to serialize a presence delta");
+            tracing::error!(
+                error = %e, // redaction-ok: serde_json serialization error over PresenceEntry's derived Serialize (String/unit-enum/Option<u64>); serializer errors are static messages and never echo the value
+                "failed to serialize a presence delta"
+            );
             return;
         }
     };
     if let Err(e) = client.publish(subject, payload.into()).await {
-        tracing::error!(error = %e, "failed to publish a host.<hfp>.presence delta");
+        tracing::error!(
+            error = %e, // redaction-ok: async_nats::PublishError Display is its static kind (or payload sizes) plus a tokio channel-closed source; no subject or payload bytes
+            "failed to publish a host.<hfp>.presence delta"
+        );
     }
     let _ = client.flush().await;
 }
@@ -1579,7 +1674,20 @@ async fn connz_request(sys_client: &async_nats::Client) -> Result<serde_json::Va
     .map_err(|_| ConnzError::Timeout)?
     .map_err(|e| ConnzError::Transport(e.to_string()))?;
 
-    serde_json::from_slice(&reply.payload).map_err(|e| ConnzError::BadJson(e.to_string()))
+    serde_json::from_slice(&reply.payload).map_err(|e| {
+        // A serde_json parse error can echo the reply's bytes (`unknown variant `...``,
+        // `invalid type: string "..."`), and the CONNZ reply carries connection metadata. Keep
+        // only the content-free category; `ConnzError`'s callers log this string verbatim.
+        ConnzError::BadJson(
+            match e.classify() {
+                serde_json::error::Category::Io => "I/O error",
+                serde_json::error::Category::Syntax => "syntax error",
+                serde_json::error::Category::Data => "data error",
+                serde_json::error::Category::Eof => "unexpected end of input",
+            }
+            .to_string(),
+        )
+    })
 }
 
 /// Why a [`connz_request`] round trip failed to produce a usable reply — carried instead of
@@ -1670,7 +1778,7 @@ async fn seed_maps(
         Ok(v) => v,
         Err(ConnzError::Transport(e)) => {
             tracing::warn!(
-                error = %e,
+                error = %e, // redaction-ok: ConnzError::Transport(String) holds a RequestError Display (static kind + timeout/channel-closed source), no subject or payload bytes
                 "CONNZ request failed — starting presence and kick maps empty"
             );
             return (presence_map, kick_map);
@@ -1681,7 +1789,7 @@ async fn seed_maps(
         }
         Err(ConnzError::BadJson(e)) => {
             tracing::warn!(
-                error = %e,
+                error = %e, // redaction-ok: ConnzError::BadJson(String) holds only serde_json's Category name, never reply bytes
                 "CONNZ reply was not valid JSON — starting presence and kick maps empty"
             );
             return (presence_map, kick_map);
@@ -1773,7 +1881,7 @@ async fn connz_kick_fallback(
         Ok(v) => v,
         Err(ConnzError::Transport(e)) => {
             tracing::warn!(
-                error = %e,
+                error = %e, // redaction-ok: ConnzError::Transport(String) holds a RequestError Display (static kind + timeout/channel-closed source), no subject or payload bytes
                 unresolved = unresolved.len(),
                 "CONNZ kick-fallback request failed — these sessions remain unresolved"
             );
@@ -1788,7 +1896,7 @@ async fn connz_kick_fallback(
         }
         Err(ConnzError::BadJson(e)) => {
             tracing::warn!(
-                error = %e,
+                error = %e, // redaction-ok: ConnzError::BadJson(String) holds only serde_json's Category name, never reply bytes
                 unresolved = unresolved.len(),
                 "CONNZ kick-fallback reply was not valid JSON — these sessions remain unresolved"
             );
@@ -1845,7 +1953,7 @@ async fn connz_kick_fallback(
         };
         tracing::info!(
             nats_fp = %target.nats_fp.redacted(),
-            matched_subject = %target.matched_subject,
+            matched_subject = %target.matched_subject.redacted(),
             "CONNZ kick fallback resolved a session the delayed re-plan still missed"
         );
         issue_kick(&sys_client, &target).await;
@@ -1910,11 +2018,66 @@ enum HandleError {
     MissingClaim(&'static str),
 }
 
+impl HandleError {
+    /// A log-safe `Display` view — see [`RedactedHandleError`].
+    fn redacted(&self) -> RedactedHandleError<'_> {
+        RedactedHandleError(self)
+    }
+}
+
+/// Why [`HandleError`]'s plain `Display` cannot be logged at a `tracing::` call site:
+/// [`NatsJwtError::Json`] wraps a `serde_json::Error` produced from the request's claim bytes,
+/// and serde_json's parse errors can echo those bytes (`unknown variant `...``, `invalid type:
+/// string "..."`). Every arm below therefore keeps only variant identity and numeric/static
+/// facts. The match is exhaustive with no catch-all so a new variant must be classified here.
+struct RedactedHandleError<'a>(&'a HandleError);
+
+impl std::fmt::Display for RedactedHandleError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            HandleError::NonUtf8Payload => {
+                f.write_str("callout request payload is not valid UTF-8")
+            }
+            // The field name comes from this file's `MissingClaim(..)` construction sites, never
+            // from request bytes.
+            HandleError::MissingClaim(field) => {
+                write!(f, "callout request claims missing {field}")
+            }
+            HandleError::Jwt(err) => match err {
+                NatsJwtError::MalformedJwt(parts) => {
+                    write!(f, "not a 3-part compact JWT (got {parts} part(s))")
+                }
+                // `base64::DecodeError` carries an index and at most one offending byte, but its
+                // exact text is not needed; the category is enough.
+                NatsJwtError::Base64(_) => f.write_str("invalid base64url in JWT part"),
+                // Peer claim bytes are the input to this parse; see this type's doc comment.
+                NatsJwtError::Json(_) => f.write_str("invalid JSON in JWT claims"),
+                // `Sign(String)` comes from nkey signing, which may echo key material.
+                NatsJwtError::Sign(_) => f.write_str("nkey signing failed"),
+            },
+        }
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+/// The JSON kind of a value, for log lines that must not carry the value itself. The KICK
+/// reply's `error` field is nats-server text and may echo a connection id or subject, so only its
+/// shape is logged (both are already logged as structured fields on the same line).
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 /// A redacted identifier derived from a parametrized subject's final token, for log lines about a
@@ -2152,6 +2315,35 @@ fn handle_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RedactedHandleError` must withhold the peer-controlled JSON parse text that
+    /// `NatsJwtError::Json`'s plain `Display` would emit, and the nkey signing text, while still
+    /// naming the category. The fixture asserts its own marker really is reachable, so this
+    /// cannot pass vacuously against an error type that stopped echoing input.
+    #[test]
+    fn redacted_handle_error_withholds_peer_bytes_and_names_the_category() {
+        // `serde_json` reports `invalid type: string "PEER_SECRET", expected a tuple ...`,
+        // embedding the offending token verbatim.
+        let json_error =
+            serde_json::from_str::<(u8, u8)>("\"PEER_SECRET\"").expect_err("type mismatch");
+        assert!(
+            json_error.to_string().contains("PEER_SECRET"),
+            "fixture must actually carry the marker: {json_error}"
+        );
+
+        let json = HandleError::Jwt(NatsJwtError::Json(json_error));
+        let sign = HandleError::Jwt(NatsJwtError::Sign("PEER_SECRET".to_string()));
+
+        for error in [&json, &sign] {
+            let rendered = error.redacted().to_string();
+            assert!(
+                !rendered.contains("PEER_SECRET"),
+                "redacted Display leaked peer bytes: {rendered}"
+            );
+        }
+        assert_eq!(json.redacted().to_string(), "invalid JSON in JWT claims");
+        assert_eq!(sign.redacted().to_string(), "nkey signing failed");
+    }
 
     /// One row of a real `$SYS.REQ.SERVER.PING.CONNZ` reply, captured with `{"auth": true}` in
     /// the request (spikes/s5-presence's fix — an empty request body's rows have no identity

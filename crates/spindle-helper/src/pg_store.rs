@@ -103,6 +103,33 @@ fn key_from_row(bytes: &[u8]) -> [u8; 32] {
     <[u8; 32]>::try_from(bytes).expect("stored public-key column must be exactly 32 bytes")
 }
 
+/// A log-safe summary of a `sqlx::Error`. Postgres error text can echo bound parameters — a
+/// unique-violation detail names the conflicting key, and these statements bind full
+/// fingerprints — so a database error is reduced to its SQLSTATE code. Non-database variants
+/// (pool, IO, protocol) are reduced to a static category, never their `Display`.
+///
+/// `pub` because the helper binary is a separate target and logs the same startup failure this
+/// module's callers log.
+pub fn sqlx_error_summary(error: &sqlx::Error) -> String {
+    match error.as_database_error() {
+        Some(db) => match db.code() {
+            Some(code) => format!("database error {code}"),
+            None => "database error".to_string(),
+        },
+        // `sqlx::Error::Io` is the one non-database variant whose kind is both safe and useful;
+        // the unit variants worth telling apart get their own static text.
+        None => match error {
+            sqlx::Error::Io(io) => format!("io error {:?}", io.kind()),
+            sqlx::Error::PoolTimedOut => "pool timed out".to_string(),
+            sqlx::Error::PoolClosed => "pool closed".to_string(),
+            sqlx::Error::RowNotFound => "row not found".to_string(),
+            sqlx::Error::WorkerCrashed => "background worker crashed".to_string(),
+            sqlx::Error::BeginFailed => "transaction begin failed".to_string(),
+            _ => "non-database error".to_string(),
+        },
+    }
+}
+
 impl PgStore {
     /// Connects to `database_url`, runs the embedded migrations (`migrations/`), and returns a
     /// ready store. `admission_mode`/`operator_pk` are process configuration, not durable state —
@@ -465,7 +492,7 @@ impl PgStore {
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
             Err(e) => {
-                tracing::error!(error = %e, "failed to begin self-revocation transaction");
+                tracing::error!(error = %sqlx_error_summary(&e), "failed to begin self-revocation transaction");
                 return None;
             }
         };
@@ -480,7 +507,7 @@ impl PgStore {
         .execute(&mut *tx)
         .await
         {
-            tracing::error!(error = %e, "self_revocation_epochs max-wins upsert failed");
+            tracing::error!(error = %sqlx_error_summary(&e), "self_revocation_epochs max-wins upsert failed");
             return None;
         }
 
@@ -498,25 +525,26 @@ impl PgStore {
         .execute(&mut *tx)
         .await
         {
-            tracing::error!(error = %e, "self_revocations bulk insert failed");
+            tracing::error!(error = %sqlx_error_summary(&e), "self_revocations bulk insert failed");
             return None;
         }
 
-        let stored =
-            match sqlx::query("SELECT epoch FROM self_revocation_epochs WHERE root_fp = $1")
-                .bind(fp_bytes(root_fp))
-                .fetch_one(&mut *tx)
-                .await
-            {
-                Ok(row) => row.get::<i64, _>("epoch") as u64,
-                Err(e) => {
-                    tracing::error!(error = %e, "self_revocation_epoch read-back failed");
-                    return None;
-                }
-            };
+        let stored = match sqlx::query(
+            "SELECT epoch FROM self_revocation_epochs WHERE root_fp = $1",
+        )
+        .bind(fp_bytes(root_fp))
+        .fetch_one(&mut *tx)
+        .await
+        {
+            Ok(row) => row.get::<i64, _>("epoch") as u64,
+            Err(e) => {
+                tracing::error!(error = %sqlx_error_summary(&e), "self_revocation_epoch read-back failed");
+                return None;
+            }
+        };
 
         if let Err(e) = tx.commit().await {
-            tracing::error!(error = %e, "commit self-revocation transaction failed");
+            tracing::error!(error = %sqlx_error_summary(&e), "commit self-revocation transaction failed");
             return None;
         }
 

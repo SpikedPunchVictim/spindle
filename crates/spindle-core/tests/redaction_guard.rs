@@ -25,32 +25,48 @@
 //! RedactedFingerprint`]'s own doc comment applies to what redaction protects against.
 //!
 //! **Interpolated errors are the concrete, load-bearing case of that blindness.** This guard
-//! inspects *binding names only*. `error`, `e`, and `remove_error` are not suspicious names, so
-//! every `%error` in the workspace passes — no matter what that error's type actually emits. A
-//! manual audit (2026-09-07) found real leaks that way: `rusqlite::Error`'s `Display` embeds the
-//! database file's path (`unable to open database file: <path>`), which `spindle_vfs::store::
-//! StoreError::Sqlite` passes straight through; `spindle_proto::artifacts::ProtoError::
-//! UnknownField` carries a CBOR map key taken verbatim from a peer's bytes; and
-//! `spindle_net::signaling::SignalingError`'s subject variants spell out two *untruncated*
-//! fingerprints. **Passing this test is not evidence that a `tracing::` line is safe.** Before
-//! interpolating an error, read what its type can emit, transitively through every `#[from]` and
-//! `{0}` in its `thiserror` attributes, and reach for that type's own redacted `Display` view
-//! (`ProtoError::redacted`, `SignalingError::redacted`) where one exists. Which content is
-//! permitted — and the operator-configuration exemption that lets a daemon log its own store
-//! path — is stated in `spindle-vfs`, `spindle-host-core`, and `spindle-hostd`'s crate-root
-//! `tracing` sections.
+//! therefore applies two independent predicates to every `%ident`/`?ident` interpolation:
+//!
+//! 1. A *name* heuristic ([`is_suspicious`]), for identifiers and paths whose binding name says
+//!    they are content-bearing (`*_fp`, `*path*`, ...).
+//! 2. An *error-shape* heuristic ([`is_error_shaped`]), for bindings whose last dot-separated
+//!    segment is `e`, `err`, or `error`, or ends with `_error`/`_err`. An error's `Display` is
+//!    written somewhere else entirely — often in a third-party crate — and can carry peer bytes,
+//!    filesystem paths, or untruncated identifiers. The interpolation is a violation unless it is
+//!    already safe via `.redacted()`, or the line carries the escape hatch below.
+//!
+//! A manual audit (2026-09-07) found the leaks the second predicate exists to catch:
+//! `rusqlite::Error`'s `Display` embeds the database file's path (`unable to open database file:
+//! <path>`), which `spindle_vfs::store::StoreError::Sqlite` passes straight through;
+//! `spindle_proto::artifacts::ProtoError::UnknownField` carries a CBOR map key taken verbatim
+//! from a peer's bytes; and `spindle_net::signaling::SignalingError`'s subject variants spell out
+//! two *untruncated* fingerprints. **Passing this test is not evidence that a `tracing::` line is
+//! safe.** Before interpolating an error, read what its type can emit, transitively through every
+//! `#[from]` and `{0}` in its `thiserror` attributes, and reach for that type's own redacted
+//! `Display` view (`ProtoError::redacted`, `SignalingError::redacted`, `StoreError::redacted`,
+//! `BundleWireError::redacted`) where one exists. Which content is permitted — and the
+//! operator-configuration exemption that lets a daemon log its own store path — is stated in
+//! `spindle-vfs`, `spindle-host-core`, and `spindle-hostd`'s crate-root `tracing` sections.
+//!
+//! Both predicates are still text heuristics and cannot resolve a binding to its type: an error
+//! bound under a non-error-shaped name (`failure`, `cause`), an error reached two functions away
+//! from the `tracing::` call, and a `Display` impl on a type that merely embeds a full fingerprint
+//! are all invisible. The escape hatch is how a known-safe error *type* is recorded: annotate the
+//! line with what its `Display` carries and why that is safe.
 //!
 //! # Escape hatch
 //!
 //! A binding name matching a suspicious pattern is not always actually unsafe to log (e.g. its
-//! value may already have been redacted upstream, several lines before the `tracing::` call).
-//! Rather than an allowlist of `file:line`s (which rots the moment a line above it is edited),
-//! annotate the *specific line* with a trailing comment: `// redaction-ok: <reason>`. The
-//! reason must be non-empty — it exists so the exception is visible in code review, not just to
-//! silence this test. See `crates/spindle-helper/src/bin/helper.rs`'s `nats_fps = ?fingerprints`
-//! call site for a real example (the `Vec<String>` it logs is built from
-//! `Fingerprint::redacted()` output, not full fingerprints, but the binding is still named
-//! `fingerprints`).
+//! value may already have been redacted upstream, several lines before the `tracing::` call), and
+//! an error-shaped binding can hold a type whose `Display` is provably content-free (an enum of
+//! numeric codes, say). Rather than an allowlist of `file:line`s (which rots the moment a line
+//! above it is edited), annotate the *specific line* with a trailing comment: `//
+//! redaction-ok: <reason>`. The reason must be non-empty — it exists so the exception is visible
+//! in code review, not just to silence this test. For an error interpolation the reason must name
+//! the type and what its `Display` can carry (or cannot). See
+//! `crates/spindle-helper/src/bin/helper.rs`'s `nats_fps = ?fingerprints` call site for a real
+//! name-heuristic example (the `Vec<String>` it logs is built from `Fingerprint::redacted()`
+//! output, not full fingerprints, but the binding is still named `fingerprints`).
 //!
 //! # Neuter-verification
 //!
@@ -86,20 +102,43 @@ const MACRO_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 /// exception. Must be followed by a non-empty reason — see this file's module doc comment.
 const ESCAPE_HATCH_MARKER: &str = "// redaction-ok:";
 
-/// A binding name is suspicious if its last dot-separated segment matches one of these — a
-/// deliberately loose heuristic (see module doc comment), not a type check.
-fn is_suspicious(binding: &str) -> bool {
-    let last = binding
+/// The last dot-separated segment of a binding path, lowercased. `tracing` field paths are
+/// dot-separated (`error.source`), and the heuristic always keys on the final segment.
+fn last_segment(binding: &str) -> String {
+    binding
         .rsplit('.')
         .next()
         .unwrap_or(binding)
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
+
+/// A binding name is suspicious if its last dot-separated segment matches one of these — a
+/// deliberately loose heuristic (see module doc comment), not a type check.
+fn is_suspicious(binding: &str) -> bool {
+    let last = last_segment(binding);
     last.ends_with("_fp")
         || last.contains("fingerprint")
         || last.contains("path")
         || last.contains("member_id")
         || last.contains("group")
         || last.contains("cap")
+}
+
+/// An interpolation is error-shaped if **any** dot-separated segment is `e`, `err`, or `error`,
+/// or ends with `_error`/`_err`. Every segment is checked, not just the last: the error value is
+/// often consumed by a method or field access before it reaches the formatter (`%e.classify()`,
+/// `%outcome.error.unwrap_or_default()`), and keying on the last segment alone would let exactly
+/// those through. Errors are their own category because their `Display` lives in (often
+/// third-party) type definitions this text scan cannot see — see the module doc comment. This is
+/// a name heuristic, not a type check: an error under a name like `failure` is invisible.
+fn is_error_shaped(binding: &str) -> bool {
+    binding.to_ascii_lowercase().split('.').any(|segment| {
+        segment == "e"
+            || segment == "err"
+            || segment == "error"
+            || segment.ends_with("_error")
+            || segment.ends_with("_err")
+    })
 }
 
 #[test]
@@ -127,7 +166,9 @@ fn tracing_calls_never_interpolate_untruncated_identifiers_or_paths() {
                 for (sigil_pos, binding, safe_via_redacted_call) in
                     scan_span_for_bindings(masked.as_bytes(), span_start, span_end)
                 {
-                    if safe_via_redacted_call || !is_suspicious(&binding) {
+                    let suspicious_name = is_suspicious(&binding);
+                    let error_shaped = is_error_shaped(&binding);
+                    if safe_via_redacted_call || (!suspicious_name && !error_shaped) {
                         continue;
                     }
                     let line_no = line_number_at(&original, sigil_pos);
@@ -135,15 +176,30 @@ fn tracing_calls_never_interpolate_untruncated_identifiers_or_paths() {
                     if has_escape_hatch(line_text) {
                         continue;
                     }
-                    violations.push(format!(
-                        "{}:{line_no}: `tracing::` call interpolates `{binding}`, which looks \
-                         like an untruncated identifier or path (matches this guard's \
-                         suspicious-name heuristic). Fix with `.redacted()` (see \
-                         `spindle_core::Fingerprint::redacted`), or if this specific \
-                         interpolation is already safe, annotate the line with \
-                         `{ESCAPE_HATCH_MARKER} <reason>`.",
-                        file.display(),
-                    ));
+                    if suspicious_name {
+                        violations.push(format!(
+                            "{}:{line_no}: `tracing::` call interpolates `{binding}`, which \
+                             looks like an untruncated identifier or path (matches this guard's \
+                             suspicious-name heuristic). Fix with `.redacted()` (see \
+                             `spindle_core::Fingerprint::redacted`), or if this specific \
+                             interpolation is already safe, annotate the line with \
+                             `{ESCAPE_HATCH_MARKER} <reason>`.",
+                            file.display(),
+                        ));
+                    }
+                    if error_shaped {
+                        violations.push(format!(
+                            "{}:{line_no}: `tracing::` call interpolates the error-shaped binding \
+                             `{binding}` without `.redacted()`. An error's Display/Debug can carry \
+                             peer-controlled bytes, filesystem paths, or untruncated identifiers, \
+                             and this guard cannot resolve the binding's type. Read the error type \
+                             (transitively through `#[from]`/`{{0}}`) and use its redacted view \
+                             (e.g. `%{binding}.redacted()`), or — only if its Display is provably \
+                             content-free — annotate the line with `{ESCAPE_HATCH_MARKER} <type> \
+                             Display carries <what>, no peer bytes/paths/full ids`.",
+                            file.display(),
+                        ));
+                    }
                 }
             }
         }
@@ -151,11 +207,83 @@ fn tracing_calls_never_interpolate_untruncated_identifiers_or_paths() {
 
     assert!(
         violations.is_empty(),
-        "\n\nredaction_guard found {} untruncated identifier(s)/path(s) interpolated into a \
-         `tracing::` call:\n\n{}\n",
+        "\n\nredaction_guard found {} untruncated identifier(s)/path(s) or unreviewed \
+         error-shaped interpolation(s) in a `tracing::` call:\n\n{}\n",
         violations.len(),
         violations.join("\n"),
     );
+}
+
+/// The two predicates are pure functions of the binding text, so they can be exercised directly
+/// without breaking a scanned crate's source. `.redacted()` safety is a property of the scanner's
+/// parse, so that half is asserted against synthetic masked snippets.
+#[test]
+fn error_shaped_bindings_and_redacted_call_sites_are_classified() {
+    for binding in [
+        "e",
+        "err",
+        "error",
+        "signaling_error",
+        "x_err",
+        "source.error",
+        "e.classify",
+        "e.to_string",
+        "outcome.error.unwrap_or_default",
+    ] {
+        assert!(
+            is_error_shaped(binding),
+            "`{binding}` should be classified as error-shaped"
+        );
+    }
+    for binding in [
+        "device_fp",
+        "path",
+        "redacted",
+        "error_code",
+        "failure",
+        "cause",
+    ] {
+        assert!(
+            !is_error_shaped(binding),
+            "`{binding}` should not be classified as error-shaped"
+        );
+    }
+
+    // `%error.redacted()` / `%e.redacted()` are the safe shapes the main scan skips.
+    for snippet in ["%error.redacted()", "error = %e.redacted()"] {
+        let hits = scan_span_for_bindings(snippet.as_bytes(), 0, snippet.len());
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected one binding in `{snippet}`: {hits:?}"
+        );
+        assert!(
+            hits[0].2,
+            "`{snippet}` should be recognized as safe via a `.redacted()` call"
+        );
+    }
+
+    // Bare interpolation of the same bindings is not safe, including when a method/field access
+    // sits between the error value and the formatter.
+    for snippet in [
+        "%error",
+        "error = %e",
+        "%signing_error",
+        "?e.classify()",
+        "%e.to_string()",
+    ] {
+        let hits = scan_span_for_bindings(snippet.as_bytes(), 0, snippet.len());
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected one binding in `{snippet}`: {hits:?}"
+        );
+        assert!(!hits[0].2, "`{snippet}` should not be recognized as safe");
+        assert!(
+            is_error_shaped(&hits[0].1),
+            "`{snippet}`'s binding should be error-shaped"
+        );
+    }
 }
 
 /// `crates/spindle-core` sits two directories below the workspace root
