@@ -3780,6 +3780,211 @@ mod tests {
         );
     }
 
+    /// td-a53e1d: the authorized half of td-48fb1d's fold-collision fix. The test above covers the
+    /// refused path (collision without `delete`); this drives `upload` + `delete` over an existing
+    /// differently-spelled dirent end to end, asserting the whole commit path `b0c2f3f` changed:
+    /// `finalize_upload` must rename onto the pre-existing dirent's spelling, the ledger must end
+    /// up with exactly one row (the fold-key upsert), both counters must reflect only the new
+    /// bytes, `upload_commit` must forget the identity baseline recorded under the old spelling,
+    /// and the commit's audit entry must be present on a verifying chain.
+    ///
+    /// The pre-existing file is first uploaded through the real flow rather than seeded directly on
+    /// disk, so its bytes are in `uploaded_files` and both counters: the "counters equal the new
+    /// size, not old + new" assertion below would otherwise be trivially true.
+    ///
+    /// **Platform caveat:** on a default macOS/APFS volume this test passes with or without the
+    /// b0c2f3f fix, because APFS folds case and `rename(2)` preserves the pre-existing dirent's
+    /// spelling by itself. The one-dirent/old-spelling assertions are only fully discriminating on
+    /// a case-sensitive filesystem (ext4, or a case-sensitive APFS image): there, unfixed code
+    /// leaves both `Photo.TXT` and `photo.txt` behind.
+    #[test]
+    fn upload_commit_with_delete_fold_collision_lands_on_existing_dirent() {
+        let fx = UploadFixture::new(Perms::UPLOAD | Perms::DELETE | Perms::DOWNLOAD);
+        let server = fx.server();
+
+        // The pre-existing dirent, uploaded through the real path so the ledger and both counters
+        // start with its bytes and the overwrite below has something to replace.
+        let old_data = b"old content".to_vec();
+        let old_session = fx.open(&server, 1, "Drop/Photo.TXT", &old_data);
+        assert_eq!(
+            server.handle(
+                &fx.ctx(),
+                2,
+                req(
+                    1,
+                    VfsRequest::UploadChunk {
+                        session_id: old_session.clone(),
+                        offset: 0,
+                        data: old_data.clone(),
+                    },
+                ),
+            ),
+            VfsReply::UploadChunk {
+                offset: old_data.len() as u64
+            }
+        );
+        assert_eq!(
+            server.handle(
+                &fx.ctx(),
+                3,
+                req(
+                    1,
+                    VfsRequest::UploadCommit {
+                        session_id: old_session,
+                    },
+                ),
+            ),
+            VfsReply::UploadCommit
+        );
+        assert_eq!(
+            fx.h.store.member_upload_bytes(fx.member_id).unwrap(),
+            old_data.len() as u64
+        );
+
+        // Record an identity baseline under the pre-existing spelling; the fold-colliding commit
+        // below must clear it (td-9bf38d's `forget` is keyed on the folded path, not literal bytes).
+        let baseline = server.handle(
+            &fx.ctx(),
+            4,
+            req(
+                1,
+                VfsRequest::Read {
+                    path: "Drop/Photo.TXT".to_string(),
+                    offset: 0,
+                    len: old_data.len() as u32,
+                },
+            ),
+        );
+        assert!(
+            matches!(baseline, VfsReply::Read { .. }),
+            "expected a successful baseline read, got {baseline:?}"
+        );
+
+        // Upload the case-variant spelling with `delete`: this is an overwrite of the pre-existing
+        // dirent (DESIGN.md "collision == overwrite"), not a second file.
+        let new_data = b"new content!".to_vec();
+        let session_id = fx.open(&server, 5, "Drop/photo.txt", &new_data);
+        assert_eq!(
+            server.handle(
+                &fx.ctx(),
+                6,
+                req(
+                    1,
+                    VfsRequest::UploadChunk {
+                        session_id: session_id.clone(),
+                        offset: 0,
+                        data: new_data.clone(),
+                    },
+                ),
+            ),
+            VfsReply::UploadChunk {
+                offset: new_data.len() as u64
+            }
+        );
+        assert_eq!(
+            server.handle(
+                &fx.ctx(),
+                7,
+                req(1, VfsRequest::UploadCommit { session_id }),
+            ),
+            VfsReply::UploadCommit
+        );
+
+        // Exactly one dirent remains, under the spelling that was already on disk.
+        let entries: Vec<std::ffi::OsString> = std::fs::read_dir(fx.real_root())
+            .expect("read_dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "a fold-collision overwrite must replace the existing dirent, not add a second: {entries:?}"
+        );
+        assert_eq!(
+            entries[0],
+            std::ffi::OsString::from("Photo.TXT"),
+            "the surviving dirent must keep the pre-existing on-disk spelling"
+        );
+        assert_eq!(
+            std::fs::read(fx.real_root().join("Photo.TXT")).expect("read landed file"),
+            new_data,
+            "the surviving dirent's contents must be the newly uploaded bytes"
+        );
+
+        // The ledger's fold-key upsert leaves exactly one row, carrying the landed spelling and
+        // the new size; a second row (or an old + new total) would mean the collision was treated
+        // as two files.
+        let uploads = fx.h.store.list_uploads(fx.share_id).expect("list_uploads");
+        assert_eq!(uploads.len(), 1, "exactly one ledger row: {uploads:?}");
+        assert_eq!(uploads[0].member_id, fx.member_id);
+        assert_eq!(uploads[0].subpath, "Photo.TXT");
+        assert_eq!(uploads[0].bytes, new_data.len() as u64);
+        assert_eq!(
+            fx.h.store.member_upload_bytes(fx.member_id).unwrap(),
+            new_data.len() as u64,
+            "member counter must be the new size, not old + new"
+        );
+        assert_eq!(
+            fx.h.store.share_upload_bytes(fx.share_id).unwrap(),
+            new_data.len() as u64,
+            "share counter must be the new size, not old + new"
+        );
+
+        // `upload_commit`'s `forget` must have cleared the baseline recorded under the old
+        // spelling. No accessor exposes the cache's contents, so probe it through `mismatches`:
+        // with no entry left for the folded path, no identity (including a sentinel that cannot be
+        // the old one) can mismatch. A retained baseline would be compared against the sentinel
+        // and report `true`.
+        let old_spelling = VirtualPath::parse("Photo.TXT").expect("parse old spelling");
+        assert!(
+            !server.identity_cache.mismatches(
+                fx.member_id,
+                fx.share_id,
+                &old_spelling,
+                &(u64::MAX, u64::MAX),
+            ),
+            "upload_commit must forget the identity baseline recorded for the pre-existing spelling"
+        );
+        // ... and its user-visible consequence: the member's next read of that spelling must not
+        // be refused as `file_changed` (the neighbouring td-9bf38d test asserts the same).
+        let after = server.handle(
+            &fx.ctx(),
+            8,
+            req(
+                1,
+                VfsRequest::Read {
+                    path: "Drop/Photo.TXT".to_string(),
+                    offset: 0,
+                    len: new_data.len() as u32,
+                },
+            ),
+        );
+        assert!(
+            matches!(after, VfsReply::Read { .. }),
+            "the member's own overwrite must not deny the next read as identity_changed, got {after:?}"
+        );
+
+        // The commit's audit row is present and the chain still verifies. The audit entry records
+        // the *requested* virtual path (`handle_upload_commit` passes `path_str`, built from
+        // `session.subpath`), while the landed spelling is recorded in the ledger row asserted
+        // above — see this ticket's report.
+        fx.h.store
+            .audit()
+            .verify_chain()
+            .expect("audit chain must verify");
+        let page = fx.h.store.audit().list(None, 100).expect("audit list");
+        let commit = page
+            .records
+            .iter()
+            .find(|record| {
+                record.entry.action == "upload_commit"
+                    && record.entry.virtual_path.as_deref() == Some("Drop/photo.txt")
+            })
+            .expect("an upload_commit audit entry for the overwrite");
+        assert_eq!(commit.entry.outcome, "ok");
+        assert_eq!(commit.entry.bytes, Some(new_data.len() as u64));
+    }
+
     #[test]
     fn upload_abort_discards_session_and_staging_bytes() {
         let fx = UploadFixture::new(Perms::UPLOAD);
