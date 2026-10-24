@@ -889,33 +889,74 @@ impl Store {
 
     /// DESIGN.md §A4b member status: `invited -> active -> revoked`, revoked terminal. Rejects
     /// any other transition (including a no-op self-transition, and `active -> invited`).
+    ///
+    /// **Device rows (td-f19bc4)**: when `new_status` is [`MemberStatus::Revoked`], this also
+    /// marks every device row belonging to the member revoked
+    /// (`UPDATE devices SET revoked = 1 WHERE member_id = ?1 AND revoked = 0`). Without that,
+    /// `devices.revoked` kept asserting `0` — "this device is live" — for every device of a
+    /// member who was just revoked, contradicting the member gate. The member's `status` remains
+    /// the authoritative authorization gate (`crate::model::Device::revoked`'s doc comment has
+    /// the full argument); this write only makes the device rows stop saying something false.
+    /// Non-`Revoked` transitions never touch device rows: activating a member must not revive or
+    /// otherwise alter a device that was revoked individually.
+    ///
+    /// **Atomicity**: the status read, the transition check, the `members.status` write, and (on
+    /// a revoke) the device-row write all happen inside one [`Store::with_transaction`]
+    /// (`TransactionBehavior::Deferred`, matching [`Store::revoke_member_and_bump_epoch`]). A
+    /// crash or failure before commit rolls back both writes, so no durable state ever shows a
+    /// `Revoked` member whose devices still claim to be live. The transition check is inside the
+    /// transaction as well, so the status it validated is the same one the `UPDATE` replaces —
+    /// the read-then-write gap is not observable to another connection. No rollback path needs to
+    /// flip the device rows back: `Revoked` is terminal (there is no `Revoked -> ...` transition),
+    /// so once written they stay correct.
+    ///
+    /// The `AND revoked = 0` predicate makes the device write a no-op for rows that are already
+    /// revoked (including devices revoked individually before their member), so this never
+    /// rewrites a row that already carries the right value.
     pub fn set_member_status(
         &self,
         member_id: MemberId,
         new_status: MemberStatus,
     ) -> Result<(), StoreError> {
         self.check_not_poisoned()?;
-        let current = self
-            .get_member(member_id)?
-            .ok_or(StoreError::MemberNotFound(member_id))?
-            .status;
-        let allowed = matches!(
-            (current, new_status),
-            (MemberStatus::Invited, MemberStatus::Active)
-                | (MemberStatus::Invited, MemberStatus::Revoked)
-                | (MemberStatus::Active, MemberStatus::Revoked)
-        );
-        if !allowed {
-            return Err(StoreError::InvalidStatusTransition {
-                from: current,
-                to: new_status,
-            });
-        }
-        self.conn.execute(
-            "UPDATE members SET status = ?1 WHERE member_id = ?2",
-            params![status_str(new_status), member_id.0 as i64],
-        )?;
-        Ok(())
+        self.with_transaction("set_member_status", TransactionBehavior::Deferred, |tx| {
+            let current: Option<String> = tx
+                .query_row(
+                    "SELECT status FROM members WHERE member_id = ?1",
+                    params![member_id.0 as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(current_str) = current else {
+                return Err(StoreError::MemberNotFound(member_id));
+            };
+            let current = parse_status(&current_str);
+            let allowed = matches!(
+                (current, new_status),
+                (MemberStatus::Invited, MemberStatus::Active)
+                    | (MemberStatus::Invited, MemberStatus::Revoked)
+                    | (MemberStatus::Active, MemberStatus::Revoked)
+            );
+            if !allowed {
+                return Err(StoreError::InvalidStatusTransition {
+                    from: current,
+                    to: new_status,
+                });
+            }
+            tx.execute(
+                "UPDATE members SET status = ?1 WHERE member_id = ?2",
+                params![status_str(new_status), member_id.0 as i64],
+            )?;
+            if new_status == MemberStatus::Revoked {
+                // Same transaction as the status write — see this method's doc comment.
+                // `AND revoked = 0` keeps this idempotent per row.
+                tx.execute(
+                    "UPDATE devices SET revoked = 1 WHERE member_id = ?1 AND revoked = 0",
+                    params![member_id.0 as i64],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Convenience for the common redemption path: `invited -> active`.
@@ -935,12 +976,13 @@ impl Store {
     /// [`Store::set_member_status`] permits only `Invited -> Active | Invited -> Revoked |
     /// Active -> Revoked`, every retry then failed forever with
     /// `StoreError::InvalidStatusTransition { from: Revoked, to: Revoked }`. This method does not
-    /// change [`Store::revoke_member`] or [`Store::set_member_status`]'s existing behavior at all
-    /// (both are untouched, and `revoke_does_not_bump_cap_epoch_automatically` still passes
-    /// unchanged) — it is an additional, atomic entry point a caller can use instead.
+    /// change [`Store::revoke_member`] or [`Store::set_member_status`]'s behavior at all (both
+    /// are untouched by this method, and `revoke_does_not_bump_cap_epoch_automatically` still
+    /// passes unchanged) — it is an additional, atomic entry point a caller can use instead.
     ///
     /// The whole operation — reading the member's current status, writing
-    /// `status = 'revoked'`, and bumping `cap_epoch` — happens inside one transaction, via
+    /// `status = 'revoked'`, marking the member's device rows revoked, and bumping `cap_epoch` —
+    /// happens inside one transaction, via
     /// [`Store::with_transaction`] (`TransactionBehavior::Deferred`, matching what this method's
     /// direct `self.conn.unchecked_transaction()` call began before that wrapper existed — see its
     /// doc comment for why DEFERRED is the right behavior here and IMMEDIATE would not be).
@@ -961,9 +1003,20 @@ impl Store {
     /// - `Err(StoreError::MemberNotFound(member_id))` if the member does not exist.
     /// - `Ok(None)` if the member is already `Revoked`: nothing is written and `cap_epoch` is
     ///   deliberately **not** bumped. `cap_epoch` invalidates every outstanding capability on
-    ///   this host, so a redundant revoke must not pay that cost again for no reason.
+    ///   this host, so a redundant revoke must not pay that cost again for no reason. This early
+    ///   return is a true no-op for device rows too: the call that first revoked the member
+    ///   already marked them, so there is nothing left to write.
     /// - `Ok(Some(new_epoch))` if the member was `Invited` or `Active`: its status becomes
-    ///   `Revoked` and `cap_epoch` is bumped exactly once, returning the new value.
+    ///   `Revoked`, every device row of that member is marked revoked
+    ///   (`UPDATE devices SET revoked = 1 WHERE member_id = ?1 AND revoked = 0`, in this same
+    ///   transaction — td-f19bc4; see [`Store::set_member_status`]'s doc comment for why), and
+    ///   `cap_epoch` is bumped exactly once, returning the new value.
+    ///
+    /// The status write, the device-row write, and the epoch bump commit or roll back together:
+    /// after a successful call both the member's `Revoked` status and its devices' revoked flags
+    /// are visible, and a failure before commit leaves neither. `AND revoked = 0` makes the
+    /// device write idempotent per row, including devices that were already revoked individually
+    /// while the member was still `Active`.
     ///
     /// [`Store::revoke_device_and_bump_epoch`] behaves identically on retry — that symmetry is
     /// the point. The old device path (a plain `UPDATE ... SET revoked = 1` with no status-machine
@@ -1005,6 +1058,15 @@ impl Store {
                 }
                 tx.execute(
                     "UPDATE members SET status = 'revoked' WHERE member_id = ?1",
+                    params![member_id.0 as i64],
+                )?;
+                // td-f19bc4: mark this member's device rows revoked too, in the same
+                // transaction, so `devices.revoked` stops asserting these devices are live.
+                // Order relative to the epoch bump is irrelevant inside one transaction; this
+                // sits next to the status write it accompanies. `AND revoked = 0` is
+                // idempotent per row.
+                tx.execute(
+                    "UPDATE devices SET revoked = 1 WHERE member_id = ?1 AND revoked = 0",
                     params![member_id.0 as i64],
                 )?;
                 let new_epoch = bump_cap_epoch_in_tx(tx)?;
@@ -3105,6 +3167,241 @@ mod tests {
             e0,
             "cap_epoch must be unchanged when the member does not exist"
         );
+    }
+
+    // ---- td-f19bc4: revoking a member revokes its device rows, in the same transaction --------
+
+    /// Reads `member_id`'s device rows back through [`Store::get_member`] — the same path the
+    /// authorizer uses — so these tests assert on persisted state, not on a local variable.
+    /// Sorted by label because `devices_for_member` has no `ORDER BY`; these tests are about the
+    /// flags, not row order.
+    fn devices_of(store: &Store, member_id: MemberId) -> Vec<(String, bool)> {
+        let mut devices: Vec<(String, bool)> = store
+            .get_member(member_id)
+            .expect("get_member")
+            .expect("member exists")
+            .devices
+            .into_iter()
+            .map(|d| (d.label, d.revoked))
+            .collect();
+        devices.sort();
+        devices
+    }
+
+    #[test]
+    fn revoking_a_member_marks_all_of_its_device_rows_revoked() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        store.activate_member(member_id).expect("activate");
+        store
+            .add_device(
+                member_id,
+                Fingerprint::of_parts(&[b"alex-laptop"]),
+                "laptop",
+                0,
+                None,
+            )
+            .expect("add laptop");
+        store
+            .add_device(
+                member_id,
+                Fingerprint::of_parts(&[b"alex-phone"]),
+                "phone",
+                1,
+                None,
+            )
+            .expect("add phone");
+        let e0 = store.cap_epoch().expect("e0");
+
+        // Plain path: `revoke_member` -> `set_member_status(Revoked)`.
+        store.revoke_member(member_id).expect("revoke_member");
+
+        let member = store
+            .get_member(member_id)
+            .expect("get_member")
+            .expect("exists");
+        assert_eq!(member.status, MemberStatus::Revoked);
+        assert_eq!(
+            devices_of(&store, member_id),
+            vec![("laptop".to_string(), true), ("phone".to_string(), true)],
+            "both device rows must be persisted as revoked after the member revoke; the fixture \
+             must really contain both devices, not silently have skipped them"
+        );
+        assert_eq!(
+            store.cap_epoch().expect("e unchanged"),
+            e0,
+            "the plain revoke path must still not bump cap_epoch"
+        );
+    }
+
+    #[test]
+    fn revoke_member_and_bump_epoch_marks_all_device_rows_revoked_and_bumps_once() {
+        let store = Store::open_in_memory().expect("open");
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add_member");
+        store.activate_member(member_id).expect("activate");
+        for (label, seed) in [
+            ("laptop", &b"alex-laptop"[..]),
+            ("phone", &b"alex-phone"[..]),
+        ] {
+            store
+                .add_device(member_id, Fingerprint::of_parts(&[seed]), label, 0, None)
+                .expect("add_device");
+        }
+        let e0 = store.cap_epoch().expect("e0");
+
+        let new_epoch = store
+            .revoke_member_and_bump_epoch(member_id)
+            .expect("revoke_member_and_bump_epoch")
+            .expect("an Active member must be revoked, not treated as a no-op");
+
+        assert_eq!(new_epoch, e0 + 1, "must bump cap_epoch by exactly one");
+        assert_eq!(
+            store.cap_epoch().expect("e1"),
+            e0 + 1,
+            "the store's cap_epoch must reflect the bump"
+        );
+        let member = store
+            .get_member(member_id)
+            .expect("get_member")
+            .expect("exists");
+        assert_eq!(member.status, MemberStatus::Revoked);
+        assert_eq!(
+            devices_of(&store, member_id),
+            vec![("laptop".to_string(), true), ("phone".to_string(), true)],
+            "both the status write and the device-row writes must be visible after the one \
+             successful call — they committed in the same transaction"
+        );
+
+        // The already-Revoked early return is a true no-op: no bump, and nothing writes the
+        // device rows back (a revocation cannot be undone).
+        let second = store
+            .revoke_member_and_bump_epoch(member_id)
+            .expect("retry must be Ok(None), not an error");
+        assert_eq!(second, None, "an already-revoked member must not re-bump");
+        assert_eq!(
+            store.cap_epoch().expect("e after second"),
+            e0 + 1,
+            "the no-op retry must leave cap_epoch unchanged"
+        );
+        assert_eq!(
+            devices_of(&store, member_id),
+            vec![("laptop".to_string(), true), ("phone".to_string(), true)],
+            "the no-op retry must leave the device rows revoked"
+        );
+    }
+
+    #[test]
+    fn revoking_an_invited_member_marks_its_device_rows_revoked() {
+        let store = Store::open_in_memory().expect("open");
+        // `add_member` leaves the member Invited; `Invited -> Revoked` is an allowed transition.
+        let member_id = store
+            .add_member(Fingerprint::of_parts(&[b"pending"]), "pending", 0)
+            .expect("add_member");
+        store
+            .add_device(
+                member_id,
+                Fingerprint::of_parts(&[b"pending-phone"]),
+                "phone",
+                0,
+                None,
+            )
+            .expect("add_device");
+
+        store.revoke_member(member_id).expect("invited -> revoked");
+
+        let member = store
+            .get_member(member_id)
+            .expect("get_member")
+            .expect("exists");
+        assert_eq!(member.status, MemberStatus::Revoked);
+        assert_eq!(
+            devices_of(&store, member_id),
+            vec![("phone".to_string(), true)],
+            "the allowed Invited -> Revoked transition must not skip the device-row write"
+        );
+    }
+
+    #[test]
+    fn revoking_a_member_leaves_another_members_devices_unrevoked() {
+        let store = Store::open_in_memory().expect("open");
+        let revoked_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add alex");
+        let untouched_id = store
+            .add_member(Fingerprint::of_parts(&[b"bob"]), "Bob", 0)
+            .expect("add bob");
+        store.activate_member(revoked_id).expect("activate alex");
+        store.activate_member(untouched_id).expect("activate bob");
+        store
+            .add_device(
+                revoked_id,
+                Fingerprint::of_parts(&[b"alex-laptop"]),
+                "alex-laptop",
+                0,
+                None,
+            )
+            .expect("add alex device");
+        store
+            .add_device(
+                untouched_id,
+                Fingerprint::of_parts(&[b"bob-laptop"]),
+                "bob-laptop",
+                0,
+                None,
+            )
+            .expect("add bob device");
+
+        store.revoke_member(revoked_id).expect("revoke alex");
+
+        assert_eq!(
+            devices_of(&store, revoked_id),
+            vec![("alex-laptop".to_string(), true)],
+            "the revoked member's own device must be marked revoked"
+        );
+        assert_eq!(
+            store
+                .get_member(untouched_id)
+                .expect("get_member")
+                .expect("exists")
+                .status,
+            MemberStatus::Active,
+            "the other member must remain Active"
+        );
+        assert_eq!(
+            devices_of(&store, untouched_id),
+            vec![("bob-laptop".to_string(), false)],
+            "another member's device rows must be untouched by the revocation"
+        );
+    }
+
+    #[test]
+    fn revoking_a_member_with_no_devices_succeeds() {
+        let store = Store::open_in_memory().expect("open");
+        let plain_id = store
+            .add_member(Fingerprint::of_parts(&[b"alex"]), "Alex", 0)
+            .expect("add alex");
+        let atomic_id = store
+            .add_member(Fingerprint::of_parts(&[b"bob"]), "Bob", 0)
+            .expect("add bob");
+        store.activate_member(plain_id).expect("activate alex");
+        store.activate_member(atomic_id).expect("activate bob");
+
+        // Zero matching device rows is not an error on either entry point.
+        store.revoke_member(plain_id).expect("plain revoke");
+        store
+            .revoke_member_and_bump_epoch(atomic_id)
+            .expect("atomic revoke")
+            .expect("an Active member must bump even with no devices");
+
+        for id in [plain_id, atomic_id] {
+            let member = store.get_member(id).expect("get_member").expect("exists");
+            assert_eq!(member.status, MemberStatus::Revoked);
+            assert!(member.devices.is_empty());
+        }
     }
 
     #[test]

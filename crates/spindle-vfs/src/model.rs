@@ -272,6 +272,18 @@ pub struct Device {
     pub device_fp: Fingerprint,
     pub label: String,
     pub added: u64,
+    /// True when this device was revoked **directly** ([`crate::store::Store::revoke_device`] /
+    /// [`crate::store::Store::revoke_device_and_bump_epoch`]) **or** because its member was
+    /// revoked: [`crate::store::Store::set_member_status`] (and therefore
+    /// [`crate::store::Store::revoke_member`]) and
+    /// [`crate::store::Store::revoke_member_and_bump_epoch`] mark every device row of the
+    /// revoked member in the same transaction as the member's status write (td-f19bc4).
+    ///
+    /// This flag is **never** a substitute for the member's [`MemberStatus`]. It answers only
+    /// "was this particular device revoked?", not "may this device connect?" — an `Invited` or
+    /// `Revoked` member's device is refused by the member gate even when this is `false`.
+    /// Authorization must keep checking both (see [`crate::store::Store::member_for_device_fp`]).
+    /// Revocation is terminal for both members and devices, so nothing ever clears this flag.
     pub revoked: bool,
     pub sign_pk: Option<Vec<u8>>,
     pub agree_pk: Option<Vec<u8>>,
@@ -304,6 +316,14 @@ pub struct DevicePublicKeys {
 }
 
 /// `invited | active | revoked` (§A4b).
+///
+/// `Revoked` is terminal — there is no transition out of it. Revoking a member
+/// ([`crate::store::Store::set_member_status`] with `Revoked`, and therefore
+/// [`crate::store::Store::revoke_member`]) also marks all of that member's device rows revoked in
+/// the same transaction (td-f19bc4), so a revoked member's devices never appear live in
+/// [`Device::revoked`]. Because revocation cannot be undone, those rows never need to be flipped
+/// back. This status remains the authoritative gate: [`Device::revoked`] supplements it, it does
+/// not replace it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemberStatus {
     Invited,
@@ -316,6 +336,11 @@ pub enum MemberStatus {
 /// `Members` group with `groups` containing only that group's id and therefore has **no** grants
 /// anywhere — "secure by default" (§A4b) is a property of there being no entitlements naming that
 /// group's id yet, not of anything special in this struct.
+///
+/// Revoking a member also marks every [`Device`] in `devices` revoked in the same transaction
+/// (td-f19bc4); `status` is still the authoritative gate, and a device flag is never a substitute
+/// for it. [`MemberStatus::Revoked`] is terminal, so neither `status` nor those device flags are
+/// ever cleared.
 #[derive(Clone, Debug)]
 pub struct Member {
     pub member_id: MemberId,
