@@ -5261,6 +5261,49 @@ mod tests {
         );
     }
 
+    /// The cross-member refund above cannot prove the refund is *exactly* the old file's bytes,
+    /// because [`Store::adjust_member_upload_bytes`] clamps at `MAX(bytes + delta, 0)`: there the
+    /// old uploader's only file is overwritten, so the correct refund (`-100`) and an injected
+    /// over-refund of `-(old_bytes + new_bytes)` (`-250`) both clamp to 0 and the test stays green.
+    /// Here the old uploader keeps a second file, so its counter never reaches the clamp floor and
+    /// the two rules disagree observably: the correct result is 200 (`300 - 100`), while the
+    /// over-refund leaves 150 (`300 - (100 + 50)`). The share counter is unaffected by that bug
+    /// (it moves by the difference either way), so this test also pins it to 250.
+    #[test]
+    fn record_upload_cross_member_overwrite_refunds_old_bytes_above_the_clamp_floor() {
+        let (_sandbox, store, share_id, member_a, member_b) = upload_ledger_fixture();
+
+        store
+            .record_upload(share_id, member_a, "a.txt", 100)
+            .expect("member_a uploads a.txt");
+        store
+            .record_upload(share_id, member_a, "b.txt", 200)
+            .expect("member_a uploads b.txt");
+        assert_eq!(store.member_upload_bytes(member_a).unwrap(), 300);
+        assert_eq!(store.share_upload_bytes(share_id).unwrap(), 300);
+
+        store
+            .record_upload(share_id, member_b, "a.txt", 50)
+            .expect("member_b overwrites member_a's a.txt");
+
+        assert_eq!(
+            store.member_upload_bytes(member_a).unwrap(),
+            200,
+            "member_a must be refunded exactly a.txt's old 100 bytes and keep b.txt's 200; an \
+             over-refund of old+new (150) would leave 150 here"
+        );
+        assert_eq!(
+            store.member_upload_bytes(member_b).unwrap(),
+            50,
+            "the new uploader gains the full new size"
+        );
+        assert_eq!(
+            store.share_upload_bytes(share_id).unwrap(),
+            250,
+            "the share moves only by the size difference (300 - 100 + 50)"
+        );
+    }
+
     #[test]
     fn remove_uploads_under_removes_a_single_file_and_decrements_both_counters() {
         let (_sandbox, store, share_id, member_a, _member_b) = upload_ledger_fixture();
@@ -5587,21 +5630,43 @@ mod tests {
         );
     }
 
+    /// Both calls fail the foreign key check, and the *second* one also proves `record_upload`'s
+    /// transaction rolls back a counter write that happened before the failure: the no-existing-row
+    /// branch adjusts the share counter first and only then adjusts the member counter, so a
+    /// nonexistent member's FK violation is raised **after** `share_upload_bytes` has already been
+    /// written inside the same `Immediate` transaction. Without rollback, the failed call would
+    /// leave the share counter inflated by 10; asserting it is unchanged is what makes this test
+    /// bite an injected missing-transaction bug rather than merely re-asserting that callers get
+    /// an error. The nonexistent-member id must be genuinely absent from `members` (the fixture
+    /// creates only `member_a`/`member_b`) for the share adjustment to be reached at all.
     #[test]
     fn record_upload_for_a_nonexistent_share_or_member_fails_the_foreign_key_check() {
         let (_sandbox, store, share_id, member_a, _member_b) = upload_ledger_fixture();
+
+        let before = store.share_upload_bytes(share_id).unwrap();
 
         let no_such_share = ShareId(999_999);
         let err = store
             .record_upload(no_such_share, member_a, "a.txt", 10)
             .expect_err("a nonexistent share must fail the foreign key check");
         assert_foreign_key_violation(&err);
+        assert_eq!(
+            store.share_upload_bytes(share_id).unwrap(),
+            before,
+            "a failed upload to a nonexistent share must not change the real share's counter"
+        );
 
         let no_such_member = MemberId(999_999);
         let err = store
             .record_upload(share_id, no_such_member, "a.txt", 10)
             .expect_err("a nonexistent member must fail the foreign key check");
         assert_foreign_key_violation(&err);
+        assert_eq!(
+            store.share_upload_bytes(share_id).unwrap(),
+            before,
+            "the share-counter adjustment made before the member FK failure must be rolled back \
+             (without a transaction the counter would be inflated by 10)"
+        );
     }
 
     // ---- Upload ledger fold-key identity (SCHEMA_V7, this ticket) ----
