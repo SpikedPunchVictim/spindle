@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.49) + Execution Plan
+# Spindle — System Design Document (draft v0.9.50) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -228,6 +228,12 @@
 > into the caller's own concrete `_INBOX_<device_fp>.` address; a mismatch is dropped. The
 > `$SYS.REQ.USER.AUTH` callout reply is exempt because the requester is `nats-server` and the
 > reply is its own correlation inbox.
+> v0.9.50: one decision (A10.50), no wire change. A7b said "unknown `v` ⇒ reject", but every
+> version check was a floor — a legitimately signed `v = 99` capability or envelope would have
+> been verified against today's v1 field layout. Signed v-carrying artifacts now enforce a ceiling
+> at the build's current version as well; the unsigned VFS request envelope and bootstrap bundle
+> stay floor-only, where forward compatibility is a transport policy rather than an artifact
+> version question.
 
 ---
 
@@ -1358,6 +1364,12 @@ rotating the root or op key would re-wall members or break cap chains.
 Every signed artifact shares: version byte `v`, **distinct domain-separation tag**, canonical CBOR (RFC 8949
 §4.2.1), a stated time rule, and a stated replay rule. Unknown `v` ⇒ reject. Catalog:
 
+**[amended v0.9.50]** For signed artifacts this is a **known-set** rule, not a floor: a `v` above
+this build's current version is rejected, because a legitimately signed future artifact verified
+under today's field layout is exactly the confusion the version byte exists to prevent. The
+unsigned `VfsRequestEnvelope` and `DeviceBootstrapBundle` keep floor-only checks — forward
+compatibility there is a wire policy, not an artifact-version question.
+
 | Artifact | Tag | Signer | Time rule | Replay rule |
 |----------|-----|--------|-----------|-------------|
 | Envelope | `spindle-env-v1` | device key | `ts` ±2 min (client's own out-of-band clock, §A7) | (sid, direction, seq) monotonic |
@@ -1721,6 +1733,7 @@ Docker is explicitly not the primary dev environment.
 | 47 | Repeated grants to one entitlement key: replace or union | **DECIDED 2026-09-13:** a repeated grant to an identity-equal `(group, share, fold_key(subpath))` **replaces** `perms`; it does not union them. §A4b's union algebra was silent here — it defines union across *distinct* grants (different groups, different prefixes) and says nothing about re-granting the same key, while `add_entitlement`'s `ON CONFLICT … DO UPDATE SET perms = excluded.perms` has always replaced. Forced onto the record by v0.9.44: A4b now creates a member's entitlements **up front**, at invite time, so the first surface that edits a grant sits on the enrollment path rather than in some later admin tool. Rejected: *union on repeat* — it makes permissions monotonically increasing, so the only way to reduce a grant becomes remove-then-re-add, and an editing surface that round-trips a permission set would silently fail to revoke. That is the failure mode the positive-only algebra deliberately accepts *across* grants and must not accept *within* one. **Fold identity**, decided the same way and for the same reason as the dirent rule: on a collision the pre-existing literal spelling wins and only `perms` is replaced, so a row's name is decided once by whichever spelling created it. **Measured, not assumed:** substituting a bitwise-OR upsert (`perms` OR-ed with `excluded.perms`) for the replace left all 188 `spindle-vfs` tests green — the semantics were pinned by nothing when this row was written, so it ships with a test that discriminates the two. Bears on td-fb40fd, td-bbb933. |
 | 48 | Does an admission token carry the registry endpoint? | **DECIDED 2026-10-23 (user decision):** not in v1. `AdmissionToken` keeps `{nonce, exp, label, quota_profile, sig_operator}`, and the host daemon keeps taking the registry address from its own configuration until a host-onboarding flow exists that consumes a token. A4's old "admission tokens likewise" sentence described a property nothing implemented and no consumer needed. Rejected for now: *adding `endpoints[]` + `tls_pin` to the signed preimage* — this artifact has no `v` field, so a wire-visible change forces a §A7b domain-tag bump (`spindle-adm-v2`) and regenerated vectors in both languages, for a field no caller reads; rejected: *an unsigned wrapper* — unlike the addressed member invite, an admission token is a bearer credential, so an attacker who rewrites the wrapper's endpoint can exfiltrate a token the host would otherwise redeem first. Revisit when host onboarding is built; if the endpoint must travel with the token then, it belongs inside the signed artifact. Bears on td-1dff5e. |
 | 49 | Rate-limiting order for `helper.revoke.<nfp>` | **DECIDED 2026-10-23:** the per-root token bucket is charged **after** signature verification and only for a deposit that changes state; pre-verification attempts are bounded by a separate **per-device** budget. Forced by an adversarial review of the first implementation, which charged the root before verifying: any compromised device under a root (valid certificate, cap, and session — but no root key) could publish unsigned records carrying that root's `root_fp`, which is public, spend the root's ten-token burst, and have the owner's genuinely signed revocation refused `rate limited` before it was ever verified — suppressing the very revocation S14 exists to deliver. The per-root key remains DESIGN's requirement; only the ordering changed. An already-applied record is detected before the charge and costs nothing, so replaying a recorded message cannot drain the bucket. Residual, stated: an observer who captures a *not-yet-applied* valid record can replay it into the bucket — but that observer is the registry itself, which can already drop the record, so this adds no power. Rejected: *keep the pre-verification charge and raise the burst* — any finite burst a compromised device can spend is a suppression budget. Bears on td-b5d50c. |
+| 50 | Which version checks reject an unknown future version? | **DECIDED 2026-10-24:** every signed v-carrying artifact — `Envelope`, `Capability`, `AdminCommand` — enforces a **ceiling** at the build's current version in addition to the existing floor, both before any signature work. Forced because all three checks were floors while A7b says "unknown `v` ⇒ reject": a legitimately signed v2 artifact would otherwise be verified under v1 semantics, and the signature does not save us — it is valid, just under fields this build would misread. The unsigned `VfsRequestEnvelope` and `DeviceBootstrapBundle` keep floor-only checks: forward compatibility with newer clients is a wire policy, and neither is a signed artifact. Rejected: *ceiling on VFS RPC too* — it would reject newer clients on a transport host and client are expected to upgrade independently, turning a version floor into a rollout coupling; rejected: *leaving signed artifacts floor-only* — that is the bug this row closes. Bears on td-bffaac. |
 
 ## A11. Alternatives considered
 
@@ -1920,6 +1933,13 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.50 (2026-10-24)** — One decision (A10.50), no wire change. A7b has always said "unknown `v` ⇒
+  reject", but every check implemented only a floor, so a legitimately signed `v = 99` capability,
+  admin command, or envelope passed and was then verified under the v1 field layout. Signed v-carrying
+  artifacts now also enforce a ceiling at the build's current version, before signature work. The
+  unsigned VFS request envelope and bootstrap bundle remain floor-only: there, accepting a newer
+  version is a deliberate forward-compatibility policy, not a claim about signed artifact semantics.
+  (td-bffaac)
 - **v0.9.49 (2026-10-23)** — One correction, no wire change. NATS authorizes the PUB subject, not the
   reply field: td-fc5a30 measured that `nats-server` does not refuse a foreign `msg.reply`, so a member
   could make the helper's privileged app connection publish into another tenant's subject. The three
