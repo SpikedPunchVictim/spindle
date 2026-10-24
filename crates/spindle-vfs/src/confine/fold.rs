@@ -57,6 +57,9 @@ pub fn names_collide(a: &str, b: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollidingEntry {
     pub name: std::ffi::OsString,
+    /// Whether the colliding dirent is a directory. This is *verified* against the filesystem,
+    /// never assumed from a failed type lookup — see `scan_for_collision`'s note on its
+    /// `file_type()` fallback.
     pub is_dir: bool,
 }
 
@@ -68,11 +71,17 @@ pub struct CollidingEntry {
 /// that keep case/Unicode variants as distinct, non-colliding dirents at the OS level, which is
 /// exactly why Spindle must do this check itself rather than relying on the filesystem.
 ///
-/// If the colliding entry's type cannot be determined (e.g. a race where it vanished between the
-/// readdir syscall and this follow-up `file_type()` call), it is reported as *not* a directory —
-/// matching this function's pre-existing behavior when kind wasn't tracked at all, and erring
-/// toward the file/overwrite path rather than silently authorizing a directory no-op or refusing a
-/// write that would otherwise have succeeded.
+/// The colliding entry's kind is always *verified*, never guessed. On the rare filesystem
+/// (DT_UNKNOWN) or race where `file_type()` fails, the entry is re-statted by name with
+/// [`Dir::symlink_metadata`] instead of assuming a file. `symlink_metadata` mirrors the success
+/// path exactly: `file_type()` on a symlink reports *not* a directory, and so does the fallback.
+/// A re-stat that fails with `NotFound` means the entry vanished between readdir and the stat —
+/// there is no collision left to report, so the scan moves on to the next entry. Any other stat
+/// failure is returned as [`ConfineError::Io`] rather than converted into a type guess: for an
+/// upload that genuine error still aborts before any bytes are staged, which is the honest
+/// outcome for an entry we cannot inspect, whereas guessing "file" would authorize an overwrite
+/// and a rename onto what may be a directory (DESIGN.md §A8 transfer manager). A vanished entry
+/// is thus *not* a collision, and a real stat failure is surfaced, not defaulted.
 fn scan_for_collision(
     dir: &Dir,
     candidate_name: &str,
@@ -83,7 +92,20 @@ fn scan_for_collision(
         let name = entry.file_name();
         if let Some(name_str) = name.to_str() {
             if fold_key(name_str) == target_key {
-                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let is_dir = match entry.file_type() {
+                    Ok(file_type) => file_type.is_dir(),
+                    // The dirent's type was indeterminate (DT_UNKNOWN, or it changed between
+                    // readdir and the stat). Re-stat by name — with `symlink_metadata`, so a
+                    // symlink is classified exactly as `file_type()` would have classified it —
+                    // rather than guessing "file".
+                    Err(_) => match dir.symlink_metadata(&name) {
+                        Ok(md) => md.file_type().is_dir(),
+                        // The entry is gone: no collision remains, keep scanning.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        // A real stat failure: surface it instead of inventing a type.
+                        Err(e) => return Err(ConfineError::io(name_str, e)),
+                    },
+                };
                 return Ok(Some(CollidingEntry { name, is_dir }));
             }
         }
@@ -123,6 +145,17 @@ mod tests {
     #[cfg(target_os = "macos")]
     use crate::confine::resolve_identity;
     use tempfile::tempdir;
+
+    // Coverage note (td-c27150): `scan_for_collision`'s fallback for a failed
+    // `DirEntry::file_type()` — the DT_UNKNOWN case, and the race where the entry vanishes
+    // between readdir and the re-stat — has no deterministic test here. Neither condition is
+    // injectable through `cap_std::fs::Dir`'s public API: there is no callback seam between a
+    // `ReadDir` yielding an entry and that entry's `file_type()`, and `symlink_metadata` on an
+    // existing name cannot be made to fail for just one entry. Adding such a seam would mean
+    // production code that exists only for the test, so the fallback is verified by inspection;
+    // the success path that shares its `is_dir` semantics is covered by the collision tests below.
+    // If a deterministic trigger ever becomes available, the two required outcomes are: NotFound
+    // skips the entry (no collision), and any other stat error surfaces as `ConfineError::Io`.
 
     #[test]
     fn case_fold_collision_detected() {
