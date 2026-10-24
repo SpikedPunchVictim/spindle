@@ -73,8 +73,22 @@ pub fn staging_name(session_id: &[u8]) -> String {
 /// True if `name` is a hidden upload-staging filename ([`staging_name`]'s output shape) that must
 /// never appear in a `list` reply (DESIGN.md §A8: "never listed") regardless of which directory is
 /// being listed or the share's `show_hidden` flag.
+///
+/// The test is on the **folded** name ([`fold_key`]), not the literal spelling: the reserved
+/// namespace is whatever *resolves to* [`STAGING_NAME_PREFIX`] after case/Unicode folding, so
+/// legacy case variants created before [`upload_target_path`]'s guard existed — e.g.
+/// `.SPINDLE-UPLOAD-13` on a case-sensitive host — are hidden exactly like a live staging file.
+/// (`STAGING_NAME_PREFIX` is ASCII, so its own fold is itself.) This hides the namespace; it is
+/// **not** path validation: [`upload_target_path`] remains the only place a candidate write name
+/// is refused.
+///
+/// Residual: a legacy staging-shaped **directory** is hidden here too (this function has no kind
+/// information), and because [`super::listing::remove_confined`] routes through
+/// [`upload_target_path`], it can no longer be removed through the virtual tree. Only live staging
+/// files are host-created and cleaned up per session; a legacy case-variant file or directory is
+/// operator cleanup.
 pub fn is_staging_name(name: &str) -> bool {
-    name.starts_with(STAGING_NAME_PREFIX)
+    fold_key(name).starts_with(STAGING_NAME_PREFIX)
 }
 
 /// What kind of dirent the caller intends to create at the candidate name — passed to
@@ -462,8 +476,23 @@ mod tests {
         let name = staging_name(&id);
         assert_eq!(name, ".spindle-upload-0102abff");
         assert!(is_staging_name(&name));
+        // td-5e3f1d: the filter is by fold key, so legacy case variants of the reserved namespace
+        // are hidden too, whether or not the host filesystem itself folds case.
+        for variant in [
+            ".SPINDLE-UPLOAD-13",
+            ".Spindle-Upload-13",
+            ".sPiNdLe-UpLoAd-13",
+        ] {
+            assert!(
+                is_staging_name(variant),
+                "{variant:?} must fold onto the reserved staging prefix"
+            );
+        }
         assert!(!is_staging_name("photo.jpg"));
         assert!(!is_staging_name(".hidden-but-not-staging"));
+        // Benign near-misses of the reserved namespace stay visible.
+        assert!(!is_staging_name(".spindle-uploads"));
+        assert!(!is_staging_name("notes.spindle-upload-13"));
         // Deterministic: same id always yields the same name (so a session's staging file can be
         // found again by id alone).
         assert_eq!(staging_name(&id), name);

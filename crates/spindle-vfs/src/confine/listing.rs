@@ -52,7 +52,12 @@ fn unix_seconds(meta: &std::fs::Metadata) -> u64 {
 /// An entry matching [`super::upload::is_staging_name`] is likewise skipped unconditionally
 /// (DESIGN.md §A8 transfer manager: an in-progress upload's hidden staging file is "never
 /// listed") — this is independent of the share's `show_hidden` flag, which governs real dotfiles
-/// a member placed, not host-internal bookkeeping files.
+/// a member placed, not host-internal bookkeeping files. That test folds case/Unicode
+/// (td-5e3f1d), so a legacy case variant such as `.SPINDLE-UPLOAD-13` on a case-sensitive host is
+/// hidden just like a live staging file. The same applies to staging-shaped **directories**,
+/// which are hidden here and — because [`remove_confined`] validates through
+/// [`upload_target_path`] — can no longer be removed through the virtual tree (operator cleanup
+/// remains); only genuine per-session staging files are created by the host.
 pub fn list_dir(dir: &Dir, relative: &str) -> Result<Vec<RealDirEntry>, ConfineError> {
     let read_dir = if relative.is_empty() {
         dir.entries()
@@ -283,6 +288,63 @@ mod tests {
 
         assert_eq!(entries.len(), 1, "the staging file must never be listed");
         assert_eq!(entries[0].name, "a.txt");
+    }
+
+    /// td-5e3f1d: the staging filter is by fold key, not literal spelling. Names are created
+    /// directly in the real share (bypassing the guarded upload path), as a legacy case variant
+    /// would have been before td-645b91's guard existed. Distinct suffixes keep the set distinct
+    /// even on a case-insensitive host, so the test asserts the same thing on every platform.
+    #[test]
+    fn list_dir_hides_staging_names_by_fold_key_but_keeps_benign_near_misses() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("mkdir root");
+
+        std::fs::write(root.join("a.txt"), b"a").expect("write a");
+        // An ordinary dotfile: this function only skips staging names, so it stays listed
+        // (`show_hidden` filtering, when it applies, is a separate layer).
+        std::fs::write(root.join(".hidden-but-not-staging"), b"dot").expect("write dotfile");
+        // Benign names that merely resemble the reserved namespace.
+        std::fs::write(root.join(".spindle-uploads"), b"x").expect("write near-miss");
+        std::fs::write(root.join("notes.spindle-upload-13"), b"y").expect("write near-miss");
+
+        // The exact live staging name, plus legacy case variants.
+        let staging = super::super::upload::staging_name(&[0x01, 0x02, 0x03]);
+        std::fs::write(root.join(&staging), b"partial").expect("write live staging");
+        for legacy in [
+            ".SPINDLE-UPLOAD-13",
+            ".Spindle-Upload-14",
+            ".sPiNdLe-UpLoAd-15",
+        ] {
+            std::fs::write(root.join(legacy), b"legacy").expect("write legacy staging variant");
+        }
+        // A staging-shaped directory is hidden too; the residual (it is no longer removable
+        // through the virtual tree) is asserted below.
+        std::fs::create_dir(root.join(".SPINDLE-UPLOAD-DIR")).expect("mkdir legacy staging dir");
+
+        let dir = open_share_root(&root).expect("open");
+        let mut names: Vec<_> = list_dir(&dir, "")
+            .expect("list root")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                ".hidden-but-not-staging".to_string(),
+                ".spindle-uploads".to_string(),
+                "a.txt".to_string(),
+                "notes.spindle-upload-13".to_string(),
+            ],
+            "every fold-equivalent of the reserved staging namespace must be skipped; ordinary \
+             dotfiles and benign near-misses must stay listed"
+        );
+
+        // Residual documented on `is_staging_name`: legacy staging-shaped directories are hidden
+        // AND refused as delete targets, so operator cleanup remains.
+        let err = remove_confined(&dir, ".SPINDLE-UPLOAD-DIR").unwrap_err();
+        assert!(matches!(err, ConfineError::ReservedStagingName(_)));
     }
 
     #[test]
