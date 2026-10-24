@@ -960,6 +960,11 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
     // "Transfer manager" / "Upload sessions", §A4b upload edge rules)
     // -------------------------------------------------------------------------------------
 
+    /// Handles `upload_open` (DESIGN.md §A8). The eventual target name is validated through
+    /// [`confine::upload_target_path`] **here, before a session exists or any staging byte is
+    /// written** — this is the first gate. An unsafe or reserved-staging target is refused with
+    /// `VfsErrorCode::UploadRejected`. `upload_commit` re-validates the same name through
+    /// `finalize_upload` as a defense-in-depth backstop.
     #[allow(clippy::too_many_arguments)]
     fn handle_upload_open(
         &self,
@@ -1028,6 +1033,22 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
                 "upload_open",
                 Some(path),
                 "denied:not_found",
+            );
+        }
+
+        // td-645b91: reject an unsafe or reserved-staging target before a session is created or
+        // the staging file is opened, so no manifest is accepted and no byte is staged for a
+        // name that could never become a member-visible file. `upload_commit`'s
+        // `finalize_upload` re-validates through the same function as a backstop.
+        if confine::upload_target_path(&subpath.to_path_string()).is_err() {
+            return self.deny_with_code(
+                ts,
+                member,
+                ctx,
+                "upload_open",
+                Some(path),
+                "denied:upload_rejected",
+                VfsErrorCode::UploadRejected,
             );
         }
 
@@ -2695,6 +2716,152 @@ mod tests {
                 .share_upload_bytes(fx.share_id)
                 .expect("share_upload_bytes"),
             data.len() as u64
+        );
+    }
+
+    /// td-645b91: a target whose final component folds onto the reserved upload-staging prefix is
+    /// refused by `upload_open` itself — the first gate — before a session exists or a single byte
+    /// is staged. The reply is `UploadRejected`; no session, staging file, or quota charge may
+    /// exist afterwards.
+    #[test]
+    fn upload_open_refuses_reserved_staging_target_before_staging_bytes() {
+        let fx = UploadFixture::new(Perms::UPLOAD);
+        let server = fx.server();
+        let data = b"invisible bytes".to_vec();
+        let path = "Drop/.spindle-upload-13";
+        let hash = sha256(&data);
+        let sig = sign_manifest(&fx.signing_key, path, data.len() as u64, &hash);
+
+        let open_reply = server.handle(
+            &fx.ctx(),
+            1,
+            req(
+                1,
+                VfsRequest::UploadOpen {
+                    path: path.to_string(),
+                    size: data.len() as u64,
+                    hash,
+                    manifest_sig: sig,
+                },
+            ),
+        );
+        assert_eq!(
+            open_reply,
+            VfsReply::Error {
+                code: VfsErrorCode::UploadRejected
+            },
+            "upload_open must refuse a reserved staging target before accepting the manifest"
+        );
+
+        // No session was created (the forged id below must not resolve), no staging file exists,
+        // and neither quota counter moved.
+        let commit_reply = server.handle(
+            &fx.ctx(),
+            2,
+            req(
+                1,
+                VfsRequest::UploadCommit {
+                    session_id: vec![0xaa; 32],
+                },
+            ),
+        );
+        assert_eq!(
+            commit_reply,
+            VfsReply::Error {
+                code: VfsErrorCode::NotFound
+            },
+            "no session may exist for a target upload_open refused"
+        );
+        assert_eq!(
+            std::fs::read_dir(fx.real_root()).expect("read_dir").count(),
+            0,
+            "nothing may be staged for a target upload_open refused"
+        );
+        assert_eq!(
+            fx.h.store
+                .member_upload_bytes(fx.member_id)
+                .expect("member_upload_bytes"),
+            0
+        );
+        assert_eq!(
+            fx.h.store
+                .share_upload_bytes(fx.share_id)
+                .expect("share_upload_bytes"),
+            0
+        );
+    }
+
+    /// td-645b91, defense-in-depth backstop: `upload_open` is the first gate (see the test above),
+    /// but `upload_commit` re-validates the same target through `finalize_upload` /
+    /// `upload_target_path` before the rename. A session that could not be created through
+    /// `upload_open` any more — this test injects one directly, standing in for a session opened
+    /// before the open-side gate existed — must still be refused at commit, with the staged bytes
+    /// GC'd and neither quota counter charged.
+    #[test]
+    fn upload_commit_refuses_reserved_staging_target_as_backstop_and_records_no_quota() {
+        let fx = UploadFixture::new(Perms::UPLOAD);
+        let server = fx.server();
+        let data = b"invisible bytes".to_vec();
+        let path = "Drop/.spindle-upload-13";
+        let subpath = VirtualPath::parse(".spindle-upload-13").expect("parse reserved subpath");
+        let hash = sha256(&data);
+        let sig = sign_manifest(&fx.signing_key, path, data.len() as u64, &hash);
+        let session = server.upload_sessions.open_or_resume(
+            fx.member_id,
+            fx.share_id,
+            &subpath,
+            data.len() as u64,
+            &hash,
+            &sig,
+            Some(fx.device_fp),
+            1,
+            UPLOAD_SESSION_TTL_SECS,
+            fx.h.store.grants_version().unwrap_or(0),
+            fx.h.store.cap_epoch().unwrap_or(0),
+        );
+        // Simulate bytes already staged and fully transferred before commit.
+        let dir = confine::open_share_root(&fx.real_root()).expect("open share root");
+        dir.write(confine::staging_name(&session.id), &data)
+            .expect("write staging");
+        server
+            .upload_sessions
+            .set_offset(&session.id, data.len() as u64);
+
+        let commit_reply = server.handle(
+            &fx.ctx(),
+            2,
+            req(
+                1,
+                VfsRequest::UploadCommit {
+                    session_id: session.id,
+                },
+            ),
+        );
+        assert_eq!(
+            commit_reply,
+            VfsReply::Error {
+                code: VfsErrorCode::NotFound
+            },
+            "a reserved staging target must be refused at commit even with a pre-existing session"
+        );
+        assert_eq!(
+            fx.h.store
+                .member_upload_bytes(fx.member_id)
+                .expect("member_upload_bytes"),
+            0,
+            "no quota may be charged for a target that never landed"
+        );
+        assert_eq!(
+            fx.h.store
+                .share_upload_bytes(fx.share_id)
+                .expect("share_upload_bytes"),
+            0,
+            "no share quota may be charged for a target that never landed"
+        );
+        assert_eq!(
+            std::fs::read_dir(fx.real_root()).expect("read_dir").count(),
+            0,
+            "the aborted session's staging file must be GC'd and nothing may land"
         );
     }
 

@@ -98,6 +98,21 @@ pub enum ConfineError {
          is empty (DESIGN.md §A4b upload scoping, closes A12 #23)"
     )]
     UnsafeUploadPath(String),
+
+    /// An upload/mkdir/delete target's **final component** folds (case/Unicode) onto a reserved
+    /// hidden upload-staging filename — the `.spindle-upload-` prefix [`upload::staging_name`]
+    /// generates. Staging names are host bookkeeping: they are never part of the virtual tree and
+    /// are filtered out of every listing ([`upload::is_staging_name`]), so a member-visible file
+    /// landing under one could never be listed, resolved, or removed through the virtual tree,
+    /// while its bytes would still be charged to member and share quota forever. Rejected before
+    /// any bytes are accepted. DESIGN.md §A8 transfer manager.
+    #[error(
+        "upload path {0:?} names a reserved upload-staging file (\"{prefix}\" prefix): staging \
+         names are host bookkeeping, never listed and never part of the virtual tree, so \
+         accepting one would charge quota for an invisible file (DESIGN.md §A8 transfer manager)",
+        prefix = upload::STAGING_NAME_PREFIX
+    )]
+    ReservedStagingName(String),
 }
 
 impl ConfineError {

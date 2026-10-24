@@ -3,7 +3,7 @@
 //! #23 (upload outside granted subpath / overwrite) and, via [`write_is_authorized`]'s use of
 //! `crate::confine::fold`, A12 #31 (case/NFD upload collision overwrites without `delete`).
 
-use super::fold::existing_entry_colliding_typed;
+use super::fold::{existing_entry_colliding_typed, fold_key};
 use super::listing::split_parent_and_name;
 use super::ConfineError;
 use cap_std::fs::Dir;
@@ -13,6 +13,17 @@ use std::path::{Path, PathBuf};
 /// subdirectory: every component must be a plain (`Normal`) path segment — any `..`, absolute
 /// root, Windows prefix, or even `.` component is rejected outright (fail closed rather than try
 /// to prove a `..`-laden path nets to something safe).
+///
+/// The **final component** must also not name a reserved upload-staging file: it is folded with
+/// [`fold_key`] and refused ([`ConfineError::ReservedStagingName`]) if the folded key starts with
+/// [`STAGING_NAME_PREFIX`]. Staging names are host bookkeeping ([`staging_name`]), never part of
+/// the virtual tree and filtered out of every listing ([`is_staging_name`]), so a member-visible
+/// file landing under one could never be listed or removed through the virtual tree while still
+/// consuming quota. The check is on the *folded* key rather than the literal spelling so
+/// `.SPINDLE-UPLOAD-13`, `.Spindle-Upload-13`, and any NFD spelling are rejected identically on
+/// case-sensitive and case-insensitive hosts — behavior must not depend on the filesystem's own
+/// folding. Only the final component is checked: the staging namespace is a filename namespace,
+/// so an ordinary path through a parent directory keeps working.
 pub fn upload_target_path(relative: &str) -> Result<PathBuf, ConfineError> {
     let mut resolved = PathBuf::new();
     for component in Path::new(relative).components() {
@@ -22,10 +33,19 @@ pub fn upload_target_path(relative: &str) -> Result<PathBuf, ConfineError> {
         }
     }
     if resolved.as_os_str().is_empty() {
-        Err(ConfineError::UnsafeUploadPath(relative.to_string()))
-    } else {
-        Ok(resolved)
+        return Err(ConfineError::UnsafeUploadPath(relative.to_string()));
     }
+    // Every component came from `relative: &str` and was a `Normal` segment, so the resolved path
+    // is non-empty and its final component is a UTF-8 slice of the original input.
+    let final_name = resolved
+        .file_name()
+        .expect("a non-empty all-Normal path has a final component")
+        .to_str()
+        .expect("a Normal component of a &str path is valid UTF-8");
+    if fold_key(final_name).starts_with(STAGING_NAME_PREFIX) {
+        return Err(ConfineError::ReservedStagingName(relative.to_string()));
+    }
+    Ok(resolved)
 }
 
 /// The fixed prefix every upload-session staging file's real (hidden) name starts with —
@@ -34,7 +54,7 @@ pub fn upload_target_path(relative: &str) -> Result<PathBuf, ConfineError> {
 /// listing never has a reason to expose host-internal bookkeeping files, regardless of a share's
 /// `show_hidden` flag (staging files are not part of the *virtual* tree at all, so that flag,
 /// which governs whether dotfiles a member actually placed are shown, does not apply to them).
-const STAGING_NAME_PREFIX: &str = ".spindle-upload-";
+pub(crate) const STAGING_NAME_PREFIX: &str = ".spindle-upload-";
 
 /// The real (hidden) filename an in-progress upload session's staged bytes are written under,
 /// inside the share's real root — DESIGN.md §A8: "staging files use a hidden name never listed
@@ -335,6 +355,104 @@ mod tests {
         assert!(
             upload_target_path("../escape.txt").is_err(),
             "a malicious upload path must never be handed to Dir::write at all"
+        );
+    }
+
+    #[test]
+    fn staging_names_are_rejected_as_upload_targets() {
+        // The exact-name hole: the same spelling `staging_name` generates, including a value
+        // produced by that function itself, must never be accepted as a member-visible target.
+        let exact_reserved = [".spindle-upload-00".to_string(), staging_name(&[0xab])];
+        for reserved in &exact_reserved {
+            assert!(
+                matches!(
+                    upload_target_path(reserved),
+                    Err(ConfineError::ReservedStagingName(_))
+                ),
+                "reserved staging target {reserved:?} must be refused as ReservedStagingName"
+            );
+        }
+
+        // td-b48fb1d widened the hole: case variants fold onto the staging name. These must be
+        // refused via the fold key, not the literal spelling, so the outcome is the same on a
+        // case-sensitive host (Linux) as on a case-insensitive one (macOS/Windows).
+        for reserved in [
+            ".SPINDLE-UPLOAD-13",
+            ".Spindle-Upload-13",
+            ".sPiNdLe-UpLoAd-13",
+        ] {
+            assert!(
+                matches!(
+                    upload_target_path(reserved),
+                    Err(ConfineError::ReservedStagingName(_))
+                ),
+                "case variant {reserved:?} must fold onto the reserved staging prefix"
+            );
+        }
+
+        // Only the final component is checked — the staging namespace is a filename namespace.
+        // A nested target whose *final* name is reserved is refused in either spelling...
+        for reserved in ["dir/.spindle-upload-13", "dir/.SPINDLE-UPLOAD-13"] {
+            assert!(
+                matches!(
+                    upload_target_path(reserved),
+                    Err(ConfineError::ReservedStagingName(_))
+                ),
+                "nested reserved target {reserved:?} must be refused"
+            );
+        }
+
+        // ...while genuinely benign names (no reserved prefix after folding) still resolve,
+        // including ones that merely share a substring or a benign parent directory.
+        for benign in [
+            ".spindle-uploads",        // no hyphen where the reserved prefix has one
+            "notes.spindle-upload-13", // prefix not at the start
+            "spindle-upload-13",       // no leading dot
+            "dir/file",
+            "dir/.spindle-uploads",
+        ] {
+            assert!(
+                upload_target_path(benign).is_ok(),
+                "benign target {benign:?} must still be accepted"
+            );
+        }
+
+        // The existing unsafe-path rejection is unchanged and stays a *distinct* error: a caller
+        // must be able to tell "escapes the share" from "reserved name".
+        assert!(matches!(
+            upload_target_path("../.spindle-upload-13"),
+            Err(ConfineError::UnsafeUploadPath(_))
+        ));
+    }
+
+    /// The upload caller's guarantee: `finalize_upload` refuses a reserved final name via
+    /// `upload_target_path` before it opens a parent directory, checks collisions, or renames —
+    /// the staged bytes are left untouched and nothing lands under the reserved name.
+    #[test]
+    fn finalize_upload_refuses_reserved_staging_target_before_touching_disk() {
+        let sandbox = tempdir().expect("tempdir");
+        let root = sandbox.path().join("share");
+        std::fs::create_dir(&root).expect("create share root");
+        let dir = open_share_root(&root).expect("open share root");
+        let staging = staging_name(&[0x42]);
+        dir.write(&staging, b"uploaded-bytes")
+            .expect("write staging");
+
+        let err = finalize_upload(&dir, &staging, ".spindle-upload-13", true)
+            .expect_err("reserved target must be refused");
+        assert!(
+            matches!(err, ConfineError::ReservedStagingName(_)),
+            "expected ReservedStagingName, got {err:?}"
+        );
+
+        let entries: Vec<_> = std::fs::read_dir(&root)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from(&staging)],
+            "only the still-pending staging file may remain; nothing landed"
         );
     }
 

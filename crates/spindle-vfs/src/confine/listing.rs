@@ -315,6 +315,12 @@ mod tests {
         // Traversal attempt rejected outright.
         let err = create_dir_confined(&dir, "../escape", true, true).unwrap_err();
         assert!(matches!(err, ConfineError::UnsafeUploadPath(_)));
+
+        // td-645b91: mkdir shares the upload target validation point, so a reserved staging
+        // name is refused before anything is created.
+        let err = create_dir_confined(&dir, ".spindle-upload-13", true, false).unwrap_err();
+        assert!(matches!(err, ConfineError::ReservedStagingName(_)));
+        assert!(!root.join(".spindle-upload-13").exists());
     }
 
     /// td-789f11, NEW behavior 3: `mkdir` whose name fold-collides with an existing **directory**
