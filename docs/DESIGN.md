@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.50) + Execution Plan
+# Spindle — System Design Document (draft v0.9.51) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -234,6 +234,12 @@
 > at the build's current version as well; the unsigned VFS request envelope and bootstrap bundle
 > stay floor-only, where forward compatibility is a transport policy rather than an artifact
 > version question.
+> v0.9.51: one wire change. The bootstrap `BundleEntry` carries `alg_id` and a bundle is now `v = 2`;
+> a decoder defaults an absent `alg_id` to `ALG_ID_V1`, so v1 bundles still decode, while `alg_id`
+> naming any other suite is rejected explicitly at verification instead of being hashed as v1.
+> The measured entry grew 521 → 529 B (the `alg_id` pair is 8 B); the four QR host counts are
+> unchanged (4/5 short registry at EC-M/L, 3/5 at the 256-byte registry), but EC-L at the ceiling
+> now has 27 B of margin.
 
 ---
 
@@ -672,7 +678,7 @@ QR channel that conveys the root identity itself, so a signature would have no v
 already establish, and the one security-bearing value inside it — `member_cap` — is an independently verifiable
 signed artifact. **This holds only while the bundle stays on that channel**: relaying it over the network, cloud
 sync, or a file export makes it a signed artifact requiring a §A7b entry with its own tag, time rule, and replay
-rule. **QR ceiling**: an entry is ~521 B (two 32-byte keys plus a 424-byte cap) **[amended v0.9.33]**,
+rule. **QR ceiling**: an entry is ~529 B (two 32-byte keys, `alg_id`, plus a 424-byte cap) **[amended v0.9.51]**,
 so a version-40 QR carries **4** hosts at EC level M and **5** at level L with a
 short registry endpoint, and **3** at EC level M and **5** at level L at the 256-byte
 `MAX_REGISTRY_LEN` ceiling — against the 32-host presentation cap in §A4. **[amended v0.9.33]**
@@ -1933,6 +1939,14 @@ Deferred: mDNS local signaling (v2); member-level operator remedies (would break
 
 # Part D — Change log
 
+- **v0.9.51 (2026-10-24)** — One wire change. `BundleEntry` gained `alg_id`, so `verify_bootstrap_bundle`
+  rejects a non-v1 suite explicitly instead of hashing it as `ALG_ID_V1`; the bundle version moved to 2,
+  while an absent field on decode defaults to v1 so existing bundles keep working (an old decoder rejects
+  a v2 bundle at the closed schema, which is the intended explicit failure). The measured entry moved
+  521 → 529 B through the production encoder, and the four QR host counts were re-measured with both-sides
+  bounds: 4/5 for a short registry at EC-M/L and 3/5 at the 256-byte ceiling, all unchanged; EC-L at the
+  ceiling now has 27 B of margin. Adding `alg_id` does not make a second algorithm work — the algorithm is
+  pinned by the parsed key types, and anything not v1 is refused. (td-4f520f)
 - **v0.9.50 (2026-10-24)** — One decision (A10.50), no wire change. A7b has always said "unknown `v` ⇒
   reject", but every check implemented only a floor, so a legitimately signed `v = 99` capability,
   admin command, or envelope passed and was then verified under the v1 field layout. Signed v-carrying
