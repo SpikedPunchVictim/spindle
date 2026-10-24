@@ -185,11 +185,12 @@ sequenceDiagram
     Server-->>Dev: connection accepted or uniform refusal
 ```
 
-**Ordering, exactly as coded** (`crates/spindle-helper/src/authz.rs:373-563`) — note this is
+**Ordering, exactly as coded** (`decide_device_connect`) — note this is
 *more precise* than "cheap checks → nkey sig → device cert → root_fp → session attestation →
-caps → revocation": revocation is actually checked in step 5, **before** any signature
-verification at all, specifically so a revoked device never costs the callout an Ed25519
-verification (`authz.rs:410-416` comment):
+caps → revocation": host-scoped revocation is checked in step 6, with the root-scoped
+`is_self_revoked` check just before it, **before** any signature verification at all — so neither
+dropping a revoked cap nor refusing an all-revoked set (or a self-revoked device) ever costs the
+callout an Ed25519 verification:
 
 1. `caps.len() > 32` → `TooManyCapabilities` (`authz.rs:381-383`)
 2. `caps.is_empty()` → `NoCapabilitiesPresented` (`authz.rs:384-386`)
@@ -531,10 +532,11 @@ specifically so no future caller can accidentally skip it.
   negotiation; the assumption is that real clocks are already within the window.
 - **Cheap-before-crypto is a deliberate DoS defense, not incidental ordering (§A6).** Every
   `verify_*`/`decide_*` function in this document checks version floors, field shapes, and store
-  lookups before touching an Ed25519 verification. `decide_device_connect`'s ordering
-  (`authz.rs:373-563`) is the sharpest example: a revoked device is refused in step 6, *before*
-  `verify_nkey_sig` in step 7 — a revoked device literally cannot cost the callout a signature
-  check.
+  lookups before touching an Ed25519 verification. `decide_device_connect`'s ordering is the
+  sharpest example: host-scoped revocation runs in step 6 and root-scoped `is_self_revoked` just
+  before it, *before* `verify_nkey_sig` in step 7 — a host-revoked cap is dropped without a
+  signature check, and a connection refused because no cap survives (or because the device is
+  self-revoked) never reaches one.
 - **Two host fingerprints, never interchangeable.** `host_fp` (`SHA-256(host_root_pk)`) scopes
   every NATS subject a host owns. `host_device_fp` is the host's own envelope identity for A7
   signaling, verified inside `HostDeviceCert`. A capability's `host_fp` and an envelope's
