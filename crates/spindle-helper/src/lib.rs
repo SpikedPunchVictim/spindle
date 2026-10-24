@@ -103,6 +103,16 @@ pub mod self_revoke;
 pub mod session;
 pub mod turn;
 
+/// The NATS account whose User JWTs the callout responder mints (`src/bin/helper.rs`'s
+/// `--account-name`/`ACCOUNT_NAME` default).
+///
+/// This name is not free-standing: `deploy/nats/nats-server.conf`'s `accounts:` map must contain
+/// exactly this account, or every minted User JWT names an account the server does not have and
+/// the connection is refused at CONNECT time — silently, with no startup error on either side.
+/// `tests/deploy_config_guard.rs` derives the account names from that conf and asserts this
+/// constant is among them.
+pub const DEFAULT_ACCOUNT_NAME: &str = "APP";
+
 use spindle_core::Fingerprint;
 
 /// Parses the final `.`-delimited token of `subject` as a [`Fingerprint`], requiring `subject` to

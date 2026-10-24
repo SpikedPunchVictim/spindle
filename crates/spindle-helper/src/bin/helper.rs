@@ -356,7 +356,8 @@ impl Config {
                 .ok_or(ConfigError::Missing("CALLOUT_USER_SEED", "callout-seed"))?,
             app_account_seed: app_account_seed
                 .ok_or(ConfigError::Missing("APP_ACCOUNT_SEED", "app-account-seed"))?,
-            account_name: account_name.unwrap_or_else(|| "APP".to_string()),
+            account_name: account_name
+                .unwrap_or_else(|| spindle_helper::DEFAULT_ACCOUNT_NAME.to_string()),
             app_conn_seed,
             sys_conn_seed,
             operator_seed,
