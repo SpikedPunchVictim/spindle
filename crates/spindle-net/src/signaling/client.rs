@@ -40,9 +40,14 @@ use super::wire::{new_offer_context, open_answer, seal_ice, seal_offer, OfferCon
 ///   identity is structurally forced to be a separate keypair. This is the `to_fp` an offer is
 ///   sealed to and the `from_fp` its answer arrives under.
 ///
+/// The distinction is normative, not incidental: `HostDeviceCert` (A4/A10.35) is signed by the
+/// host **operating** key (`sig_host_op(host_device_fp, alg_id, sign_pk, agree_pk, ts)`), chaining
+/// root→op→device, and its `device_fp` *is* the host's A7 envelope identity. `host_fp` and
+/// `device_fp` are therefore not interchangeable.
+///
 /// `spikes/s2-signaling` kept the two apart from the start (`HostState { host_fp, host_device_fp,
-/// .. }`); DESIGN.md never spells the relationship out, which is how the two came to be merged
-/// during graduation.
+/// .. }`); graduation merged them before A10.35 named the rule, which is what the live
+/// `tests/live_signaling.rs` run caught.
 pub struct HostIdentity {
     /// The host's root fingerprint — the NATS subject-scoping token only. Never an envelope field.
     pub host_fp: Fingerprint,
