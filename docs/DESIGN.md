@@ -256,7 +256,11 @@
 > shape had only a test-only builder and the helper's decoder, so no production code could present a host
 > CONNECT at all — the gap `crates/spindle-helper/src/auth_token.rs` recorded. The envelope is not a §A7b signed
 > artifact (no domain tag; it wraps artifacts that are individually signed) and gains no `v` field. The device
-> arm and a TypeScript twin remain unbuilt until a client exists.
+> arm and a TypeScript twin remain unbuilt until a client exists. Host-side, `spindle-hostd` mints that token once
+> per process and bounds the client to one connect attempt: async-nats 0.35 replays the static token on an automatic
+> reconnect, which the attestation's ±2 minute window makes unverifiable, so a lost connection is process-fatal and
+> a supervised restart re-mints the credential; the first-run recovery phrase likewise leaves the process only to a
+> terminal or an explicit `0600` file, never a piped stdout/log stream.
 
 ---
 

@@ -35,8 +35,11 @@
 //! The envelope [`DeviceKey`] is deliberately ephemeral: A10.44 makes it fresh per process, so
 //! the identity that has to survive a restart is the root seed in [`keystore::HostKeyStore`], not
 //! a [`DeviceKey`]. [`DeviceKey::from_seeds`] remains "TEST-ONLY / crypto-vector use" and is not a
-//! persistence mechanism. The headless binary prints the seed's recovery phrase once, at explicit
-//! enrollment (`--init` or `--restore-seed`), and refuses to invent one on any other start.
+//! persistence mechanism. The headless binary delivers the seed's recovery phrase once, at
+//! explicit `--init` enrollment — to stdout only when stdout is a terminal, otherwise to the
+//! operator-configured `--recovery-phrase-file` — and refuses to invent a seed on any other
+//! start. A restored identity (`--restore-seed-file` or `SPINDLE_HOST_RESTORE_SEED`) is never
+//! printed: the operator already holds that phrase.
 //!
 //! # The caller-owned NATS client rule
 //!

@@ -54,10 +54,11 @@ pub use capability::{issue_capability, verify_capability};
 pub use device_cert::{issue_device_certificate, verify_device_certificate};
 pub use host_device_cert::{issue_host_device_cert, verify_host_device_cert};
 pub use host_op_key_cert::{issue_host_op_key_cert, verify_host_op_key_cert};
-// Re-exported so a crate that depends on `spindle-core` but not directly on `spindle-proto` (per
-// A9c's layering law) can name the type `issue_host_op_key_cert` returns. First consumer:
-// `spindle-hostd`'s `HostIdentity::op_cert` (td-539ffa slice 2), whose crate does not take a
-// `spindle-proto` runtime dependency.
+// Re-exported so a crate that depends on `spindle-core` can name the type
+// `issue_host_op_key_cert` returns without importing `spindle-proto` itself. First consumer:
+// `spindle-hostd`'s `HostIdentity::op_cert` (td-539ffa slice 2). That crate also takes a *direct*
+// `spindle-proto` dependency for the CONNECT `auth_token` encoder, but this re-export keeps the
+// identity API usable without one.
 pub use host_session_attest::{
     issue_host_session_attestation, verify_host_session_attestation,
     HOST_SESSION_ATTESTATION_CLOCK_SKEW_SECS,

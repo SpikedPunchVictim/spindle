@@ -6,17 +6,29 @@
 //! live test uses) and of `crates/spindle-helper/src/bin/helper.rs`'s responder-side wiring: the
 //! same sequence DESIGN.md §A4 specifies, with a real [`HostIdentity`] instead of fixture seeds.
 //!
-//! # The token is minted fresh at every connect
+//! # The token is minted once per `connect_host` call, not per reconnect
 //!
 //! DESIGN.md §A4 step 3 and A10.40 make the host's NATS nkey **per-session**: [`KeyPair::new_user`]
-//! creates a new one here on every call, the operating key signs a fresh
+//! creates a new one on every [`connect_host`] call, the operating key signs a fresh
 //! `HostSessionAttestation` over that session's `nats_fp`, and the resulting `auth_token` is
-//! presented exactly once. Nothing about the connection is cached or reused across calls — a
-//! long-lived host that reconnects (after a server restart, say) mints a new session and a new
-//! token rather than replaying the old pair. A replayed attestation is inert anyway without the
-//! nkey secret it names (the callout proves possession of that key with the server nonce), but
-//! treating the pair as single-use is what keeps the design's freshness rule observable in the
-//! code rather than merely guaranteed downstream.
+//! handed to [`async_nats::ConnectOptions::token`] once. async-nats 0.35 does not re-run this
+//! function on an automatic reconnect: its reconnect path calls the same connector
+//! (`async-nats-0.35.1/src/lib.rs`, `handle_reconnect`), which re-sends the static
+//! `auth_token` from the saved options (`connector.rs:193`). The attestation inside that token is
+//! valid only within its ±2 minute window, so a reconnect later than that is refused by the
+//! callout.
+//!
+//! [`connect_host`] therefore sets `.max_reconnects(1)` — the initial attempt is attempt one;
+//! every later attempt fails immediately and closes the client. The headless binary treats that
+//! close as terminal and relies on process restart to re-authenticate (a fresh process mints a
+//! fresh nkey, attestation, and token, per A10.43/A10.44). Without the bound, an unlimited
+//! reconnect loop would retry a credential that can never verify again, hiding a permanently
+//! dead host behind a client that still looks alive; with it, the loss is a visible close.
+//!
+//! The auth-callback escape hatch does not help here: async-nats 0.35 encodes whatever an auth
+//! callback returns into a `String` (`connector.rs`, `URL_SAFE_NO_PAD.encode(auth.signature)`), so
+//! it cannot carry this envelope's raw bytes. The callback would need raw 64-byte signature bytes,
+//! which `Option<String>` cannot represent.
 //!
 //! # `now` is the moment of connect, never process start
 //!
@@ -92,6 +104,11 @@ pub async fn connect_host(
             // `{event:?}` or anything that could grow to include connect options.
             tracing::debug!(event = %event, "host NATS connection event");
         })
+        // The initial attempt only. A reconnect replays the static `token` below
+        // (`async-nats-0.35.1/src/connector.rs:193`), whose attestation is stale after ±2
+        // minutes, so a retry is guaranteed to fail and would hide the lost connection forever.
+        // See this module's "minted once per `connect_host` call" section.
+        .max_reconnects(1)
         .nkey(session.seed()?)
         .token(token)
         .connect(nats_url)

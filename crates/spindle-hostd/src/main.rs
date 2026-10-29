@@ -16,9 +16,20 @@
 //!
 //! Only the root seed persists (DESIGN.md A10.41). The operating key and envelope device key are
 //! minted fresh at every start, so `host_fp` survives a restart while `device_fp` does not. The
-//! recovery phrase is printed **once**, to **stdout**, by a plain `println!` rather than through
-//! `tracing`: a secret must not enter a log pipeline or aggregator. Everything else this process
-//! says goes to stderr through `tracing`.
+//! recovery phrase is delivered **once**, at explicit enrollment, and only to a channel that is
+//! not a log pipeline: stdout when stdout is a terminal, otherwise the operator-configured
+//! `--recovery-phrase-file`. Everything else this process says goes to stderr through `tracing`.
+//!
+//! # A lost NATS connection is process-fatal in this slice
+//!
+//! The CONNECT `auth_token` is minted once per process ([`connect_host`]), and async-nats 0.35
+//! replays that static token on an automatic reconnect (`connector.rs:193`). The host session
+//! attestation inside it is valid for only ±2 minutes, so a reconnect later than that window is
+//! refused by the Auth Callout. [`spindle_hostd::connect`] therefore bounds reconnects, and this
+//! binary treats a closed connection as terminal: [`HostDaemon::run`] ends, the process exits
+//! non-zero, and a supervised restart re-mints the session credential (a fresh process gets a
+//! fresh nkey, attestation, and token per A10.43/A10.44). A NATS blip is process-fatal by design;
+//! supervised restart is the recovery.
 //!
 //! A mid-process certificate renewal (A10.45: re-issue the operating certificate at two-thirds of
 //! its 90-day lifetime) is **not wired here**. A process that outlives `HOST_OP_CERT_TTL_SECS`
@@ -39,7 +50,9 @@
 mod config;
 
 use std::env;
+use std::io::{IsTerminal as _, Write as _};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -47,11 +60,14 @@ use rand::rngs::OsRng;
 use rand::RngCore as _;
 use spindle_host_core::RootKeyCapIssuer;
 use spindle_hostd::connect::connect_host;
+#[cfg(unix)]
+use spindle_hostd::keystore::{check_file_mode, check_parent_mode};
 use spindle_hostd::{
     format_recovery_phrase, mint_host_identity, parse_recovery_phrase, wall_clock_now_secs,
-    HostDaemon, HostDaemonError, HostKeyStore, HostOptions, KeyStoreError, SeedFileStore,
-    ROOT_SEED_LEN,
+    HostDaemon, HostDaemonError, HostIdentity, HostKeyStore, HostOptions, KeyStoreError,
+    SeedFileStore, ROOT_SEED_LEN,
 };
+use spindle_proto::artifacts::AdmissionToken;
 
 use crate::config::Config;
 
@@ -101,17 +117,30 @@ async fn run(config: Config) -> ExitCode {
         "host identity minted for this process"
     );
 
-    // The admission token is opaque to this process: the helper is the verifier, and this binary
-    // deliberately does not re-implement its validation (a second, driftable verifier is worse
-    // than none). An unreadable configured file is a startup failure, not a silent "connect
-    // without a token" — that would turn a typo into a confusing callout refusal later.
+    // The admission token's *authority* remains the helper: this process does not re-implement
+    // the callout's signature, expiry, or nonce checks, and never will (a second, driftable
+    // verifier is worse than none). It does decode the configured file once at startup, because
+    // embedding a newline-padded or empty file verbatim would only surface later as a uniform
+    // callout refusal that names nothing. An unreadable or non-canonical configured file is a
+    // startup failure, not a silent "connect without a token" — that would turn a typo into a
+    // confusing refusal later.
     let admission_token_bytes = match &config.admission_token_file {
         Some(path) => match std::fs::read(path) {
             Ok(bytes) => {
+                if let Err(error) = AdmissionToken::from_canonical_bytes(&bytes) {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %error, // redaction-ok: ProtoError Display is static schema text, field names, and CBOR byte offsets; it never echoes the file's bytes
+                        "the configured admission token file is not a canonical AdmissionToken; \
+                         the helper would refuse this token at CONNECT (a trailing newline or an \
+                         empty file is the usual cause)"
+                    );
+                    return ExitCode::FAILURE;
+                }
                 tracing::info!(
                     path = %path.display(),
                     len = bytes.len(),
-                    "admission token file read"
+                    "admission token file read and decoded"
                 );
                 Some(bytes)
             }
@@ -157,13 +186,29 @@ async fn run(config: Config) -> ExitCode {
         identity.op_cert.clone(),
         identity.op_signing.clone(),
     );
-    let daemon = HostDaemon::new(
-        client,
-        identity.device,
-        identity.host_fp,
-        config.store.clone(),
-    )
-    .with_cap_issuer(Box::new(issuer));
+
+    // Every consumer of the identity has now been served: `connect_host` presented it,
+    // `RootKeyCapIssuer` owns the public half and its own signing copies, and the daemon needs
+    // only the envelope device key and the root fingerprint. Destructure so the root private key
+    // (and the operating key, whose private half the issuer already cloned) is dropped before the
+    // daemon starts — its wrapped `SigningKey` zeroizes on drop. `host_fp`/`device_fp` are `Copy`
+    // copies of values already logged; nothing below signs as the root.
+    let HostIdentity {
+        root: _,
+        op_signing: _,
+        op_cert: _,
+        device,
+        host_fp,
+        device_fp,
+    } = identity;
+    tracing::debug!(
+        host_fp = %host_fp.redacted(),
+        device_fp = %device_fp.redacted(),
+        "root private key dropped after the capability issuer was built"
+    );
+
+    let daemon = HostDaemon::new(client, device, host_fp, config.store.clone())
+        .with_cap_issuer(Box::new(issuer));
 
     // Only `bind_ip` is configurable in this slice; the lifecycle durations and the concurrency
     // cap keep `HostOptions`' defaults (taken from one `default()` value rather than restated
@@ -177,10 +222,31 @@ async fn run(config: Config) -> ExitCode {
     };
 
     tokio::select! {
+        // `biased` and the shutdown branch first are deliberate: `shutdown_signal` installs the
+        // OS signal handlers on its first poll, and doing that before `daemon.run` logs "host
+        // daemon starting" closes the startup window in which a SIGINT/SIGTERM still has its
+        // default (process-killing) disposition.
+        biased;
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received");
+            // Dropping the daemon drops the NATS client and its SQLite connections. The signaling
+            // run loop has no separate shutdown channel (`HostDaemon::run`'s doc comment), so
+            // there is nothing else to drain.
+            ExitCode::SUCCESS
+        }
         result = daemon.run(options) => match result {
             Ok(()) => {
-                tracing::info!("host daemon exited cleanly");
-                ExitCode::SUCCESS
+                // The signaling loop only returns `Ok(())` when the NATS client closes; a
+                // command/request failure is the `Err` arm. Treating this as a clean exit would
+                // report success for a host that is no longer reachable.
+                tracing::error!(
+                    "host daemon signaling loop ended because the NATS connection closed; the \
+                     host is no longer reachable. Its CONNECT credential is minted once per \
+                     process and cannot be replayed after the attestation's ±2 minute window, so \
+                     restarting the process is what re-authenticates it (a fresh nkey, \
+                     attestation, and token)"
+                );
+                ExitCode::FAILURE
             }
             Err(error) => {
                 // `HostDaemonError`'s `Display` forwards `SignalingError`/`StoreError` bodies,
@@ -198,33 +264,75 @@ async fn run(config: Config) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutdown signal received");
-            // Dropping the daemon drops the NATS client and its SQLite connections. The signaling
-            // run loop has no separate shutdown channel (`HostDaemon::run`'s doc comment), so
-            // there is nothing else to drain.
-            ExitCode::SUCCESS
+    }
+}
+
+/// Resolves when the process is asked to stop: Ctrl-C (SIGINT) everywhere, and SIGTERM on Unix.
+///
+/// Docker and systemd stop a container/service with SIGTERM, so installing only `ctrl_c()` would
+/// leave a supervised deployment waiting for the SIGKILL that follows its grace period. The log
+/// line names which signal fired; both use the "shutdown signal received" prefix the binary's
+/// live test asserts on. A failure to install the SIGTERM handler is a warning, never fatal:
+/// Ctrl-C still works, which is the one signal this process cannot lose.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(terminate) => terminate,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error, // redaction-ok: std::io::Error from signal-handler registration is OS error text, never member data
+                    "could not install the SIGTERM handler; Ctrl-C (SIGINT) still shuts down"
+                );
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    tracing::info!("shutdown signal received (SIGINT)");
+                }
+                return;
+            }
+        };
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if result.is_ok() {
+                    tracing::info!("shutdown signal received (SIGINT)");
+                }
+            }
+            _ = terminate.recv() => {
+                tracing::info!("shutdown signal received (SIGTERM)");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("shutdown signal received (SIGINT)");
         }
     }
 }
 
 /// Resolves the root seed according to DESIGN.md A10.41's enrollment rule, then returns it.
 ///
-/// - Seed present → use it. If `--init`/`--restore-seed` was also given, refuse: an existing
+/// - Seed present → use it. If an enrollment action was also requested, refuse: an existing
 ///   seed's `host_fp` is what every member is bound to, and overwriting it (which
 ///   `SeedFileStore::store_root_seed` would refuse anyway) must fail before anything is touched.
-/// - Seed absent + `--restore-seed <phrase>` → parse and store the phrase's seed.
-/// - Seed absent + `--init` → fill 32 bytes from the OS CSPRNG, store, and print the recovery
-///   phrase once.
-/// - Seed absent + neither → refuse, naming both ways to proceed. Never generate implicitly:
+/// - Seed absent + `--init` → fill 32 bytes from the OS CSPRNG, store, and deliver the recovery
+///   phrase once (stdout on a terminal, otherwise a configured phrase file).
+/// - Seed absent + `--restore-seed-file <path>` or `SPINDLE_HOST_RESTORE_SEED` → parse the
+///   phrase's seed and store it.
+/// - Seed absent + none → refuse, naming every way to proceed. Never generate implicitly:
 ///   A10.41(b) makes an absent seed a refusal to start, not a quiet first run.
 fn prepare_root_seed(config: &Config, store: &SeedFileStore) -> Result<[u8; ROOT_SEED_LEN], ()> {
+    let enrollment_requested =
+        config.init || config.restore_seed.is_some() || config.restore_seed_file.is_some();
+
     match store.load_root_seed() {
         Ok(seed) => {
-            if config.init || config.restore_seed.is_some() {
+            if enrollment_requested {
                 tracing::error!(
                     path = %store.path().display(), // redaction-ok: operator-configured host seed path (SPINDLE_HOST_SEED_FILE/--seed-file), never member data (operator-config exemption, lib.rs)
-                    "--init/--restore-seed was given but a host root seed already exists; \
+                    "an enrollment action was given but a host root seed already exists; \
                      refusing to overwrite the identity every member of this host is bound to"
                 );
                 return Err(());
@@ -232,63 +340,17 @@ fn prepare_root_seed(config: &Config, store: &SeedFileStore) -> Result<[u8; ROOT
             Ok(seed)
         }
         Err(KeyStoreError::Absent { .. }) => {
-            if let Some(phrase) = &config.restore_seed {
-                let seed = match parse_recovery_phrase(phrase) {
-                    Ok(seed) => seed,
-                    Err(error) => {
-                        // `RecoveryPhraseError` describes the encoding fault only; it never
-                        // carries the phrase.
-                        tracing::error!(
-                            error = %error, // redaction-ok: RecoveryPhraseError Display is static encoding-fault text and byte counts only; it never carries the phrase
-                            "--restore-seed did not contain a valid host recovery phrase"
-                        );
-                        return Err(());
-                    }
-                };
-                if let Err(error) = store.store_root_seed(&seed) {
-                    tracing::error!(
-                        path = %store.path().display(), // redaction-ok: operator-configured host seed path (SPINDLE_HOST_SEED_FILE/--seed-file), never member data (operator-config exemption, lib.rs)
-                        error = %error, // redaction-ok: KeyStoreError Display names the operator-configured seed path and octal mode/byte count (A10.41 refusal diagnostic) plus any io::Error OS text; no peer bytes, identifiers, or secrets (operator-config exemption, lib.rs)
-                        "failed to store the restored host root seed"
-                    );
-                    return Err(());
-                }
-                tracing::info!(
-                    path = %store.path().display(), // redaction-ok: operator-configured host seed path (SPINDLE_HOST_SEED_FILE/--seed-file), never member data (operator-config exemption, lib.rs)
-                    "host root seed restored from the recovery phrase"
-                );
-                Ok(seed)
-            } else if config.init {
-                let mut seed = [0u8; ROOT_SEED_LEN];
-                OsRng.fill_bytes(&mut seed);
-                if let Err(error) = store.store_root_seed(&seed) {
-                    tracing::error!(
-                        path = %store.path().display(), // redaction-ok: operator-configured host seed path (SPINDLE_HOST_SEED_FILE/--seed-file), never member data (operator-config exemption, lib.rs)
-                        error = %error, // redaction-ok: KeyStoreError Display names the operator-configured seed path and octal mode/byte count (A10.41 refusal diagnostic) plus any io::Error OS text; no peer bytes, identifiers, or secrets (operator-config exemption, lib.rs)
-                        "failed to store the newly generated host root seed"
-                    );
-                    return Err(());
-                }
-
-                // Plain `println!`, not `tracing`: this is the one secret this process ever
-                // prints, and a subscriber's formatting/filtering/aggregation pipeline is exactly
-                // where it must never end up. stdout is reserved for this phrase — all logs go to
-                // stderr (see `main`).
-                println!("{}", format_recovery_phrase(&seed));
-                tracing::warn!(
-                    path = %store.path().display(), // redaction-ok: operator-configured host seed path (SPINDLE_HOST_SEED_FILE/--seed-file), never member data (operator-config exemption, lib.rs)
-                    "the host recovery phrase was written once to stdout above. Anyone holding \
-                     it can restore this host's root identity and act as this host. Store it \
-                     offline; never paste it into a log, ticket, or shell history."
-                );
-                Ok(seed)
+            if config.init {
+                init_root_seed(config, store)
+            } else if enrollment_requested {
+                restore_root_seed(config, store)
             } else {
                 tracing::error!(
                     path = %store.path().display(), // redaction-ok: operator-configured host seed path (SPINDLE_HOST_SEED_FILE/--seed-file), never member data (operator-config exemption, lib.rs)
-                    "host root seed is absent and neither --init nor --restore-seed was given; \
-                     refusing to generate one implicitly (DESIGN.md A10.41). Run once with \
-                     --init to enroll this host, or with --restore-seed <phrase> to restore an \
-                     existing identity."
+                    "host root seed is absent and no enrollment action was given; refusing to \
+                     generate one implicitly (DESIGN.md A10.41). Run once with --init to enroll \
+                     this host, with --restore-seed-file <path> or SPINDLE_HOST_RESTORE_SEED to \
+                     restore an existing identity."
                 );
                 Err(())
             }
@@ -302,6 +364,210 @@ fn prepare_root_seed(config: &Config, store: &SeedFileStore) -> Result<[u8; ROOT
             Err(())
         }
     }
+}
+
+/// Restores a seed from `--restore-seed-file` or `SPINDLE_HOST_RESTORE_SEED`. Only reached when
+/// the seed file is absent and at least one of those sources is configured.
+fn restore_root_seed(config: &Config, store: &SeedFileStore) -> Result<[u8; ROOT_SEED_LEN], ()> {
+    let phrase = match restore_phrase(config) {
+        Ok(phrase) => phrase,
+        Err(()) => return Err(()),
+    };
+    let seed = match parse_recovery_phrase(&phrase) {
+        Ok(seed) => seed,
+        Err(error) => {
+            // `RecoveryPhraseError` describes the encoding fault only; it never carries the
+            // phrase.
+            tracing::error!(
+                error = %error, // redaction-ok: RecoveryPhraseError Display is static encoding-fault text and byte counts only; it never carries the phrase
+                "--restore-seed-file/SPINDLE_HOST_RESTORE_SEED did not contain a valid host recovery phrase"
+            );
+            return Err(());
+        }
+    };
+    if let Err(error) = store.store_root_seed(&seed) {
+        tracing::error!(
+            path = %store.path().display(), // redaction-ok: operator-configured host seed path (SPINDLE_HOST_SEED_FILE/--seed-file), never member data (operator-config exemption, lib.rs)
+            error = %error, // redaction-ok: KeyStoreError Display names the operator-configured seed path and octal mode/byte count (A10.41 refusal diagnostic) plus any io::Error OS text; no peer bytes, identifiers, or secrets (operator-config exemption, lib.rs)
+            "failed to store the restored host root seed"
+        );
+        return Err(());
+    }
+    tracing::info!(
+        path = %store.path().display(), // redaction-ok: operator-configured host seed path (SPINDLE_HOST_SEED_FILE/--seed-file), never member data (operator-config exemption, lib.rs)
+        "host root seed restored from the recovery phrase"
+    );
+    Ok(seed)
+}
+
+/// Returns the configured restore phrase. There is no precedence question: [`Config`] refuses
+/// both sources at once, so at most one is present.
+fn restore_phrase(config: &Config) -> Result<String, ()> {
+    if let Some(phrase) = &config.restore_seed {
+        return Ok(phrase.clone());
+    }
+    let Some(path) = &config.restore_seed_file else {
+        // Unreachable: `prepare_root_seed` only calls this when a restore source is present.
+        tracing::error!("no restore phrase source is configured");
+        return Err(());
+    };
+    match read_phrase_file(path) {
+        Ok(phrase) => Ok(phrase),
+        Err(error) => {
+            tracing::error!(
+                path = %path.display(), // redaction-ok: operator-configured restore-seed path (operator-config exemption, lib.rs)
+                error = %error, // redaction-ok: KeyStoreError Display names the operator-configured path, octal mode, or io::Error OS text; it never carries the file's contents
+                "failed to read the configured --restore-seed-file"
+            );
+            Err(())
+        }
+    }
+}
+
+/// Reads a restore phrase file under the same POSIX discipline as the root seed itself: the
+/// parent directory at most `0700` and the file at most `0600`, checked before the phrase is
+/// copied into this process. A wider entry is refused by naming the path and mode found.
+#[cfg(unix)]
+fn read_phrase_file(path: &Path) -> Result<String, KeyStoreError> {
+    check_parent_mode(path)?;
+    check_file_mode(path)?;
+    std::fs::read_to_string(path).map_err(|source| KeyStoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// `#[cfg(not(unix))]` only: mode bits are not meaningful, and the seed-file store this binary
+/// depends on is unsupported here, so refusing is consistent with the rest of the custody path.
+#[cfg(not(unix))]
+fn read_phrase_file(_path: &Path) -> Result<String, KeyStoreError> {
+    Err(KeyStoreError::UnsupportedPlatform)
+}
+
+/// Generates, stores, and delivers a first-run root seed. `--init` only.
+fn init_root_seed(config: &Config, store: &SeedFileStore) -> Result<[u8; ROOT_SEED_LEN], ()> {
+    // Decide where the phrase can actually go *before* generating or storing anything. A seed
+    // whose phrase is written into a log pipeline (or nowhere) creates an identity nobody can
+    // ever recover; this is the last point at which refusing leaves nothing persisted.
+    let sink = match phrase_sink(config) {
+        Ok(sink) => sink,
+        Err(()) => return Err(()),
+    };
+
+    let mut seed = [0u8; ROOT_SEED_LEN];
+    OsRng.fill_bytes(&mut seed);
+    if let Err(error) = store.store_root_seed(&seed) {
+        tracing::error!(
+            path = %store.path().display(), // redaction-ok: operator-configured host seed path (SPINDLE_HOST_SEED_FILE/--seed-file), never member data (operator-config exemption, lib.rs)
+            error = %error, // redaction-ok: KeyStoreError Display names the operator-configured seed path and octal mode/byte count (A10.41 refusal diagnostic) plus any io::Error OS text; no peer bytes, identifiers, or secrets (operator-config exemption, lib.rs)
+            "failed to store the newly generated host root seed"
+        );
+        return Err(());
+    }
+
+    // A plain write, not `tracing`: this is the one secret this process ever emits, and a
+    // subscriber's formatting/filtering/aggregation pipeline is exactly where it must never end
+    // up. The write result is checked on both paths: the seed is already persisted, so a failed
+    // delivery must say so loudly rather than exit as if enrollment succeeded.
+    let phrase = format_recovery_phrase(&seed);
+    match sink {
+        PhraseSink::Stdout => {
+            let mut stdout = std::io::stdout();
+            if let Err(error) = writeln!(stdout, "{phrase}").and_then(|()| stdout.flush()) {
+                tracing::error!(
+                    error = %error, // redaction-ok: std::io::Error OS text only (broken pipe, closed descriptor); never the phrase
+                    "the host root seed is now persisted, but its recovery phrase could NOT be \
+                     written to stdout; this identity cannot be recovered without that phrase"
+                );
+                return Err(());
+            }
+            tracing::warn!(
+                path = %store.path().display(), // redaction-ok: operator-configured host seed path (SPINDLE_HOST_SEED_FILE/--seed-file), never member data (operator-config exemption, lib.rs)
+                "the host recovery phrase was written once to stdout above. Anyone holding \
+                 it can restore this host's root identity and act as this host. Store it \
+                 offline; never paste it into a log, ticket, or shell history."
+            );
+        }
+        PhraseSink::File(path) => {
+            if let Err(error) = write_phrase_file(&path, &phrase) {
+                tracing::error!(
+                    path = %path.display(), // redaction-ok: operator-configured recovery-phrase path (operator-config exemption, lib.rs)
+                    error = %error, // redaction-ok: KeyStoreError Display names the operator-configured path and octal mode or io::Error OS text; it never carries the phrase
+                    "the host root seed is now persisted, but its recovery phrase could NOT be \
+                     written to the configured phrase file; this identity cannot be recovered \
+                     without that phrase"
+                );
+                return Err(());
+            }
+            tracing::warn!(
+                path = %path.display(), // redaction-ok: operator-configured recovery-phrase path (operator-config exemption, lib.rs)
+                "the host recovery phrase was written once to the configured file. Anyone \
+                 holding it can restore this host's root identity and act as this host. Move \
+                 the file offline and delete it; never paste the phrase into a log, ticket, or \
+                 shell history."
+            );
+        }
+    }
+    Ok(seed)
+}
+
+/// Where the one-time recovery phrase can be delivered without passing through a log pipeline.
+enum PhraseSink {
+    /// stdout is a terminal, so the phrase goes to the operator directly and nowhere else.
+    Stdout,
+    /// stdout is redirected (a service manager, a pipe, a log collector); the phrase goes to a
+    /// fresh `0600` file instead and the operator is told to move it offline and delete it.
+    File(PathBuf),
+}
+
+/// Chooses the phrase sink, refusing before any seed exists when neither channel is usable.
+fn phrase_sink(config: &Config) -> Result<PhraseSink, ()> {
+    if std::io::stdout().is_terminal() {
+        return Ok(PhraseSink::Stdout);
+    }
+    match &config.recovery_phrase_file {
+        Some(path) => Ok(PhraseSink::File(path.clone())),
+        None => {
+            tracing::error!(
+                "stdout is not a terminal and no recovery phrase file is configured; refusing \
+                 to generate a host root seed before its phrase can be delivered. Persisting a \
+                 seed whose phrase could only reach a log stream (or nowhere) would create an \
+                 identity nobody could ever recover. Set SPINDLE_HOST_RECOVERY_PHRASE_FILE or \
+                 --recovery-phrase-file <path>, or run --init in a terminal."
+            );
+            Err(())
+        }
+    }
+}
+
+/// Writes `phrase` to a new `0600` file inside a `0700` parent (`check_parent_mode`, shared with
+/// [`SeedFileStore`] rather than re-implemented), refusing to overwrite an existing file.
+/// `create_new` makes the existence check atomic, so a second enrollment cannot silently replace
+/// a phrase the operator may already have stored elsewhere.
+#[cfg(unix)]
+fn write_phrase_file(path: &Path, phrase: &str) -> Result<(), KeyStoreError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    check_parent_mode(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|source| KeyStoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    writeln!(file, "{phrase}").map_err(|source| KeyStoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// `#[cfg(not(unix))]` only: see [`read_phrase_file`].
+#[cfg(not(unix))]
+fn write_phrase_file(_path: &Path, _phrase: &str) -> Result<(), KeyStoreError> {
+    Err(KeyStoreError::UnsupportedPlatform)
 }
 
 /// Installs the Prometheus exporter once, iff `SPINDLE_METRICS_ADDR`/`--metrics-addr` is set.

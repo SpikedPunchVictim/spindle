@@ -75,19 +75,21 @@ pub enum KeyStoreError {
     )]
     ParentMissing { path: PathBuf },
 
-    /// The parent directory is wider than the required `0700`.
+    /// The parent directory is wider than the required `0700`. Reused by [`check_parent_mode`]
+    /// for the one-shot recovery-phrase files, whose directory is held to the same rule.
     #[error(
-        "host seed directory {} has mode 0o{:o}, wider than the required 0o700; refusing to start \
-         rather than silently correcting it, since the seed may already have been read",
+        "directory {} has mode 0o{:o}, wider than the required 0o700; refusing to use it rather \
+         than silently correcting it, since the secret it holds may already have been read",
         .path.display(),
         mode
     )]
     ParentModeTooWide { path: PathBuf, mode: u32 },
 
-    /// The seed file is wider than the required `0600`.
+    /// The secret file is wider than the required `0600`. Reused by [`check_file_mode`] for the
+    /// one-shot recovery-phrase files, which are held to the same rule as the seed file.
     #[error(
-        "host seed file {} has mode 0o{:o}, wider than the required 0o600; refusing to start \
-         rather than silently correcting it, since the seed may already have been read",
+        "file {} has mode 0o{:o}, wider than the required 0o600; refusing to read it rather than \
+         silently correcting it, since the secret may already have been read",
         .path.display(),
         mode
     )]
@@ -112,8 +114,8 @@ pub enum KeyStoreError {
     )]
     AlreadyExists { path: PathBuf },
 
-    /// Reading or writing the seed or its directory metadata failed.
-    #[error("host seed I/O failed at {}: {source}", .path.display())]
+    /// Reading or writing the secret file or its directory metadata failed.
+    #[error("file I/O failed at {}: {source}", .path.display())]
     Io {
         path: PathBuf,
         #[source]
@@ -232,48 +234,93 @@ impl HostKeyStore for SeedFileStore {
 
 #[cfg(unix)]
 impl SeedFileStore {
-    /// The directory the seed file lives in. A bare relative file name has an empty parent; treat
-    /// that as the current directory rather than statting an empty path.
-    fn parent_dir(&self) -> &std::path::Path {
-        self.path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."))
-    }
-
     /// A10.41's parent-directory half of the mode rule. Called before any read or write, so an
     /// over-wide directory is refused identically at load and store time.
     fn ensure_parent_is_private(&self) -> Result<(), KeyStoreError> {
-        let parent = self.parent_dir();
-        let metadata = match std::fs::metadata(parent) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(KeyStoreError::ParentMissing {
-                    path: parent.to_path_buf(),
-                });
-            }
-            Err(source) => {
-                return Err(KeyStoreError::Io {
-                    path: parent.to_path_buf(),
-                    source,
-                });
-            }
-        };
-        if !metadata.is_dir() {
+        check_parent_mode(&self.path)
+    }
+}
+
+/// The directory `path` lives in. A bare relative file name has an empty parent; treat that as
+/// the current directory rather than statting an empty path.
+#[cfg(unix)]
+fn parent_dir(path: &std::path::Path) -> &std::path::Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
+/// A10.41's parent-directory half of the mode rule, for a secret file at `path`.
+///
+/// Exposed so the binary can hold the one-shot recovery-phrase files (`--recovery-phrase-file`,
+/// `--restore-seed-file`) to the seed file's `0700` directory rule without re-implementing it or
+/// drifting from the diagnostics [`SeedFileStore`] already emits. The check is a refusal that
+/// names the directory and the mode found; it never `chmod`s anything on the operator's behalf.
+#[cfg(unix)]
+pub fn check_parent_mode(path: &std::path::Path) -> Result<(), KeyStoreError> {
+    let parent = parent_dir(path);
+    let metadata = match std::fs::metadata(parent) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(KeyStoreError::ParentMissing {
                 path: parent.to_path_buf(),
             });
         }
-
-        let mode = metadata.mode() & 0o7777;
-        if mode & !0o700 != 0 {
-            return Err(KeyStoreError::ParentModeTooWide {
+        Err(source) => {
+            return Err(KeyStoreError::Io {
                 path: parent.to_path_buf(),
-                mode,
+                source,
             });
         }
-        Ok(())
+    };
+    if !metadata.is_dir() {
+        return Err(KeyStoreError::ParentMissing {
+            path: parent.to_path_buf(),
+        });
     }
+
+    let mode = metadata.mode() & 0o7777;
+    if mode & !0o700 != 0 {
+        return Err(KeyStoreError::ParentModeTooWide {
+            path: parent.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+/// A10.41's file half of the mode rule: `path` must carry no permission bit outside `0600`.
+///
+/// Exposed for the same reason as [`check_parent_mode`]. The mode is checked before any secret
+/// is read, so a file that is already group/world-readable is never copied into the process
+/// merely to discover that it should not have been read.
+#[cfg(unix)]
+pub fn check_file_mode(path: &std::path::Path) -> Result<(), KeyStoreError> {
+    let metadata = std::fs::metadata(path).map_err(|source| KeyStoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mode = metadata.mode() & 0o7777;
+    if mode & !0o600 != 0 {
+        return Err(KeyStoreError::SeedFileModeTooWide {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+/// `#[cfg(not(unix))]` only: A10.41(c) makes mode-bit checks meaningless here, and the seed-file
+/// store itself is unsupported, so a caller reaching this function is already misconfigured.
+#[cfg(not(unix))]
+pub fn check_parent_mode(_path: &std::path::Path) -> Result<(), KeyStoreError> {
+    Err(KeyStoreError::UnsupportedPlatform)
+}
+
+/// `#[cfg(not(unix))]` only: see [`check_parent_mode`].
+#[cfg(not(unix))]
+pub fn check_file_mode(_path: &std::path::Path) -> Result<(), KeyStoreError> {
+    Err(KeyStoreError::UnsupportedPlatform)
 }
 
 #[cfg(not(unix))]

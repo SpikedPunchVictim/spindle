@@ -14,11 +14,17 @@
 //!
 //! # One-shot enrollment flags
 //!
-//! `--init` and `--restore-seed <phrase>` are both enrollment actions, and DESIGN.md A10.41(b)
-//! forbids either from being an implicit fallback on an absent seed. They are mutually exclusive
-//! (`ConfigError::ConflictingEnrollment`) and, in `main`, refused outright when a seed file
-//! already exists rather than silently overwriting the identity every member of this host is
-//! bound to.
+//! `--init`, `--restore-seed-file <path>`, and `SPINDLE_HOST_RESTORE_SEED` are all enrollment
+//! actions, and DESIGN.md A10.41(b) forbids any of them from being an implicit fallback on an
+//! absent seed. They are mutually exclusive (`ConfigError::ConflictingEnrollment`) and, in
+//! `main`, refused outright when a seed file already exists rather than silently overwriting the
+//! identity every member of this host is bound to.
+//!
+//! There is deliberately no inline `--restore-seed <phrase>` flag. A phrase passed in argv is
+//! visible to every process listing on the machine and is written into shell history; the file
+//! flag and the environment variable (`/proc/<pid>/environ` of the same user only, no shell
+//! history) are the two exposed spellings. A rejected `--restore-seed=<phrase>` token is still
+//! truncated at `=` by [`ConfigError::unknown_arg`], so the removal cannot turn into a leak.
 
 use std::env;
 use std::net::{IpAddr, Ipv4Addr};
@@ -40,12 +46,22 @@ pub(crate) struct Config {
     /// presents no admission token at all (`auth_token`'s host arm omits the key), which is the
     /// normal shape for an already-admitted host (DESIGN.md §A3b).
     pub(crate) admission_token_file: Option<PathBuf>,
+    /// `SPINDLE_HOST_RECOVERY_PHRASE_FILE` / `--recovery-phrase-file <path>`. Required with
+    /// `--init` when stdout is not a terminal: the recovery phrase must land in a file the
+    /// operator can move offline, never in a log pipeline. Ignored when stdout is a terminal,
+    /// where the phrase is printed instead.
+    pub(crate) recovery_phrase_file: Option<PathBuf>,
     /// `SPINDLE_HOST_INIT` (`1`/`true`) / `--init`. Generate a root seed on first run, printing
-    /// the recovery phrase once.
+    /// the recovery phrase once (to stdout, or to `recovery_phrase_file` when stdout is not a
+    /// terminal).
     pub(crate) init: bool,
-    /// `SPINDLE_HOST_RESTORE_SEED` / `--restore-seed <phrase>`. Restore an existing identity from
-    /// its recovery phrase on first run.
+    /// `SPINDLE_HOST_RESTORE_SEED` only. Restore an existing identity from its recovery phrase on
+    /// first run. There is no flag spelling: argv is visible to other processes and shell history.
     pub(crate) restore_seed: Option<String>,
+    /// `--restore-seed-file <path>` (no env-var equivalent). Read the recovery phrase from a file
+    /// whose mode is at most `0600` inside a directory of at most `0700`. A file keeps the phrase
+    /// out of argv and out of the shell history the inline flag would have written it to.
+    pub(crate) restore_seed_file: Option<PathBuf>,
     /// `SPINDLE_METRICS_ADDR` / `--metrics-addr`. `Some` installs the Prometheus exporter in
     /// `main`; `None` leaves every metrics macro a no-op.
     pub(crate) metrics_addr: Option<String>,
@@ -64,7 +80,10 @@ pub(crate) enum ConfigError {
     BadBindIp { given: String },
     #[error("invalid value {given:?} for --init / SPINDLE_HOST_INIT (expected 1|true|0|false)")]
     BadBoolean { given: String },
-    #[error("--init and --restore-seed cannot be combined; choose one enrollment path")]
+    #[error(
+        "--init, --restore-seed-file, and SPINDLE_HOST_RESTORE_SEED cannot be combined; choose \
+         one enrollment path"
+    )]
     ConflictingEnrollment,
     /// Only the part of the argument before the first `=` is ever kept — see
     /// [`ConfigError::unknown_arg`], which is the only way this variant is constructed.
@@ -77,10 +96,11 @@ impl ConfigError {
     /// first `=`.
     ///
     /// This parser is space-separated, so the common `--flag=value` spelling of a *recognized*
-    /// flag falls through to the unknown-argument arm with the value still attached. One of this
-    /// binary's flags takes a recovery phrase (`--restore-seed`), and echoing that into a log is
-    /// the same credential leak `helper.rs`'s identically named helper exists to prevent.
-    /// Truncating at the `=` keeps the diagnosis without the secret.
+    /// flag falls through to the unknown-argument arm with the value still attached. The removed
+    /// inline enrollment flag and a hand-written `SPINDLE_HOST_RESTORE_SEED`-style spelling both
+    /// make that shape a phrase-bearing token, and echoing it into a log is the same credential
+    /// leak `helper.rs`'s identically named helper exists to prevent. Truncating at the `=` keeps
+    /// the diagnosis without the secret.
     fn unknown_arg(arg: &str) -> ConfigError {
         ConfigError::UnknownArg(arg.split('=').next().unwrap_or("").to_string())
     }
@@ -91,7 +111,8 @@ const HELP: &str = r#"spindle-hostd — the headless Spindle host daemon
 USAGE:
     spindle-hostd [FLAGS]
 
-Every flag has an env-var equivalent (flags override the env var if both are set):
+Every flag has an env-var equivalent unless the entry says "(no env equivalent)"; flags override
+the env var if both are set:
     --nats-url <url>            SPINDLE_NATS_URL             (required)
     --seed-file <path>          SPINDLE_HOST_SEED_FILE       (required; file mode 0600, parent 0700)
     --store <path>              SPINDLE_HOST_STORE           (required; SQLite database path)
@@ -99,13 +120,20 @@ Every flag has an env-var equivalent (flags override the env var if both are set
     --admission-token-file <p>  SPINDLE_ADMISSION_TOKEN_FILE (optional; unset sends no token)
     --init                      SPINDLE_HOST_INIT            (1|true|0|false; generate a seed on
                                                              first run)
-    --restore-seed <phrase>     SPINDLE_HOST_RESTORE_SEED    (restore an existing identity once)
+    --recovery-phrase-file <p>  SPINDLE_HOST_RECOVERY_PHRASE_FILE
+                                                             (required with --init when stdout is
+                                                             not a terminal; the file must not
+                                                             exist, mode 0600, parent 0700)
+    --restore-seed-file <path>  (no env equivalent)          (restore an existing identity once;
+                                                             phrase file mode 0600, parent 0700)
     --metrics-addr <addr>       SPINDLE_METRICS_ADDR         (optional; Prometheus scrape listener,
                                                              e.g. 127.0.0.1:9100. Unset → no
                                                              recorder is installed)
     -h, --help                  show this message
 
-A first run (no seed file) requires exactly one of --init or --restore-seed <phrase>.
+A first run (no seed file) requires exactly one of --init, --restore-seed-file <path>, or
+SPINDLE_HOST_RESTORE_SEED. There is deliberately no inline --restore-seed <phrase> flag: a phrase
+in argv is visible to every process listing and is written to shell history.
 "#;
 
 impl Config {
@@ -117,8 +145,10 @@ impl Config {
         let mut store = env::var("SPINDLE_HOST_STORE").ok();
         let mut bind_ip = env::var("SPINDLE_HOST_BIND_IP").ok();
         let mut admission_token_file = env::var("SPINDLE_ADMISSION_TOKEN_FILE").ok();
+        let mut recovery_phrase_file = env::var("SPINDLE_HOST_RECOVERY_PHRASE_FILE").ok();
         let mut init = env::var("SPINDLE_HOST_INIT").ok();
-        let mut restore_seed = env::var("SPINDLE_HOST_RESTORE_SEED").ok();
+        let restore_seed = env::var("SPINDLE_HOST_RESTORE_SEED").ok();
+        let mut restore_seed_file = None;
         let mut metrics_addr = env::var("SPINDLE_METRICS_ADDR").ok();
 
         while let Some(arg) = args.next() {
@@ -157,11 +187,15 @@ impl Config {
                     })?)
                 }
                 "--init" => init = Some("true".to_string()),
-                "--restore-seed" => {
-                    restore_seed =
-                        Some(args.next().ok_or_else(|| {
-                            ConfigError::FlagMissingValue("restore-seed".to_string())
-                        })?)
+                "--recovery-phrase-file" => {
+                    recovery_phrase_file = Some(args.next().ok_or_else(|| {
+                        ConfigError::FlagMissingValue("recovery-phrase-file".to_string())
+                    })?)
+                }
+                "--restore-seed-file" => {
+                    restore_seed_file = Some(args.next().ok_or_else(|| {
+                        ConfigError::FlagMissingValue("restore-seed-file".to_string())
+                    })?)
                 }
                 "--metrics-addr" => {
                     metrics_addr =
@@ -183,7 +217,12 @@ impl Config {
             Some(given) => parse_bool(&given)?,
             None => false,
         };
-        if init && restore_seed.is_some() {
+        if init && (restore_seed.is_some() || restore_seed_file.is_some()) {
+            return Err(ConfigError::ConflictingEnrollment);
+        }
+        // Two restore sources would leave which phrase wins to parser order — the same ambiguity
+        // the init/restore conflict refuses. One enrollment path per first run.
+        if restore_seed.is_some() && restore_seed_file.is_some() {
             return Err(ConfigError::ConflictingEnrollment);
         }
 
@@ -195,8 +234,10 @@ impl Config {
             store: PathBuf::from(store.ok_or(ConfigError::Missing("SPINDLE_HOST_STORE", "store"))?),
             bind_ip,
             admission_token_file: admission_token_file.map(PathBuf::from),
+            recovery_phrase_file: recovery_phrase_file.map(PathBuf::from),
             init,
             restore_seed,
+            restore_seed_file: restore_seed_file.map(PathBuf::from),
             metrics_addr,
         })
     }
@@ -226,12 +267,13 @@ mod tests {
     /// and must not inherit whatever the developer's shell exported.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const ENV_NAMES: [&str; 8] = [
+    const ENV_NAMES: [&str; 9] = [
         "SPINDLE_NATS_URL",
         "SPINDLE_HOST_SEED_FILE",
         "SPINDLE_HOST_STORE",
         "SPINDLE_HOST_BIND_IP",
         "SPINDLE_ADMISSION_TOKEN_FILE",
+        "SPINDLE_HOST_RECOVERY_PHRASE_FILE",
         "SPINDLE_HOST_INIT",
         "SPINDLE_HOST_RESTORE_SEED",
         "SPINDLE_METRICS_ADDR",
@@ -289,8 +331,10 @@ mod tests {
 
         assert_eq!(config.bind_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(config.admission_token_file, None);
+        assert_eq!(config.recovery_phrase_file, None);
         assert!(!config.init);
         assert_eq!(config.restore_seed, None);
+        assert_eq!(config.restore_seed_file, None);
         assert_eq!(config.metrics_addr, None);
     }
 
@@ -300,6 +344,10 @@ mod tests {
         vars.extend([
             ("SPINDLE_HOST_BIND_IP", "127.0.0.1"),
             ("SPINDLE_ADMISSION_TOKEN_FILE", "/tmp/spindle/admission.bin"),
+            (
+                "SPINDLE_HOST_RECOVERY_PHRASE_FILE",
+                "/tmp/spindle/recovery.txt",
+            ),
             ("SPINDLE_HOST_INIT", "true"),
             ("SPINDLE_METRICS_ADDR", "127.0.0.1:9100"),
         ]);
@@ -313,6 +361,10 @@ mod tests {
         assert_eq!(
             config.admission_token_file,
             Some(PathBuf::from("/tmp/spindle/admission.bin"))
+        );
+        assert_eq!(
+            config.recovery_phrase_file,
+            Some(PathBuf::from("/tmp/spindle/recovery.txt"))
         );
         assert!(config.init);
         assert_eq!(config.metrics_addr.as_deref(), Some("127.0.0.1:9100"));
@@ -333,6 +385,8 @@ mod tests {
             "--admission-token-file",
             "/tmp/flag/admission.bin",
             "--init",
+            "--recovery-phrase-file",
+            "/tmp/flag/recovery.txt",
             "--metrics-addr",
             "127.0.0.1:9200",
         ])
@@ -346,8 +400,46 @@ mod tests {
             config.admission_token_file,
             Some(PathBuf::from("/tmp/flag/admission.bin"))
         );
+        assert_eq!(
+            config.recovery_phrase_file,
+            Some(PathBuf::from("/tmp/flag/recovery.txt"))
+        );
         assert!(config.init);
         assert_eq!(config.metrics_addr.as_deref(), Some("127.0.0.1:9200"));
+    }
+
+    #[test]
+    fn the_restore_phrase_comes_from_a_file_or_the_environment_but_never_argv_inline() {
+        {
+            let _env = CleanEnv::new(&REQUIRED_ENV);
+            let config = parse(&["--restore-seed-file", "/tmp/flag/recovery.txt"])
+                .expect("--restore-seed-file parses");
+            assert_eq!(config.restore_seed, None);
+            assert_eq!(
+                config.restore_seed_file,
+                Some(PathBuf::from("/tmp/flag/recovery.txt"))
+            );
+        }
+
+        {
+            let mut vars = REQUIRED_ENV.to_vec();
+            vars.push(("SPINDLE_HOST_RESTORE_SEED", "words in a phrase"));
+            let _env = CleanEnv::new(&vars);
+            let config = parse(&[]).expect("the environment phrase parses");
+            assert_eq!(config.restore_seed.as_deref(), Some("words in a phrase"));
+            assert_eq!(config.restore_seed_file, None);
+        }
+
+        {
+            // The inline flag is gone on purpose: argv is visible to process listings and lands
+            // in shell history. It must be rejected as an unknown argument, and its value must
+            // not be echoed back.
+            let _env = CleanEnv::new(&REQUIRED_ENV);
+            match parse(&["--restore-seed", "words in a phrase"]) {
+                Err(ConfigError::UnknownArg(arg)) => assert_eq!(arg, "--restore-seed"),
+                other => panic!("expected UnknownArg, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -422,11 +514,27 @@ mod tests {
     }
 
     #[test]
-    fn init_and_restore_seed_are_rejected_together() {
-        let _env = CleanEnv::new(&REQUIRED_ENV);
-        match parse(&["--init", "--restore-seed", "aaaa"]) {
-            Err(ConfigError::ConflictingEnrollment) => {}
-            other => panic!("expected ConflictingEnrollment, got {other:?}"),
+    fn enrollment_sources_are_rejected_together() {
+        {
+            let _env = CleanEnv::new(&REQUIRED_ENV);
+            match parse(&["--init", "--restore-seed-file", "/tmp/phrase.txt"]) {
+                Err(ConfigError::ConflictingEnrollment) => {}
+                other => panic!("expected ConflictingEnrollment, got {other:?}"),
+            }
+        }
+
+        let mut env = REQUIRED_ENV.to_vec();
+        env.push(("SPINDLE_HOST_RESTORE_SEED", "words in a phrase"));
+        {
+            let _env = CleanEnv::new(&env);
+            match parse(&["--init"]) {
+                Err(ConfigError::ConflictingEnrollment) => {}
+                other => panic!("expected ConflictingEnrollment, got {other:?}"),
+            }
+            match parse(&["--restore-seed-file", "/tmp/phrase.txt"]) {
+                Err(ConfigError::ConflictingEnrollment) => {}
+                other => panic!("expected ConflictingEnrollment, got {other:?}"),
+            }
         }
     }
 
