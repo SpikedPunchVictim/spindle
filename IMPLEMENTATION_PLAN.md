@@ -843,7 +843,15 @@ adds a second device, recovers unaided) met; S10 (invite/redeem + "Preview as" +
 usability test — non-technical tester completes unaided) met.
 **Tests**: S10/S13/S15 usability/automated suites; Tauri IPC command allowlist matches ADR-009's
 enumerated list (lint-enforced engine-api-only imports).
-**Status**: Not Started
+**Status**: Not Started (the headless host binary this stage implied landed separately under td-539ffa — see the note below)
+
+**Note**: 2026-10-29 — **td-539ffa landed**: `spindle-hostd` now ships a real headless binary (`src/main.rs`), so the crate is no longer a library nothing can launch.
+
+- **Wiring.** Env + `--flag` config mirroring `spindle-helper`'s binary (no `clap`); tracing on **stderr** (stdout is reserved for the one-time recovery phrase); the Prometheus exporter installed when `SPINDLE_METRICS_ADDR` is set, which closes A10.51's "host exporter wiring lands with the host binary"; `Ctrl-C` drains and returns `ExitCode::SUCCESS`.
+- **Custody (A10.41).** `SeedFileStore` holds the raw 32-byte root seed at mode `0600` inside a `0700` parent; a wider mode is a refusal that names the path and the mode found, never a silent `chmod`; an absent seed is a refusal, never an implicit first run. `--init` generates the seed from the OS CSPRNG and prints the base32 recovery phrase once; `--restore-seed` writes a supplied phrase. `mint_host_identity` re-mints the operating key and the envelope `DeviceKey` at every start (A10.43/A10.44), so `host_fp` survives a restart while `device_fp` does not.
+- **Connect.** A per-session nkey, a fresh `HostSessionAttestation`, the production `spindle_proto::auth_token` host-arm encoder (A10.53), and an optional admission token (A3b: only a first connect needs one). A `RootKeyCapIssuer` built from the same identity means an accepted connect carries a member capability.
+- **Proven live 2026-10-29** against `deploy/docker-compose.yml`: `cargo test -p spindle-hostd --test live_host_binary -- --ignored` — the binary reached `host daemon starting` (emitted only after the callout-authenticated connect succeeded and `HostDaemon::run` began), SIGINT exited 0, the seed file was `0600`, and a restart without `--init` logged the same redacted `host_fp`. The three existing `live_hostd` tests stayed green in the same run.
+- **Unproven / remaining.** No client app exists, so no end-to-end member session has crossed this binary. `registry.devcert.<hfp>` publication (A10.37) has no encoder, no helper handler, and no publish grant, so a client cannot fetch a fresh host device certificate after a restart — tracked as **td-65884b**. A10.45 mid-process certificate renewal is unimplemented: a process alive past 90 d serves an expired op cert — tracked as **td-81ef38**. Desktop (OS-keychain) custody and the Tauri host shell remain Stage 7.
 
 ## Stage 8: engine-web + apps/web + hardened delivery
 **Goal**: Implement `@spindle/engine-web` (nats.ws + browser WebRTC) and the `apps/web` browser
