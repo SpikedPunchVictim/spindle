@@ -361,6 +361,15 @@ fn prepare_root_seed(config: &Config, store: &SeedFileStore) -> Result<[u8; ROOT
                 error = %error, // redaction-ok: KeyStoreError Display names the operator-configured seed path and octal mode/byte count (A10.41 refusal diagnostic) plus any io::Error OS text; no peer bytes, identifiers, or secrets (operator-config exemption, lib.rs)
                 "failed to load the host root seed"
             );
+            if enrollment_requested {
+                tracing::error!(
+                    path = %store.path().display(), // redaction-ok: operator-configured host seed path (SPINDLE_HOST_SEED_FILE/--seed-file), never member data (operator-config exemption, lib.rs)
+                    "the configured enrollment source was NOT used because the existing seed file \
+                     is unusable (wrong length, a wider mode, or an I/O error; the cause is \
+                     logged above for this path). Move or repair that file before re-running \
+                     enrollment."
+                );
+            }
             Err(())
         }
     }
@@ -446,10 +455,22 @@ fn read_phrase_file(_path: &Path) -> Result<String, KeyStoreError> {
 
 /// Generates, stores, and delivers a first-run root seed. `--init` only.
 fn init_root_seed(config: &Config, store: &SeedFileStore) -> Result<[u8; ROOT_SEED_LEN], ()> {
-    // Decide where the phrase can actually go *before* generating or storing anything. A seed
-    // whose phrase is written into a log pipeline (or nowhere) creates an identity nobody can
-    // ever recover; this is the last point at which refusing leaves nothing persisted.
-    let sink = match phrase_sink(config) {
+    init_root_seed_with(config, store, std::io::stdout().is_terminal())
+}
+
+/// [`init_root_seed`] with the terminal check injected so the refusal ordering is testable
+/// without a real TTY.
+fn init_root_seed_with(
+    config: &Config,
+    store: &SeedFileStore,
+    stdout_is_terminal: bool,
+) -> Result<[u8; ROOT_SEED_LEN], ()> {
+    // Resolve and *open* the phrase sink before generating or storing anything. A seed whose
+    // phrase cannot be delivered — no sink, a wider-than-0700 parent, an existing phrase file,
+    // an unwritable directory — creates an identity nobody can ever recover, and this is the last
+    // point at which refusing leaves nothing persisted. Opening here also means the only failure
+    // left after `store_root_seed` is the data write itself.
+    let sink = match phrase_sink_for(config, stdout_is_terminal) {
         Ok(sink) => sink,
         Err(()) => return Err(()),
     };
@@ -457,6 +478,19 @@ fn init_root_seed(config: &Config, store: &SeedFileStore) -> Result<[u8; ROOT_SE
     let mut seed = [0u8; ROOT_SEED_LEN];
     OsRng.fill_bytes(&mut seed);
     if let Err(error) = store.store_root_seed(&seed) {
+        // The phrase file was created (empty, 0600) before this failure. Leaving it behind would
+        // make the next `--init` fail on `create_new` with no obvious cause, so remove it.
+        if let PhraseSink::File { path, .. } = &sink {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(remove_error) => tracing::warn!(
+                    path = %path.display(), // redaction-ok: operator-configured recovery-phrase path (operator-config exemption, lib.rs)
+                    error = %remove_error, // redaction-ok: std::io::Error OS text only, never the phrase (the file is empty at this point)
+                    "could not remove the empty recovery phrase file after the seed store failed; delete it before retrying --init"
+                ),
+            }
+        }
         tracing::error!(
             path = %store.path().display(), // redaction-ok: operator-configured host seed path (SPINDLE_HOST_SEED_FILE/--seed-file), never member data (operator-config exemption, lib.rs)
             error = %error, // redaction-ok: KeyStoreError Display names the operator-configured seed path and octal mode/byte count (A10.41 refusal diagnostic) plus any io::Error OS text; no peer bytes, identifiers, or secrets (operator-config exemption, lib.rs)
@@ -488,15 +522,40 @@ fn init_root_seed(config: &Config, store: &SeedFileStore) -> Result<[u8; ROOT_SE
                  offline; never paste it into a log, ticket, or shell history."
             );
         }
-        PhraseSink::File(path) => {
-            if let Err(error) = write_phrase_file(&path, &phrase) {
-                tracing::error!(
-                    path = %path.display(), // redaction-ok: operator-configured recovery-phrase path (operator-config exemption, lib.rs)
-                    error = %error, // redaction-ok: KeyStoreError Display names the operator-configured path and octal mode or io::Error OS text; it never carries the phrase
-                    "the host root seed is now persisted, but its recovery phrase could NOT be \
-                     written to the configured phrase file; this identity cannot be recovered \
-                     without that phrase"
-                );
+        PhraseSink::File { path, mut file } => {
+            let write_result = writeln!(file, "{phrase}").and_then(|()| file.flush());
+            if let Err(error) = write_result {
+                // Do not leave a half-written phrase behind: a zero-length or partial file is
+                // not recoverable material and would make the next `--init` fail on `create_new`.
+                drop(file);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => tracing::error!(
+                        path = %path.display(), // redaction-ok: operator-configured recovery-phrase path (operator-config exemption, lib.rs)
+                        error = %error, // redaction-ok: std::io::Error OS text only; never the phrase
+                        "the host root seed is now persisted, but its recovery phrase could NOT \
+                         be written to the configured phrase file; the partial file was removed, \
+                         and this identity cannot be recovered without that phrase"
+                    ),
+                    Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::error!(
+                            path = %path.display(), // redaction-ok: operator-configured recovery-phrase path (operator-config exemption, lib.rs)
+                            error = %error, // redaction-ok: std::io::Error OS text only; never the phrase
+                            "the host root seed is now persisted, but its recovery phrase could \
+                             NOT be written to the configured phrase file (the partial file had \
+                             already disappeared); this identity cannot be recovered without \
+                             that phrase"
+                        )
+                    }
+                    Err(remove_error) => tracing::error!(
+                        path = %path.display(), // redaction-ok: operator-configured recovery-phrase path (operator-config exemption, lib.rs)
+                        error = %error, // redaction-ok: std::io::Error OS text only; never the phrase
+                        remove_error = %remove_error, // redaction-ok: std::io::Error OS text only; never the phrase
+                        "the host root seed is now persisted, but its recovery phrase could NOT \
+                         be written to the configured phrase file, and the partial file could NOT \
+                         be removed; delete that file and treat this identity as unrecoverable \
+                         without the phrase"
+                    ),
+                }
                 return Err(());
             }
             tracing::warn!(
@@ -515,18 +574,34 @@ fn init_root_seed(config: &Config, store: &SeedFileStore) -> Result<[u8; ROOT_SE
 enum PhraseSink {
     /// stdout is a terminal, so the phrase goes to the operator directly and nowhere else.
     Stdout,
-    /// stdout is redirected (a service manager, a pipe, a log collector); the phrase goes to a
-    /// fresh `0600` file instead and the operator is told to move it offline and delete it.
-    File(PathBuf),
+    /// stdout is redirected (a service manager, a pipe, a log collector); this is an already-open
+    /// fresh `0600` file in a `0700` parent, created before the seed is persisted so that a path
+    /// problem cannot leave a stored seed whose phrase has nowhere to go.
+    File { path: PathBuf, file: std::fs::File },
 }
 
-/// Chooses the phrase sink, refusing before any seed exists when neither channel is usable.
-fn phrase_sink(config: &Config) -> Result<PhraseSink, ()> {
-    if std::io::stdout().is_terminal() {
+/// Chooses the phrase sink, refusing before any seed exists when neither channel is usable. The
+/// terminal check is injected so the refusal ordering is testable without a real TTY.
+fn phrase_sink_for(config: &Config, stdout_is_terminal: bool) -> Result<PhraseSink, ()> {
+    if stdout_is_terminal {
         return Ok(PhraseSink::Stdout);
     }
     match &config.recovery_phrase_file {
-        Some(path) => Ok(PhraseSink::File(path.clone())),
+        Some(path) => match open_phrase_file(path) {
+            Ok(file) => Ok(PhraseSink::File {
+                path: path.clone(),
+                file,
+            }),
+            Err(error) => {
+                tracing::error!(
+                    path = %path.display(), // redaction-ok: operator-configured recovery-phrase path (operator-config exemption, lib.rs)
+                    error = %error, // redaction-ok: KeyStoreError Display names the operator-configured path and octal mode or io::Error OS text; it never carries a phrase
+                    "the configured recovery phrase file cannot be created; refusing to generate \
+                     a host root seed whose phrase could not be delivered"
+                );
+                Err(())
+            }
+        },
         None => {
             tracing::error!(
                 "stdout is not a terminal and no recovery phrase file is configured; refusing \
@@ -540,16 +615,16 @@ fn phrase_sink(config: &Config) -> Result<PhraseSink, ()> {
     }
 }
 
-/// Writes `phrase` to a new `0600` file inside a `0700` parent (`check_parent_mode`, shared with
+/// Opens a new `0600` phrase file inside a `0700` parent (`check_parent_mode`, shared with
 /// [`SeedFileStore`] rather than re-implemented), refusing to overwrite an existing file.
 /// `create_new` makes the existence check atomic, so a second enrollment cannot silently replace
 /// a phrase the operator may already have stored elsewhere.
 #[cfg(unix)]
-fn write_phrase_file(path: &Path, phrase: &str) -> Result<(), KeyStoreError> {
+fn open_phrase_file(path: &Path) -> Result<std::fs::File, KeyStoreError> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     check_parent_mode(path)?;
-    let mut file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -557,16 +632,12 @@ fn write_phrase_file(path: &Path, phrase: &str) -> Result<(), KeyStoreError> {
         .map_err(|source| KeyStoreError::Io {
             path: path.to_path_buf(),
             source,
-        })?;
-    writeln!(file, "{phrase}").map_err(|source| KeyStoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+        })
 }
 
 /// `#[cfg(not(unix))]` only: see [`read_phrase_file`].
 #[cfg(not(unix))]
-fn write_phrase_file(_path: &Path, _phrase: &str) -> Result<(), KeyStoreError> {
+fn open_phrase_file(_path: &Path) -> Result<std::fs::File, KeyStoreError> {
     Err(KeyStoreError::UnsupportedPlatform)
 }
 
@@ -602,5 +673,152 @@ fn init_metrics_exporter(metrics_addr: Option<&str>) {
             error = %error, // redaction-ok: metrics_exporter_prometheus::BuildError Display is static build/bind/recorder text, no member identifiers or payload bytes
             "metrics exporter could not be installed — metrics disabled"
         ),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn private_dir() -> TempDir {
+        let dir = TempDir::new().expect("temp dir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+        dir
+    }
+
+    /// The fields under test, with everything else required by [`Config`] filled in directly:
+    /// no environment variable is read, so these tests cannot be affected by the developer's
+    /// shell and need no environment lock.
+    fn test_config(dir: &Path) -> Config {
+        Config {
+            nats_url: "nats://example.test:4222".to_string(),
+            seed_file: dir.join("host.seed"),
+            store: dir.join("host.db"),
+            bind_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            admission_token_file: None,
+            recovery_phrase_file: None,
+            init: true,
+            restore_seed: None,
+            restore_seed_file: None,
+            metrics_addr: None,
+        }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// The HIGH regression: a non-TTY stdout with no phrase file must be refused *before* the
+    /// seed is generated and stored, not after.
+    #[test]
+    fn init_refuses_before_persisting_when_stdout_is_not_a_terminal_and_no_phrase_file_is_configured(
+    ) {
+        let dir = private_dir();
+        let config = test_config(dir.path());
+        let store = SeedFileStore::new(config.seed_file.clone());
+
+        assert!(init_root_seed_with(&config, &store, false).is_err());
+        assert!(
+            !config.seed_file.exists(),
+            "the refusal must happen before the seed is persisted"
+        );
+    }
+
+    /// The other side of the same ordering: a phrase path that fails its A10.41 parent-mode check
+    /// is refused before the seed exists, so no unrecoverable identity is left on disk.
+    #[test]
+    fn init_refuses_a_phrase_file_in_a_wider_parent_before_persisting() {
+        let seed_dir = private_dir();
+        let wide_dir = TempDir::new().expect("wide temp dir");
+        set_mode(wide_dir.path(), 0o755);
+        let phrase_path = wide_dir.path().join("recovery.phrase");
+
+        let mut config = test_config(seed_dir.path());
+        config.recovery_phrase_file = Some(phrase_path.clone());
+        let store = SeedFileStore::new(config.seed_file.clone());
+
+        assert!(init_root_seed_with(&config, &store, false).is_err());
+        assert!(
+            !config.seed_file.exists(),
+            "a phrase-path refusal must happen before the seed is persisted"
+        );
+        assert!(
+            !phrase_path.exists(),
+            "the refused phrase file must not be created"
+        );
+    }
+
+    #[test]
+    fn opening_a_phrase_file_refuses_an_existing_file() {
+        let dir = private_dir();
+        let path = dir.path().join("recovery.phrase");
+        fs::write(&path, b"already here").expect("write existing phrase file");
+        set_mode(&path, 0o600);
+
+        match open_phrase_file(&path) {
+            Err(KeyStoreError::Io { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists)
+            }
+            other => panic!("expected Io(AlreadyExists), got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(&path).expect("existing file is untouched"),
+            b"already here"
+        );
+    }
+
+    /// If the seed store loses its race, the phrase file opened before it is removed rather than
+    /// left behind as an empty file that would block the next `--init` on `create_new`.
+    #[test]
+    fn a_failed_seed_store_removes_the_already_created_phrase_file() {
+        let dir = private_dir();
+        let mut config = test_config(dir.path());
+        let phrase_path = dir.path().join("recovery.phrase");
+        config.recovery_phrase_file = Some(phrase_path.clone());
+        fs::write(&config.seed_file, [0x11; ROOT_SEED_LEN]).expect("pre-existing seed");
+        set_mode(&config.seed_file, 0o600);
+
+        let store = SeedFileStore::new(config.seed_file.clone());
+        assert!(init_root_seed_with(&config, &store, false).is_err());
+        assert!(
+            !phrase_path.exists(),
+            "the empty phrase file must be removed when the seed store fails"
+        );
+        assert_eq!(
+            fs::read(&config.seed_file).expect("pre-existing seed survives"),
+            [0x11; ROOT_SEED_LEN]
+        );
+    }
+
+    #[test]
+    fn read_phrase_file_rejects_a_wider_file_mode() {
+        let dir = private_dir();
+        let path = dir.path().join("restore.phrase");
+        fs::write(&path, b"any phrase").expect("write phrase file");
+        set_mode(&path, 0o644);
+
+        match read_phrase_file(&path) {
+            Err(KeyStoreError::SeedFileModeTooWide { mode, .. }) => assert_eq!(mode, 0o644),
+            other => panic!("expected SeedFileModeTooWide, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_restore_phrase_file_is_rejected() {
+        let dir = private_dir();
+        let path = dir.path().join("restore.phrase");
+        fs::write(&path, b"").expect("write empty phrase file");
+        set_mode(&path, 0o600);
+
+        let text = read_phrase_file(&path).expect("a 0600 empty file is readable");
+        assert!(
+            parse_recovery_phrase(&text).is_err(),
+            "an empty phrase must never restore a seed"
+        );
     }
 }

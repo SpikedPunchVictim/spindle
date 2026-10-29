@@ -257,10 +257,11 @@
 > CONNECT at all — the gap `crates/spindle-helper/src/auth_token.rs` recorded. The envelope is not a §A7b signed
 > artifact (no domain tag; it wraps artifacts that are individually signed) and gains no `v` field. The device
 > arm and a TypeScript twin remain unbuilt until a client exists. Host-side, `spindle-hostd` mints that token once
-> per process and bounds the client to one connect attempt: async-nats 0.35 replays the static token on an automatic
-> reconnect, which the attestation's ±2 minute window makes unverifiable, so a lost connection is process-fatal and
-> a supervised restart re-mints the credential; the first-run recovery phrase likewise leaves the process only to a
-> terminal or an explicit `0600` file, never a piped stdout/log stream.
+> per process and bounds the client to one reconnect attempt per disconnect (`max_reconnects(1)`): async-nats 0.35
+> replays the static token on an automatic reconnect, so a retry inside the attestation's ±2 minute window may still
+> verify while one after it never will, and any loop exit is process-fatal, with a supervised restart re-minting the
+> credential; the first-run recovery phrase likewise leaves the process only to a terminal or an explicit `0600`
+> file, never a piped stdout/log stream.
 
 ---
 

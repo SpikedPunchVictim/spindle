@@ -18,17 +18,25 @@
 //! valid only within its ±2 minute window, so a reconnect later than that is refused by the
 //! callout.
 //!
-//! [`connect_host`] therefore sets `.max_reconnects(1)` — the initial attempt is attempt one;
-//! every later attempt fails immediately and closes the client. The headless binary treats that
-//! close as terminal and relies on process restart to re-authenticate (a fresh process mints a
-//! fresh nkey, attestation, and token, per A10.43/A10.44). Without the bound, an unlimited
-//! reconnect loop would retry a credential that can never verify again, hiding a permanently
-//! dead host behind a client that still looks alive; with it, the loss is a visible close.
+//! [`connect_host`] therefore sets `.max_reconnects(1)`. async-nats resets its attempt counter
+//! after every successful connect (`connector.rs:286`, `self.attempts = 0`), so the bound means
+//! **one reconnect attempt per disconnect**: if that attempt fails, the client closes instead of
+//! retrying forever. A reconnect that lands inside the attestation's ±2 minute window can still
+//! verify — an already-admitted host presents no admission token, and the server checks only the
+//! skew — but one after the window never will. The headless binary treats any loop exit as
+//! terminal and relies on process restart to re-authenticate (a fresh process mints a fresh nkey,
+//! attestation, and token, per A10.43/A10.44). Without the bound, an unlimited reconnect loop
+//! would retry a credential that can never verify again, hiding a permanently dead host behind a
+//! client that still looks alive; with it, the loss is a visible close.
 //!
-//! The auth-callback escape hatch does not help here: async-nats 0.35 encodes whatever an auth
-//! callback returns into a `String` (`connector.rs`, `URL_SAFE_NO_PAD.encode(auth.signature)`), so
-//! it cannot carry this envelope's raw bytes. The callback would need raw 64-byte signature bytes,
-//! which `Option<String>` cannot represent.
+//! The auth-callback escape hatch does not solve this either. async-nats 0.35 copies
+//! `auth.token` verbatim (`connector.rs`, `connect_info.auth_token = auth.token`), so the
+//! envelope itself could be carried, but it base64-encodes `auth.signature` again —
+//! `connect_info.signature = auth.signature.map(|signature| URL_SAFE_NO_PAD.encode(signature))`
+//! — and `auth.signature` is an `Option<String>`. A callback therefore cannot hand the client
+//! the raw 64-byte signature a fresh nkey handshake needs; any value it supplies is encoded a
+//! second time. Re-minting the session credential inside a callback is not available, which is
+//! why bounding the retry is the honest option.
 //!
 //! # `now` is the moment of connect, never process start
 //!
@@ -104,10 +112,11 @@ pub async fn connect_host(
             // `{event:?}` or anything that could grow to include connect options.
             tracing::debug!(event = %event, "host NATS connection event");
         })
-        // The initial attempt only. A reconnect replays the static `token` below
-        // (`async-nats-0.35.1/src/connector.rs:193`), whose attestation is stale after ±2
-        // minutes, so a retry is guaranteed to fail and would hide the lost connection forever.
-        // See this module's "minted once per `connect_host` call" section.
+        // One reconnect attempt per disconnect. A reconnect replays the static `token` below
+        // (`async-nats-0.35.1/src/connector.rs:193`); the attempt counter resets after every
+        // successful connect (`connector.rs:286`), so this admits one retry before the client
+        // closes. That retry verifies only inside the attestation's ±2 minute window — after it,
+        // never. See this module's "minted once per `connect_host` call" section.
         .max_reconnects(1)
         .nkey(session.seed()?)
         .token(token)

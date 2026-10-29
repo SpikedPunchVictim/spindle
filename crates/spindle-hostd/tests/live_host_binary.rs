@@ -1,7 +1,8 @@
 #![cfg(unix)]
 //! Live smoke test for the `spindle-hostd` binary itself (td-539ffa slice 3): first-run
-//! enrollment, graceful SIGINT shutdown, identity survival across a restart, and a restore from
-//! the delivered recovery phrase into a fresh directory.
+//! enrollment, graceful SIGINT shutdown, identity survival across a restart, and restores from
+//! the delivered recovery phrase into fresh directories — once through
+//! `SPINDLE_HOST_RESTORE_SEED` and once through `--restore-seed-file`.
 //!
 //! # What this proves that `tests/live_hostd.rs` does not
 //!
@@ -11,9 +12,10 @@
 //! seed and recovery-phrase files, the real NATS connect through
 //! `spindle_hostd::connect::connect_host`, the `HostDaemon` assembly, and `Ctrl-C` handling — and
 //! that the one persisted artifact (the root seed) makes `host_fp` survive a second start. It
-//! also restores the phrase delivered by the first run into a **fresh** directory and asserts the
-//! same `host_fp`, which ties the delivered phrase to the persisted seed. Because the test pipes
-//! stdout, the binary uses the non-TTY `--recovery-phrase-file` sink and the phrase is read back
+//! also restores the phrase delivered by the first run into a **fresh** directory with both
+//! restore spellings and asserts the same `host_fp`, which ties the delivered phrase to the
+//! persisted seed. Because the test pipes stdout, the binary uses the non-TTY
+//! `--recovery-phrase-file` sink and the phrase is read back
 //! from that file.
 //!
 //! # Gating
@@ -112,16 +114,28 @@ impl StderrCapture {
 }
 
 /// Spawns the shipped binary against the live stack. `init` is the difference between a first run
-/// (`SPINDLE_HOST_INIT=1`) and a restart (no enrollment flag at all). `extra_env` carries the
-/// enrollment source for the restore round-trip.
+/// (`SPINDLE_HOST_INIT=1`) and a restart (no enrollment flag at all).
 fn spawn_host(dir: &TempDir, init: bool) -> (Child, StderrCapture) {
-    spawn_host_with_env(dir, init, &[])
+    spawn_host_with(dir, init, &[], &[])
 }
 
+/// [`spawn_host`] with an enrollment source carried in the environment (the restore round-trip
+/// via `SPINDLE_HOST_RESTORE_SEED`).
 fn spawn_host_with_env(
     dir: &TempDir,
     init: bool,
     extra_env: &[(&str, &str)],
+) -> (Child, StderrCapture) {
+    spawn_host_with(dir, init, extra_env, &[])
+}
+
+/// [`spawn_host`] with extra environment variables and argv tokens. The argv form is used for
+/// `--restore-seed-file`, whose path is the one enrollment input the environment does not carry.
+fn spawn_host_with(
+    dir: &TempDir,
+    init: bool,
+    extra_env: &[(&str, &str)],
+    extra_args: &[&str],
 ) -> (Child, StderrCapture) {
     let mut command = Command::new(BINARY);
     command
@@ -141,6 +155,7 @@ fn spawn_host_with_env(
         // ANSI escapes so the fingerprint field can be compared textually.
         .env("RUST_LOG", "info")
         .env("NO_COLOR", "1")
+        .args(extra_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (name, value) in extra_env {
@@ -396,5 +411,52 @@ fn first_run_enrolls_shuts_down_cleanly_and_the_printed_phrase_restores_the_same
     assert!(
         restored_stdout.is_empty(),
         "a restore must not reprint the phrase (the operator already holds it), got:\n{restored_stdout:?}"
+    );
+
+    // ---- restore via --restore-seed-file: the flag path must work too -------------------
+    let flag_dir = private_tempdir();
+    let flag_phrase_path = flag_dir.path().join("restore.phrase");
+    fs::write(&flag_phrase_path, phrase.as_bytes()).expect("write the restore phrase file");
+    fs::set_permissions(&flag_phrase_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod the restore phrase file 0600");
+    let flag_phrase_arg = flag_phrase_path
+        .to_str()
+        .expect("the temp path is valid UTF-8");
+
+    let (mut flagged, flagged_stderr) = spawn_host_with(
+        &flag_dir,
+        false,
+        &[],
+        &["--restore-seed-file", flag_phrase_arg],
+    );
+    let flagged_startup = wait_for_line(&flagged_stderr, STARTUP_MARKER);
+    let flagged_host_fp = redacted_host_fp(&flagged_startup);
+
+    assert_eq!(
+        first_host_fp, flagged_host_fp,
+        "--restore-seed-file must restore the same host_fp as the phrase the first run delivered"
+    );
+
+    assert!(
+        flagged
+            .try_wait()
+            .expect("try_wait on the flag-restored host child")
+            .is_none(),
+        "the flag-restored run exited before SIGINT could be delivered\ncaptured stderr:\n{}",
+        flagged_stderr.transcript()
+    );
+    send_sigint(&flagged);
+    let flagged_status = wait_for_exit(&mut flagged, SHUTDOWN_TIMEOUT);
+    assert!(
+        flagged_status.success(),
+        "the flag-restored run must exit successfully on SIGINT, got {flagged_status}\ncaptured stderr:\n{}",
+        flagged_stderr.transcript()
+    );
+    wait_for_line(&flagged_stderr, "shutdown signal received");
+
+    let flagged_stdout = read_stdout(&mut flagged);
+    assert!(
+        flagged_stdout.is_empty(),
+        "a --restore-seed-file run must not print the phrase, got:\n{flagged_stdout:?}"
     );
 }
