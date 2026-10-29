@@ -25,22 +25,21 @@ edition.workspace = true
 # (callout-authenticated the same way this crate's live integration test, `tests/live_hostd.rs`,
 # authenticates its own client) and hands it, along with the host's identity and store path, to
 # `HostDaemon::new`/`run` in `src/lib.rs` below. That is the whole point of this crate being a
-# library first (see that module's doc comment) — this crate ships no binary of its own today (see
-# `src/lib.rs`'s own module doc comment, "Why this crate ships no binary (yet)") and won't until
-# Stage 7.
+# library first. Since td-539ffa slice 3 it also ships a headless `[[bin]]` (see `src/main.rs`),
+# which owns seed-file custody and its own NATS connection; that binary is a separate deployment
+# shape, not an alternate entry point for `apps/host`.
 #
 # Dependency set approved by the user for exactly this crate (no others — see this crate's task
 # brief): `spindle-core`, `spindle-net`, `spindle-vfs`, `spindle-host-core` supply the identity,
 # signaling, VFS, and daemon-wiring types `src/lib.rs` assembles; `async-nats` is the caller-owned
 # NATS client type `HostDaemon` is constructed from (never connected by this crate itself — see
 # `src/lib.rs`'s module doc comment); `tokio` backs `HostDaemon::run`'s `async fn` and the
-# `SignalingHost::run` future it drives — this crate ships no binary to execute that future itself
-# (see `src/lib.rs`'s own module doc comment, "Why this crate ships no binary (yet)");
-# `tests/live_hostd.rs`'s live integration test drives it on a real Tokio runtime today, and a real
-# Stage 7 caller (`apps/host`'s Tauri shell, or a binary this crate may grow then) will need the
-# same runtime to run it in production; `thiserror` matches
+# `SignalingHost::run` future it drives, and is the runtime both `src/main.rs` and
+# `tests/live_hostd.rs` execute it on; `thiserror` matches
 # every other library crate in this workspace's error-enum convention (see
-# `spindle-host-core/Cargo.toml`'s own comment on the same point).
+# `spindle-host-core/Cargo.toml`'s own comment on the same point); `rand` supplies `OsRng` for
+# the per-start operating key `identity::mint_host_identity` mints under DESIGN.md A10.43 and for
+# the first-run root seed `src/main.rs` generates under A10.41.
 [dependencies]
 spindle-core = { path = "../spindle-core" }
 spindle-net = { path = "../spindle-net" }
@@ -54,12 +53,42 @@ async-nats = { workspace = true }
 # crate-local `features = [...]` override is added on top of it.
 tokio = { workspace = true }
 thiserror = { workspace = true }
+# `rand (OsRng)` is already in the A9c dependency manifest and is the same workspace pin
+# `spindle-core` uses for its own `SigningKey::generate(&mut OsRng)` calls, so this adds no new
+# dependency family — it is here because hostd, not spindle-core, mints the operating key.
+rand = { workspace = true }
 
 # td-6c9d95 step 4 adds `tracing` — already a workspace dependency (root `Cargo.toml`) and already
 # sanctioned by the A9c manifest (DESIGN.md:814); `crates/spindle-vfs`'s instrumentation (step 2)
 # sets the house style this crate's call sites follow. This crate stays a library: it must never
 # call `tracing_subscriber` or install a global subscriber — see `src/lib.rs`'s module doc comment.
 tracing = { workspace = true }
+
+# `spindle-proto::auth_token::encode_host_auth_token` (DESIGN.md §A4) is how `src/main.rs` mints
+# the host's CONNECT `auth_token`, and `tests/live_hostd.rs` already names `spindle-proto` types
+# directly. An integration test may use a normal dependency directly, so one entry serves both
+# targets — the previous dev-dependency entry for this crate was folded in here rather than
+# listed twice.
+spindle-proto = { path = "../spindle-proto" }
+
+# nkeys and base64: same versions and the same justifications as
+# `crates/spindle-helper/Cargo.toml` (ADR-009's runtime-dependency allowance). nkeys supplies the
+# per-session user nkey a host presents on every CONNECT (A10.40); base64 is the base64url
+# presentation rule DESIGN.md §A4 applies to the `auth_token` envelope.
+nkeys = "0.4"
+base64 = "0.22"
+
+# tracing-subscriber: `tracing` alone has no default subscriber, and only the binary may install
+# one (this crate's library must not — see `src/lib.rs`'s module doc comment). `env-filter` is what
+# gives `RUST_LOG` its usual meaning, matching `crates/spindle-helper/src/bin/helper.rs`.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# A10.51 places the host's Prometheus exporter in this binary. Recording is via the `metrics`
+# facade; the exporter is installed exactly once in `main`, and only when SPINDLE_METRICS_ADDR is
+# set. Same workspace pins and feature choice as `crates/spindle-helper/Cargo.toml` (the exporter
+# stays pull/scrape-only, with no TLS backend or C toolchain pulled in).
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 # `tests/live_hostd.rs`'s own remaining code (Stage 4 part 2, td-539ffa): the `#[ignore]`d live
 # test that drives `HostDaemon` — and therefore the production `HostConnectAuthorizer<
@@ -73,13 +102,6 @@ tracing = { workspace = true }
 # (a disposable temp directory for a store/confinement test, never a runtime dependency).
 tempfile = "3"
 
-# The test sends a real `spindle_proto::VfsRequestEnvelope` (`VfsRequest::Whoami`) over the QUIC
-# control stream and decodes the `VfsReply` that comes back. `spindle-proto` is already a
-# transitive dependency of this crate (via `spindle-core`/`spindle-net`/`spindle-vfs`/
-# `spindle-host-core`), but an integration test can only name a crate directly if it is a direct
-# dependency of the package under test — hence this explicit dev-dependency.
-spindle-proto = { path = "../spindle-proto" }
-
 # The NATS Auth Callout bootstrap fixtures (`fixtures::DeviceIdentity`/`HostRootIdentity`) and
 # live-stack connection helpers (`connect_device`/`connect_host`/`nats_url`/
 # `assert_no_permission_violation`) this test needs are the exact same ones
@@ -88,3 +110,11 @@ spindle-proto = { path = "../spindle-proto" }
 # that crate's own module doc comment for the full rationale (the 2026-08-31 wire-schema incident
 # `tests/live_hostd.rs`'s own module doc comment also carries forward).
 spindle-test-fixtures = { path = "../spindle-test-fixtures" }
+
+# The headless host process (td-539ffa slice 3). The library remains the target `apps/host` calls
+# in-process; this binary is the server-deployment shape: it owns seed-file custody, the
+# recovery-phrase ceremony, the NATS connect, and the daemon run loop. See `src/main.rs`'s module
+# doc comment.
+[[bin]]
+name = "spindle-hostd"
+path = "src/main.rs"

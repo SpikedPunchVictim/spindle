@@ -54,6 +54,10 @@ pub use capability::{issue_capability, verify_capability};
 pub use device_cert::{issue_device_certificate, verify_device_certificate};
 pub use host_device_cert::{issue_host_device_cert, verify_host_device_cert};
 pub use host_op_key_cert::{issue_host_op_key_cert, verify_host_op_key_cert};
+// Re-exported so a crate that depends on `spindle-core` but not directly on `spindle-proto` (per
+// A9c's layering law) can name the type `issue_host_op_key_cert` returns. First consumer:
+// `spindle-hostd`'s `HostIdentity::op_cert` (td-539ffa slice 2), whose crate does not take a
+// `spindle-proto` runtime dependency.
 pub use host_session_attest::{
     issue_host_session_attestation, verify_host_session_attestation,
     HOST_SESSION_ATTESTATION_CLOCK_SKEW_SECS,
@@ -63,6 +67,7 @@ pub use self_revocation::{issue_self_revocation, verify_self_revocation};
 pub use session_attest::{
     issue_session_attestation, verify_session_attestation, SESSION_ATTESTATION_CLOCK_SKEW_SECS,
 };
+pub use spindle_proto::artifacts::HostOpKeyCert;
 
 use thiserror::Error;
 

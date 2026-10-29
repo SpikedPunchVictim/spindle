@@ -13,28 +13,30 @@
 //! from a non-`main` caller, not just from this crate's own live integration test
 //! (`tests/live_hostd.rs`).
 //!
-//! # Why this crate ships no binary (yet)
+//! # The headless binary
 //!
-//! This crate is library-only today: no `src/main.rs`, no `[[bin]]` target. [`HostDaemon::new`]
-//! needs this host's envelope [`DeviceKey`] and root [`Fingerprint`] (`host_fp`) — see this
-//! module's "Two fingerprints, not one" section below — and DESIGN.md §A4 puts custody of a
-//! host's root key in the OS keystore, the same custody model §A4 states for a person's identity
-//! root key. That keystore integration is Stage 7 work and does not exist anywhere in this
-//! workspace yet, confirmed against `crates/spindle-vfs/src/store/schema.rs`, which has no table
-//! for a host root key, an operating key, or a device key of any kind.
+//! The library remains the deliverable for `apps/host`: Stage 7's Tauri shell still calls
+//! [`HostDaemon`] in-process, with its own already-connected client and its own key custody.
+//! `src/main.rs` (td-539ffa slice 3) is the other shape — the headless one. It owns the seed-file
+//! custody path, the recovery-phrase ceremony, the per-start identity minting, and the NATS
+//! connect (see [`connect::connect_host`]), then hands the assembled [`HostDaemon`] to
+//! [`HostDaemon::run`]. It exists because [`HostDaemon::new`] needs this host's envelope
+//! [`DeviceKey`] and root [`Fingerprint`] (`host_fp`) — see this module's "Two fingerprints, not
+//! one" section below — and something has to own the values that produce them. It does not
+//! change the Tauri calling pattern: `apps/host` never shells out to this binary.
 //!
-//! The only public way this workspace can produce a [`DeviceKey`] today is
-//! [`DeviceKey::generate`] (a fresh, unpersisted random keypair — useless here, since a real host
-//! needs the *same* identity across restarts) or [`DeviceKey::from_seeds`], whose own doc comment
-//! reads "Deterministic construction from two 32-byte seeds — TEST-ONLY / crypto-vector use."
-//! Wiring seeds in from the environment would satisfy the type signature while being a dishonest
-//! implementation of key custody, not a real one. A binary that cannot possibly work is worse
-//! than no binary at all — someone runs it, it fails, and they conclude the daemon itself is
-//! broken — so no binary ships until there is something real for it to do.
+//! Key custody itself lives here: the headless half of DESIGN.md A10.41 is
+//! [`keystore::HostKeyStore`] and its seed-file implementation [`keystore::SeedFileStore`], and
+//! [`identity::mint_host_identity`] turns the persisted root seed into the per-start operating key
+//! (A10.43) and ephemeral envelope device key (A10.44). The desktop/Tauri half — an OS-keychain
+//! store behind the same trait — is still Stage 7 work and does not exist anywhere in this
+//! workspace yet.
 //!
-//! Stage 7, when OS-keystore-backed host identity lands, is when a real entry point appears —
-//! either a binary here, or, per this module's own opening paragraphs, `apps/host`'s Tauri shell
-//! calling [`HostDaemon`] directly instead.
+//! The envelope [`DeviceKey`] is deliberately ephemeral: A10.44 makes it fresh per process, so
+//! the identity that has to survive a restart is the root seed in [`keystore::HostKeyStore`], not
+//! a [`DeviceKey`]. [`DeviceKey::from_seeds`] remains "TEST-ONLY / crypto-vector use" and is not a
+//! persistence mechanism. The headless binary prints the seed's recovery phrase once, at explicit
+//! enrollment (`--init` or `--restore-seed`), and refuses to invent one on any other start.
 //!
 //! # The caller-owned NATS client rule
 //!
@@ -114,18 +116,28 @@
 //! can actually emit, transitively, before interpolating it.
 //!
 //! **This crate must never call `tracing_subscriber` or install a global subscriber**, even though
-//! it is daemon-shaped. It is a library with no runtime of its own — see this module's own "Why
-//! this crate ships no binary (yet)" section above — and installing a subscriber here would apply
+//! it is daemon-shaped. It is a library with no runtime of its own — see this module's own "The
+//! headless binary" section above — and installing a subscriber here would apply
 //! workspace-wide to whatever binary eventually links this crate, including `apps/host`'s Tauri
 //! shell, which must own that decision itself. Only a binary initializes one (see
 //! `crates/spindle-helper/src/bin/helper.rs:349-351`'s `tracing_subscriber::fmt()...init()` for the
-//! precedent this crate's future binary, or `apps/host`, should follow). If output from this crate
+//! precedent this crate's own binary and `apps/host` follow). If output from this crate
 //! ever seems to vanish, the fix is to init a subscriber in the consuming binary, not to add one
 //! here.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod connect;
+pub mod identity;
+pub mod keystore;
+
+pub use identity::{
+    format_recovery_phrase, mint_host_identity, parse_recovery_phrase, HostIdentity,
+    RecoveryPhraseError, HOST_OP_CERT_TTL_SECS,
+};
+pub use keystore::{HostKeyStore, KeyStoreError, SeedFileStore, ROOT_SEED_LEN};
 
 use spindle_core::identity::DeviceKey;
 use spindle_core::Fingerprint;
@@ -269,18 +281,19 @@ impl HostDaemon {
     ///
     /// Constructing a real [`spindle_host_core::RootKeyCapIssuer`] needs three pieces of this
     /// host's own signing material: its root public key, its current operating-key certificate,
-    /// and — the sensitive one — the operating **signing** key itself. Per DESIGN.md §A4, custody
-    /// of that key belongs in an OS keystore, and (per this module's own doc comment's "Why this
-    /// crate ships no binary (yet)" section) that keystore integration is unresolved Stage 7
-    /// work — the same blocker recorded against td-539ffa and S13. If `HostDaemon` reached into
-    /// key material to build its own issuer, this crate would need to either grow that keystore
-    /// dependency itself or fall back to a dishonest stand-in (seeds from the environment, say),
-    /// neither of which this crate should do on its caller's behalf. Taking `Box<dyn CapIssuer>`
-    /// instead keeps key custody entirely on the caller's side of the boundary: today, this
-    /// crate's own live integration test builds a [`spindle_host_core::RootKeyCapIssuer`] from
-    /// test-fixture key material and installs it here; once Stage 7's keystore lands, the real
-    /// caller (a binary here, or `apps/host`'s Tauri shell per this module's doc comment) does the
-    /// same with real key material, and this crate's own code does not change at all.
+    /// and — the sensitive one — the operating **signing** key itself. [`mint_host_identity`]
+    /// produces exactly that triple for one process from the persisted root seed (DESIGN.md
+    /// A10.43: the operating key is ephemeral and re-minted at every start), so a caller can
+    /// build the issuer from a [`HostIdentity`]. This crate still takes the issuer rather than
+    /// constructing one, which keeps key custody on the caller's side of the boundary and leaves
+    /// the OS-keychain half of A10.41 unshipped Stage 7 work. If `HostDaemon` reached into key
+    /// material to build its own issuer, this crate would need to either own that custody or
+    /// fall back to a dishonest stand-in (seeds from the environment, say), neither of which this
+    /// crate should do on its caller's behalf. Taking `Box<dyn CapIssuer>` instead means that
+    /// today, this crate's own live integration test builds a
+    /// [`spindle_host_core::RootKeyCapIssuer`] from test-fixture key material and installs it
+    /// here; once the Tauri shell's keychain store lands, the real caller does the same with the
+    /// [`HostIdentity`] it minted, and this crate's own code does not change at all.
     ///
     /// Chainable, matching [`spindle_host_core::RootKeyCapIssuer::new`]'s own builder shape
     /// (`new(...).with_now_fn(...)`), not this struct's own alternative-constructor shape
@@ -354,8 +367,9 @@ impl HostDaemon {
         let connect_lookup = SqliteDeviceLookup::new(connect_store);
         let authorizer = match issuer {
             // `with_cap_issuer`'s doc comment explains why this crate never builds this seam
-            // itself: a real `RootKeyCapIssuer` needs this host's operating signing key, and that
-            // key's custody (an OS keystore) is unresolved Stage 7 work. Whether one is installed
+            // itself: a real `RootKeyCapIssuer` needs this host's operating signing key, and
+            // this crate deliberately receives that seam from its caller rather than owning key
+            // custody. Whether one is installed
             // changes behavior materially (with none, connect answers never carry a member
             // capability), so it is worth its own `info!` line rather than folding into the
             // startup line above.

@@ -16,6 +16,9 @@
 //!   [`AdmissionToken`], [`DeviceCertificate`], [`RevocationRecord`],
 //!   [`SelfRevocationRecord`], [`AdminCommand`], [`HostOpKeyCert`], [`HostDeviceCert`],
 //!   [`SessionAttestation`], [`HostSessionAttestation`]).
+//! - [`auth_token`] — the production encoder for the host CONNECT `auth_token` envelope
+//!   (DESIGN.md §A4): raw canonical CBOR, base64url-wrapped by the caller. Host arm only — see
+//!   the module docs for why the device arm is deliberately not included yet.
 //! - [`vfs_rpc`] — the VFS RPC wire types (DESIGN.md §A8), Stage 6 slice 3: request/reply types
 //!   for `list`/`stat`/`read`/`mkdir`/`delete`/`whoami` and the typed VFS error-code model. Not
 //!   one of the A7b signed artifacts (no domain tag, no `sig`) — see that module's doc
@@ -60,6 +63,7 @@
 //! has zero non-dev dependencies.
 
 pub mod artifacts;
+pub mod auth_token;
 pub mod bootstrap;
 pub mod canonical;
 pub mod invite;

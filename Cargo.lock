@@ -3693,6 +3693,11 @@ name = "spindle-hostd"
 version = "0.1.0"
 dependencies = [
  "async-nats",
+ "base64",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "nkeys",
+ "rand 0.8.7",
  "spindle-core",
  "spindle-host-core",
  "spindle-net",
@@ -3703,6 +3708,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

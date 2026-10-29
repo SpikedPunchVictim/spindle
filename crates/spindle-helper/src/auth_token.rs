@@ -20,11 +20,14 @@
 //! Each of `device_cert`/`session_attest` (both arms)/`host_op_cert`/`caps[i]`/`admission_token`
 //! is the artifact's own `to_canonical_bytes()` output re-embedded as a CBOR byte string; the
 //! whole envelope is canonical-CBOR-encoded, then base64url (no padding), matching DESIGN.md's
-//! presentation rule. The **encode/builder** side of this envelope
-//! (`spindle_test_fixtures::fixtures::device_auth_token`/`host_auth_token`, in the in-repo
-//! `spindle-test-fixtures` dev-dependency crate — this crate's own tests call it, and so does
-//! `spindle-net`'s live integration test) stays test-code-only: no production encoder exists
-//! anywhere in this workspace; the responder only ever needs to *decode* one.
+//! presentation rule. The **encode/builder** side of this envelope has a production encoder for
+//! the **host** arm:
+//! [`spindle_proto::auth_token::encode_host_auth_token`] (td-539ffa; `spindle-hostd`'s headless
+//! binary mints its own CONNECT token with it). The responder in this crate still only ever
+//! *decodes* one. The **device** arm remains fixture-only: its sole builder is
+//! `spindle_test_fixtures::fixtures::device_auth_token`, and no production device encoder exists
+//! anywhere in this workspace yet. `spindle_test_fixtures::fixtures::host_auth_token` likewise
+//! stays test-code-only, as the fixture-side cross-check for the production host encoder.
 //!
 //! `session_attest` (device arm added v0.9.29, td-0bcab4 §A4 step 2; host arm added v0.9.31,
 //! td-583db5) is **required** on both arms, unlike `admission_token` on the host arm above. On the
@@ -268,6 +271,7 @@ mod tests {
     use spindle_core::identity::{DeviceKey, RootKey};
     use spindle_core::FINGERPRINT_LEN;
     use spindle_proto::artifacts::CapKind;
+    use spindle_proto::auth_token::encode_host_auth_token;
     use spindle_test_fixtures::fixtures::{device_auth_token, host_auth_token};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -456,6 +460,61 @@ mod tests {
         assert_eq!(
             h.admission_token.expect("present").to_canonical_bytes(),
             tok.to_canonical_bytes()
+        );
+    }
+
+    /// td-539ffa: `spindle_proto::auth_token::encode_host_auth_token` is the production encoder
+    /// for the host arm, and until it existed this envelope's shape was pinned only by this
+    /// module's decoder and `fixtures::host_auth_token`. Comparing `b64url(proto bytes)` against
+    /// the fixture token byte-for-byte pins encoder, decoder and fixture together in one
+    /// assertion — the fixture builder is documented byte-compatible with `decode_auth_token`,
+    /// so identical bytes mean the production encoder's output decodes to the same payload. The
+    /// decode is still run explicitly below, so this test also fails if that documented
+    /// compatibility is ever wrong.
+    #[test]
+    fn proto_encoder_output_matches_the_fixture_and_decodes() {
+        let host_root = RootKey::from_seed([0x71; 32]);
+        let op_signer = spindle_core::SigningKey::from_bytes(&[0x72; 32]);
+        let cert = issue_host_op_key_cert(&host_root, &op_signer.verifying_key(), 0, 2_000_000);
+        let nats_fp = Fingerprint::of_parts(&[b"host-nats-proto-encoder"]);
+        let attest = issue_host_session_attestation(&op_signer, nats_fp, 0);
+        let operator = spindle_core::SigningKey::from_bytes(&[0x73; 32]);
+        let tok = issue_admission_token(
+            &operator,
+            vec![0xDD; 16],
+            2_000_000,
+            "workshop-nas".to_string(),
+            "default".to_string(),
+        );
+        let host_root_pk = host_root.public_key().to_bytes();
+        let cert_bytes = cert.to_canonical_bytes();
+        let attest_bytes = attest.to_canonical_bytes();
+        let tok_bytes = tok.to_canonical_bytes();
+
+        let proto_token = b64url(&encode_host_auth_token(
+            &host_root_pk,
+            &cert_bytes,
+            &attest_bytes,
+            Some(&tok_bytes),
+        ));
+        let fixture_token = host_auth_token(&host_root_pk, &cert, &attest, Some(&tok));
+
+        assert_eq!(
+            proto_token, fixture_token,
+            "spindle_proto::auth_token's host encoder and fixtures::host_auth_token must emit \
+             identical bytes -- they are two independent encoders of the one envelope shape"
+        );
+
+        let decoded = decode_auth_token(&proto_token).expect("decode accepts proto output");
+        let DecodedAuthToken::Host(h) = decoded else {
+            panic!("expected a host payload");
+        };
+        assert_eq!(h.host_root_pk_bytes, host_root_pk);
+        assert_eq!(h.host_op_cert.to_canonical_bytes(), cert_bytes);
+        assert_eq!(h.session_attest.to_canonical_bytes(), attest_bytes);
+        assert_eq!(
+            h.admission_token.expect("present").to_canonical_bytes(),
+            tok_bytes
         );
     }
 

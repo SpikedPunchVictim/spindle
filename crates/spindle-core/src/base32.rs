@@ -9,6 +9,10 @@
 //! Hand-rolled rather than pulling in a `base32` crate: the A9c dependency manifest for
 //! `spindle-core` does not list one, and RFC 4648 base32 is small enough to implement directly
 //! without adding a dependency.
+//!
+//! Public since td-539ffa slice 2: `spindle-hostd`'s host recovery phrase (DESIGN.md A10.41)
+//! reuses this exact alphabet and encoder as its human encoding, so the module is now
+//! `pub mod base32` rather than `mod base32` — one consumer, no second copy of the encoder.
 
 const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 

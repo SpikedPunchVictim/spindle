@@ -51,7 +51,7 @@ pub mod envelope;
 pub mod fingerprint;
 pub mod identity;
 
-mod base32;
+pub mod base32;
 
 pub use artifacts::checked_verifying_key;
 pub use clock_diagnostics::{
