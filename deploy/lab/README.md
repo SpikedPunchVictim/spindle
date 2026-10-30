@@ -1,0 +1,247 @@
+# Two-container NAT + netem lab (S19 follow-up)
+
+This is a **simulated, still-one-kernel** improvement on the single-container network-namespace
+rig in `spikes/s19-quic-transport/s19-nat-run.sh`. It is **not** S19 leg 4, and it does not close
+the real-two-host clause in `spikes/s19-quic-transport/RESULTS.md`.
+
+It exists to answer what the netns harness could not:
+
+- a **routed** path through two independent NAT containers, not two network namespaces inside one
+  container;
+- **per-side** `tc netem` shaping (delay, loss, reordering applied independently on each peer's
+  egress), rather than one qdisc on `lo`;
+- **real packet reordering** (`netem reorder`), not just the delay-only qdisc's incidental
+  reordering.
+
+## Topology
+
+```
+                      registry side — docker network "wan" 172.28.0.0/24
+   nats .10   helper .11   postgres .12   coturn .13   stun .14
+        \          |            |             |           /
+         +---------+------------+-------------+----------+
+                                |
+                          wan bridge (Docker)
+                         /                      \
+                 gw-a 172.28.0.21          gw-b 172.28.0.22
+                 MASQUERADE                MASQUERADE + tcp DNAT
+                 (cone | --random-fully)   (cone | --random-fully)
+                         |                      |
+              nat-a 172.28.10.0/24      nat-b 172.28.20.0/24
+                 gw-a .254                  gw-b .254
+                         |                      |
+                 peer-a 172.28.10.2         peer-b 172.28.20.2
+                 tc netem (egress)          tc netem (egress)
+                 quic-peer --mode send      quic-peer --mode recv
+```
+
+- `peer-a` and `peer-b` have **no interface on `wan`**. Their only route off their private
+  network is their gateway container, which is a real second network namespace with its own
+  conntrack table, `ip_forward=1`, and `MASQUERADE` on its wan-facing leg.
+- `gw-b` additionally DNATs the recv peer's TCP `--signal` port, because `quic-peer`'s signaling
+  is a direct listen/connect channel rather than a rendezvous server. A real deployment's
+  signaling server is dialled out to by both peers; this DNAT is the lab's stand-in for that
+  reachability, and is not part of ICE or TURN.
+- `stun` is the in-repo `stun-server` binary (`spikes/s19-quic-transport/src/bin/stun-server.rs`)
+  on the registry side. `coturn` is the dev stack's relay (`use-auth-secret`, the same
+  `TURN_SECRET` the helper is given), also on the registry side.
+- `nats`, `postgres`, and `helper` are copied from `deploy/docker-compose.yml` (images, commands,
+  environment, volumes unchanged); only static `wan` addresses and the lack of host port
+  publications differ. The lab does not exercise them — they are present so the "registry side"
+  is the real dev stack rather than a stub.
+
+## Four Docker/kernel facts this lab had to work around (verified empirically)
+
+1. **Interface names are not stable.** `docker-compose.lab.yml` declares `wan` before `nat-a`/
+   `nat-b`, but on this Docker Desktop VM the kernel-visible order came out
+   `eth0=private, eth1=wan` on one run and `eth0=wan, eth1=private` on another. Every script
+   locates interfaces by IPv4 prefix (`WAN_PREFIX`, `PRIVATE_PREFIX`), never by name or
+   declaration order.
+
+2. **`.1` is reserved.** Docker assigns the first address of each user-defined subnet to the
+   bridge itself, so a NAT-gateway container cannot hold `x.x.x.1`. Gateways use `.254` for
+   their private leg, and `peer-entrypoint.sh` replaces Docker's default route (which points at
+   the bridge, i.e. the Docker host) with a default route via the gateway container. Without
+   that override, peer traffic would bypass the NAT container and be routed by the host between
+   its own bridges — the lab would not test NAT at all.
+
+3. **The inbound signaling DNAT needs a second NAT hop.** The DNATed SYN is forwarded out gw-b's
+   private interface still carrying the *other* gateway's wan source address (`172.28.0.21`).
+   gw-b's conntrack records the DNAT flow as `[UNREPLIED]`, the peer never sees a SYN, and the
+   `nc -z`/`quic-peer` connect hangs: the frame crosses onto the private Docker bridge with a
+   source belonging to a different bridge and the host's bridge netfilter/rp_filter drops it.
+   `gw-signal.sh` therefore SNATs the forwarded signal flow to gw-b's own private address
+   (`LAB_SIGNAL_SNAT`), so peer-b sees a same-subnet source. Verified: with the SNAT the TCP
+   connect succeeds and conntrack shows the reply; without it, the flow stays `[UNREPLIED]`. A
+   real rendezvous server does not need this, because both peers dial *out* to it.
+
+4. **The Docker host routes between the private bridges, so the gateways must drop
+   private→other-private forwarding.** Without that drop, a peer's packet to the *other* peer's
+   private host candidate is forwarded by its gateway's default route to the Docker host, which
+   routes it straight onto the other private bridge. The packet never meets the second NAT, and
+   ICE selects the private host candidates (`172.28.20.2`/`172.28.10.2`) — observed empirically:
+   all six `sym_ice` attempts "succeeded" against `--random-fully` NAT for exactly this reason.
+   `gw-nat.sh` now installs `LAB_FORWARD` with `-s <own-private> -d <other-private> -j DROP` ahead
+   of `ACCEPT`, and `gw-entrypoint.sh` sets the gateway's default route to the wan gateway. After
+   the fix, a successful punch must select a `172.28.0.x` (NAT-mapped) address; the runner's raw
+   logs record the selected address, and the matrix is only meaningful when it is a wan address.
+
+A fifth, kernel-level fact: `tc ... netem reorder 25% 50%` **is refused** without a delay
+(`reordering not possible without specifying some delay`). The matrix's reordering cell therefore
+uses `delay 10ms reorder 25% 50%` on each peer; this is reported as a deviation from the bare
+form in `RESULTS.md`.
+
+## What is and is not simulated
+
+**Simulated / added over the netns rig**
+
+- Two separate gateway containers, each with its own netns, routing table, conntrack table, and
+  MASQUERADE rule. Peers are routed through them, and each gateway drops private→other-private
+  forwarding so the private host candidates cannot be reached around the NATs.
+- Cone NAT = plain `MASQUERADE` (port-restricted cone filtering). Symmetric NAT =
+  `MASQUERADE --random-fully` (a fresh external port per destination).
+- Independent per-side shaping on each peer's egress: delay, loss, reordering.
+- STUN and TURN reached through the gateways, exactly as a NATed peer reaches a public server.
+- A real TCP cross-NAT signaling path (listen on peer-b, DNAT through gw-b, connect from peer-a).
+
+**Not simulated / still unproven**
+
+- **Not two hosts.** Both peers are containers in Docker Desktop's single Linux VM
+  (`linuxkit`), sharing one kernel. This is the same nested-virtualization environment that made
+  the netns harness's cone-NAT punch probabilistic; the lab measures that environment again, not
+  a real home router.
+- **Not a real WAN.** netem delay/loss/reorder is synthetic and independent per side; it is not a
+  sampled RTT/jitter distribution from a real link.
+- **Not the real two-host leg 4.** No physical NICs, no real path between machines, no real
+  router. The real-two-host clause of S19's pass bar remains open.
+- **No production signaling.** `--signal`/`--cert-fp`/`--turn-secret` are spike stand-ins; the
+  A7 envelope path and the helper's credential minting are not exercised.
+- **No browser/WebRTC leg.** Native↔native QUIC only.
+- **No congestion/latency validation on macOS.** Nothing is shaped on the host; see below.
+
+## macOS / Docker Desktop caveat
+
+`NET_ADMIN`, `iptables`, `tc`, and the gateway sysctls all operate **inside the Linux VM** that
+Docker Desktop runs. Nothing is shaped, NATed, or filtered on the macOS host, and the macOS host
+sees no part of this topology. Results are properties of the Linux VM's kernel and its virtual
+bridge/conntrack implementation, not of the Mac's network stack.
+
+`/proc/sys` is read-only inside these containers (the netns harness remounted it rw), but compose
+`sysctls:` are applied by the runtime from outside the container's mount namespace, so
+`net.ipv4.ip_forward=1` and `rp_filter=0` take effect without `SYS_ADMIN` or a remount. This was
+verified before relying on it.
+
+## Usage
+
+```bash
+# full matrix (builds the image, brings the lab up, runs cells, tears down)
+deploy/lab/run-matrix.sh
+
+# leave the lab running for manual poking
+KEEP_LAB=1 deploy/lab/run-matrix.sh
+
+# fewer/more attempts, smaller transfer
+RUNS=3 MAX_ATTEMPTS=8 BYTES_MIB=32 WINDOW_MIB=2 deploy/lab/run-matrix.sh
+```
+
+The script prints markdown tables to stdout and writes raw per-attempt evidence to
+`deploy/lab/.artifacts/` (gitignored): recv/send `--json` lines, stderr, `--stats-out` samples,
+`tc -s qdisc` snapshots, `attempts.tsv`, `summary.tsv`, and `lab-env.txt`.
+
+### Manual cell
+
+```bash
+C="docker compose -p spindle-lab -f deploy/lab/docker-compose.lab.yml"
+
+# shape both peers (delay_ms loss_pct reorder_pct reorder_corr_pct)
+$C exec -T peer-a /usr/local/bin/apply-netem.sh 25 0 0 0
+$C exec -T peer-b /usr/local/bin/apply-netem.sh 25 0 0 0
+
+# install the signaling DNAT for this attempt's port
+$C exec -T gw-b /usr/local/bin/gw-signal.sh 15101
+
+# recv (peer-b, behind nat-b)
+$C exec -T peer-b /usr/local/bin/quic-peer --mode recv --transport ice \
+  --signal listen:15101 --stun 172.28.0.14:3478 --ice-bind 172.28.20.2 \
+  --bytes 32 --window 2 --json
+
+# send (peer-a, behind nat-a) -- connect to gw-b's wan address
+$C exec -T peer-a /usr/local/bin/quic-peer --mode send --transport ice \
+  --signal connect:172.28.0.22:15101 --stun 172.28.0.14:3478 --ice-bind 172.28.10.2 \
+  --bytes 32 --window 2 --json
+```
+
+Switch NAT behavior on a live lab:
+
+```bash
+$C exec -T gw-a /usr/local/bin/gw-nat.sh symmetric
+$C exec -T gw-b /usr/local/bin/gw-nat.sh symmetric
+$C exec -T gw-a conntrack -F && $C exec -T gw-b conntrack -F
+```
+
+### Service names and `extra_hosts`
+
+Docker's embedded DNS is scoped to the networks a container is attached to. Peers are attached
+only to their private network, so they cannot resolve `stun`, `coturn`, `gw-b`, etc. Each peer
+gets `extra_hosts` entries mapping those names to their static `wan` addresses. Note that
+`quic-peer`'s `--signal`, `--stun`, and `--turn` flags parse `SocketAddr` and therefore require
+**IP literals**; `run-matrix.sh` passes IPs. The `/etc/hosts` entries are for diagnostics
+(`ping stun`, `getent hosts coturn`) and any future hostname-accepting client.
+
+## Cell matrix
+
+| Cell | Each peer's netem | NAT | Transport | Purpose |
+|------|-------------------|-----|-----------|---------|
+| `baseline` | none | cone:cone | `ice` | punch success + unshaped throughput |
+| `delay25` | `delay 25ms` | cone:cone | `ice` | ~50 ms RTT, comparable to leg 1's pass-bar cell |
+| `delay50` | `delay 50ms` | cone:cone | `ice` | ~100 ms RTT |
+| `loss1` | `loss 1%` | cone:cone | `ice` | QUIC under loss |
+| `reorder25` | `delay 10ms reorder 25% 50%` | cone:cone | `ice` | QUIC survival under real reordering |
+| `sym_ice` | none | symmetric:symmetric | `ice` | expected punch failure |
+| `sym_relay` | none | symmetric:symmetric | `relay` | TURN fallback through coturn |
+
+`run-matrix.sh` repeats until `RUNS` successes (default 3) or `MAX_ATTEMPTS` (default 8),
+reporting the success count as well as the median/spread over successful runs. `sym_ice` runs
+exactly `RUNS` attempts because failure is the expected result.
+
+## Measured outcome (2026-10-30)
+
+On this Docker Desktop VM (kernel `7.0.14-linuxkit`), with the corrected topology and 32 MiB
+transfers, `--window 2`:
+
+- **Cone punch is probabilistic.** Default-MASQUERADE cone×cone punched **3/12 (25%)**, matching
+  the netns rig's 3/13; successful punches selected NAT-mapped `172.28.0.x` addresses and ran at
+  **326.261 MB/s** median (259.670-372.547).
+- **Any nonzero delay prevented punching here** (0/24 at 25 ms each way, 0/6 at 50 ms, 0/10 at
+  10 ms + `reorder 25% 50%`), all with the same 15 s no-pair timeout. **1% loss alone did not**:
+  3/5 punches, 368.437 MB/s median.
+- Because punching fails under delay, shaped throughput was also measured over the **relay**
+  fallback: 1.912 MB/s at 51 ms RTT (25 ms shaping), 2.703 MB/s at 101 ms (50 ms shaping), and
+  **0.347 MB/s under `reorder 25% 50%`** — QUIC survives reordering but collapses, with 55-78
+  lost packets on the recv path.
+- Symmetric×symmetric: ICE **0/3** (expected), relay **3/3 at 77.112 MB/s** (74.298-82.317).
+
+These are **not** leg 4 results: one kernel, virtual bridges, synthetic shaping. The full
+write-up, exact flags, and what remains unproven are in
+`spikes/s19-quic-transport/RESULTS.md` under "Results — two-container lab (simulated; still one
+kernel)".
+
+## File map
+
+- `Dockerfile.lab` — multi-stage build of `quic-peer` + `stun-server` (builder pinned by
+  `rust-toolchain.toml`) and a runtime with `iproute2`, `iptables`, `conntrack`, `tcpdump`,
+  `bash`.
+- `docker-compose.lab.yml` — the topology.
+- `gw-entrypoint.sh` — gateway startup: forwarding, MASQUERADE, signal DNAT.
+- `gw-nat.sh` — switch a live gateway between `cone` and `symmetric`.
+- `gw-signal.sh` — (re)install the signaling DNAT rule and its private-leg SNAT.
+- `peer-entrypoint.sh` — set the default route to the gateway and apply compose netem.
+- `apply-netem.sh` — apply/clear a netem qdisc; refuses reorder without a delay.
+- `run-matrix.sh` — orchestration, measurement, markdown output.
+
+## Relationship to leg 4
+
+This lab adds a routed two-NAT path, per-side shaping, and real reordering on the *same kernel*.
+It does not substitute for two real hosts. The measured numbers are recorded in
+`spikes/s19-quic-transport/RESULTS.md` under "Results — two-container lab (simulated; still one
+kernel)", which says explicitly what remains unproven.

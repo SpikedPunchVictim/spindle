@@ -1,0 +1,4 @@
+# Per-attempt raw evidence written by run-matrix.sh (JSON, stderr, --stats-out samples, qdisc
+# snapshots). RESULTS.md / the lab README carry the curated numbers; this is regenerable local
+# evidence, same convention as spikes/s19-quic-transport/.gitignore.
+.artifacts/

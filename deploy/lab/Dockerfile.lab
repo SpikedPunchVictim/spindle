@@ -1,0 +1,59 @@
+# deploy/lab/Dockerfile.lab — image for the two-container NAT + netem lab (S19 follow-up).
+#
+# Build context is the REPO ROOT (compose sets `context: ../..`), not deploy/lab, because the
+# spike binaries live in a Cargo workspace member and `cargo build` needs the whole workspace
+# manifest graph to resolve.
+#
+# Builder pinning: the repo's authoritative Rust pin is rust-toolchain.toml (ADR-009; mise.toml
+# only gives `mise install` a floating "stable" to fetch). Copying that file into an official
+# rust image before the first cargo invocation makes rustup honour the repo's pin exactly, so
+# this does not introduce a second toolchain declaration. It is deliberately NOT Dockerfile.toolchain
+# (mise + Node + pnpm + just): that image installs tooling this lab never uses and is not built
+# locally. The runtime image is the same Debian base family as Dockerfile.toolchain's.
+
+FROM rust:1-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Repo toolchain pin first, so rustup resolves/installs it before cargo runs.
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+COPY spikes/ ./spikes/
+
+# Only the two binaries this lab needs. The spike crate's deps are pure Rust (ring, rcgen,
+# rtc-*, quinn) — no cmake/C compiler beyond the base image.
+RUN cargo build --release -p spike-s19-quic-transport --bin quic-peer --bin stun-server
+
+# --- runtime -----------------------------------------------------------------------------------
+# iproute2 = `ip` + `tc netem`; iptables = the gateways' MASQUERADE/DNAT; conntrack = per-attempt
+# table flush (the single-container netns harness found stale conntrack state could make a good
+# topology punch fail); tcpdump/netcat for diagnosis; bash = the entrypoints; procps = pgrep in
+# the healthcheck.
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        iproute2 \
+        iptables \
+        conntrack \
+        tcpdump \
+        iputils-ping \
+        netcat-openbsd \
+        procps \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /workspace/target/release/quic-peer /usr/local/bin/quic-peer
+COPY --from=builder /workspace/target/release/stun-server /usr/local/bin/stun-server
+COPY deploy/lab/gw-entrypoint.sh deploy/lab/peer-entrypoint.sh \
+     deploy/lab/gw-nat.sh deploy/lab/gw-signal.sh deploy/lab/apply-netem.sh \
+     /usr/local/bin/
+RUN chmod +x /usr/local/bin/*.sh
+
+WORKDIR /lab
+CMD ["bash"]

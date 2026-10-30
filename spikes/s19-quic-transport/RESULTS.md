@@ -573,3 +573,176 @@ same `| Date | Host pair / link | RTT (ms) | cc | MB/s | Notes |` shape used thr
 | Date | Host pair / link | RTT (ms) | cc | MB/s | Notes |
 |------|-------------------|----------|-----|------|-------|
 | | | | | | |
+
+---
+
+## Results — two-container lab (simulated; still one kernel)
+
+**2026-10-30.** This section records a composed two-container NAT + netem lab (`deploy/lab/`, with
+its own README and `run-matrix.sh`). It is **not leg 4 and does not close the real-two-host
+clause** below: both peers are containers in Docker Desktop's single Linux VM
+(`7.0.14-linuxkit`; Docker server 29.9.2, linux/arm64; Compose 5.6.0 on macOS), so this is still
+one kernel and the same nested-virtualization conntrack environment leg 2 root-caused. What it
+adds over `s19-nat-run.sh`: a **routed** path through two independent gateway containers, **per
+side** `tc netem` on each peer's egress, and **real reordering**. Leg 4 remains **not run**.
+
+### Topology
+
+```
+                 wan 172.28.0.0/24 (registry side)
+ nats .10  helper .11  postgres .12  coturn .13  stun .14
+        \        |          |           |         /
+         +-------+----------+-----------+--------+
+                            |
+                    gw-a .21              gw-b .22
+             MASQUERADE (cone|sym)   MASQUERADE (cone|sym)
+                    |                      |
+          nat-a 172.28.10.0/24     nat-b 172.28.20.0/24
+             gw-a .254                 gw-b .254
+                    |                      |
+            peer-a 172.28.10.2        peer-b 172.28.20.2
+            tc netem (egress)         tc netem (egress)
+```
+
+The peers have no interface on `wan`. Each gateway drops private→other-private forwarding
+(`-s <own-private> -d <other-private> -j DROP` before `ACCEPT`), so the only reachable peer
+address is the NAT-mapped one; each gateway's default route is via the wan gateway. The recv
+peer's TCP `--signal` port is DNATed through gw-b and SNATed onto gw-b's private leg (the host's
+bridge netfilter otherwise drops the DNATed frame, whose source belongs to the other bridge).
+Successful punches below selected `172.28.0.21`/`172.28.0.22` — the srflx candidates — confirming
+the NATs were traversed.
+
+### Exact flags and netem
+
+```bash
+# peer-b (recv), behind nat-b
+quic-peer --mode recv --transport ice --signal listen:<port> \
+  --stun 172.28.0.14:3478 --ice-bind 172.28.20.2 \
+  --bytes 32 --window 2 --json \
+  --stats-interval-ms 500 --stats-out /lab-artifacts/<cell>-attempt<N>-recv-stats.jsonl
+
+# peer-a (send), behind nat-a
+quic-peer --mode send --transport ice --signal connect:172.28.0.22:<port> \
+  --stun 172.28.0.14:3478 --ice-bind 172.28.10.2 \
+  --bytes 32 --window 2 --json \
+  --stats-interval-ms 500 --stats-out /lab-artifacts/<cell>-attempt<N>-send-stats.jsonl
+
+# relay cells replace --transport/--stun with:
+#   --transport relay --turn 172.28.0.13:3478 --turn-secret spindle-turn-dev-only \
+#   --turn-user-label peerB|peerA        (and no --stun)
+
+# netem, applied to eth0 on BOTH peers (each peer's egress):
+tc qdisc add dev eth0 root netem delay 25ms                 # delay25 (25 ms each way ≈ 50 ms RTT)
+tc qdisc add dev eth0 root netem delay 50ms                 # delay50 (50 ms each way ≈ 100 ms RTT)
+tc qdisc add dev eth0 root netem loss 1%                    # loss1
+tc qdisc add dev eth0 root netem delay 10ms reorder 25% 50% # reorder25
+
+# symmetric cell: both gateways
+iptables -t nat -A LAB_MASQ -s <private>/24 -o <wan_if> -j MASQUERADE --random-fully
+```
+
+`tc ... netem reorder 25% 50%` **without** a delay is refused by this kernel:
+`Error: reordering not possible without specifying some delay`. The reorder cell therefore uses
+`delay 10ms` as the smallest reorder window; that substitution is the cell's one deviation from
+the bare requested form.
+
+Cells were attempted until 3 successes or the cap shown in the Attempts column (12 for
+baseline/delay25, 6 for delay50, 10 for reorder25; delay25 was sampled twice, 12 attempts each;
+the symmetric ICE cell ran exactly 3). `delay50` is the literal "50 ms on each peer" cell;
+`delay25` was added because 25 ms each way yields ~50 ms RTT, the RTT at which the pass bar is
+stated, giving a like-for-like comparison with leg 1. Throughput is the recv side's
+first-byte-to-last-byte rate; RTT is the last `rtt_ms`
+sample in `--stats-out`; `lost_packets`/`congestion_events` are quinn's path counters (quinn
+reports lost packets, not a separate retransmit counter). The 32 MiB transfers at baseline-class
+rates take 75-130 ms, so the 500 ms sampler often captured only its initial sample there; the
+netem qdisc counters are the evidence that shaping was active in those cells.
+
+### Results
+
+| Cell | Each peer's netem | NAT | Transport | Attempts | Successes | MB/s median | MB/s spread | RTT ms | max lost_packets | Notes |
+|------|-------------------|-----|-----------|----------|-----------|-------------|-------------|--------|------------------|-------|
+| baseline | none | cone:cone | ice | 12 | 3 (25%) | 326.261 | 259.670-372.547 | 0.3 | 0 | successful punches |
+| delay25 | delay 25 ms | cone:cone | ice | 12 + 12 | 0 | n/a | n/a | n/a | n/a | two independent samples |
+| delay50 | delay 50 ms | cone:cone | ice | 6 | 0 | n/a | n/a | n/a | n/a | |
+| loss1 | loss 1% | cone:cone | ice | 5 | 3 (60%) | 368.437 | 305.837-399.290 | 0.5 | 0\* | netem dropped 22/8 pkts |
+| reorder25 | delay 10 ms reorder 25% 50% | cone:cone | ice | 10 | 0 | n/a | n/a | n/a | n/a | punch fails under any delay |
+| delay25_relay | delay 25 ms | cone:cone | relay | 3 | 3 | 1.912 | 1.893-1.940 | 51.1 | 1 | relay, **not punch** |
+| delay50_relay | delay 50 ms | cone:cone | relay | 3 | 3 | 2.703 | 2.504-3.328 | 101.5 | 1 | relay, **not punch** |
+| reorder25_relay | delay 10 ms reorder 25% 50% | cone:cone | relay | 3 | 3 | 0.347 | 0.346-0.350 | 21.6 | 78 | relay; QUIC survives |
+| sym_ice | none | symmetric:symmetric | ice | 3 | 0 | n/a | n/a | n/a | n/a | expected punch failure |
+| sym_relay | none | symmetric:symmetric | relay | 3 | 3 | 77.112 | 74.298-82.317 | 0.7 | 0 | TURN fallback |
+
+\* 0 is a sampling-window artifact for the ~90 ms loss1 transfers; see finding 4.
+
+### Findings
+
+1. **Cone punching is probabilistic, and the two-container topology reproduces the netns rig's
+   rate.** 3/12 (25%) default-MASQUERADE cone×cone attempts punched and completed; the netns rig
+   measured 3/13 (~23%). Every successful punch selected `172.28.0.21`/`172.28.0.22`. Every
+   failure is the same: `ICE punch timed out after 15.0s with no pair selected`, with the srflx
+   flow `[UNREPLIED]` in gateway conntrack — the NAT mapping was not endpoint-independent, the
+   same environment-specific behavior leg 2 documented. This is a small sample; it reproduces
+   the earlier rate, it does not prove a stable one.
+
+2. **Any nonzero delay prevented punching here; 1% loss did not.** Pure-delay cells failed
+   0/24 at 25 ms, 0/6 at 50 ms, and the reorder cell (10 ms + reorder) failed 0/10. With 1% loss
+   and no delay, 3/5 punched. The failure signature is identical (15 s timeout, `[UNREPLIED]`).
+   **The mechanism is not root-caused**: we observed the correlation, not that the delay itself
+   changes the port-allocation decision. This is the lab's most consequential result for the
+   pass bar: the 50 ms throughput cells could not be measured through the punched path at all
+   in this environment, so their numbers below are relay measurements, not punch numbers.
+
+3. **Unshaped baseline through successful punches: 326.261 MB/s median** (259.670-372.547, n=3,
+   32 MiB, window 2 MiB). The spread is large because a 32 MiB transfer at these rates lasts
+   75-130 ms, so cold-start and scheduling noise are a large fraction. This is the baseline for
+   the shaped cells, not a pass-bar cell.
+
+4. **1% loss alone did not prevent punching or materially reduce throughput**: 3/5, median
+   368.437 MB/s (305.837-399.290), RTT 0.5 ms. Netem's counters confirm loss was injected (22
+   drops on peer-a, 8 on peer-b in the attempt-2 snapshot). The 500 ms sampler captured only the
+   initial sample on the ~90 ms transfers, so quinn's `lost_packets` reads 0 there; do not read
+   that as lossless delivery. As with the baseline, the sample is small (n=3 successes).
+
+5. **Shaped throughput through both NATs, via the relay fallback**: delay25 1.912 MB/s
+   (1.893-1.940, RTT 51.1 ms); delay50 2.703 MB/s (2.504-3.328, RTT 101.5 ms); reorder25
+   0.347 MB/s (0.346-0.350, RTT 21.6 ms). **The delay25/delay50 relay numbers are
+   non-monotonic** — the higher-RTT cell measured faster — which we report as measured and
+   cannot yet explain. They are far below the 15 MB/s @ 50 ms bar, but that bar is stated for
+   the punched path; leg 3's shaped relay was also sub-MB/s to ~3 MB/s.
+
+6. **QUIC survives real reordering, but throughput collapses.** All 3 reorder25 relay transfers
+   completed (no `MAX_CHUNKS` assembler abort): 0.347 MB/s median, roughly 1000× below the
+   unshaped baseline. `--stats-out` on the recv path shows 55-78 `lost_packets` and 0-3
+   `congestion_events`, with `cwnd` falling to 8400-4116 in two runs. (The pre-fix host-candidate
+   run, discarded as a NAT result, showed the send side at 900 lost packets and 129 congestion
+   events; quinn reports cumulative lost packets, not retransmits.) This answers "does QUIC
+   survive reordering" for the packet layer only — it is **not** evidence about the A7 envelope
+   `seq` rule (a retry is a new envelope with a fresh `seq`, DESIGN v0.9.14).
+
+7. **Symmetric×symmetric:** ICE failed 3/3 with the 15 s no-pair timeout, as theory predicts for
+   `--random-fully` on both gateways. TURN relay through coturn completed 3/3 at **77.112 MB/s
+   median** (74.298-82.317, RTT 0.7 ms); both sides allocated on `172.28.0.13`
+   (`:49192`/`:49166`) and the transfer ran over those allocations. This is the combo leg 2
+   measured as a hard 0/12 punch failure; here it is closed by relay again, through two
+   containers rather than netns.
+
+### A first topology that falsely "succeeded" (methodological finding)
+
+The first version of this lab did not stop the peers reaching each other's **private host
+candidates**. Docker's host routes between the `nat-a` and `nat-b` bridges, so a packet from
+peer-a to `172.28.20.2` was forwarded by gw-a's default route to the host and delivered straight
+onto nat-b, bypassing gw-b's NAT. ICE selected `172.28.20.2`/`172.28.10.2`, and
+symmetric:symmetric punching appeared to succeed **3/3 at 285-466 MB/s** — a false result caused
+by the lab, not by ICE. The fix is the private→other-private `DROP` in `deploy/lab/gw-nat.sh`
+plus default-routing the gateways via the wan. Every number in the table above is from the
+corrected topology; the pre-fix numbers were discarded rather than reported as NAT results.
+
+### What this adds, and what it does not
+
+**Adds:** a routed path through two independent NAT containers; per-side delay/loss/reorder;
+real reordering; a cone-punch rate that reproduces the netns rig's ~25%; the measured
+delay-vs-loss punch asymmetry; shaped throughput through both NATs via relay; and symmetric
+relay confirmation. **Does not add:** a real two-host link (leg 4 remains open); real WAN jitter
+and loss distributions; the S2 across-NATs offer→usable-stream number (this measures
+`quic-peer`, not `spindle-net`); envelope-`seq` behavior under real reordering; or the production
+signaling/credential paths.

@@ -468,6 +468,29 @@ exactly the app/engine
 app exists yet, and the library itself still takes no `async-nats` dependency. Stage 5's own
 Status is unchanged (other criteria, notably S18's bootstrap bundle, remain open).
 
+**Note**: 2026-10-30 — **S19 two-container NAT + netem lab (simulated; still one kernel).**
+`deploy/lab/` adds a composed lab that routes two peer containers through two independent NAT
+gateway containers (default MASQUERADE; `--random-fully` for symmetric), with per-side `tc netem`
+and STUN/coturn on the `wan` network. It is **not leg 4** and does not close the real-two-host
+clause: both peers are containers in Docker Desktop's single Linux VM (7.0.14-linuxkit), the same
+nested-virtualization conntrack environment leg 2 root-caused. Measured (`spikes/s19-quic-transport/
+RESULTS.md` → "Results — two-container lab (simulated; still one kernel)"): cone×cone baseline
+punched 3/12 (25%, matching the netns rig's 3/13) at 326.261 MB/s median; 1% loss punched 3/5 at
+368.437 MB/s; **any nonzero delay prevented punching** (0/24 at 25 ms, 0/6 at 50 ms, 0/10 at
+10 ms + reorder 25%/50%), so the shaped-throughput cells were measured over the relay fallback
+instead (1.912 MB/s at 51 ms RTT, 2.703 at 101 ms, 0.347 under reorder 25%/50%); symmetric:symmetric
+ICE failed 3/3 and relay completed 3/3 at 77.112 MB/s. Successful punches selected the NAT-mapped
+`172.28.0.x` addresses, not the private host candidates. The lab also forced two construction
+fixes: private→other-private forwarding must be dropped at the gateways (the Docker host
+otherwise routes around the second NAT — this made symmetric ICE falsely succeed 3/3 before the
+fix), and the signaling DNAT needs a private-leg SNAT. See `deploy/lab/README.md`.
+- **td-c694b2, stated precisely**: the across-NATs S2 number still does **not** exist — this lab
+  measures `quic-peer` punch/throughput, not `spindle-net` offer→usable-stream, and the live
+  signaling test remains loopback. The reordering item gains a reordering-capable substrate and
+  measured QUIC packet-level behavior under `netem reorder`, but **not** envelope-`seq` evidence:
+  nothing drives DESIGN v0.9.14's fresh-`seq` retry rule. ICE is traversed across two NATs *for
+  the S19 spike's socket path* in this lab, but Stage 5's production signaling path is unchanged.
+
 ## Stage 6: spindle-vfs + host-core
 **Goal**: Implement the shares/groups/entitlements engine and the VFS RPC server in
 `spindle-vfs`/`spindle-host-core`, enforcing A4b's permission algebra per request.

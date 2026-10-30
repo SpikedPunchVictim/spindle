@@ -1,0 +1,260 @@
+# Two-container NAT + netem lab for S19 (quinn-over-punched-ICE).
+#
+#   peer-a --- nat-a --- gw-a --- wan --- gw-b --- nat-b --- peer-b
+#   (shaped)   172.28.10/24  MASQ  (registry:      MASQ  172.28.20/24  (shaped)
+#                                  nats/helper/
+#                                  postgres/coturn/stun)
+#
+# peer-a and peer-b have NO interface on `wan`: their only route to the registry side is through
+# their own gateway container, which MASQUERADEs them (cone by default, --random-fully for the
+# symmetric cell). Both peers can be shaped independently with tc netem. This is still ONE kernel
+# (Docker Desktop's Linux VM) — see README.md for exactly what that does and does not prove.
+#
+# Differences from deploy/docker-compose.yml, all deliberate and documented in README.md:
+#   * registry services are copied (not `extends`) and pinned to static wan addresses;
+#   * host port publications are dropped — the lab is self-contained and publishing 4222/3478/etc.
+#     would collide with a running dev stack;
+#   * the helper's build context is `../..` (repo root) because this file lives in deploy/lab.
+#
+# Interface naming on the dual-homed gateways is NOT stable (see gw-entrypoint.sh); all scripts
+# locate interfaces by IPv4 prefix, never by name or declaration order.
+name: spindle-lab
+
+# One build definition for all five lab containers; compose tags the same image once.
+x-lab-build: &lab-build
+  context: ../..
+  dockerfile: deploy/lab/Dockerfile.lab
+
+x-lab-image: &lab-image
+  image: spindle-lab:local
+  build: *lab-build
+
+services:
+  # ── Registry side (reused from deploy/docker-compose.yml) ────────────────────────────────────
+  nats:
+    image: nats:2.10-alpine
+    command: ["-c", "/etc/nats/nats-server.conf", "-m", "8222"]
+    volumes:
+      - ../nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+    networks:
+      wan:
+        ipv4_address: 172.28.0.10
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-spindle}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spindle-dev-only}
+      POSTGRES_DB: ${POSTGRES_DB:-spindle}
+    volumes:
+      - spindle-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-spindle} -d ${POSTGRES_DB:-spindle}"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    networks:
+      wan:
+        ipv4_address: 172.28.0.12
+
+  coturn:
+    image: coturn/coturn
+    command:
+      - "-n"
+      - "--listening-port=3478"
+      - "--realm=spindle.local"
+      - "--use-auth-secret"
+      - "--static-auth-secret=${TURN_SECRET:-spindle-turn-dev-only}"
+      - "--min-port=49160"
+      - "--max-port=49200"
+      - "--no-cli"
+      - "--no-tls"
+      - "--no-dtls"
+    networks:
+      wan:
+        ipv4_address: 172.28.0.13
+
+  helper:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+    environment:
+      NATS_URL: "nats://nats:4222"
+      CALLOUT_USER_SEED: "SUAP32HDCRWO6KRJBIRSNCD5NZGDP33A6RKOG2KZNZBQDC7MHQL5KWLDOM"
+      APP_ACCOUNT_SEED: "SAAODS72DAQRLQ2OKCAR4AHZPNKOR6YNYRPVBHXQA7T3GBUURXFECWCMXU"
+      APP_CONN_SEED: "SUAFWWQRCTGQTS6DKVAJKMMFMIJKFZ3MRFGFQ4WCRZ5RVZ5WFRB4CXPYBY"
+      SYS_CONN_SEED: "SUAJNND3A4EBPOPMXASJCSIAPEFJROE7JFVDDZMLN2WEP3OPTNQSLMBO6A"
+      ACCOUNT_NAME: "APP"
+      ADMISSION_MODE: "open"
+      RUST_LOG: "info,spindle_helper=debug"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-spindle}:${POSTGRES_PASSWORD:-spindle-dev-only}@postgres:5432/${POSTGRES_DB:-spindle}"
+      TURN_SECRET: "${TURN_SECRET:-spindle-turn-dev-only}"
+      TURN_URIS: "turn:127.0.0.1:3478?transport=udp,turn:127.0.0.1:3478?transport=tcp"
+      TURN_TTL_SECS: "3600"
+      TURN_MONTHLY_QUOTA: "1000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    restart: on-failure
+    networks:
+      wan:
+        ipv4_address: 172.28.0.11
+
+  # The in-repo STUN responder (spikes/s19-quic-transport/src/bin/stun-server.rs). It listens on
+  # the registry-side wan address, so each peer's STUN-mapped address is its gateway's public
+  # address — exactly what the single-container netns harness arranged with a root-ns STUN server.
+  stun:
+    <<: *lab-image
+    entrypoint: ["/usr/local/bin/stun-server", "0.0.0.0:3478"]
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -x stun-server >/dev/null"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    networks:
+      wan:
+        ipv4_address: 172.28.0.14
+
+  # ── NAT gateways ─────────────────────────────────────────────────────────────────────────────
+  # x.x.x.254 (not .1): Docker reserves the first address of every user-defined subnet for the
+  # bridge itself, so a container cannot hold .1. Each gateway's private leg is .254 and its
+  # peers point their default route at that address (see peer-entrypoint.sh).
+  gw-a:
+    <<: *lab-image
+    entrypoint: ["/usr/local/bin/gw-entrypoint.sh"]
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    environment:
+      WAN_PREFIX: "172.28.0."
+      WAN_SUBNET: "172.28.0.0/24"
+      PRIVATE_PREFIX: "172.28.10."
+      PRIVATE_SUBNET: "172.28.10.0/24"
+      OTHER_PRIVATE_SUBNET: "172.28.20.0/24"
+      WAN_GATEWAY: "172.28.0.1"
+      NAT_MODE: "cone"
+      SIGNAL_PORT: "15000"
+    healthcheck:
+      test: ["CMD-SHELL", "iptables -t nat -S LAB_MASQ | grep -q MASQUERADE"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    networks:
+      wan:
+        ipv4_address: 172.28.0.21
+      nat-a:
+        ipv4_address: 172.28.10.254
+
+  gw-b:
+    <<: *lab-image
+    entrypoint: ["/usr/local/bin/gw-entrypoint.sh"]
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    environment:
+      WAN_PREFIX: "172.28.0."
+      WAN_SUBNET: "172.28.0.0/24"
+      PRIVATE_PREFIX: "172.28.20."
+      PRIVATE_SUBNET: "172.28.20.0/24"
+      OTHER_PRIVATE_SUBNET: "172.28.10.0/24"
+      WAN_GATEWAY: "172.28.0.1"
+      NAT_MODE: "cone"
+      SIGNAL_PORT: "15000"
+      PEER_IP: "172.28.20.2"
+    healthcheck:
+      test: ["CMD-SHELL", "iptables -t nat -S LAB_MASQ | grep -q MASQUERADE"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    networks:
+      wan:
+        ipv4_address: 172.28.0.22
+      nat-b:
+        ipv4_address: 172.28.20.254
+
+  # ── Peers (private network only; default route = gateway) ───────────────────────────────────
+  peer-a:
+    <<: *lab-image
+    entrypoint: ["/usr/local/bin/peer-entrypoint.sh"]
+    cap_add: [NET_ADMIN]
+    environment:
+      PRIVATE_PREFIX: "172.28.10."
+      GW_PRIVATE_IP: "172.28.10.254"
+      NETEM_DELAY_MS: "0"
+      NETEM_LOSS_PCT: "0"
+      NETEM_REORDER_PCT: "0"
+      NETEM_REORDER_CORR: "0"
+    volumes:
+      - ./.artifacts:/lab-artifacts
+    extra_hosts:
+      - "gw-a:172.28.0.21"
+      - "gw-b:172.28.0.22"
+      - "stun:172.28.0.14"
+      - "coturn:172.28.0.13"
+      - "nats:172.28.0.10"
+      - "helper:172.28.0.11"
+      - "postgres:172.28.0.12"
+    healthcheck:
+      test: ["CMD-SHELL", "ip route show default | grep -q 172.28.10.254"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    networks:
+      nat-a:
+        ipv4_address: 172.28.10.2
+
+  peer-b:
+    <<: *lab-image
+    entrypoint: ["/usr/local/bin/peer-entrypoint.sh"]
+    cap_add: [NET_ADMIN]
+    environment:
+      PRIVATE_PREFIX: "172.28.20."
+      GW_PRIVATE_IP: "172.28.20.254"
+      NETEM_DELAY_MS: "0"
+      NETEM_LOSS_PCT: "0"
+      NETEM_REORDER_PCT: "0"
+      NETEM_REORDER_CORR: "0"
+    volumes:
+      - ./.artifacts:/lab-artifacts
+    extra_hosts:
+      - "gw-a:172.28.0.21"
+      - "gw-b:172.28.0.22"
+      - "stun:172.28.0.14"
+      - "coturn:172.28.0.13"
+      - "nats:172.28.0.10"
+      - "helper:172.28.0.11"
+      - "postgres:172.28.0.12"
+    healthcheck:
+      test: ["CMD-SHELL", "ip route show default | grep -q 172.28.20.254"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    networks:
+      nat-b:
+        ipv4_address: 172.28.20.2
+
+networks:
+  wan:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+  nat-a:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.10.0/24
+  nat-b:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.20.0/24
+
+volumes:
+  spindle-postgres-data:
