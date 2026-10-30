@@ -28,7 +28,9 @@
 //!   <nfp>`, `helper.presence.get.<nfp>`, `helper.devcert.get.<nfp>` (a request/reply fetch of a
 //!   host's cached `HostDeviceCert` — see `spindle_helper::devcert`), and `helper.revoke.<nfp>`
 //!   (a request/reply deposit of a root-signed `spindle-self-rev-v1` record — see
-//!   `spindle_helper::self_revoke`), publishes `host.<hfp>.presence` deltas, and ingests
+//!   `spindle_helper::self_revoke`; the reply is published **before** any kick the deposit
+//!   triggers, so a deposit that revokes the depositing session's own device still observes its
+//!   typed `Ok(epoch)` reply — td-b49943), publishes `host.<hfp>.presence` deltas, and ingests
 //!   `registry.revoke.<hfp>` (leg 2 of DESIGN.md §A4's revoke -> kick -> reject chain — see
 //!   `spindle_helper::revoke`) and `registry.devcert.<hfp>` (the A10.37 `HostDeviceCert`
 //!   distribution cache — see `spindle_helper::devcert`) publishes. Both registry subjects are
@@ -913,7 +915,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // helper.revoke.<own_nats_fp>`, see `permissions::client_member_permissions`), and
     // `self_revoke::handle_self_revoke` recovers `<nfp>` from `msg.subject` itself, then checks
     // the record's `root_fp` and signature against the session record's retained `root_pk`. Same
-    // app connection and same "not configured" handling as `helper.turn.get.*` above.
+    // app connection and same "not configured" handling as `helper.turn.get.*` above. The reply is
+    // published before any kick this deposit triggers (td-b49943): the deposit may revoke the
+    // depositing session's own device, and the caller must still observe the typed reply.
     let mut self_revoke_sub: Option<async_nats::Subscriber> = match &app_client {
         Some(client) => Some(client.subscribe("helper.revoke.*").await?),
         None => None,
@@ -1292,7 +1296,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 // an endpoint; `redacted()` keeps it to a prefix like every other id in this
                 // file's log lines (a malformed subject has no fingerprint to redact).
                 let nfp = redacted_subject_token(msg.subject.as_str(), "helper.revoke.");
-                match serde_json::from_slice::<self_revoke::SelfRevokeReply>(&reply_payload) {
+                // Decode and log the handler's own outcome first, and record the propagation
+                // metric for an accepted state-changing write. Kicks are deliberately NOT planned
+                // here; the reply is published first, below (see that block's comment, td-b49943).
+                let accepted = match serde_json::from_slice::<self_revoke::SelfRevokeReply>(&reply_payload) {
                     Ok(outcome) if outcome.ok => {
                         tracing::info!(
                             nfp = %nfp,
@@ -1306,42 +1313,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                         if let Some(record_ts) = result.accepted_ts {
                             metrics::record_revocation_propagation(now_secs(), record_ts);
                         }
-
-                        // Leg 3 (S9): kick the live sessions of the devices this deposit *newly*
-                        // added — not the whole post-write union. A replay/no-op reports nothing
-                        // here (so a redelivery kicks nothing), and an already-revoked entry has
-                        // already been handled by the deposit that added it. The handler computes
-                        // that set; see `SelfRevokeResult`'s doc.
-                        if !result.newly_revoked.is_empty() {
-                            tracing::info!(
-                                nfp = %nfp,
-                                newly_revoked = result.newly_revoked.len(),
-                                "helper.revoke.<nfp> self-revocation newly revoked devices — \
-                                 planning kicks"
-                            );
-                            // Build the plan before awaiting the kick helper: `kicks_for_revocation`
-                            // borrows `store` mutably, and the await below must not hold that
-                            // borrow. `plan` owns its targets, so the borrow ends here.
-                            let plan = kick::kicks_for_revocation(
-                                &result.newly_revoked,
-                                &kick_map,
-                                &mut store,
-                                now_secs(),
-                            );
-                            if !plan.unresolved.is_empty() {
-                                // Same fail-open wording as the `registry.revoke.<hfp>` branch
-                                // above: a revoked session that looked unkickable only because its
-                                // own CONNECT advisory hadn't drained into `kick_map` yet is
-                                // security-relevant and must survive a production `warn` filter.
-                                tracing::warn!(
-                                    nfp = %nfp,
-                                    unresolved = plan.unresolved.len(),
-                                    "revocation matched live session records with no known \
-                                     connection to kick yet — scheduling a delayed re-plan"
-                                );
-                            }
-                            execute_kick_plan(plan, sys_ref, &kick_retry_tx).await;
-                        }
+                        true
                     }
                     Ok(outcome) => {
                         tracing::warn!(
@@ -1349,6 +1321,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                             reason = %outcome.error.unwrap_or_default(), // redaction-ok: SelfRevokeReply.error is built only from static literals/VERIFICATION_FAILED by SelfRevokeReply::err; no peer bytes or identifiers
                             "helper.revoke.<nfp> self-revocation rejected"
                         );
+                        false
                     }
                     Err(_) => {
                         // The handler always emits its own `SelfRevokeReply` JSON; failing to
@@ -1356,8 +1329,18 @@ async fn run(config: Config) -> anyhow::Result<()> {
                         tracing::error!(
                             "helper.revoke.<nfp> handler produced an undecodable reply"
                         );
+                        false
                     }
-                }
+                };
+
+                // Publish the reply BEFORE planning or executing any kick (td-b49943). The reply
+                // is to the caller's own inbox, which still exists at this instant: the kick is
+                // the consequence of a write that is already durable, and ordering it after the
+                // reply is what makes the "ok with the stored epoch" contract true for a deposit
+                // that revokes the depositing session's own device (a primary revoking itself).
+                // Kicking first tore down this very connection before the reply could be written,
+                // so the client always saw a request timeout on a deposit that had been applied.
+                // The kick still happens, immediately below.
                 if !session::reply_belongs_to_caller(
                     reply.as_str(),
                     msg.subject.as_str(),
@@ -1365,8 +1348,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     &mut store,
                     now_secs(),
                 ) {
-                    // The deposit has already been applied and its live sessions kicked above;
-                    // only the reply publish is skipped here.
+                    // The deposit has already been applied; only the reply publish is skipped
+                    // here. The kicks below still run.
                     tracing::warn!(
                         nfp = %nfp,
                         "dropping helper.revoke.<nfp> reply: msg.reply is not the caller's \
@@ -1380,6 +1363,42 @@ async fn run(config: Config) -> anyhow::Result<()> {
                         );
                     }
                     let _ = client.flush().await;
+                }
+
+                // Leg 3 (S9): kick the live sessions of the devices this deposit *newly* added —
+                // not the whole post-write union. A replay/no-op reports nothing here (so a
+                // redelivery kicks nothing), and an already-revoked entry has already been
+                // handled by the deposit that added it. The handler computes that set; see
+                // `SelfRevokeResult`'s doc. Deliberately after the reply publish above (td-b49943).
+                if accepted && !result.newly_revoked.is_empty() {
+                    tracing::info!(
+                        nfp = %nfp,
+                        newly_revoked = result.newly_revoked.len(),
+                        "helper.revoke.<nfp> self-revocation newly revoked devices — \
+                         planning kicks"
+                    );
+                    // Build the plan before awaiting the kick helper: `kicks_for_revocation`
+                    // borrows `store` mutably, and the await below must not hold that
+                    // borrow. `plan` owns its targets, so the borrow ends here.
+                    let plan = kick::kicks_for_revocation(
+                        &result.newly_revoked,
+                        &kick_map,
+                        &mut store,
+                        now_secs(),
+                    );
+                    if !plan.unresolved.is_empty() {
+                        // Same fail-open wording as the `registry.revoke.<hfp>` branch
+                        // above: a revoked session that looked unkickable only because its
+                        // own CONNECT advisory hadn't drained into `kick_map` yet is
+                        // security-relevant and must survive a production `warn` filter.
+                        tracing::warn!(
+                            nfp = %nfp,
+                            unresolved = plan.unresolved.len(),
+                            "revocation matched live session records with no known \
+                             connection to kick yet — scheduling a delayed re-plan"
+                        );
+                    }
+                    execute_kick_plan(plan, sys_ref, &kick_retry_tx).await;
                 }
             }
             msg = next_or_pending(&mut connect_sub) => {

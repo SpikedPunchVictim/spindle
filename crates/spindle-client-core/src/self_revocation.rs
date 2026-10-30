@@ -18,9 +18,11 @@
 //!
 //! # No production caller yet
 //!
-//! **Nothing in this workspace calls these functions yet.** The Tauri client shell, the primary
-//! device's key-custody flow, and the actual NATS adapter are later slices; this module is the
-//! library-level half of td-a06afc, not an app integration.
+//! **Nothing in this workspace calls these functions in production.** The Tauri client shell, the
+//! primary device's key-custody flow, and the actual NATS adapter are later slices; this module is
+//! the library-level half of td-a06afc, not an app integration. `tests/live_self_revocation.rs`
+//! drives both functions over a real callout-authenticated connection against the helper (the
+//! deposit → later-CONNECT-refused proof), but that adapter is test-local, not a shipped one.
 
 use serde::Deserialize;
 use spindle_core::artifacts::issue_self_revocation;

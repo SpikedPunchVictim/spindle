@@ -18,3 +18,15 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# `tests/live_self_revocation.rs` (td-a06afc) needs the shared callout-bootstrap fixtures and
+# `connect_device`, so the test authenticates through the real NATS Auth Callout instead of
+# re-implementing the CONNECT envelope; `async-nats` is the live member connection the test-local
+# `RevokeTransport` adapter drives (the production adapter lands with the app, not in this
+# crate); `rand` supplies the per-run `OsRng` seeds the module doc explains are load-bearing
+# against the helper's durable revoked set. `nkeys` mints the second connection's fresh session
+# key exactly as `spindle-net/tests/live_signaling.rs`'s revoked-reconnect probe does. All four
+# are test-only: the library itself stays runtime-neutral (see `[dependencies]` above).
+spindle-test-fixtures = { path = "../spindle-test-fixtures" }
+async-nats = { workspace = true }
+rand = { workspace = true }
+nkeys = "0.4"

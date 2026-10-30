@@ -101,12 +101,15 @@
 //! can already drop the legitimate message outright. An already-applied record is detected by the
 //! no-op check and costs no root token.
 //!
-//! # No producer exists in this workspace yet
-//! Nothing here mints or deposits these records yet: no client publishes `helper.revoke.*`, and
-//! the wire type deliberately has no TypeScript issuer (the TS twin parses records; it does not
-//! mint them). This handler is therefore exercised only by this module's in-crate tests today.
-//! DESIGN.md §A5b's status row records the missing producer; this paragraph is the code-side
-//! record of the same gap, in the style of `revoke.rs`'s "Out of scope" section rather than
+//! # No *app* producer exists in this workspace yet
+//! The library half now exists: `spindle-client-core`'s `self_revocation` module mints and
+//! deposits these records, and `crates/spindle-client-core/tests/live_self_revocation.rs`
+//! exercises this handler end to end over a live callout-authenticated connection (the deposit is
+//! accepted, a later CONNECT by the revoked device is refused). What is still missing is the
+//! app/engine `RevokeTransport` adapter and the primary device's key-custody flow; no app exists.
+//! The wire type deliberately still has no TypeScript issuer (the TS twin parses records; it does
+//! not mint them). DESIGN.md §A5b's status row records the app-side gap; this paragraph is the
+//! code-side record of it, in the style of `revoke.rs`'s "Out of scope" section rather than
 //! leaving the absence implicit.
 //!
 //! # Wire schema (following `presence.rs`'s `{ok, ...}` envelope precedent)
@@ -121,9 +124,15 @@
 //! reply err: { "ok": false, "error": "<human-readable reason>" }
 //! ```
 //! `src/bin/helper.rs` subscribes `helper.revoke.*`, passes `msg.subject` and `msg.payload` into
-//! [`handle_self_revoke`], publishes [`SelfRevokeResult::reply`] to `msg.reply`, and kicks the
-//! sessions of [`SelfRevokeResult::newly_revoked`] — see that type's doc for why only the newly
-//! added set, not the whole union, is what drives kicks.
+//! [`handle_self_revoke`], checks that `msg.reply` is the caller's granted inbox, publishes
+//! [`SelfRevokeResult::reply`] to it, and only **then** kicks the sessions of
+//! [`SelfRevokeResult::newly_revoked`] — see that type's doc for why only the newly added set, not
+//! the whole union, is what drives kicks. That order is load-bearing (td-b49943): the reply goes
+//! to the caller's own inbox, which still exists at that instant, while the kick is the
+//! consequence of a write that is already durable. A deposit that revokes the depositing session's
+//! own device therefore still receives its typed `Ok(epoch)` reply — kicking first destroyed that
+//! connection before the reply could be published, so the client always timed out on a deposit
+//! that had been applied.
 
 use serde::{Deserialize, Serialize};
 use spindle_core::artifacts::verify_self_revocation;
