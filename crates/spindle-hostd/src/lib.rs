@@ -137,6 +137,7 @@ pub mod connect;
 pub mod devcert;
 pub mod identity;
 pub mod keystore;
+pub mod reconcile_surface;
 
 pub use cap_gate::GateableCapIssuer;
 pub use devcert::{
@@ -172,8 +173,8 @@ pub use spindle_net::signaling::host::HostOptions;
 ///
 /// Saturates to `0` rather than panicking if the system clock reads before the epoch — a
 /// misconfigured clock should degrade the daemon's timestamps, not crash it outright. This mirrors
-/// `spindle_host_core::serve::serve_control_stream`'s own `now_fn` seam and
-/// `spindle_host_core::server::VfsRpcServer::handle_bytes`'s `ts` parameter: every timestamp seam
+/// `spindle_host_core::serve::serve_control_stream`'s own `now_fn` seam and the VFS pipeline's
+/// per-request `ts` parameter: every timestamp seam
 /// in this workspace is injectable so a test can supply a deterministic clock instead of racing the
 /// real one.
 pub fn wall_clock_now_secs() -> u64 {
@@ -215,8 +216,8 @@ type AssembledSignalingHost<N> = SignalingHost<
 /// generic over every caller's choice of clock. [`HostDaemon::new`] takes any `Fn() -> u64 + Send +
 /// Sync + 'static` and boxes it here once; [`wall_clock_now_secs`] is the production default a
 /// caller reaches for when it has no reason to inject anything else, and a test supplies its own
-/// deterministic closure instead — the same seam `serve_control_stream`'s `now_fn` and
-/// `VfsRpcServer::handle_bytes`'s `ts` establish elsewhere in this workspace.
+/// deterministic closure instead — the same seam `serve_control_stream`'s `now_fn` and the VFS
+/// pipeline's `ts` establish elsewhere in this workspace.
 type BoxedNowFn = Box<dyn Fn() -> u64 + Send + Sync + 'static>;
 
 /// The assembled host process for one host identity: an already-connected NATS client, this host's
@@ -241,6 +242,10 @@ pub struct HostDaemon {
     /// [`Self::with_cap_issuer`]'s doc comment for why this crate never builds a
     /// [`spindle_host_core::RootKeyCapIssuer`] on its own.
     issuer: Option<Box<dyn CapIssuer>>,
+    /// The process-wide per-share upload/reconcile lock (td-042e4f), installed by
+    /// [`Self::with_upload_locks`] and handed to the session handler in [`Self::run`]. `None`
+    /// leaves the previous behavior unchanged.
+    upload_locks: Option<spindle_host_core::UploadLedgerLocks>,
 }
 
 impl HostDaemon {
@@ -305,6 +310,22 @@ impl HostDaemon {
             store_path: store_path.into(),
             now_fn: Box::new(now_fn),
             issuer: None,
+            upload_locks: None,
+        }
+    }
+
+    /// Installs the process-wide per-share upload/reconcile lock (td-042e4f). The caller creates
+    /// one [`spindle_host_core::UploadLedgerLocks`] and hands clones to both this daemon and the
+    /// scheduled disk sweep, so a sweep cannot delete a ledger row a concurrent upload has just
+    /// committed. Chainable, like [`Self::with_cap_issuer`].
+    ///
+    /// Without this call, `UploadCommit` behaves exactly as before; the one-shot
+    /// `--reconcile-once` path runs in a separate process and cannot share this lock, which is why
+    /// its `HELP` text requires the host to be stopped.
+    pub fn with_upload_locks(self, locks: spindle_host_core::UploadLedgerLocks) -> Self {
+        HostDaemon {
+            upload_locks: Some(locks),
+            ..self
         }
     }
 
@@ -367,6 +388,7 @@ impl HostDaemon {
             store_path,
             now_fn,
             issuer,
+            upload_locks,
         } = self;
 
         // Bound to a plain local first (rather than interpolating `device.device_fp().redacted()`
@@ -458,6 +480,10 @@ impl HostDaemon {
             Box::new(move || (*now)())
         };
         let handler = VfsSessionHandler::new(factory, session_lookup, handler_now);
+        let handler = match upload_locks {
+            Some(locks) => handler.with_upload_locks(locks),
+            None => handler,
+        };
 
         tracing::info!(
             connections_opened = 2u32,

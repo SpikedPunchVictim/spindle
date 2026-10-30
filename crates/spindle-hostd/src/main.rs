@@ -76,6 +76,22 @@
 //! is set. Unset means no global recorder is installed and every `metrics` macro is a no-op. The
 //! library itself never installs a recorder.
 //!
+//! # Upload-ledger reconcile surfaces (td-042e4f)
+//!
+//! `--reconcile-once` / `SPINDLE_HOST_RECONCILE_ONCE` is an operator repair action: it runs before
+//! the seed/NATS/metrics wiring, needs no identity, touches every share's ledger against disk and
+//! then both quota counter tables, and exits. Because it is a separate process, it cannot share the
+//! in-process per-share upload lock the serving host uses; it must be run with the host **stopped**
+//! (SQLite still prevents corruption, but a live commit can be mis-reconciled). It also operates
+//! only on an existing Spindle store — an absent, zero-byte, or foreign database is refused, not
+//! created or migrated. `--reconcile-interval-secs` / `SPINDLE_HOST_RECONCILE_INTERVAL_SECS`
+//! instead schedules **only** the disk -> ledger sweep on a timer while the host serves, under the
+//! same per-share lock every session's `UploadCommit` takes. The split is deliberate:
+//! DB-vs-filesystem skew has ongoing sources, while ledger-vs-counter drift is impossible by
+//! construction, so the counter reconcile is a repair tool rather than routine maintenance.
+//! Neither surface is tied to a client connect. See `reconcile_surface`'s module doc comment for the
+//! lock interaction.
+//!
 //! # Redaction
 //!
 //! Every fingerprint in a log line is rendered through `Fingerprint::redacted()`. Credentials,
@@ -95,10 +111,13 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use rand::rngs::OsRng;
 use rand::RngCore as _;
 use spindle_core::{RootKey, SigningKey, VerifyingKey};
-use spindle_host_core::RootKeyCapIssuer;
+use spindle_host_core::{RootKeyCapIssuer, UploadLedgerLocks};
 use spindle_hostd::connect::{connect_host, ConnectError, HostConnectCredentials};
 #[cfg(unix)]
 use spindle_hostd::keystore::{create_secret_file, open_secret_file};
+use spindle_hostd::reconcile_surface::{
+    reconcile_once, run_scheduled_disk_sweep, ReconcileOnceError,
+};
 use spindle_hostd::{
     format_recovery_phrase, mint_host_identity_with_ttl, parse_recovery_phrase,
     renew_operating_identity_with_ttl, wall_clock_now_secs, GateableCapIssuer, HostDaemon,
@@ -106,6 +125,7 @@ use spindle_hostd::{
     ROOT_SEED_LEN,
 };
 use spindle_proto::artifacts::{AdmissionToken, HostOpKeyCert};
+use spindle_vfs::store::StoreError;
 
 use crate::config::Config;
 
@@ -133,16 +153,122 @@ async fn main() -> ExitCode {
         }
     };
 
+    // An operator repair action, not a serving mode: run it before the metrics, seed, identity,
+    // and NATS wiring so it works on a host with none of them, then exit. `run` is never reached
+    // with this flag set.
+    if config.reconcile_once {
+        // Serving-only settings are not silently dropped: say so before exiting, so an operator
+        // who combined them with the one-shot action sees why they had no effect. (Enrollment
+        // actions are a hard config error instead — see `ConfigError::ConflictingEnrollment`.)
+        if config.reconcile_interval_secs.is_some() {
+            tracing::warn!(
+                "--reconcile-interval-secs / SPINDLE_HOST_RECONCILE_INTERVAL_SECS is ignored with \
+                 --reconcile-once: the one-shot action exits instead of serving"
+            );
+        }
+        if config.metrics_addr.is_some() {
+            tracing::warn!(
+                "--metrics-addr / SPINDLE_METRICS_ADDR is ignored with --reconcile-once: the \
+                 one-shot action exits before installing the exporter"
+            );
+        }
+        return run_reconcile_once(&config.store);
+    }
+
     init_metrics_exporter(config.metrics_addr.as_deref());
 
     run(config).await
+}
+
+/// Runs the `--reconcile-once` operator action and maps its outcome to the documented exit code.
+///
+/// `SUCCESS` means every share's ledger was swept against disk **and** both counter tables were
+/// recomputed. A share that could not be swept (logged with the others by `reconcile_once`) or a
+/// failed counter reconcile is `FAILURE`; failing to open the store or list its shares is also
+/// `FAILURE`. The per-share and summary lines are logged by `reconcile_once` itself.
+fn run_reconcile_once(store_path: &Path) -> ExitCode {
+    match reconcile_once(store_path) {
+        Ok(report) if !report.failed() => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::FAILURE,
+        Err(ReconcileOnceError::StoreAbsent(path)) => {
+            tracing::error!(
+                path = %path.display(), // redaction-ok: operator-configured SPINDLE_HOST_STORE path (operator-config exemption, lib.rs), never member data
+                "the configured host store does not exist; refusing to create an empty one. Fix \
+                 the path, or start the host once so its store exists, then re-run \
+                 --reconcile-once"
+            );
+            ExitCode::FAILURE
+        }
+        Err(ReconcileOnceError::Store(StoreError::NotASpindleStore {
+            user_version,
+            missing,
+        })) => {
+            tracing::error!(
+                path = %store_path.display(), // redaction-ok: operator-configured SPINDLE_HOST_STORE path (operator-config exemption, lib.rs), never member data
+                user_version,
+                missing = ?missing, // static Spindle table names, never member data
+                "the file at the configured host store path is not an existing Spindle store; \
+                 refusing to create or migrate it. Point --store at the host's real database"
+            );
+            ExitCode::FAILURE
+        }
+        Err(ReconcileOnceError::Store(_)) => {
+            // Deliberately not `%error`: StoreError's Display can carry filesystem paths.
+            tracing::error!(
+                "the one-shot upload-ledger reconciliation could not open the configured host \
+                 store or list its shares; nothing was reconciled"
+            );
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// The running half of `main`: custody, identity, connect, daemon. Every failure logs its own
 /// content-free cause and returns [`ExitCode::FAILURE`]; there is no error type crossing this
 /// boundary because there is no caller to report to.
 async fn run(config: Config) -> ExitCode {
-    let seed_store = SeedFileStore::new(config.seed_file.as_path());
+    // The scheduled disk -> ledger sweep (td-042e4f). It is deliberately not per client connect:
+    // it runs on its own timer and opens its own store connection on every tick. The sender is
+    // held for this function's whole lifetime; dropping it — on any return, including the
+    // shutdown-signal arms below — wakes the sweep task's `changed()` and stops it. A failed tick
+    // logs and retries on the next interval; it never takes the host down.
+    // One registry is shared by every session's upload commit and the scheduled sweep; that shared
+    // lock is what stops the sweep from deleting a ledger row a concurrent commit just inserted.
+    let upload_locks = UploadLedgerLocks::new();
+    let _reconcile_stop = match config.reconcile_interval_secs {
+        Some(interval_secs) => {
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            tracing::info!(
+                interval_secs,
+                "scheduled upload-ledger disk sweep enabled (disk -> ledger only; the counter \
+                 reconcile stays operator-only). It shares the per-share upload lock with live \
+                 commits, uses its own store connection, and takes short Immediate transactions, \
+                 so it can briefly block session writes"
+            );
+            tokio::spawn(run_scheduled_disk_sweep(
+                config.store.clone(),
+                std::time::Duration::from_secs(interval_secs),
+                upload_locks.clone(),
+                stop_rx,
+            ));
+            Some(stop_tx)
+        }
+        None => None,
+    };
+
+    // Serving mode's requirements. The parser enforces both when `--reconcile-once` is absent, and
+    // `main` returns from the one-shot path without calling this function, so `None` here is an
+    // internal invariant violation rather than an operator error.
+    let (Some(nats_url), Some(seed_file)) =
+        (config.nats_url.as_deref(), config.seed_file.as_deref())
+    else {
+        tracing::error!(
+            "internal configuration error: serving mode started without a NATS URL or seed file"
+        );
+        return ExitCode::FAILURE;
+    };
+
+    let seed_store = SeedFileStore::new(seed_file);
     let mut seed = match prepare_root_seed(&config, &seed_store) {
         Ok(seed) => seed,
         Err(()) => return ExitCode::FAILURE,
@@ -307,7 +433,7 @@ async fn run(config: Config) -> ExitCode {
             }
             result = connect_host(
                 &credentials,
-                &config.nats_url,
+                nats_url,
                 admission_token_bytes.as_deref(),
                 wall_clock_now_secs(),
             ) => result,
@@ -405,7 +531,8 @@ async fn run(config: Config) -> ExitCode {
         );
         let daemon =
             HostDaemon::new_shared(client, Arc::clone(&device), host_fp, config.store.clone())
-                .with_cap_issuer(Box::new(issuer));
+                .with_cap_issuer(Box::new(issuer))
+                .with_upload_locks(upload_locks.clone());
 
         let outcome = {
             // The daemon future is one-shot, and a *failed* renewal must keep this same daemon —
@@ -1230,8 +1357,8 @@ mod tests {
     /// shell and need no environment lock.
     fn test_config(dir: &Path) -> Config {
         Config {
-            nats_url: "nats://example.test:4222".to_string(),
-            seed_file: dir.join("host.seed"),
+            nats_url: Some("nats://example.test:4222".to_string()),
+            seed_file: Some(dir.join("host.seed")),
             store: dir.join("host.db"),
             bind_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             admission_token_file: None,
@@ -1241,11 +1368,21 @@ mod tests {
             restore_seed_file: None,
             metrics_addr: None,
             op_cert_ttl_secs: HOST_OP_CERT_TTL_SECS,
+            reconcile_once: false,
+            reconcile_interval_secs: None,
         }
     }
 
     fn set_mode(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// `test_config` always supplies the serving-mode seed path; these tests only exercise custody.
+    fn configured_seed_path(config: &Config) -> &Path {
+        config
+            .seed_file
+            .as_deref()
+            .expect("test config always has a seed file")
     }
 
     /// The HIGH regression: a non-TTY stdout with no phrase file must be refused *before* the
@@ -1255,11 +1392,11 @@ mod tests {
     ) {
         let dir = private_dir();
         let config = test_config(dir.path());
-        let store = SeedFileStore::new(config.seed_file.clone());
+        let store = SeedFileStore::new(configured_seed_path(&config));
 
         assert!(init_root_seed_with(&config, &store, false).is_err());
         assert!(
-            !config.seed_file.exists(),
+            !configured_seed_path(&config).exists(),
             "the refusal must happen before the seed is persisted"
         );
     }
@@ -1275,11 +1412,11 @@ mod tests {
 
         let mut config = test_config(seed_dir.path());
         config.recovery_phrase_file = Some(phrase_path.clone());
-        let store = SeedFileStore::new(config.seed_file.clone());
+        let store = SeedFileStore::new(configured_seed_path(&config));
 
         assert!(init_root_seed_with(&config, &store, false).is_err());
         assert!(
-            !config.seed_file.exists(),
+            !configured_seed_path(&config).exists(),
             "a phrase-path refusal must happen before the seed is persisted"
         );
         assert!(
@@ -1315,17 +1452,17 @@ mod tests {
         let mut config = test_config(dir.path());
         let phrase_path = dir.path().join("recovery.phrase");
         config.recovery_phrase_file = Some(phrase_path.clone());
-        fs::write(&config.seed_file, [0x11; ROOT_SEED_LEN]).expect("pre-existing seed");
-        set_mode(&config.seed_file, 0o600);
+        fs::write(configured_seed_path(&config), [0x11; ROOT_SEED_LEN]).expect("pre-existing seed");
+        set_mode(configured_seed_path(&config), 0o600);
 
-        let store = SeedFileStore::new(config.seed_file.clone());
+        let store = SeedFileStore::new(configured_seed_path(&config));
         assert!(init_root_seed_with(&config, &store, false).is_err());
         assert!(
             !phrase_path.exists(),
             "the empty phrase file must be removed when the seed store fails"
         );
         assert_eq!(
-            fs::read(&config.seed_file).expect("pre-existing seed survives"),
+            fs::read(configured_seed_path(&config)).expect("pre-existing seed survives"),
             [0x11; ROOT_SEED_LEN]
         );
     }

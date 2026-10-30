@@ -4,7 +4,9 @@
 //!
 //! `VfsRpcServer` is transport-agnostic and synchronous by design (task brief: "pure and testable
 //! without any I/O framework"): [`VfsRpcServer::handle`] takes a typed request and returns a typed
-//! reply; [`VfsRpcServer::handle_bytes`] is the thin bytes-in/bytes-out wrapper around it.
+//! reply. Byte framing and the per-share upload/reconcile lock live in
+//! [`crate::serve::serve_control_stream`], which is the only byte-level entry point (td-042e4f);
+//! there is deliberately no unlocked `handle_bytes` wrapper.
 //! Wiring a real transport (accepting connections, framing, backpressure, streaming a `read`
 //! reply's bytes over a QUIC/WebRTC data channel rather than returning them all at once) is
 //! `spindle-net`'s job, out of scope here (task brief SCOPE/OUT).
@@ -16,17 +18,17 @@ use crate::limits::{FreeSpaceProbe, UnlimitedFreeSpace, UploadLimits};
 use crate::mount::{MountLookup, MountNode, MountTable};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::upload::{manifest_signing_bytes, UploadSession, UploadSessions};
+use crate::upload_locks::UploadLedgerLocks;
 use cap_std::fs::OpenOptions;
 use spindle_core::{verify_bytes, Fingerprint};
 use spindle_proto::{
-    DirEntry, EntryKind, ProtoError, VfsErrorCode, VfsPerms, VfsReply, VfsRequest,
-    VfsRequestEnvelope, MAX_LIST_PAGE, MAX_READ_CHUNK, MAX_UPLOAD_CHUNK, MIN_PROTOCOL_VERSION,
-    UPLOAD_SESSION_TTL_SECS,
+    DirEntry, EntryKind, VfsErrorCode, VfsPerms, VfsReply, VfsRequest, VfsRequestEnvelope,
+    MAX_LIST_PAGE, MAX_READ_CHUNK, MAX_UPLOAD_CHUNK, MIN_PROTOCOL_VERSION, UPLOAD_SESSION_TTL_SECS,
 };
 use spindle_vfs::algebra::{AccessDecision, EffectiveGrants, GrantsVersion};
 use spindle_vfs::audit::AuditEntry;
 use spindle_vfs::confine::{self, identity as confine_identity, MkdirOutcome, UploadOutcome};
-use spindle_vfs::model::{Member, MemberStatus, Perms, Share, VirtualPath};
+use spindle_vfs::model::{Member, MemberId, MemberStatus, Perms, Share, ShareId, VirtualPath};
 use spindle_vfs::store::Store;
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
@@ -83,6 +85,11 @@ pub struct VfsRpcServer<S> {
     limits: UploadLimits,
     free_space_probe: Box<dyn FreeSpaceProbe + Send>,
     rate_limiter: RateLimiter,
+    /// The in-process per-share upload/reconcile lock (td-042e4f). `None` by default, which
+    /// preserves every existing constructor's behavior; production session wiring installs one via
+    /// [`Self::with_upload_locks`]. See [`UploadLedgerLocks`]'s module doc comment for the race it
+    /// closes.
+    upload_locks: Option<UploadLedgerLocks>,
 }
 
 impl<S: Borrow<Store>> VfsRpcServer<S> {
@@ -122,7 +129,17 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
             limits,
             free_space_probe,
             rate_limiter: RateLimiter::new(rate_limit_config),
+            upload_locks: None,
         }
+    }
+
+    /// Installs the in-process per-share upload/reconcile lock (td-042e4f). Chainable, matching
+    /// [`Self::with_limits`]'s configuration style. Without it, requests behave exactly as before;
+    /// with it, [`crate::serve::serve_control_stream`] serializes the two ledger-mutating request
+    /// kinds (`UploadCommit` and `Delete`) against the scheduled disk sweep.
+    pub fn with_upload_locks(mut self, locks: UploadLedgerLocks) -> Self {
+        self.upload_locks = Some(locks);
+        self
     }
 
     /// Removes every upload session whose TTL has passed as of `now` (DESIGN.md §A8: 48h),
@@ -172,26 +189,49 @@ impl<S: Borrow<Store>> VfsRpcServer<S> {
         }
     }
 
-    /// Bytes-in/bytes-out wrapper around [`Self::handle`]. `ts` is the audit timestamp for this
-    /// request — threaded in explicitly rather than read from a wall clock inside this crate, so
-    /// the whole pipeline (including its audit trail) stays deterministic and testable without
-    /// any I/O framework (task brief), exactly like every other input here.
+    /// A cheap clone of the installed upload/reconcile lock registry, for the async serve loop.
     ///
-    /// Returns `Err` only when `bytes` does not even decode as a [`VfsRequestEnvelope`] —
-    /// deliberately distinct from every [`VfsErrorCode`]: DESIGN.md §A8's error model defines
-    /// typed codes for well-formed-but-rejected requests, not for bytes that are not a request at
-    /// all (a transport bug or a corrupt/hostile peer *inside* an already-authenticated session).
-    /// No existing code honestly describes "this wasn't a request"; flagged in this slice's report
-    /// as a documented gap rather than silently mapped onto e.g. `NotFound`. The transport layer
-    /// (`spindle-net`, later) decides what to do with this `Err` — e.g. closing the session.
-    pub fn handle_bytes(
+    /// The loop must **not** hold `&self` across the lock's await: `VfsRpcServer` is deliberately
+    /// `!Sync` (its caches are `RefCell`s), so a borrow held across an await point would make the
+    /// session's `Send` future `!Send` — the same constraint `crate::serve`'s module doc comment
+    /// explains. Cloning the registry (an `Arc` bump) before awaiting is what keeps the borrow out
+    /// of the await.
+    pub(crate) fn upload_locks(&self) -> Option<UploadLedgerLocks> {
+        self.upload_locks.clone()
+    }
+
+    /// The share whose upload ledger a request may mutate, for the serve loop's pre-dispatch lock
+    /// (td-042e4f). Two request kinds qualify:
+    ///
+    /// - `UploadCommit` — from its in-flight [`crate::upload::UploadSessions`] entry, filtered by
+    ///   the same `member_id` ownership rule `handle_upload_commit` applies.
+    /// - `Delete` — by resolving its virtual path through the same [`MountTable`] `handle_delete`
+    ///   uses. Resolution only; no grant evaluation, no filesystem access, and no store write. A
+    ///   path outside every mounted share (or an unparseable one) returns `None`, and
+    ///   `handle_delete` will deny it; there is no ledger row to lock.
+    ///
+    /// Returns `None` for every other request. The caller must hold the returned share's lock
+    /// across the whole request, because both of these kinds unlink/create files and then mutate
+    /// `uploaded_files` in a separate transaction.
+    pub(crate) fn ledger_share_for(
         &self,
-        ctx: &SessionContext,
-        ts: u64,
-        bytes: &[u8],
-    ) -> Result<Vec<u8>, ProtoError> {
-        let env = VfsRequestEnvelope::from_canonical_bytes(bytes)?;
-        Ok(self.handle(ctx, ts, env).to_canonical_bytes())
+        request: &VfsRequest,
+        member_id: MemberId,
+    ) -> Option<ShareId> {
+        match request {
+            VfsRequest::UploadCommit { session_id } => {
+                self.upload_sessions.share_for(session_id, member_id)
+            }
+            VfsRequest::Delete { path } => {
+                let (shares, _entitlements) = self.grants_cache.get(self.store()).ok()?;
+                let vp = VirtualPath::parse(path).ok()?;
+                match MountTable::build(shares).resolve(&vp) {
+                    MountLookup::Share { share, .. } => Some(share.share_id),
+                    MountLookup::Intermediate(_) | MountLookup::NotFound => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The pipeline, in the order the task brief specifies (cheapest checks first):
@@ -2200,6 +2240,49 @@ mod tests {
 
     fn req(v: u8, request: VfsRequest) -> VfsRequestEnvelope {
         VfsRequestEnvelope { v, request }
+    }
+
+    /// td-042e4f: the pre-dispatch ledger-lock resolver covers `Delete` as well as `UploadCommit`,
+    /// resolving the delete path through the same mount table `handle_delete` uses. A path outside
+    /// every mounted share has no ledger row to protect and returns `None` (the handler denies it);
+    /// non-ledger requests take no share lock.
+    #[test]
+    fn ledger_share_for_resolves_delete_paths_inside_mounted_shares() {
+        let h = Harness::new();
+        let (member_id, _device_fp) = h.add_active_member("alex");
+        let share_id = h.add_share("Drop", "Drop", ShareFlags::default());
+        let server = h.server();
+
+        assert_eq!(
+            server.ledger_share_for(
+                &VfsRequest::Delete {
+                    path: "/Drop/a.txt".to_string(),
+                },
+                member_id,
+            ),
+            Some(share_id),
+            "a delete inside a mounted share must take that share's ledger lock"
+        );
+        assert_eq!(
+            server.ledger_share_for(
+                &VfsRequest::Delete {
+                    path: "/not-mounted/a.txt".to_string(),
+                },
+                member_id,
+            ),
+            None,
+            "a delete outside every mount has no ledger row to protect"
+        );
+        assert_eq!(
+            server.ledger_share_for(
+                &VfsRequest::Stat {
+                    path: "/Drop/a.txt".to_string(),
+                },
+                member_id,
+            ),
+            None,
+            "a read-only request takes no ledger lock"
+        );
     }
 
     /// Signs `(path, size, hash)` the same way a real client would build an upload manifest's

@@ -16,7 +16,8 @@ edition.workspace = true
 #
 # Stage 6 slice 5 adds `spindle-net` (the layering law explicitly allows host-core -> net) for
 # `serve.rs`'s binding loop: it reads/writes `spindle_net::framing` frames off a real QUIC control
-# stream and calls straight into this crate's own `VfsRpcServer::handle_bytes` — no new wire
+# stream and dispatches decoded requests through this crate's own `VfsRpcServer::handle` (under the
+# per-share upload/reconcile lock for ledger-mutating requests, td-042e4f) — no new wire
 # dependency beyond `spindle-net` itself, since the frame payloads are still this crate's own
 # canonical-CBOR bytes. `tokio` is new here too: `serve_control_stream` is `async fn`, generic over
 # any `tokio::io::{AsyncRead, AsyncWrite}` half (not tied to QUIC specifically — see that

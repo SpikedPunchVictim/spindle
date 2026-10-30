@@ -61,6 +61,7 @@ use crate::limits::{FreeSpaceProbe, OsFreeSpace, UploadLimits};
 use crate::ratelimit::RateLimitConfig;
 use crate::serve::serve_control_stream;
 use crate::server::{SessionContext, VfsRpcServer};
+use crate::upload_locks::UploadLedgerLocks;
 use spindle_core::Fingerprint;
 use spindle_net::quic::ControlStream;
 use spindle_net::signaling::host::SessionHandler;
@@ -157,6 +158,10 @@ pub struct VfsSessionHandler<F, L, N> {
     now_fn: N,
     limits: UploadLimits,
     probe_factory: Box<dyn Fn() -> Box<dyn FreeSpaceProbe + Send> + Send + Sync>,
+    /// The in-process per-share upload/reconcile lock (td-042e4f), installed on each session's
+    /// [`VfsRpcServer`] via [`Self::with_upload_locks`]. `None` preserves the previous behavior
+    /// for every existing caller.
+    upload_locks: Option<UploadLedgerLocks>,
 }
 
 impl<F, L, N> VfsSessionHandler<F, L, N>
@@ -209,7 +214,20 @@ where
             now_fn,
             limits,
             probe_factory,
+            upload_locks: None,
         }
+    }
+
+    /// Installs the process-wide per-share upload/reconcile lock (td-042e4f), so every session's
+    /// `UploadCommit` serializes against the scheduled disk sweep (and other commits to the same
+    /// share). Chainable, matching [`Self::with_limits`].
+    ///
+    /// The real host creates one [`UploadLedgerLocks`] and hands clones to both this handler (via
+    /// `HostDaemon::with_upload_locks`) and its scheduled sweep. The one-shot `--reconcile-once`
+    /// path is a separate process and cannot share it; see its `HELP` text.
+    pub fn with_upload_locks(mut self, locks: UploadLedgerLocks) -> Self {
+        self.upload_locks = Some(locks);
+        self
     }
 }
 
@@ -319,12 +337,15 @@ where
             }
         };
 
-        let server = VfsRpcServer::with_limits(
+        let mut server = VfsRpcServer::with_limits(
             store,
             self.limits,
             (self.probe_factory)(),
             RateLimitConfig::default(),
         );
+        if let Some(locks) = &self.upload_locks {
+            server = server.with_upload_locks(locks.clone());
+        }
 
         // The session is authorized and has its own server, so it counts as live from here until
         // this function returns. The RAII guard covers the serve loop's every exit (clean EOF and

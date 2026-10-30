@@ -5,7 +5,9 @@
 //! [`server::VfsRpcServer`] decodes/encodes). **As of Stage 6 slice 5**, this crate also depends on
 //! `spindle-net` — the layering law explicitly permits `host-core -> net` — for [`serve`]'s binding
 //! loop, which reads/writes `spindle_net::framing` frames off a real QUIC control stream
-//! (`spindle_net::quic`) and calls straight into [`server::VfsRpcServer::handle_bytes`]. Streaming
+//! (`spindle_net::quic`) and dispatches each decoded request through
+//! [`server::VfsRpcServer::handle`] (taking the share's upload/reconcile lock first for the two
+//! ledger-mutating request kinds — see [`upload_locks`]). Streaming
 //! a `read`/`upload_chunk` reply's bytes across multiple frames rather than one shot, and binding
 //! the browser-peer WebRTC data-channel transport, remain out of scope (Stage 5, unscheduled as of
 //! this slice — see [`serve`]'s module doc comment).
@@ -67,8 +69,9 @@
 //!   production caller yet — the delivery route is td-bdab3a.
 //! - [`serve`] (Stage 6 slice 5) — [`serve::serve_control_stream`], the binding loop: reads
 //!   [`spindle_net::framing`] frames off a real duplex stream (production: a
-//!   `spindle_net::quic::ControlStream`'s QUIC control stream), calls
-//!   [`server::VfsRpcServer::handle_bytes`], and writes the reply frame back. Framing/decode
+//!   `spindle_net::quic::ControlStream`'s QUIC control stream), dispatches the decoded request to
+//!   [`server::VfsRpcServer::handle`] under the relevant share's [`upload_locks::UploadLedgerLocks`]
+//!   lock when it mutates the upload ledger, and writes the reply frame back. Framing/decode
 //!   violations close the connection rather than producing a typed [`spindle_proto::VfsErrorCode`]
 //!   — see that module's doc comment for the §A5 uniform-drop rationale.
 //! - [`session`] (Stage 5 slice 4) — [`session::VfsSessionHandler`], the production
@@ -98,11 +101,13 @@
 //! transfer manager: resumable sessions, hidden staging names, 48h TTL GC, manifest-signature
 //! verification before move-into-place, entitlement-change-mid-transfer abort), per-member/
 //! per-share upload quotas, a free-space floor seam, and a per-caller rate limit — all
-//! transport-agnostic and pure/testable (bytes-in/bytes-out, or typed request/typed reply —
-//! [`server::VfsRpcServer`] offers both).
+//! transport-agnostic and pure/testable (typed request in, typed reply out; byte framing is
+//! [`serve::serve_control_stream`]'s job, so the only byte-level entry point is the locked serve
+//! loop).
 //!
-//! **In (Stage 6 slice 5 addition)**: [`serve::serve_control_stream`] — binding
-//! [`server::VfsRpcServer::handle_bytes`] to a real QUIC control stream (`spindle-net`).
+//! **In (Stage 6 slice 5 addition)**: [`serve::serve_control_stream`] — binding the VFS RPC
+//! pipeline to a real QUIC control stream (`spindle-net`), including the td-042e4f per-share
+//! upload/reconcile lock around the ledger-mutating request kinds.
 //!
 //! **Out**: streaming a `read`/`upload_chunk` reply's bytes across multiple frames instead of one
 //! shot; the browser-peer WebRTC data-channel transport (needs signaling — Stage 5, unscheduled).
@@ -158,6 +163,7 @@ mod ratelimit;
 pub mod revoke;
 pub mod self_revocation;
 mod upload;
+pub mod upload_locks;
 
 pub use authorize::{
     CapIssuer, DeviceLookup, HostConnectAuthorizer, LookupError, RedactedLookupError,
@@ -174,6 +180,7 @@ pub use session::{
     SqliteStoreFactory, StoreFactory, VfsSessionHandler, CLOSE_PROTOCOL_VIOLATION,
     CLOSE_SESSION_REFUSED, CLOSE_SESSION_UNAVAILABLE,
 };
+pub use upload_locks::UploadLedgerLocks;
 
 #[cfg(test)]
 mod tests {

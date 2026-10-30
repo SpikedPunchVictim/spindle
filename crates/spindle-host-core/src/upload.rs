@@ -150,6 +150,18 @@ impl UploadSessions {
     /// A clone of the session, if `id` names one owned by `member_id`. Ownership is checked here,
     /// centrally, rather than left to each caller — see the module doc comment on why session ids
     /// are not this design's security boundary.
+    /// The share an in-flight session belongs to, filtered by the same `member_id` ownership rule
+    /// as [`Self::get_owned`]. Used by the serve loop to take the share's upload/reconcile lock
+    /// before dispatching an `UploadCommit` (td-042e4f); an id that is unknown, expired, or owned
+    /// by another member returns `None`, and `handle_upload_commit` then denies it.
+    pub(crate) fn share_for(&self, id: &[u8], member_id: MemberId) -> Option<ShareId> {
+        self.sessions
+            .borrow()
+            .get(id)
+            .filter(|session| session.member_id == member_id)
+            .map(|session| session.share_id)
+    }
+
     pub(crate) fn get_owned(&self, id: &[u8], member_id: MemberId) -> Option<UploadSession> {
         self.sessions
             .borrow()

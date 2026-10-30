@@ -30,16 +30,19 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
+use spindle_hostd::reconcile_surface::MIN_SWEEP_INTERVAL_SECS;
 use spindle_hostd::HOST_OP_CERT_TTL_SECS;
 
 /// Runtime configuration for one host process.
 #[derive(Debug)]
 pub(crate) struct Config {
-    /// `SPINDLE_NATS_URL` / `--nats-url`. Required.
-    pub(crate) nats_url: String,
-    /// `SPINDLE_HOST_SEED_FILE` / `--seed-file`. Required; `SeedFileStore` enforces the `0600`
+    /// `SPINDLE_NATS_URL` / `--nats-url`. Required in serving mode; `None` only with
+    /// `--reconcile-once`, which never connects (and so needs no broker).
+    pub(crate) nats_url: Option<String>,
+    /// `SPINDLE_HOST_SEED_FILE` / `--seed-file`. Required in serving mode; `None` only with
+    /// `--reconcile-once`, which never mints an identity. `SeedFileStore` enforces the `0600`
     /// file / `0700` directory rule of DESIGN.md A10.41.
-    pub(crate) seed_file: PathBuf,
+    pub(crate) seed_file: Option<PathBuf>,
     /// `SPINDLE_HOST_STORE` / `--store`. Required; the SQLite database `HostDaemon::run` opens.
     pub(crate) store: PathBuf,
     /// `SPINDLE_HOST_BIND_IP` / `--bind-ip`. Defaults to `0.0.0.0`, matching `HostOptions::default`.
@@ -74,6 +77,16 @@ pub(crate) struct Config {
     /// design's bound. The minimum is [`MIN_OP_CERT_TTL_SECS`] (3 s), so the two-thirds renewal
     /// point still leaves at least one second before expiry instead of landing on `ts`.
     pub(crate) op_cert_ttl_secs: u64,
+    /// `SPINDLE_HOST_RECONCILE_ONCE` (`1`/`true`/`0`/`false`) / `--reconcile-once`. Run one
+    /// operator repair pass against `store` — every share's upload ledger against disk, then both
+    /// counter tables from the ledger — and exit. This path needs no NATS connection, seed, or
+    /// host identity; it is an operator tool, not a serving mode.
+    pub(crate) reconcile_once: bool,
+    /// `SPINDLE_HOST_RECONCILE_INTERVAL_SECS` / `--reconcile-interval-secs`. `Some` schedules the
+    /// disk -> ledger sweep while the host serves; `None` leaves startup and serving unchanged.
+    /// The ledger -> counters reconcile is deliberately **not** schedulable — see `HELP` and
+    /// `reconcile_surface`'s module doc comment.
+    pub(crate) reconcile_interval_secs: Option<u64>,
 }
 
 /// Everything [`Config::from_env_and_args`] can reject.
@@ -95,8 +108,13 @@ pub(crate) enum ConfigError {
     )]
     BadOpCertTtl { given: String, min: u64, max: u64 },
     #[error(
-        "--init, --restore-seed-file, and SPINDLE_HOST_RESTORE_SEED cannot be combined; choose \
-         one enrollment path"
+        "invalid value {given:?} for --reconcile-interval-secs / \
+         SPINDLE_HOST_RECONCILE_INTERVAL_SECS (expected a whole number of seconds >= {min})"
+    )]
+    BadReconcileInterval { given: String, min: u64 },
+    #[error(
+        "--init, --restore-seed-file, and SPINDLE_HOST_RESTORE_SEED cannot be combined with each \
+         other or with --reconcile-once; choose one action"
     )]
     ConflictingEnrollment,
     /// Only the part of the argument before the first `=` is ever kept — see
@@ -148,11 +166,44 @@ the env var if both are set:
                                                              default 7776000 = 90 days. Shortening
                                                              it shortens the renewal point, the
                                                              retry window, and the expiry together)
+    --reconcile-once            SPINDLE_HOST_RECONCILE_ONCE  (1|true|0|false; run one operator
+                                                             repair pass and exit — every share's
+                                                             upload ledger is reconciled against
+                                                             disk, then both quota counter tables
+                                                             are recomputed from that ledger. Needs
+                                                             no NATS connection, seed, or host
+                                                             identity, but RUN IT WITH THE HOST
+                                                             STOPPED: it is a separate process and
+                                                             cannot share the in-process per-share
+                                                             upload lock, so a live commit can be
+                                                             mis-reconciled. The store must already
+                                                             exist and be a Spindle store; it is
+                                                             never created or migrated from foreign
+                                                             contents. This flag exits, so
+                                                             --reconcile-interval-secs and
+                                                             --metrics-addr are ignored with it)
+    --reconcile-interval-secs <n> SPINDLE_HOST_RECONCILE_INTERVAL_SECS
+                                                             (optional; while serving, sweep every
+                                                             share's upload ledger against disk
+                                                             every <n> seconds, n >= 60. Only the
+                                                             disk sweep is scheduled; the counter
+                                                             reconcile is operator-only, see below.
+                                                             Each sweep shares the per-share upload
+                                                             lock with live commits, opens its own
+                                                             store connection, and takes short
+                                                             Immediate transactions, so it can
+                                                             briefly block session writes)
     -h, --help                  show this message
 
 A first run (no seed file) requires exactly one of --init, --restore-seed-file <path>, or
 SPINDLE_HOST_RESTORE_SEED. There is deliberately no inline --restore-seed <phrase> flag: a phrase
 in argv is visible to every process listing and is written to shell history.
+
+Only the disk -> ledger sweep is schedulable. DB-vs-filesystem skew has genuine ongoing sources (a
+crash between a filesystem operation and its ledger write, or an owner editing an uploaded file
+out of band), while ledger-vs-counter drift cannot occur in normal operation — both move in one
+Immediate transaction. The counter reconcile is therefore a repair tool for a bug: run it
+explicitly with --reconcile-once, never on a schedule.
 "#;
 
 impl Config {
@@ -170,6 +221,8 @@ impl Config {
         let mut restore_seed_file = None;
         let mut metrics_addr = env::var("SPINDLE_METRICS_ADDR").ok();
         let mut op_cert_ttl_secs = env::var("SPINDLE_HOST_OP_CERT_TTL_SECS").ok();
+        let mut reconcile_once = env::var("SPINDLE_HOST_RECONCILE_ONCE").ok();
+        let mut reconcile_interval_secs = env::var("SPINDLE_HOST_RECONCILE_INTERVAL_SECS").ok();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -228,6 +281,12 @@ impl Config {
                         ConfigError::FlagMissingValue("op-cert-ttl-secs".to_string())
                     })?)
                 }
+                "--reconcile-once" => reconcile_once = Some("true".to_string()),
+                "--reconcile-interval-secs" => {
+                    reconcile_interval_secs = Some(args.next().ok_or_else(|| {
+                        ConfigError::FlagMissingValue("reconcile-interval-secs".to_string())
+                    })?)
+                }
                 other => return Err(ConfigError::unknown_arg(other)),
             }
         }
@@ -246,6 +305,14 @@ impl Config {
             Some(given) => parse_op_cert_ttl(&given)?,
             None => HOST_OP_CERT_TTL_SECS,
         };
+        let reconcile_once = match reconcile_once {
+            Some(given) => parse_bool(&given)?,
+            None => false,
+        };
+        let reconcile_interval_secs = match reconcile_interval_secs {
+            Some(given) => Some(parse_reconcile_interval(&given)?),
+            None => None,
+        };
         if init && (restore_seed.is_some() || restore_seed_file.is_some()) {
             return Err(ConfigError::ConflictingEnrollment);
         }
@@ -254,12 +321,34 @@ impl Config {
         if restore_seed.is_some() && restore_seed_file.is_some() {
             return Err(ConfigError::ConflictingEnrollment);
         }
+        // `--reconcile-once` is a repair action that exits before identity custody is touched. An
+        // enrollment action alongside it would be silently dropped (the one-shot path never calls
+        // `prepare_root_seed`), so refuse rather than let an operator believe they enrolled.
+        if reconcile_once && (init || restore_seed.is_some() || restore_seed_file.is_some()) {
+            return Err(ConfigError::ConflictingEnrollment);
+        }
+
+        // The one-shot repair is an operator tool, not a serving mode: it opens the store, heals
+        // it, and exits. It never connects to NATS and never touches identity custody, so a broker
+        // URL and a seed file are not requirements for it. Serving mode requires both, exactly as
+        // before.
+        let nats_url = if reconcile_once {
+            nats_url
+        } else {
+            Some(nats_url.ok_or(ConfigError::Missing("SPINDLE_NATS_URL", "nats-url"))?)
+        };
+        let seed_file = if reconcile_once {
+            seed_file.map(PathBuf::from)
+        } else {
+            Some(PathBuf::from(seed_file.ok_or(ConfigError::Missing(
+                "SPINDLE_HOST_SEED_FILE",
+                "seed-file",
+            ))?))
+        };
 
         Ok(Config {
-            nats_url: nats_url.ok_or(ConfigError::Missing("SPINDLE_NATS_URL", "nats-url"))?,
-            seed_file: PathBuf::from(
-                seed_file.ok_or(ConfigError::Missing("SPINDLE_HOST_SEED_FILE", "seed-file"))?,
-            ),
+            nats_url,
+            seed_file,
             store: PathBuf::from(store.ok_or(ConfigError::Missing("SPINDLE_HOST_STORE", "store"))?),
             bind_ip,
             admission_token_file: admission_token_file.map(PathBuf::from),
@@ -269,6 +358,8 @@ impl Config {
             restore_seed_file: restore_seed_file.map(PathBuf::from),
             metrics_addr,
             op_cert_ttl_secs,
+            reconcile_once,
+            reconcile_interval_secs,
         })
     }
 }
@@ -306,6 +397,27 @@ fn parse_op_cert_ttl(given: &str) -> Result<u64, ConfigError> {
     Ok(seconds)
 }
 
+/// Parses the scheduled-sweep interval: a whole number of seconds, at least
+/// [`MIN_SWEEP_INTERVAL_SECS`] (the library's floor, used here so the config knob and the
+/// scheduler's own clamp cannot drift apart). Zero and non-numeric values are configuration
+/// errors rather than "run continuously" or "disabled"; `SPINDLE_HOST_RECONCILE_INTERVAL_SECS`
+/// being unset is the one spelling of disabled.
+fn parse_reconcile_interval(given: &str) -> Result<u64, ConfigError> {
+    let seconds = given
+        .parse::<u64>()
+        .map_err(|_| ConfigError::BadReconcileInterval {
+            given: given.to_string(),
+            min: MIN_SWEEP_INTERVAL_SECS,
+        })?;
+    if seconds < MIN_SWEEP_INTERVAL_SECS {
+        return Err(ConfigError::BadReconcileInterval {
+            given: given.to_string(),
+            min: MIN_SWEEP_INTERVAL_SECS,
+        });
+    }
+    Ok(seconds)
+}
+
 /// Parses the `1`/`true`/`0`/`false` forms `SPINDLE_HOST_INIT` accepts. Case-sensitive, matching
 /// this workspace's other enum-valued env vars (`ADMISSION_MODE`'s `open|invite|closed`), so a
 /// typo is a startup error rather than a silently false flag.
@@ -330,7 +442,7 @@ mod tests {
     /// and must not inherit whatever the developer's shell exported.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const ENV_NAMES: [&str; 10] = [
+    const ENV_NAMES: [&str; 12] = [
         "SPINDLE_NATS_URL",
         "SPINDLE_HOST_SEED_FILE",
         "SPINDLE_HOST_STORE",
@@ -341,6 +453,8 @@ mod tests {
         "SPINDLE_HOST_RESTORE_SEED",
         "SPINDLE_METRICS_ADDR",
         "SPINDLE_HOST_OP_CERT_TTL_SECS",
+        "SPINDLE_HOST_RECONCILE_ONCE",
+        "SPINDLE_HOST_RECONCILE_INTERVAL_SECS",
     ];
 
     /// Clears every variable this module reads, applies `vars`, and restores the previous
@@ -404,6 +518,11 @@ mod tests {
             config.op_cert_ttl_secs, HOST_OP_CERT_TTL_SECS,
             "an unset knob must keep A7b's 90-day lifetime"
         );
+        assert!(!config.reconcile_once, "the one-shot repair is opt-in");
+        assert_eq!(
+            config.reconcile_interval_secs, None,
+            "an unset interval must leave startup and serving unchanged"
+        );
     }
 
     #[test]
@@ -419,12 +538,19 @@ mod tests {
             ("SPINDLE_HOST_INIT", "true"),
             ("SPINDLE_METRICS_ADDR", "127.0.0.1:9100"),
             ("SPINDLE_HOST_OP_CERT_TTL_SECS", "9"),
+            // `SPINDLE_HOST_RECONCILE_ONCE=true` is deliberately not set here: it conflicts with
+            // `SPINDLE_HOST_INIT=true` (an enrollment action), and the dedicated reconcile-settings
+            // test below covers its environment spelling with no enrollment action present.
+            ("SPINDLE_HOST_RECONCILE_INTERVAL_SECS", "120"),
         ]);
         let _env = CleanEnv::new(&vars);
         let config = parse(&[]).expect("full env configuration parses");
 
-        assert_eq!(config.nats_url, "nats://example.test:4222");
-        assert_eq!(config.seed_file, PathBuf::from("/tmp/spindle/host.seed"));
+        assert_eq!(config.nats_url.as_deref(), Some("nats://example.test:4222"));
+        assert_eq!(
+            config.seed_file,
+            Some(PathBuf::from("/tmp/spindle/host.seed"))
+        );
         assert_eq!(config.store, PathBuf::from("/tmp/spindle/host.db"));
         assert_eq!(config.bind_ip, IpAddr::from([127, 0, 0, 1]));
         assert_eq!(
@@ -438,6 +564,8 @@ mod tests {
         assert!(config.init);
         assert_eq!(config.metrics_addr.as_deref(), Some("127.0.0.1:9100"));
         assert_eq!(config.op_cert_ttl_secs, 9);
+        assert!(!config.reconcile_once);
+        assert_eq!(config.reconcile_interval_secs, Some(120));
     }
 
     #[test]
@@ -464,8 +592,8 @@ mod tests {
         ])
         .expect("flags parse");
 
-        assert_eq!(config.nats_url, "nats://flag.test:4222");
-        assert_eq!(config.seed_file, PathBuf::from("/tmp/flag/host.seed"));
+        assert_eq!(config.nats_url.as_deref(), Some("nats://flag.test:4222"));
+        assert_eq!(config.seed_file, Some(PathBuf::from("/tmp/flag/host.seed")));
         assert_eq!(config.store, PathBuf::from("/tmp/flag/host.db"));
         assert_eq!(config.bind_ip, IpAddr::from([192, 0, 2, 7]));
         assert_eq!(
@@ -479,6 +607,109 @@ mod tests {
         assert!(config.init);
         assert_eq!(config.metrics_addr.as_deref(), Some("127.0.0.1:9200"));
         assert_eq!(config.op_cert_ttl_secs, 30);
+        assert!(!config.reconcile_once);
+        assert_eq!(config.reconcile_interval_secs, None);
+    }
+
+    /// Both reconcile knobs are readable from the environment alone, and a flag overrides the
+    /// environment when both are present (the same rule every other setting follows).
+    #[test]
+    fn reconcile_settings_come_from_the_environment_and_flags_override_it() {
+        {
+            let mut vars = REQUIRED_ENV.to_vec();
+            vars.extend([
+                ("SPINDLE_HOST_RECONCILE_ONCE", "true"),
+                ("SPINDLE_HOST_RECONCILE_INTERVAL_SECS", "120"),
+            ]);
+            let _env = CleanEnv::new(&vars);
+            let config = parse(&[]).expect("env-only reconcile settings parse");
+            assert!(config.reconcile_once);
+            assert_eq!(config.reconcile_interval_secs, Some(120));
+        }
+
+        {
+            let mut vars = REQUIRED_ENV.to_vec();
+            vars.extend([
+                ("SPINDLE_HOST_RECONCILE_ONCE", "false"),
+                ("SPINDLE_HOST_RECONCILE_INTERVAL_SECS", "120"),
+            ]);
+            let _env = CleanEnv::new(&vars);
+            let config = parse(&["--reconcile-once", "--reconcile-interval-secs", "300"])
+                .expect("flags override the environment");
+            assert!(
+                config.reconcile_once,
+                "the bare flag must override an env value of false"
+            );
+            assert_eq!(
+                config.reconcile_interval_secs,
+                Some(300),
+                "the flag value must override the environment value"
+            );
+        }
+    }
+
+    /// Zero is not a spelling of "disabled" (unset is), and neither is a sub-minute cadence or a
+    /// non-numeric value. Both sources go through the same parser.
+    #[test]
+    fn invalid_reconcile_intervals_are_rejected() {
+        for invalid in ["0", "59", "not-a-number", "-1"] {
+            let _env = CleanEnv::new(&REQUIRED_ENV);
+            match parse(&["--reconcile-interval-secs", invalid]) {
+                Err(ConfigError::BadReconcileInterval { given, min }) => {
+                    assert_eq!(given, invalid);
+                    assert_eq!(min, MIN_SWEEP_INTERVAL_SECS);
+                }
+                other => panic!("expected BadReconcileInterval for {invalid:?}, got {other:?}"),
+            }
+        }
+
+        let mut vars = REQUIRED_ENV.to_vec();
+        vars.push(("SPINDLE_HOST_RECONCILE_INTERVAL_SECS", "0"));
+        let _env = CleanEnv::new(&vars);
+        match parse(&[]) {
+            Err(ConfigError::BadReconcileInterval { given, .. }) => assert_eq!(given, "0"),
+            other => panic!("expected BadReconcileInterval, got {other:?}"),
+        }
+    }
+
+    /// The one-shot repair is an operator tool, not a serving mode: it never connects to NATS and
+    /// never touches identity custody, so only the store it repairs is required.
+    #[test]
+    fn the_one_shot_reconcile_needs_only_the_store() {
+        let _env = CleanEnv::new(&[]);
+        let config = parse(&["--reconcile-once", "--store", "/tmp/spindle/host.db"])
+            .expect("the one-shot repair must not require a NATS URL or a seed file");
+        assert!(config.reconcile_once);
+        assert_eq!(config.nats_url, None);
+        assert_eq!(config.seed_file, None);
+        assert_eq!(config.store, PathBuf::from("/tmp/spindle/host.db"));
+    }
+
+    /// A one-shot repair exits before identity custody runs, so an enrollment action alongside it
+    /// would be silently dropped. Refuse the combination rather than let the operator believe they
+    /// enrolled (or restored) an identity.
+    #[test]
+    fn reconcile_once_cannot_be_combined_with_an_enrollment_action() {
+        {
+            let _env = CleanEnv::new(&REQUIRED_ENV);
+            for args in [
+                vec!["--reconcile-once", "--init"],
+                vec!["--reconcile-once", "--restore-seed-file", "/tmp/phrase.txt"],
+            ] {
+                match parse(&args) {
+                    Err(ConfigError::ConflictingEnrollment) => {}
+                    other => panic!("expected ConflictingEnrollment for {args:?}, got {other:?}"),
+                }
+            }
+        }
+
+        let mut vars = REQUIRED_ENV.to_vec();
+        vars.push(("SPINDLE_HOST_RESTORE_SEED", "words in a phrase"));
+        let _env = CleanEnv::new(&vars);
+        match parse(&["--reconcile-once"]) {
+            Err(ConfigError::ConflictingEnrollment) => {}
+            other => panic!("expected ConflictingEnrollment, got {other:?}"),
+        }
     }
 
     /// The knob exists to exercise renewal live and to let an operator tighten rotation, so its

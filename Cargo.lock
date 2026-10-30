@@ -3618,10 +3618,14 @@ dependencies = [
 name = "spindle-client-core"
 version = "0.1.0"
 dependencies = [
+ "async-nats",
+ "nkeys",
+ "rand 0.8.7",
  "serde",
  "serde_json",
  "spindle-core",
  "spindle-proto",
+ "spindle-test-fixtures",
  "thiserror 1.0.69",
  "tokio",
 ]

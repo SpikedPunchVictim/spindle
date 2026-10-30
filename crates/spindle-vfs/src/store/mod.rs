@@ -63,7 +63,9 @@ use crate::model::{
     Device, DevicePublicKeys, Entitlement, Group, GroupId, GroupKind, Member, MemberId,
     MemberStatus, ModelError, Perms, Share, ShareFlags, ShareId, VirtualPath,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use spindle_core::{Fingerprint, FingerprintError};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -296,6 +298,22 @@ pub enum StoreError {
     )]
     SchemaTooNew { found: i64, supported: i64 },
 
+    /// The file at the repair path is not an existing Spindle store. [`Store::open_for_reconcile`]
+    /// requires `PRAGMA user_version >= 1` **and** the V1-created `meta` and `shares` tables; this
+    /// variant names the version it found and every required table that was missing. Refused rather
+    /// than migrated: a repair tool that silently turned a mistyped path into a new empty store
+    /// (or, worse, half-migrated a foreign database that merely happened to carry a non-zero
+    /// `user_version`) would report success for the worst possible mistake.
+    #[error(
+        "database at the configured path is not an existing Spindle store \
+         (PRAGMA user_version = {user_version}; missing required tables: {missing:?}); refusing to \
+         migrate it"
+    )]
+    NotASpindleStore {
+        user_version: i64,
+        missing: Vec<&'static str>,
+    },
+
     /// td-c9b9bd: this connection was poisoned after a failed `ROLLBACK`/`COMMIT` left it unable
     /// to prove it is back in autocommit mode (see [`Store::poisoned`]'s doc comment for the full
     /// mechanism and the recovery contract). Every write on this handle is refused from this point
@@ -384,6 +402,7 @@ impl fmt::Display for RedactedStoreError<'_> {
             | StoreError::TooManyShares { .. }
             | StoreError::TooManyExcludeGlobs { .. }
             | StoreError::SchemaTooNew { .. }
+            | StoreError::NotASpindleStore { .. }
             | StoreError::ConnectionPoisoned) => write!(f, "{safe}"),
 
             // Leaky arms. `ModelError` can carry an invalid virtual-path component;
@@ -490,6 +509,79 @@ impl Store {
         };
         store.check_persisted_share_overlaps()?;
         Ok(store)
+    }
+
+    /// Opens an **existing** Spindle store for a repair sweep, without creating or migrating a
+    /// database that is not already one, and without the persisted-share overlap re-check.
+    ///
+    /// This is the constructor the upload-ledger repair surfaces use (td-042e4f): the one-shot
+    /// `--reconcile-once` action and the scheduled disk sweep. [`Store::open`] is the constructor
+    /// for everything that **serves** requests, and this method is deliberately not a substitute
+    /// for it.
+    ///
+    /// # Why the existence/identity check comes first
+    ///
+    /// [`Store::open`] intentionally creates and migrates a fresh database at an absent path — the
+    /// right behavior for a host's first start. A repair tool needs the opposite: an absent path, a
+    /// zero-byte file, or a foreign SQLite database that happens to sit at a mistyped or unmounted
+    /// store path must be refused **without mutation**, not quietly turned into an empty Spindle
+    /// store whose "0 shares swept" report reads as success.
+    ///
+    /// `PRAGMA user_version` alone is **not** evidence of a Spindle store: any SQLite user can set
+    /// it, and migrations commit one version at a time, so a foreign database at, say,
+    /// `user_version = 1` would otherwise be half-migrated (V2's `audit_log`/`signed_heads` added,
+    /// `user_version` bumped) before a later migration failed. The check therefore also requires
+    /// the `meta` and `shares` tables, both created by `SCHEMA_V1`. Only after that evidence is
+    /// found is the database migrated. A database whose version is newer than this build still
+    /// fails with [`StoreError::SchemaTooNew`] from the migration itself.
+    ///
+    /// The evidence check and the migration run on **one** connection, opened `READ_WRITE`
+    /// **without** `CREATE`: a read-only probe that is then dropped and reopened by path leaves a
+    /// window in which the file can vanish, and `Connection::open` would create a fresh empty store
+    /// at the very path this method exists to protect. Without `CREATE`, a vanished file is an
+    /// open error.
+    ///
+    /// # Why the overlap re-check is skipped
+    ///
+    /// [`Store::open`] re-runs `overlap_check` over every persisted share because the filesystem
+    /// can change between starts, and overlapping roots would make the **serving** grant algebra
+    /// resolve ambiguously (DESIGN.md §A4b "re-checked at host start"). A repair sweep evaluates
+    /// no grants; it only reads the ledger and the filesystem. Worse, `overlap_check` canonicalizes
+    /// every root, so a share root deleted or replaced out of band — exactly the skew this sweep
+    /// exists to heal — would make the store fail to open before any share could be swept, and one
+    /// broken share would block every other share's repair. Skipping the check here keeps the
+    /// repair path usable exactly when it is needed; it does not weaken [`Store::open`], which
+    /// every serving path still uses.
+    pub fn open_for_reconcile(path: &Path) -> Result<Self, StoreError> {
+        // READ_WRITE **without** CREATE, and one connection for the whole method: see the doc
+        // comment's TOCTOU paragraph.
+        let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+        let mut missing = Vec::new();
+        for table in ["meta", "shares"] {
+            let present: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |row| row.get(0),
+            )?;
+            if present == 0 {
+                missing.push(table);
+            }
+        }
+        if user_version < 1 || !missing.is_empty() {
+            return Err(StoreError::NotASpindleStore {
+                user_version,
+                missing,
+            });
+        }
+
+        schema::migrate(&mut conn)?;
+        Ok(Store {
+            conn,
+            limits: StoreLimits::default(),
+            poisoned: AtomicBool::new(false),
+        })
     }
 
     /// Opens a fresh in-memory store (tests, and any short-lived/ephemeral use). Nothing to
@@ -2701,6 +2793,40 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Overwrites the two upload counter tables directly, bypassing every real write path that
+    /// keeps them consistent with `uploaded_files` (all of them move both counters and the ledger
+    /// in one transaction). Its purpose is the opposite of a repair helper: a downstream test needs
+    /// to **seed** drift that the real API structurally cannot produce, to prove a surface does or
+    /// does not reconcile it. `spindle-hostd`'s scheduled-sweep test uses this to prove that one
+    /// tick repairs ledger-vs-disk skew but deliberately does **not** call
+    /// [`Store::reconcile_upload_counters`].
+    ///
+    /// Writes exactly the given values; performs no arithmetic and no validation beyond refusing a
+    /// row that would violate a foreign key (`member_id`/`share_id` must name existing rows). The
+    /// `u64` values are cast to SQLite's `i64` domain, so passing more than `i64::MAX` wraps — a
+    /// test should not do that.
+    #[doc(hidden)]
+    pub fn set_upload_counters_for_test(
+        &self,
+        member_id: MemberId,
+        member_bytes: u64,
+        share_id: ShareId,
+        share_bytes: u64,
+    ) -> Result<(), StoreError> {
+        self.check_not_poisoned()?;
+        self.conn.execute(
+            "INSERT INTO member_upload_bytes (member_id, bytes) VALUES (?1, ?2) \
+             ON CONFLICT(member_id) DO UPDATE SET bytes = excluded.bytes",
+            params![member_id.0 as i64, member_bytes as i64],
+        )?;
+        self.conn.execute(
+            "INSERT INTO share_upload_bytes (share_id, bytes) VALUES (?1, ?2) \
+             ON CONFLICT(share_id) DO UPDATE SET bytes = excluded.bytes",
+            params![share_id.0 as i64, share_bytes as i64],
+        )?;
+        Ok(())
+    }
 }
 
 /// Shared recovery/poison decision, extracted from `Audit::append` (td-c9b9bd) so both this
@@ -3826,6 +3952,188 @@ mod tests {
             }
             other => panic!("expected PersistedSharesOverlap, got {other:?}"),
         }
+    }
+
+    /// td-042e4f: the repair constructor must not turn a non-store into one. A zero-byte file is
+    /// what a mistyped `--store` or an unmounted volume's placeholder often looks like; `Store::open`
+    /// would silently migrate it into a fresh schema, so `open_for_reconcile` refuses first and
+    /// leaves the file byte-for-byte untouched.
+    #[test]
+    fn open_for_reconcile_refuses_a_zero_byte_file_without_mutating_it() {
+        let sandbox = tempdir().expect("tempdir");
+        let path = sandbox.path().join("typo.sqlite3");
+        std::fs::write(&path, b"").expect("create zero-byte file");
+
+        match Store::open_for_reconcile(&path) {
+            Err(StoreError::NotASpindleStore {
+                user_version,
+                missing,
+            }) => {
+                assert_eq!(user_version, 0);
+                assert_eq!(missing, vec!["meta", "shares"]);
+            }
+            other => panic!("expected NotASpindleStore, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("file still readable"),
+            Vec::<u8>::new(),
+            "the refused file must not be migrated or otherwise mutated"
+        );
+    }
+
+    /// A valid SQLite database that is not a Spindle store (`user_version = 0`) is refused and left
+    /// untouched: no Spindle tables may appear and its own data must survive.
+    #[test]
+    fn open_for_reconcile_refuses_a_foreign_database_without_mutating_it() {
+        let sandbox = tempdir().expect("tempdir");
+        let path = sandbox.path().join("foreign.sqlite3");
+        {
+            let raw = Connection::open(&path).expect("raw open");
+            raw.execute_batch(
+                "CREATE TABLE foreign_data (value INTEGER NOT NULL);\
+                 INSERT INTO foreign_data (value) VALUES (42);\
+                 PRAGMA user_version = 0;",
+            )
+            .expect("seed foreign database");
+        }
+
+        match Store::open_for_reconcile(&path) {
+            Err(StoreError::NotASpindleStore {
+                user_version,
+                missing,
+            }) => {
+                assert_eq!(user_version, 0);
+                assert_eq!(missing, vec!["meta", "shares"]);
+            }
+            other => panic!("expected NotASpindleStore, got {other:?}"),
+        }
+
+        let raw = Connection::open(&path).expect("raw reopen");
+        let version: i64 = raw
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, 0, "the foreign database must not be migrated");
+        let value: i64 = raw
+            .query_row("SELECT value FROM foreign_data", [], |row| row.get(0))
+            .expect("foreign table must survive unmodified");
+        assert_eq!(value, 42);
+        let spindle_tables: i64 = raw
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'members'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count Spindle tables");
+        assert_eq!(
+            spindle_tables, 0,
+            "no Spindle schema object may be created in the foreign database"
+        );
+    }
+
+    /// A non-zero `user_version` is not Spindle evidence. A foreign database at `user_version = 1`
+    /// must be refused **before** any migration runs: migrations commit one version at a time, so
+    /// accepting it would add V2's tables and bump the version before a later migration failed,
+    /// leaving a half-migrated foreign file behind.
+    #[test]
+    fn open_for_reconcile_refuses_a_foreign_database_with_a_nonzero_user_version() {
+        let sandbox = tempdir().expect("tempdir");
+        let path = sandbox.path().join("foreign-v1.sqlite3");
+        {
+            let raw = Connection::open(&path).expect("raw open");
+            raw.execute_batch(
+                "CREATE TABLE foreign_data (value INTEGER NOT NULL);\
+                 INSERT INTO foreign_data (value) VALUES (7);\
+                 PRAGMA user_version = 1;",
+            )
+            .expect("seed foreign database at version 1");
+        }
+
+        match Store::open_for_reconcile(&path) {
+            Err(StoreError::NotASpindleStore {
+                user_version,
+                missing,
+            }) => {
+                assert_eq!(
+                    user_version, 1,
+                    "the foreign version must be reported as found"
+                );
+                assert_eq!(missing, vec!["meta", "shares"]);
+            }
+            other => panic!("expected NotASpindleStore, got {other:?}"),
+        }
+
+        let raw = Connection::open(&path).expect("raw reopen");
+        let version: i64 = raw
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, 1, "the foreign user_version must be unchanged");
+        let value: i64 = raw
+            .query_row("SELECT value FROM foreign_data", [], |row| row.get(0))
+            .expect("foreign table must survive");
+        assert_eq!(value, 7);
+        let added_tables: i64 = raw
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name IN ('members', 'audit_log', 'signed_heads')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count Spindle tables");
+        assert_eq!(
+            added_tables, 0,
+            "no migration may have run: no V1 or V2 Spindle table may exist in the foreign file"
+        );
+    }
+
+    /// The repair constructor must not create a store at an absent path, even between an
+    /// existence check in the caller and the open here. `READ_WRITE` without `CREATE` makes that a
+    /// hard open error rather than a fresh empty database.
+    #[test]
+    fn open_for_reconcile_refuses_a_missing_path_without_creating_it() {
+        let sandbox = tempdir().expect("tempdir");
+        let path = sandbox.path().join("mistyped.sqlite3");
+
+        assert!(
+            Store::open_for_reconcile(&path).is_err(),
+            "an absent repair path must be refused"
+        );
+        assert!(
+            !path.exists(),
+            "the repair constructor must never create the file it was asked to open"
+        );
+    }
+
+    /// The repair constructor deliberately skips `Store::open`'s persisted-overlap re-check: a share
+    /// root deleted out of band is exactly the skew the sweep exists to heal, and canonicalizing it
+    /// would make `Store::open` fail before any share could be swept (blocking every other share).
+    #[test]
+    fn open_for_reconcile_opens_a_store_whose_share_root_has_been_deleted() {
+        let sandbox = tempdir().expect("tempdir");
+        let db_path = sandbox.path().join("host.sqlite3");
+        let gone = sandbox.path().join("gone");
+        let kept = sandbox.path().join("kept");
+        std::fs::create_dir_all(&gone).expect("mkdir gone");
+        std::fs::create_dir_all(&kept).expect("mkdir kept");
+        {
+            let store = Store::open(&db_path).expect("open fresh store");
+            store
+                .add_share("Gone", "Gone", &gone, ShareFlags::default(), &[], 0)
+                .expect("add gone share");
+            store
+                .add_share("Kept", "Kept", &kept, ShareFlags::default(), &[], 0)
+                .expect("add kept share");
+        }
+        std::fs::remove_dir_all(&gone).expect("delete one root out of band");
+
+        // The serving constructor re-checks overlaps and canonicalizes every root, so it fails.
+        assert!(
+            matches!(Store::open(&db_path), Err(StoreError::Confine(_))),
+            "Store::open must still refuse a store whose share root vanished"
+        );
+
+        // The repair constructor still opens it and sees both shares.
+        let store = Store::open_for_reconcile(&db_path).expect("repair open");
+        assert_eq!(store.list_shares().expect("list shares").len(), 2);
     }
 
     // ---- Limits ----

@@ -105,6 +105,14 @@ rustix = { version = "1.1", features = ["fs", "process"] }
 # SqliteDeviceLookup>` — against `deploy/docker-compose.yml`'s real NATS Auth Callout, in place of
 # `crates/spindle-net/tests/live_signaling.rs`'s test-local `RegistryAuthorizer`.
 [dev-dependencies]
+# td-042e4f: the scheduled-sweep test seeds counter-table drift that no real write path can
+# produce (`Store::set_upload_counters_for_test`, gated behind `spindle-vfs`'s `test-support`
+# feature) to prove that one sweep tick repairs ledger-vs-disk skew but deliberately does not call
+# `reconcile_upload_counters`. This re-declares the already-normal dependency purely to switch the
+# feature on for this crate's test builds; under `resolver = "2"` it does not leak into a plain
+# `cargo build` of `spindle-hostd` (same precedent as `spindle-host-core`'s dev-dependency entry).
+spindle-vfs = { path = "../spindle-vfs", features = ["test-support"] }
+
 # The test seeds a real, on-disk `spindle_vfs::store::Store` (via `Store::open`) at a throwaway
 # path, then hands that same path to `HostDaemon::new` so the daemon opens its own independent
 # connection to it. Crate-local (not a workspace dependency), matching the identical precedent
