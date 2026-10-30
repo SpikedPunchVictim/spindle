@@ -6,54 +6,72 @@
 //! live test uses) and of `crates/spindle-helper/src/bin/helper.rs`'s responder-side wiring: the
 //! same sequence DESIGN.md §A4 specifies, with a real [`HostIdentity`] instead of fixture seeds.
 //!
-//! # The token is minted once per `connect_host` call, not per reconnect
+//! # One fresh credential per `connect_host` call
 //!
 //! DESIGN.md §A4 step 3 and A10.40 make the host's NATS nkey **per-session**: [`KeyPair::new_user`]
 //! creates a new one on every [`connect_host`] call, the operating key signs a fresh
 //! `HostSessionAttestation` over that session's `nats_fp`, and the resulting `auth_token` is
-//! handed to [`async_nats::ConnectOptions::token`] once. async-nats 0.35 does not re-run this
-//! function on an automatic reconnect: its reconnect path calls the same connector
-//! (`async-nats-0.35.1/src/lib.rs`, `handle_reconnect`), which re-sends the static
-//! `auth_token` from the saved options (`connector.rs:193`). The attestation inside that token is
-//! valid only within its ±2 minute window, so a reconnect later than that is refused by the
-//! callout.
+//! handed to [`async_nats::ConnectOptions::token`] once. This function therefore mints a complete
+//! credential — nkey, attestation, token — on **every** call, and a caller that wants to
+//! re-authenticate after a lost connection calls it again rather than reusing an earlier client.
 //!
-//! [`connect_host`] therefore sets `.max_reconnects(1)`. async-nats resets its attempt counter
-//! after every successful connect (`connector.rs:286`, `self.attempts = 0`), so the bound means
-//! **one reconnect attempt per disconnect**: if that attempt fails, the client closes instead of
-//! retrying forever. A reconnect that lands inside the attestation's ±2 minute window can still
-//! verify — an already-admitted host presents no admission token, and the server checks only the
-//! skew — but one after the window never will. The headless binary treats any loop exit as
-//! terminal and relies on process restart to re-authenticate (a fresh process mints a fresh nkey,
-//! attestation, and token, per A10.43/A10.44). Without the bound, an unlimited reconnect loop
-//! would retry a credential that can never verify again, hiding a permanently dead host behind a
-//! client that still looks alive; with it, the loss is a visible close.
+//! async-nats 0.35 does not re-run this function on an automatic reconnect: its reconnect path
+//! calls the same connector (`async-nats-0.35.1/src/lib.rs`, `handle_reconnect`), which re-sends the
+//! static `auth_token` from the saved options (`connector.rs:193`). The attestation inside that
+//! token is valid only within its ±2 minute window, so a client-internal reconnect later than that
+//! is refused by the callout. That is why [`connect_host`] sets `.max_reconnects(1)`: async-nats
+//! resets its attempt counter after every successful connect (`connector.rs:286`,
+//! `self.attempts = 0`), so the bound means **one reconnect attempt per disconnect**. A reconnect
+//! that lands inside the attestation's ±2 minute window can still verify — an already-admitted host
+//! presents no admission token, and the server checks only the skew — while one after the window
+//! never will. The internal retry's stale token fails fast in exactly that case, which is what makes
+//! `HostDaemon::run` (and so the caller's supervision loop) return promptly instead of retrying a
+//! credential that can never verify again. The reconnect-with-fresh-credentials path belongs to the
+//! caller: `spindle-hostd`'s binary loops, calling this function again after every lost connection
+//! (see `src/main.rs`'s reconnect section). A library consumer decides for itself.
 //!
-//! The auth-callback escape hatch does not solve this either. async-nats 0.35 copies
-//! `auth.token` verbatim (`connector.rs`, `connect_info.auth_token = auth.token`), so the
-//! envelope itself could be carried, but it base64-encodes `auth.signature` again —
-//! `connect_info.signature = auth.signature.map(|signature| URL_SAFE_NO_PAD.encode(signature))`
-//! — and `auth.signature` is an `Option<String>`. A callback therefore cannot hand the client
-//! the raw 64-byte signature a fresh nkey handshake needs; any value it supplies is encoded a
-//! second time. Re-minting the session credential inside a callback is not available, which is
-//! why bounding the retry is the honest option.
+//! # The caller's envelope identity is shared, not re-minted, across reconnects [A10.44/A10.45]
+//!
+//! The credential above is fresh per call; this process's envelope [`DeviceKey`] is not. A10.44
+//! makes it fresh **per process**, and A10.45 forbids churning it mid-process, so a reconnecting
+//! caller passes the same key to every [`connect_host`] call. [`HostConnectCredentials`] is
+//! therefore a *borrowed* view over the pieces this function needs — including `&DeviceKey` — so a
+//! caller can drop the root private key before reconnecting while keeping `device_fp` stable for
+//! the process's life. (The binary holds the key in an `Arc` for the same reason; `DeviceKey` is
+//! deliberately not `Clone`.)
+//!
+//! # The auth-callback escape hatch does not solve the reconnect problem
+//!
+//! async-nats 0.35 copies `auth.token` verbatim (`connector.rs`, `connect_info.auth_token =
+//! auth.token`), so the envelope itself could be carried, but it base64-encodes `auth.signature`
+//! again — `connect_info.signature = auth.signature.map(|signature|
+//! URL_SAFE_NO_PAD.encode(signature))` — and `auth.signature` is an `Option<String>`. A callback
+//! therefore cannot hand the client the raw 64-byte signature a fresh nkey handshake needs; any
+//! value it supplies is encoded a second time. Re-minting the session credential inside a callback
+//! is not available, which is why the outer caller reconnects instead.
 //!
 //! # `now` is the moment of connect, never process start
 //!
 //! Both the `HostSessionAttestation` and the `HostOpKeyCert` it accompanies are checked against a
 //! ±2 minute server-time window (A7b; see `HOST_SESSION_ATTESTATION_CLOCK_SKEW_SECS` in
-//! `spindle_core::artifacts`). The certificate is minted once per process at startup, but the
-//! attestation is not a process-start value: the caller must pass the wall clock read at the
-//! moment it calls [`connect_host`]. Passing a startup timestamp would make every reconnect more
-//! than two minutes into the process fail authentication while looking, from this function's
-//! signature, like a perfectly ordinary connect.
+//! `spindle_core::artifacts`). The operating-key certificate is minted once per process at startup
+//! (A10.43; a future A10.45 renewal path would re-issue it), but the attestation is not a
+//! process-start value: the caller must pass the wall clock read at the moment it calls
+//! [`connect_host`]. Passing a startup timestamp would make every reconnect more than two minutes
+//! into the process fail authentication while looking, from this function's signature, like a
+//! perfectly ordinary connect. A supervised caller therefore reads the clock again for each
+//! attempt, not once at startup.
 //!
-//! # The admission token is optional
+//! # The admission token is optional, and belongs on the first connect only
 //!
 //! `admission_token_bytes: None` omits the `admission_token` key from the envelope entirely, not
 //! just its value. That is the legitimate shape for a host's second and later connections
 //! (DESIGN.md §A3b: an already-admitted host connects on its certificate alone), and it is why
-//! the field is optional here while `session_attest` is not.
+//! the field is optional here while `session_attest` is not. The binary keeps presenting the
+//! configured token across **failed** attempts too: a failure may never have reached the callout
+//! (server down, DNS, timeout), and a host that was never admitted still needs its bootstrap
+//! credential. It stops presenting it after the first **successful** connect; a retry that really
+//! did reach the callout is harmless because burning the same host+nonce is idempotent (A4).
 //!
 //! # Connection events are logged, credentials are not
 //!
@@ -78,10 +96,18 @@
 //! success branch `handle_reconnect` reaches). The pump discards the first signal it receives
 //! (the initial connect, already covered by the explicit publish below) and publishes on every
 //! later one; signals arrive in the order the callback emitted them, so the first one really is
-//! the initial connect. The bytes are reused rather than re-minted because the certificate chains
-//! to this process's operating key and embeds this process's envelope keys, and neither changes
-//! across a reconnect — re-minting would produce the same bytes again. A restart mints a fresh
-//! identity (A10.43/A10.44), and its fresh bytes replace the helper's cached copy (A10.37).
+//! the initial connect. Within one connection the bytes are reused rather than re-minted: the
+//! certificate's signed preimage includes its mint `ts`, so re-minting mid-connection would change
+//! `ts` (and therefore the encoding and signature) even though the keys do not; the cached bytes
+//! remain the current identity. A restart mints a fresh identity (A10.43/A10.44), and its fresh
+//! bytes replace the helper's cached copy (A10.37).
+//!
+//! A **caller-supervised** reconnect (the binary's loop calling [`connect_host`] again after a lost
+//! connection) re-mints the certificate on every connection from the same
+//! [`HostConnectCredentials`] and a fresh `now`: the keys, `device_fp`, and `exp` are unchanged, but
+//! `ts` advances, so the canonical bytes and signature differ from the previous connection's. The
+//! pump above only ever covers async-nats's internal, in-window reconnect; the fresh connection's
+//! own explicit publish covers the supervised case (last write wins in the helper's cache).
 //!
 //! A publish-only subject has no broker ack (§A5). The explicit publish's local error is
 //! propagated, and the follow-up [`async_nats::Client::flush`] confirms the server accepted what
@@ -105,13 +131,50 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use nkeys::KeyPair;
-use spindle_core::artifacts::issue_host_session_attestation;
-use spindle_core::Fingerprint;
+use spindle_core::artifacts::{issue_host_session_attestation, HostOpKeyCert};
+use spindle_core::{DeviceKey, Fingerprint, SigningKey, VerifyingKey};
 use spindle_proto::auth_token::encode_host_auth_token;
 use tokio::sync::mpsc;
 
-use crate::devcert::{device_cert_subject, mint_device_cert};
+use crate::devcert::{device_cert_subject_for, mint_device_cert_from_parts};
 use crate::HostIdentity;
+
+/// The borrowed pieces [`connect_host`] needs from a host identity, so a caller can keep this
+/// process's envelope [`DeviceKey`] (and its `device_fp`) stable across reconnects while dropping
+/// everything it does not need — notably the root private key — before the reconnect loop starts.
+///
+/// The set is exactly what the CONNECT credential and the A10.37 certificate need: the token's
+/// root public key, the attestation's operating signing key, the operating-key certificate
+/// embedded in the token, the root fingerprint every subject is scoped by, and the envelope
+/// device key the certificate embeds.
+pub struct HostConnectCredentials<'a> {
+    /// `root.public_key()` — embedded in the CONNECT envelope so the callout can pin it. Owned
+    /// rather than borrowed: `RootKey::public_key()` computes it, and it is a public, `Copy`
+    /// value, so the secret `root` itself can be dropped while this survives.
+    pub host_root_pk: VerifyingKey,
+    /// This process's operating key; signs the per-connect `HostSessionAttestation`.
+    pub op_signing: &'a SigningKey,
+    /// This process's operating-key certificate (`sig_host_root(host_op_pk, ts, exp)`).
+    pub op_cert: &'a HostOpKeyCert,
+    /// `hash(host_root_pk)` — the `<hfp>` token in every NATS subject and the devcert subject.
+    pub host_fp: Fingerprint,
+    /// This process's envelope device key; stable across reconnects (A10.44/A10.45).
+    pub device: &'a DeviceKey,
+}
+
+impl<'a> HostConnectCredentials<'a> {
+    /// Views a whole [`HostIdentity`]. Convenience for callers (and tests) that still hold one;
+    /// the reconnect loop constructs the view directly so it can drop `root` first.
+    pub fn from_identity(identity: &'a HostIdentity) -> Self {
+        Self {
+            host_root_pk: identity.root.public_key(),
+            op_signing: &identity.op_signing,
+            op_cert: &identity.op_cert,
+            host_fp: identity.host_fp,
+            device: &identity.device,
+        }
+    }
+}
 
 /// Everything [`connect_host`] can fail with before a client exists. A failure returns no
 /// partially-authenticated connection: the session nkey, attestation, and token are all local
@@ -171,25 +234,41 @@ impl Drop for DevCertPublisher {
 /// host CONNECT `auth_token`, and returns the client together with the
 /// [`DevCertPublisher`] guard that keeps its reconnect-republish task alive.
 ///
+/// `credentials` is the borrowed view of this process's identity (see [`HostConnectCredentials`]);
+/// the envelope [`DeviceKey`] it names stays the same across calls, so `device_fp` is stable for
+/// the process's life. Everything used to authenticate is minted fresh on every call, so calling
+/// this again after a lost connection is the supported way to re-authenticate.
+///
 /// `now` must be the wall-clock second at the moment of this call (see the module docs' "`now` is
 /// the moment of connect" section). `admission_token_bytes`, when present, is the raw bytes of the
 /// admission-token file; this function embeds them verbatim and does not validate them — the
-/// Auth Callout (the helper) is the verifier.
+/// Auth Callout (the helper) is the verifier. A caller keeps presenting it until one connect
+/// **succeeds**; an already-admitted host then connects on its certificate alone (§A3b).
 pub async fn connect_host(
-    identity: &HostIdentity,
+    credentials: &HostConnectCredentials<'_>,
     nats_url: &str,
-    admission_token_bytes: Option<Vec<u8>>,
+    admission_token_bytes: Option<&[u8]>,
     now: u64,
 ) -> Result<(async_nats::Client, DevCertPublisher), ConnectError> {
     let session = KeyPair::new_user();
     let nats_fp = nats_fp_for_session(&session)?;
-    let token = mint_auth_token(identity, nats_fp, admission_token_bytes.as_deref(), now);
+    let token = mint_auth_token(credentials, nats_fp, admission_token_bytes, now);
 
     // A10.37: mint this process's device certificate **before** connecting, so the bytes are ready
     // to publish both on the explicit connect below and on every later reconnect. See this
     // module's "The `HostDeviceCert` publish cadence" section.
-    let cert_subject = device_cert_subject(identity);
-    let cert_bytes = Arc::new(mint_device_cert(identity, now).to_canonical_bytes());
+    let cert_subject = device_cert_subject_for(credentials.host_fp);
+    let cert_bytes = Arc::new(
+        mint_device_cert_from_parts(
+            credentials.op_signing,
+            credentials.host_fp,
+            &credentials.host_root_pk,
+            credentials.op_cert,
+            credentials.device,
+            now,
+        )
+        .to_canonical_bytes(),
+    );
 
     // The callback holds a bare signal channel, never a client — see this module's
     // "reference-cycle note". It fires for the initial connect too; the pump discards that first
@@ -275,15 +354,15 @@ fn nats_fp_for_session(session: &KeyPair) -> Result<Fingerprint, nkeys::error::E
 /// envelope can be exercised without a broker (this crate's unit tests) while the live path still
 /// has exactly one construction site.
 fn mint_auth_token(
-    identity: &HostIdentity,
+    credentials: &HostConnectCredentials<'_>,
     nats_fp: Fingerprint,
     admission_token_bytes: Option<&[u8]>,
     now: u64,
 ) -> String {
-    let attestation = issue_host_session_attestation(&identity.op_signing, nats_fp, now);
+    let attestation = issue_host_session_attestation(credentials.op_signing, nats_fp, now);
     let envelope = encode_host_auth_token(
-        &identity.root.public_key().to_bytes(),
-        &identity.op_cert.to_canonical_bytes(),
+        &credentials.host_root_pk.to_bytes(),
+        &credentials.op_cert.to_canonical_bytes(),
         &attestation.to_canonical_bytes(),
         admission_token_bytes,
     );
@@ -324,12 +403,13 @@ mod tests {
     #[test]
     fn token_decodes_to_the_expected_artifact_bytes() {
         let identity = mint_host_identity([0x5a; ROOT_SEED_LEN], NOW);
+        let credentials = HostConnectCredentials::from_identity(&identity);
         let session = KeyPair::new_user();
         let nats_fp = nats_fp_for_session(&session).expect("valid nkey");
         let admission_token = [0xA5u8; 11];
         let connect_at = NOW + 7;
 
-        let token = mint_auth_token(&identity, nats_fp, Some(&admission_token), connect_at);
+        let token = mint_auth_token(&credentials, nats_fp, Some(&admission_token), connect_at);
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(token.as_bytes())
             .expect("token is unpadded base64url");
@@ -355,11 +435,12 @@ mod tests {
     #[test]
     fn no_admission_token_means_no_admission_token_bytes_in_the_envelope() {
         let identity = mint_host_identity([0x5b; ROOT_SEED_LEN], NOW);
+        let credentials = HostConnectCredentials::from_identity(&identity);
         let session = KeyPair::new_user();
         let nats_fp = nats_fp_for_session(&session).expect("valid nkey");
 
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(mint_auth_token(&identity, nats_fp, None, NOW).as_bytes())
+            .decode(mint_auth_token(&credentials, nats_fp, None, NOW).as_bytes())
             .expect("token is unpadded base64url");
 
         assert!(

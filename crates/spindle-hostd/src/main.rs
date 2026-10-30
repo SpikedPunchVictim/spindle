@@ -1,5 +1,6 @@
-//! The headless `spindle-hostd` binary: one host identity, one NATS connection, one
-//! [`HostDaemon::run`] future (td-539ffa slice 3).
+//! The headless `spindle-hostd` binary: one host identity, a supervised sequence of NATS
+//! connections, and one [`HostDaemon::run`] future per connection (td-539ffa slice 3;
+//! reconnect supervision is td-6242d2).
 //!
 //! # Why this binary exists
 //!
@@ -22,16 +23,31 @@
 //! not a log pipeline: stdout when stdout is a terminal, otherwise the operator-configured
 //! `--recovery-phrase-file`. Everything else this process says goes to stderr through `tracing`.
 //!
-//! # A lost NATS connection is process-fatal in this slice
+//! # A lost NATS connection is not process-fatal
 //!
-//! The CONNECT `auth_token` is minted once per process ([`connect_host`]), and async-nats 0.35
-//! replays that static token on an automatic reconnect (`connector.rs:193`). The host session
-//! attestation inside it is valid for only ±2 minutes, so a reconnect later than that window is
-//! refused by the Auth Callout. [`spindle_hostd::connect`] therefore bounds reconnects, and this
-//! binary treats a closed connection as terminal: [`HostDaemon::run`] ends, the process exits
-//! non-zero, and a supervised restart re-mints the session credential (a fresh process gets a
-//! fresh nkey, attestation, and token per A10.43/A10.44). A NATS blip is process-fatal by design;
-//! supervised restart is the recovery.
+//! The CONNECT `auth_token` is valid only for the session that presented it: async-nats 0.35
+//! replays the static token on an automatic reconnect (`connector.rs:193`), and the host session
+//! attestation inside it is valid for only ±2 minutes. [`spindle_hostd::connect`] therefore bounds
+//! that internal retry (`.max_reconnects(1)`); when it fails, `HostDaemon::run` returns promptly
+//! and this binary's supervised loop takes over.
+//!
+//! The loop calls `connect_host` again on every attempt, so each connection gets a **fresh**
+//! per-session nkey, `HostSessionAttestation`, `auth_token`, and `HostDeviceCert` publish. What
+//! must **not** churn is the process's envelope device key: A10.44 regenerates it per process, not
+//! per reconnect, and A10.45 forbids churning it mid-process, so `device_fp` stays the same across
+//! reconnects within one process (the certificate is re-minted with a fresh `ts` on every
+//! connection — same keys, same `device_fp`, same `exp` — because `ts` is inside the signed
+//! preimage). The admission token is presented until the first connect **succeeds** (A3b): a failed
+//! attempt may never have reached the callout, so it is not consumed; re-presenting a token that
+//! did reach it is harmless because burning the same host+nonce is idempotent (A4).
+//!
+//! Failure handling is precise: a TLS or server-address parse failure is fatal immediately (retrying
+//! cannot fix misconfiguration); an authorization refusal **at CONNECT** is fatal only after it has
+//! persisted across [`MAX_CONSECUTIVE_AUTH_REFUSALS`] attempts (>2.5 minutes of continuous backoff),
+//! because NATS reports a helper that is still re-subscribing after a broker restart with the same
+//! undifferentiated `authorization violation` it reports for a revoked host; every other failure
+//! (DNS, I/O, timeout, a `HostDaemon::run` failure) retries with a 1 s-to-30 s exponential backoff.
+//! `SIGINT`/`SIGTERM` return `SUCCESS` at any point, including during the backoff.
 //!
 //! A mid-process certificate renewal (A10.45: re-issue the operating certificate at two-thirds of
 //! its 90-day lifetime) is **not wired here**. A process that outlives `HOST_OP_CERT_TTL_SECS`
@@ -56,12 +72,13 @@ use std::io::{IsTerminal as _, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rand::rngs::OsRng;
 use rand::RngCore as _;
 use spindle_host_core::RootKeyCapIssuer;
-use spindle_hostd::connect::connect_host;
+use spindle_hostd::connect::{connect_host, ConnectError, HostConnectCredentials};
 #[cfg(unix)]
 use spindle_hostd::keystore::{check_file_mode, check_parent_mode};
 use spindle_hostd::{
@@ -158,68 +175,38 @@ async fn run(config: Config) -> ExitCode {
         None => None,
     };
 
-    // A fresh wall-clock read at the call, not a timestamp captured at process start: the
-    // attestation's `ts` is checked against a ±2 minute server-time window (see
-    // `connect`'s module docs).
-    //
-    // `_devcert_publisher` is the guard that keeps the device-certificate reconnect-republish
-    // task alive. It must live for as long as the connection does, so it is bound here (same
-    // scope as `client`) and only dropped when `run` returns; see `connect`'s reference-cycle
-    // note for why dropping the client alone would otherwise leave a pump-owned clone behind.
-    let (client, _devcert_publisher) = match connect_host(
-        &identity,
-        &config.nats_url,
-        admission_token_bytes,
-        wall_clock_now_secs(),
-    )
-    .await
-    {
-        Ok(connected) => connected,
-        Err(error) => {
-            tracing::error!(
-                error = %error, // redaction-ok: ConnectError Display is nkeys length/prefix/checksum text (Nkey arm), async_nats::ConnectError's kind text plus DNS/IO/TLS source text and the NATS server's own refusal text (Nats arm), async_nats::PublishError's fixed kind plus a length/closed-queue source (Publish arm), or the same kind of static text from a failed flush (Flush arm); it never carries the auth_token, the nkey seed, the certificate payload, or any Spindle member peer's bytes
-                "failed to connect the host to NATS"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // `connect_host` has already published this process's `HostDeviceCert` (A10.37) and flushed
-    // it before returning, so the host's identity is advertised before the daemon starts serving.
-    // Its failure is folded into the connect error arm above; a publish failure is fatal here.
-
-    // The issuer is built from the same identity the connection presented, so every capability
-    // this host mints chains to the root the Auth Callout just authenticated. See
-    // `HostDaemon::with_cap_issuer`'s doc comment for why the daemon takes this seam rather than
-    // owning key custody itself.
-    let issuer = RootKeyCapIssuer::new(
-        identity.root.public_key(),
-        identity.op_cert.clone(),
-        identity.op_signing.clone(),
-    );
-
-    // Every consumer of the identity has now been served: `connect_host` presented it,
-    // `RootKeyCapIssuer` owns the public half and its own signing copies, and the daemon needs
-    // only the envelope device key and the root fingerprint. Destructure so the root private key
-    // (and the operating key, whose private half the issuer already cloned) is dropped before the
-    // daemon starts — its wrapped `SigningKey` zeroizes on drop. `host_fp`/`device_fp` are `Copy`
-    // copies of values already logged; nothing below signs as the root.
+    // Decompose the identity so the root private key can be dropped **before** the reconnect loop
+    // starts. Only `root`'s public half survives (inside the borrowed credentials view); the
+    // operating key and envelope device key must live for the process's life, because every
+    // reconnect re-authenticates with them and A10.44/A10.45 keep `device_fp` stable within one
+    // process. `host_fp`/`device_fp` are `Copy` copies of values already logged.
     let HostIdentity {
-        root: _,
-        op_signing: _,
-        op_cert: _,
+        root,
+        op_signing,
+        op_cert,
         device,
         host_fp,
         device_fp,
     } = identity;
+    let host_root_pk = root.public_key();
+    // The issuer built below and the credentials view above need only these public/borrowed
+    // pieces. Dropping the root private key here means its wrapped `SigningKey` (which zeroizes on
+    // drop) is gone before any reconnect attempt; nothing below signs as the root.
+    drop(root);
     tracing::debug!(
         host_fp = %host_fp.redacted(),
         device_fp = %device_fp.redacted(),
-        "root private key dropped after the capability issuer was built"
+        "root private key dropped after the identity was decomposed for reconnects"
     );
 
-    let daemon = HostDaemon::new(client, device, host_fp, config.store.clone())
-        .with_cap_issuer(Box::new(issuer));
+    let device = Arc::new(device);
+    let credentials = HostConnectCredentials {
+        host_root_pk,
+        op_signing: &op_signing,
+        op_cert: &op_cert,
+        host_fp,
+        device: &device,
+    };
 
     // Only `bind_ip` is configurable in this slice; the lifecycle durations and the concurrency
     // cap keep `HostOptions`' defaults (taken from one `default()` value rather than restated
@@ -232,50 +219,332 @@ async fn run(config: Config) -> ExitCode {
         max_concurrent_connects: defaults.max_concurrent_connects,
     };
 
-    tokio::select! {
-        // `biased` and the shutdown branch first are deliberate: `shutdown_signal` installs the
-        // OS signal handlers on its first poll, and doing that before `daemon.run` logs "host
-        // daemon starting" closes the startup window in which a SIGINT/SIGTERM still has its
-        // default (process-killing) disposition.
-        biased;
-        _ = shutdown_signal() => {
-            tracing::info!("shutdown signal received");
-            // Dropping the daemon drops the NATS client and its SQLite connections; returning
-            // from `run` also drops `_devcert_publisher`, which aborts the reconnect-republish
-            // pump and releases its client clone. The signaling run loop has no separate shutdown
-            // channel (`HostDaemon::run`'s doc comment), so there is nothing else to drain.
-            ExitCode::SUCCESS
-        }
-        result = daemon.run(options) => match result {
+    // The admission token stays present until a connect **succeeds**. A failed attempt may never
+    // have reached the callout (server down, DNS, timeout), and in `invite`/`closed` admission a
+    // host that was never admitted would then be refused forever; a retry that did burn the same
+    // host+nonce is safe because the burn is idempotent (A4). After a successful first connect it
+    // is cleared, because A3b's already-admitted host connects on its certificate alone.
+    let mut admission_token_bytes = admission_token_bytes;
+
+    // One signal future for the whole loop: it installs the OS handlers on its first poll and is
+    // polled again in every `select!` below, including each backoff sleep, so Ctrl-C/SIGTERM at any
+    // point — connected, connecting, or waiting to retry — returns `SUCCESS`.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    // Backoff and refusal-streak state. `attempt` counts consecutive failed attempts since the
+    // host last *served* (`HostDaemon::run` returned `Ok`), so a daemon failing immediately after a
+    // successful connect still ramps rather than re-CONNECTing once a second.
+    let mut reconnects = ReconnectState::default();
+
+    loop {
+        // A fresh wall-clock read at every attempt, not a timestamp captured at process start: the
+        // attestation's `ts` is checked against a ±2 minute server-time window (see `connect`'s
+        // module docs), and this loop exists precisely to survive an outage longer than that.
+        let connected = tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received");
+                return ExitCode::SUCCESS;
+            }
+            result = connect_host(
+                &credentials,
+                &config.nats_url,
+                admission_token_bytes.as_deref(),
+                wall_clock_now_secs(),
+            ) => result,
+        };
+
+        let (client, devcert_publisher) = match connected {
+            Ok(connected) => {
+                // A successful connect consumes the admission token: from here on this host is
+                // admitted, so A3b says it connects on its certificate alone.
+                clear_admission_token_after_connect(&mut admission_token_bytes, true);
+                // A successful connect ends any authorization-refusal streak. It deliberately does
+                // not reset the backoff: that is reset only by a served connection below.
+                reconnects.connected();
+                connected
+            }
+            Err(error) => {
+                // async-nats reports an unanswered callout request with the same undifferentiated
+                // `authorization violation` as a revoked host (the helper answers both that way), so
+                // a refusal is retried under the normal backoff until it has persisted across
+                // MAX_CONSECUTIVE_AUTH_REFUSALS attempts. TLS and server-address parse failures
+                // cannot become correct by retrying and are fatal at once.
+                let class = classify_connect_error(&error);
+                match reconnects.connect_failed(class) {
+                    ConnectFailure::Misconfigured => {
+                        tracing::error!(
+                            error = %error, // redaction-ok: ConnectError Display is nkeys length/prefix/checksum text (Nkey arm), async_nats::ConnectError's kind text plus DNS/IO/TLS source text and the NATS server's own refusal text (Nats arm), async_nats::PublishError's fixed kind plus a length/closed-queue source (Publish arm), or the same kind of static text from a failed flush (Flush arm); it never carries the auth_token, the nkey seed, the certificate payload, or any Spindle member peer's bytes
+                            "NATS connection failed in a way retrying cannot fix (TLS or server \
+                             address misconfiguration); exiting"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    ConnectFailure::RefusedForGood => {
+                        tracing::error!(
+                            error = %error, // redaction-ok: same ConnectError Display as above; never the auth_token, the nkey seed, the certificate payload, or any Spindle member peer's bytes
+                            consecutive_refusals = reconnects.auth_refusals,
+                            "NATS refused the host's credentials on every attempt across the whole \
+                             backoff window; treating the host as revoked or misconfigured and \
+                             exiting"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    ConnectFailure::Retry(delay) => {
+                        if class == ConnectFailureClass::AuthorizationRefusal {
+                            // Includes the helper-still-re-subscribing case: NATS reports that as the
+                            // same refusal, and it resolves on its own well inside the window.
+                            tracing::warn!(
+                                error = %error, // redaction-ok: same ConnectError Display as above; never the auth_token, the nkey seed, the certificate payload, or any Spindle member peer's bytes
+                                consecutive_refusals = reconnects.auth_refusals,
+                                max_consecutive_refusals = MAX_CONSECUTIVE_AUTH_REFUSALS,
+                                delay_secs = delay.as_secs(),
+                                "NATS refused the host's credentials; retrying (a helper that is \
+                                 still re-subscribing after a broker restart answers the same way \
+                                 as a revoked host)"
+                            );
+                        } else {
+                            tracing::error!(
+                                error = %error, // redaction-ok: same ConnectError Display as above; never the auth_token, the nkey seed, the certificate payload, or any Spindle member peer's bytes
+                                delay_secs = delay.as_secs(),
+                                "failed to connect the host to NATS; retrying with fresh credentials"
+                            );
+                        }
+                        if sleep_or_shutdown(delay, shutdown.as_mut()).await {
+                            tracing::info!("shutdown signal received");
+                            return ExitCode::SUCCESS;
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+
+        // `connect_host` has already published this process's `HostDeviceCert` (A10.37) and flushed
+        // it before returning, so the host's identity is advertised before the daemon starts
+        // serving. Its failure is folded into the connect error arm above.
+
+        // The issuer is rebuilt for every connection from the same identity the connection
+        // presented, so every capability this host mints chains to the root the Auth Callout just
+        // authenticated. It is recreated rather than moved because `HostDaemon` consumes it; the
+        // operating key and certificate are unchanged across reconnects (only the session credential
+        // is fresh). See `HostDaemon::with_cap_issuer`'s doc comment for why the daemon takes this
+        // seam rather than owning key custody itself.
+        let issuer = RootKeyCapIssuer::new(host_root_pk, op_cert.clone(), op_signing.clone());
+        let daemon =
+            HostDaemon::new_shared(client, Arc::clone(&device), host_fp, config.store.clone())
+                .with_cap_issuer(Box::new(issuer));
+
+        let result = tokio::select! {
+            // `biased` and the shutdown branch first are deliberate: `shutdown_signal` installs
+            // the OS signal handlers on its first poll, and this branch keeps a SIGINT/SIGTERM
+            // from racing the daemon's own startup work below.
+            biased;
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received");
+                // Dropping the daemon drops the NATS client and its SQLite connections; dropping
+                // the guard aborts the reconnect-republish pump and releases its client clone. The
+                // signaling run loop has no separate shutdown channel (`HostDaemon::run`'s doc
+                // comment), so there is nothing else to drain.
+                drop(devcert_publisher);
+                return ExitCode::SUCCESS;
+            }
+            result = daemon.run(options) => result,
+        };
+        // The guard must not outlive the connection it serves: the next iteration publishes on a
+        // fresh client. Dropping it aborts this iteration's pump and releases its client clone.
+        drop(devcert_publisher);
+
+        let delay = match result {
             Ok(()) => {
-                // The signaling loop only returns `Ok(())` when the NATS client closes; a
-                // command/request failure is the `Err` arm. Treating this as a clean exit would
-                // report success for a host that is no longer reachable.
-                tracing::error!(
-                    "host daemon signaling loop ended because the NATS connection closed; the \
-                     host is no longer reachable. Its CONNECT credential is minted once per \
-                     process and cannot be replayed after the attestation's ±2 minute window, so \
-                     restarting the process is what re-authenticates it (a fresh nkey, \
-                     attestation, and token)"
+                // The signaling loop only returns `Ok(())` when the NATS client closes. That is now
+                // the normal "connection lost" signal, not a terminal condition: reconnect with a
+                // fresh per-session credential (A4 step 3) while keeping this process's envelope
+                // `device_fp` (A10.44/A10.45). A served connection also resets the backoff.
+                let delay = reconnects.served_and_lost();
+                tracing::warn!(
+                    delay_secs = delay.as_secs(),
+                    "host daemon signaling loop ended because the NATS connection closed; \
+                     reconnecting with fresh credentials"
                 );
-                ExitCode::FAILURE
+                delay
             }
             Err(error) => {
                 // `HostDaemonError`'s `Display` forwards `SignalingError`/`StoreError` bodies,
                 // some of which carry peer-supplied CBOR keys, untruncated subjects, member paths,
                 // or full fingerprints. `HostDaemon::run` has already logged the redacted cause;
                 // this line names which stage failed without repeating the unsafe text.
+                //
+                // Every `run` failure is retryable, and it advances the backoff (only a connection
+                // that actually *served* resets it). There is deliberately no text-matching here for
+                // an authorization refusal: a revoked host is refused at its next CONNECT, where
+                // async-nats's typed error kind is classified; `run`'s error type carries no such kind.
                 let stage = match error {
                     HostDaemonError::Store(_) => "opening the host store",
                     HostDaemonError::Signaling(_) => "the signaling run loop",
                 };
+                let delay = reconnects.run_failed();
                 tracing::error!(
                     stage = stage,
-                    "host daemon failed; the redacted cause was logged above"
+                    delay_secs = delay.as_secs(),
+                    "host daemon failed; the redacted cause was logged above; reconnecting with \
+                     fresh credentials"
                 );
-                ExitCode::FAILURE
+                delay
             }
+        };
+
+        if sleep_or_shutdown(delay, shutdown.as_mut()).await {
+            tracing::info!("shutdown signal received");
+            return ExitCode::SUCCESS;
+        }
+    }
+}
+
+/// Waits `delay` or until `shutdown` resolves, returning `true` when a shutdown signal won.
+///
+/// The reconnect backoff must be interruptible: a SIGINT/SIGTERM during a 30 s wait has to return
+/// `SUCCESS` instead of being deferred until the sleep ends.
+async fn sleep_or_shutdown<F: std::future::Future<Output = ()>>(
+    delay: std::time::Duration,
+    shutdown: std::pin::Pin<&mut F>,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown => true,
+        _ = tokio::time::sleep(delay) => false,
+    }
+}
+
+/// The reconnect backoff: 1 s, doubling per consecutive failed attempt, capped at 30 s.
+///
+/// `attempt` is the number of consecutive failures since the host last **served** (0 for the first
+/// retry after a served connection), so the first reconnect is prompt. The cap keeps a long outage
+/// from turning into an ever-longer wait, while leaving a failed-but-reachable broker a bounded
+/// probe rate.
+fn reconnect_delay(attempt: u32) -> std::time::Duration {
+    const CAP_SECS: u64 = 30;
+    // 2^5 = 32 is already past the cap; clamping the shift avoids overflow for large attempt
+    // counts (which cannot occur in practice, though `attempt` saturates above).
+    let secs = 1u64 << attempt.min(5);
+    std::time::Duration::from_secs(secs.min(CAP_SECS))
+}
+
+/// Consecutive authorization refusals after which the process gives up.
+///
+/// Ten refusals span delays 1+2+4+8+16+30+30+30+30 = 151 s (>2.5 minutes) of continuous refusal.
+/// That is far longer than a helper needs to re-subscribe after a broker restart — NATS answers an
+/// unanswered callout request with the same undifferentiated `authorization violation` it answers a
+/// revoked host with — yet short enough that a genuinely revoked host is reported, not retried
+/// forever.
+const MAX_CONSECUTIVE_AUTH_REFUSALS: u32 = 10;
+
+/// How one `connect_host` failure is classified for the reconnect loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectFailureClass {
+    /// TLS or server-address parsing cannot become correct by retrying: operator misconfiguration.
+    Misconfiguration,
+    /// async-nats's typed `authorization violation` at CONNECT. Retried under the normal backoff,
+    /// but fatal once [`MAX_CONSECUTIVE_AUTH_REFUSALS`] consecutive refusals span the whole window.
+    AuthorizationRefusal,
+    /// DNS, I/O, timeout, or a local nkey/publish/flush error: retry.
+    Transient,
+}
+
+/// Classifies a failed connect. The classification is a pure function of the error, so the loop's
+/// refusal-window behavior is unit-testable without a broker.
+fn classify_connect_error(error: &ConnectError) -> ConnectFailureClass {
+    match error {
+        ConnectError::Nats(error) => match error.kind() {
+            async_nats::ConnectErrorKind::Tls | async_nats::ConnectErrorKind::ServerParse => {
+                ConnectFailureClass::Misconfiguration
+            }
+            async_nats::ConnectErrorKind::AuthorizationViolation => {
+                ConnectFailureClass::AuthorizationRefusal
+            }
+            _ => ConnectFailureClass::Transient,
         },
+        ConnectError::Nkey(_) | ConnectError::Publish(_) | ConnectError::Flush(_) => {
+            ConnectFailureClass::Transient
+        }
+    }
+}
+
+/// What the loop should do after a failed connection attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectFailure {
+    /// Wait this long, then try again.
+    Retry(std::time::Duration),
+    /// A TLS or server-address parse failure: exit `FAILURE`.
+    Misconfigured,
+    /// Authorization was refused on every attempt across the whole bounded window: exit `FAILURE`.
+    RefusedForGood,
+}
+
+/// Backoff and refusal-streak state for the reconnect loop.
+#[derive(Debug, Default)]
+struct ReconnectState {
+    /// Consecutive failed attempts since the host last **served** (`HostDaemon::run` returned
+    /// `Ok`). A successful `connect_host` alone does not reset this: a daemon that fails right
+    /// after connecting (an unwritable store, say) must keep backing off instead of re-CONNECTing
+    /// every second.
+    attempt: u32,
+    /// Consecutive [`ConnectFailureClass::AuthorizationRefusal`]s with no other outcome between.
+    auth_refusals: u32,
+}
+
+impl ReconnectState {
+    /// A `connect_host` success: clears the refusal streak. Deliberately leaves `attempt` alone.
+    fn connected(&mut self) {
+        self.auth_refusals = 0;
+    }
+
+    /// `HostDaemon::run` returned `Ok(())` — the host served, then lost its connection. The next
+    /// reconnect is prompt, and the returned delay is the first backoff step.
+    fn served_and_lost(&mut self) -> std::time::Duration {
+        self.attempt = 0;
+        self.advance()
+    }
+
+    /// A `HostDaemon::run` failure: always retryable, and it advances the backoff.
+    fn run_failed(&mut self) -> std::time::Duration {
+        self.advance()
+    }
+
+    /// A `connect_host` failure, classified by [`classify_connect_error`].
+    fn connect_failed(&mut self, class: ConnectFailureClass) -> ConnectFailure {
+        match class {
+            ConnectFailureClass::Misconfiguration => ConnectFailure::Misconfigured,
+            ConnectFailureClass::AuthorizationRefusal => {
+                self.auth_refusals = self.auth_refusals.saturating_add(1);
+                if self.auth_refusals >= MAX_CONSECUTIVE_AUTH_REFUSALS {
+                    return ConnectFailure::RefusedForGood;
+                }
+                ConnectFailure::Retry(self.advance())
+            }
+            ConnectFailureClass::Transient => {
+                self.auth_refusals = 0;
+                ConnectFailure::Retry(self.advance())
+            }
+        }
+    }
+
+    fn advance(&mut self) -> std::time::Duration {
+        let delay = reconnect_delay(self.attempt);
+        self.attempt = self.attempt.saturating_add(1);
+        delay
+    }
+}
+
+/// Clears the admission token once a connect has **succeeded** (A3b). A failed attempt must leave
+/// it in place: the call may never have reached the callout (server down, DNS, timeout), and a host
+/// that was never admitted still needs its bootstrap credential on the next attempt. Re-presenting
+/// a token that did reach the callout is safe because burning the same host+nonce is idempotent
+/// (A4).
+fn clear_admission_token_after_connect(token: &mut Option<Vec<u8>>, connected: bool) {
+    if connected {
+        *token = None;
     }
 }
 
@@ -832,5 +1101,126 @@ mod tests {
             parse_recovery_phrase(&text).is_err(),
             "an empty phrase must never restore a seed"
         );
+    }
+
+    /// Backoff ramps across both connect and `daemon.run` failures, and is reset only by a
+    /// connection that actually served before it was lost — not merely by a successful CONNECT.
+    /// This pins the whole sequence, including a run-error iteration.
+    #[test]
+    fn backoff_ramps_across_connect_and_run_failures_and_resets_only_after_serving() {
+        use std::time::Duration;
+
+        let mut state = ReconnectState::default();
+        assert_eq!(
+            state.connect_failed(ConnectFailureClass::Transient),
+            ConnectFailure::Retry(Duration::from_secs(1))
+        );
+        assert_eq!(
+            state.connect_failed(ConnectFailureClass::Transient),
+            ConnectFailure::Retry(Duration::from_secs(2))
+        );
+        assert_eq!(
+            state.connect_failed(ConnectFailureClass::Transient),
+            ConnectFailure::Retry(Duration::from_secs(4))
+        );
+
+        // A successful CONNECT alone must not reset the ramp.
+        state.connected();
+        assert_eq!(state.run_failed(), Duration::from_secs(8));
+        assert_eq!(state.run_failed(), Duration::from_secs(16));
+
+        // A connection that served and was then lost does reset it.
+        assert_eq!(state.served_and_lost(), Duration::from_secs(1));
+        assert_eq!(state.run_failed(), Duration::from_secs(2));
+    }
+
+    /// Ten consecutive authorization refusals are fatal; nine are not, and a transient failure in
+    /// between restarts the streak (the helper-still-re-subscribing case).
+    #[test]
+    fn authorization_refusals_are_fatal_only_after_the_bounded_window() {
+        use std::time::Duration;
+
+        let mut state = ReconnectState::default();
+        for expected in [1u64, 2, 4, 8, 16, 30, 30, 30, 30] {
+            assert_eq!(
+                state.connect_failed(ConnectFailureClass::AuthorizationRefusal),
+                ConnectFailure::Retry(Duration::from_secs(expected))
+            );
+        }
+        assert_eq!(
+            state.connect_failed(ConnectFailureClass::AuthorizationRefusal),
+            ConnectFailure::RefusedForGood
+        );
+        assert_eq!(
+            state.auth_refusals, MAX_CONSECUTIVE_AUTH_REFUSALS,
+            "the window is exactly the configured number of consecutive refusals"
+        );
+
+        // A transient failure with no refusal in between resets the streak.
+        let mut state = ReconnectState::default();
+        for _ in 0..5 {
+            assert!(matches!(
+                state.connect_failed(ConnectFailureClass::AuthorizationRefusal),
+                ConnectFailure::Retry(_)
+            ));
+        }
+        assert!(matches!(
+            state.connect_failed(ConnectFailureClass::Transient),
+            ConnectFailure::Retry(_)
+        ));
+        for _ in 0..9 {
+            assert!(matches!(
+                state.connect_failed(ConnectFailureClass::AuthorizationRefusal),
+                ConnectFailure::Retry(_)
+            ));
+        }
+        assert_eq!(
+            state.connect_failed(ConnectFailureClass::AuthorizationRefusal),
+            ConnectFailure::RefusedForGood
+        );
+    }
+
+    #[test]
+    fn a_misconfiguration_class_is_fatal_without_a_backoff_step() {
+        let mut state = ReconnectState::default();
+        assert_eq!(
+            state.connect_failed(ConnectFailureClass::Misconfiguration),
+            ConnectFailure::Misconfigured
+        );
+    }
+
+    /// An unparseable server address is a `ServerParse` failure, which must be classified as
+    /// permanent misconfiguration rather than retried. No broker is needed: parsing fails locally.
+    #[tokio::test]
+    async fn a_malformed_server_address_is_classified_as_misconfiguration() {
+        let error = match async_nats::connect("definitely not a server address").await {
+            Ok(_) => panic!("an unparseable server address must not connect"),
+            Err(error) => ConnectError::Nats(error),
+        };
+        assert_eq!(
+            classify_connect_error(&error),
+            ConnectFailureClass::Misconfiguration,
+            "a server-address parse failure cannot be fixed by retrying"
+        );
+    }
+
+    /// The admission token must survive a failed attempt and be consumed only by a successful one.
+    /// A first attempt that never reached the callout must not strand a never-admitted host.
+    #[test]
+    fn admission_token_survives_a_failed_connect_and_is_cleared_by_a_successful_one() {
+        let mut token = Some(vec![0xA5u8; 11]);
+
+        clear_admission_token_after_connect(&mut token, false);
+        assert_eq!(
+            token.as_deref(),
+            Some(&[0xA5u8; 11][..]),
+            "a failed attempt must not consume the bootstrap token"
+        );
+
+        clear_admission_token_after_connect(&mut token, true);
+        assert!(token.is_none(), "a successful connect consumes the token");
+
+        clear_admission_token_after_connect(&mut token, true);
+        assert!(token.is_none(), "clearing is idempotent");
     }
 }

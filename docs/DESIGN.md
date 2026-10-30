@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.56) + Execution Plan
+# Spindle — System Design Document (draft v0.9.57) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -269,6 +269,25 @@
 > subject-token identity on ingest, stores the canonical bytes last-write-wins, and serves the certificate only for
 > hosts in the caller's session record, with one uniform refusal for "not held" and "not cached". §A5b's status
 > rows and §A5's permission bullet are corrected accordingly.
+> v0.9.57: one implementation change, no wire change. `spindle-hostd`'s headless binary now **supervises its
+> NATS connection** instead of treating a lost connection as process-fatal (td-6242d2). Each attempt calls
+> `connect_host` again, so every connection gets a fresh session nkey, `HostSessionAttestation`, `auth_token`,
+> and `HostDeviceCert` publish — satisfying §A4 step 3's per-connect attestation rule rather than deciding
+> anything new. The process's envelope `DeviceKey` is **not** re-minted: A10.44 makes it fresh per process and
+> A10.45 forbids churning it mid-process, so `device_fp` is stable across reconnects within one process. The
+> certificate itself **is** re-minted per connection with a fresh `ts` (same keys, same `device_fp`, same `exp`;
+> `ts` is inside the signed preimage), so the helper's cache is replaced last-write-wins. The admission token is
+> presented until the first connect **succeeds** (a failed attempt may never have reached the callout, and
+> re-burning the same host+nonce is idempotent per A4); after that a reconnecting host presents its certificate
+> chain alone (A3b). Failure handling: a TLS or server-address parse failure is fatal immediately (retrying
+> cannot fix misconfiguration); an authorization refusal **at CONNECT** is fatal only after it has persisted
+> across a bounded window of 10 consecutive refusals (1+2+4+8+16+30+30+30+30 = 151 s of continuous backoff),
+> because NATS reports a helper still re-subscribing after a broker restart with the same undifferentiated
+> `authorization violation` it reports for a revoked host; every other failure — including any `HostDaemon::run`
+> failure — is retried with a 1 s-doubling-to-30 s backoff, which resets only after a connection has actually
+> **served** and was then lost (not merely after a successful CONNECT). `max_reconnects(1)` remains: it bounds
+> the client-internal retry whose stale token fails fast, which is what makes `HostDaemon::run` return promptly
+> to the supervisor.
 
 ---
 

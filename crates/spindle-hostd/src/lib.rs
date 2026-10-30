@@ -227,7 +227,10 @@ type BoxedNowFn = Box<dyn Fn() -> u64 + Send + Sync + 'static>;
 /// for why `device` and `host_fp` are two distinct values rather than one.
 pub struct HostDaemon {
     nats: async_nats::Client,
-    device: DeviceKey,
+    /// This process's envelope identity, shared rather than owned: a supervised caller builds a
+    /// fresh `HostDaemon` after every reconnect with the *same* key, so `device_fp` stays stable
+    /// for the process's life (A10.44/A10.45). `DeviceKey` is deliberately not `Clone`.
+    device: Arc<DeviceKey>,
     host_fp: Fingerprint,
     store_path: PathBuf,
     now_fn: BoxedNowFn,
@@ -251,7 +254,20 @@ impl HostDaemon {
         host_fp: Fingerprint,
         store_path: impl Into<PathBuf>,
     ) -> Self {
-        Self::with_now_fn(nats, device, host_fp, store_path, wall_clock_now_secs)
+        Self::new_shared(nats, Arc::new(device), host_fp, store_path)
+    }
+
+    /// As [`Self::new`], but takes the envelope [`DeviceKey`] behind an [`Arc`]. This is the
+    /// constructor a supervised caller uses across reconnects: [`DeviceKey`] is not `Clone`, and
+    /// A10.44/A10.45 require `device_fp` to stay stable for the life of the process, so the same
+    /// key must be handed to each fresh daemon after a reconnect rather than re-minted.
+    pub fn new_shared(
+        nats: async_nats::Client,
+        device: Arc<DeviceKey>,
+        host_fp: Fingerprint,
+        store_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::with_now_fn_shared(nats, device, host_fp, store_path, wall_clock_now_secs)
     }
 
     /// As [`Self::new`], but with an explicit `now_fn` — the injectable-clock seam this module's
@@ -263,6 +279,18 @@ impl HostDaemon {
     pub fn with_now_fn(
         nats: async_nats::Client,
         device: DeviceKey,
+        host_fp: Fingerprint,
+        store_path: impl Into<PathBuf>,
+        now_fn: impl Fn() -> u64 + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_now_fn_shared(nats, Arc::new(device), host_fp, store_path, now_fn)
+    }
+
+    /// As [`Self::with_now_fn`], but takes the envelope [`DeviceKey`] behind an [`Arc`] — see
+    /// [`Self::new_shared`] for why a supervised caller needs this.
+    pub fn with_now_fn_shared(
+        nats: async_nats::Client,
+        device: Arc<DeviceKey>,
         host_fp: Fingerprint,
         store_path: impl Into<PathBuf>,
         now_fn: impl Fn() -> u64 + Send + Sync + 'static,
@@ -434,7 +462,7 @@ impl HostDaemon {
         );
 
         let host: AssembledSignalingHost<_> =
-            SignalingHost::new(nats, device, host_fp, authorizer, handler);
+            SignalingHost::new_shared(nats, device, host_fp, authorizer, handler);
         match Arc::new(host).run(opts).await {
             Ok(()) => {
                 tracing::info!(

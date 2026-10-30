@@ -66,7 +66,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use spindle_core::artifacts::{issue_capability, verify_host_device_cert};
-use spindle_hostd::connect::connect_host;
+use spindle_hostd::connect::{connect_host, HostConnectCredentials};
 use spindle_hostd::{mint_host_identity, wall_clock_now_secs};
 use spindle_proto::artifacts::{CapKind, HostDeviceCert};
 use spindle_test_fixtures::fixtures::{self, DeviceIdentity};
@@ -149,9 +149,14 @@ async fn host_publishes_its_device_cert_and_a_member_fetches_the_running_envelop
     let identity = mint_host_identity([0x6a; 32], now);
     // The second tuple element is the guard that keeps the reconnect-republish pump alive; hold
     // it for the connection's lifetime (dropping the client alone would leave the pump's clone).
-    let (host_client, _host_publisher) = connect_host(&identity, &url, None, now)
-        .await
-        .expect("host CONNECT to the live stack failed; is the stack up and the helper rebuilt?");
+    let (host_client, _host_publisher) = connect_host(
+        &HostConnectCredentials::from_identity(&identity),
+        &url,
+        None,
+        now,
+    )
+    .await
+    .expect("host CONNECT to the live stack failed; is the stack up and the helper rebuilt?");
     println!(
         "[host] connect_host published registry.devcert.{}",
         identity.host_fp
@@ -161,11 +166,16 @@ async fn host_publishes_its_device_cert_and_a_member_fetches_the_running_envelop
     // holds no capability for it, so fetching it exercises the helper's membership guard against a
     // certificate that genuinely is in the cache.
     let other_host = mint_host_identity([0x6b; 32], now);
-    let (other_host_client, _other_host_publisher) = connect_host(&other_host, &url, None, now)
-        .await
-        .unwrap_or_else(|error| {
-            panic!("second host CONNECT/publish to the live stack failed: {error}")
-        });
+    let (other_host_client, _other_host_publisher) = connect_host(
+        &HostConnectCredentials::from_identity(&other_host),
+        &url,
+        None,
+        now,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        panic!("second host CONNECT/publish to the live stack failed: {error}")
+    });
     println!(
         "[other-host] connect_host published registry.devcert.{}",
         other_host.host_fp
@@ -226,6 +236,63 @@ async fn host_publishes_its_device_cert_and_a_member_fetches_the_running_envelop
         identity.host_fp, identity.device_fp
     );
 
+    // ---- a new connection re-mints with a fresh `ts` and replaces the cached copy ------------
+    // `connect_host` mints every credential fresh on each call (new session nkey, attestation,
+    // token) and mints the certificate at that call's `now`, so a *second connection* at a later
+    // second produces different bytes: same keys, same `device_fp`, same `exp`, but a new `ts`
+    // inside the signed preimage. Polling until the helper serves that later `ts` is what proves
+    // the second publish actually landed (last-write-wins); reusing `now` would produce bytes
+    // identical to the first publish and let a missing publish pass unnoticed. This is the cheap
+    // connection-level half of td-6242d2's proof; the full NATS stop/start path is
+    // `live_reconnect.rs`, which drives the binary and therefore cannot mint a member capability
+    // for its running identity.
+    let reconnected_at = wall_clock_now_secs().max(now + 1);
+    let (reconnected_client, _reconnected_publisher) = connect_host(
+        &HostConnectCredentials::from_identity(&identity),
+        &url,
+        None,
+        reconnected_at,
+    )
+    .await
+    .expect("a second production connect for the same identity must re-publish its certificate");
+
+    let fetch_deadline = Instant::now() + FETCH_TIMEOUT;
+    let reconnected_cert = loop {
+        let reply = fetch_certificate(&device_client, &fetch_subject, &request).await;
+        let cert_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cert_field(&reply))
+            .expect("the re-served certificate is unpadded base64url");
+        let cert = HostDeviceCert::from_canonical_bytes(&cert_bytes)
+            .expect("the re-served bytes decode as a canonical HostDeviceCert");
+        if cert.ts == reconnected_at {
+            break cert;
+        }
+        assert!(
+            Instant::now() < fetch_deadline,
+            "the helper still serves the first connection's certificate (ts={}) instead of the \
+             second connection's (ts={reconnected_at}) within {}s",
+            cert.ts,
+            FETCH_TIMEOUT.as_secs()
+        );
+        tokio::time::sleep(FETCH_RETRY_INTERVAL).await;
+    };
+    verify_host_device_cert(&reconnected_cert, &identity.host_fp, reconnected_at)
+        .expect("the re-published certificate must verify against the same pinned root");
+    assert_eq!(
+        reconnected_cert.host_device_fp,
+        identity.device_fp.to_vec(),
+        "the certificate re-published on a new connection must keep this process's device_fp"
+    );
+    assert_eq!(
+        reconnected_cert.exp, identity.op_cert.exp,
+        "a re-mint changes only `ts`; `exp` still comes from the embedded op certificate"
+    );
+    println!(
+        "[device] second connection's certificate (ts={reconnected_at}) is served with the same \
+         device_fp={}",
+        identity.device_fp
+    );
+
     // ---- negative: a cached certificate for a host outside the caller's session ---------------
     // The second host's certificate really is in the helper's cache, so only the session-record
     // membership check can produce this refusal. Do not retry: the answer must be immediate.
@@ -256,7 +323,9 @@ async fn host_publishes_its_device_cert_and_a_member_fetches_the_running_envelop
     // handle really is gone. There is no reference cycle left to keep a connection alive.
     drop(_other_host_publisher);
     drop(_host_publisher);
+    drop(_reconnected_publisher);
     drop(device_client);
     drop(other_host_client);
     drop(host_client);
+    drop(reconnected_client);
 }

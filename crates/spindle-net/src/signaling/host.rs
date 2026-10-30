@@ -135,7 +135,10 @@ impl Default for HostOptions {
 /// "host.<device_fp>.connect"`, because the Auth Callout grants `sub host.<host_fp>.>`).
 pub struct SignalingHost<A, H> {
     nats: async_nats::Client,
-    device: DeviceKey,
+    /// Shared, not owned: a supervised supervisor may need to build a fresh `SignalingHost`
+    /// after every reconnect while keeping this process's envelope identity stable. `DeviceKey`
+    /// is deliberately not `Clone`, so the identity travels as an `Arc`. See [`Self::new_shared`].
+    device: Arc<DeviceKey>,
     device_fp: Fingerprint,
     /// The host's root fingerprint — the NATS subject-scoping token only, never an envelope field.
     host_fp: Fingerprint,
@@ -339,9 +342,26 @@ where
     /// `device` is this host's **envelope** identity (§A7 `to_fp`/`from_fp`, and the X25519 half
     /// `k0`/`k1` are derived from); `host_fp` is its **root** fingerprint, the token every §A5 NATS
     /// subject is scoped by. See this type's doc comment for why both are required.
+    ///
+    /// Takes ownership of `device` and delegates to [`Self::new_shared`] with a fresh `Arc`.
     pub fn new(
         nats: async_nats::Client,
         device: DeviceKey,
+        host_fp: Fingerprint,
+        authorizer: A,
+        handler: H,
+    ) -> Self {
+        Self::new_shared(nats, Arc::new(device), host_fp, authorizer, handler)
+    }
+
+    /// As [`Self::new`], but takes the envelope [`DeviceKey`] behind an [`Arc`] instead of owning
+    /// it. This is the constructor a supervised caller uses across reconnects: [`DeviceKey`] is
+    /// deliberately not `Clone`, and A10.44/A10.45 require `device_fp` to stay stable for the life
+    /// of the process, so the same key must be handed to each fresh `SignalingHost` after a
+    /// reconnect rather than re-minted.
+    pub fn new_shared(
+        nats: async_nats::Client,
+        device: Arc<DeviceKey>,
         host_fp: Fingerprint,
         authorizer: A,
         handler: H,

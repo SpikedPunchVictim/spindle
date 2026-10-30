@@ -16,11 +16,13 @@
 //! The cadence lives in [`crate::connect::connect_host`], not in the binary: that function mints
 //! the certificate before connecting, keeps its canonical bytes, publishes once after a successful
 //! connect, and republishes **the same cached bytes** on every later [`async_nats::Event::Connected`]
-//! (async-nats has no separate reconnected variant — a reconnect emits `Connected` again). Caching
-//! is correct because the certificate chains to this process's operating key and embeds this
-//! process's envelope keys; neither changes across a reconnect, so re-minting would only produce
-//! the same bytes again. A library consumer that calls `connect_host` therefore gets the cadence
-//! for free.
+//! (async-nats has no separate reconnected variant — a reconnect emits `Connected` again). The
+//! cached bytes are reused within one connection because `ts` is part of the signed preimage: a
+//! mid-connection re-mint would change it even though the keys do not. A **new connection** (a
+//! caller-supervised reconnect) calls `connect_host` with a fresh `now` and therefore re-mints the
+//! certificate with a fresh `ts` — same keys, same `device_fp`, same `exp`, different bytes — and
+//! its explicit publish replaces the helper's cached copy. A library consumer that calls
+//! `connect_host` gets the cadence for free.
 //!
 //! # Why a fresh certificate replaces the cached one on every restart [A10.44]
 //!
@@ -44,14 +46,16 @@
 //! `Result`. This function is therefore fire-and-forget by construction, and its success only
 //! means "handed to the client".
 //!
-//! # Why a publish failure is fatal on the connect path
+//! # Why a publish failure keeps the connection from serving
 //!
 //! [`crate::connect::connect_host`] publishes before it returns the client, and it propagates a
-//! local publish or flush failure as [`crate::connect::ConnectError`]. The headless binary treats
-//! that error as fatal (`ExitCode::FAILURE`), so a client can never reach the host before its
-//! certificate was at least handed to the server. The ordering is the point: otherwise the very
-//! first connect after a restart can fail against the previous process's certificate. A library
-//! consumer gets the same guarantee as an `Err` from `connect_host` and decides for itself.
+//! local publish or flush failure as [`crate::connect::ConnectError`]. The headless binary only
+//! builds and runs a `HostDaemon` — the thing that accepts connects — after `connect_host`
+//! succeeds, so a client can never reach the host on a connection whose certificate was not at
+//! least handed to the server. Such an attempt is logged and retried with a fresh credential (see
+//! `src/main.rs`'s reconnect loop); it is never served on. The ordering is the point: otherwise the
+//! very first connect after a restart can fail against the previous process's certificate. A
+//! library consumer gets the same guarantee as an `Err` from `connect_host` and decides for itself.
 //!
 //! `publish` alone is queued, not delivered, which is why the connect path follows it with
 //! [`async_nats::Client::flush`]: a flush completes only once the server has accepted everything
@@ -61,7 +65,8 @@
 //! server-side (a permission violation, say) cannot be seen through either call; it surfaces
 //! through the connection event callback or a later close.
 
-use spindle_core::artifacts::issue_host_device_cert;
+use spindle_core::artifacts::{issue_host_device_cert, HostOpKeyCert};
+use spindle_core::{DeviceKey, Fingerprint, SigningKey, VerifyingKey};
 use spindle_proto::artifacts::HostDeviceCert;
 
 use crate::HostIdentity;
@@ -103,16 +108,39 @@ pub enum DevCertPublishError {
 /// (A7b/A10.45), but deriving it from the op cert keeps the invariant when the two are minted at
 /// different times, and leaves a future A10.45 renewal path free to renew only the op cert.
 pub fn mint_device_cert(identity: &HostIdentity, now: u64) -> HostDeviceCert {
-    issue_host_device_cert(
+    mint_device_cert_from_parts(
         &identity.op_signing,
         identity.host_fp,
         &identity.root.public_key(),
         &identity.op_cert,
-        identity.device.alg_id(),
-        &identity.device.sign_public_key(),
-        &identity.device.agree_public_key(),
+        &identity.device,
         now,
-        identity.op_cert.exp,
+    )
+}
+
+/// [`mint_device_cert`] over the individual pieces of a [`HostIdentity`], for callers that hold
+/// them as a borrowed [`crate::connect::HostConnectCredentials`] rather than as a whole identity.
+///
+/// The certificate depends only on these six values; `mint_device_cert` delegates here so there
+/// is exactly one construction site.
+pub(crate) fn mint_device_cert_from_parts(
+    op_signing: &SigningKey,
+    host_fp: Fingerprint,
+    host_root_pk: &VerifyingKey,
+    op_cert: &HostOpKeyCert,
+    device: &DeviceKey,
+    now: u64,
+) -> HostDeviceCert {
+    issue_host_device_cert(
+        op_signing,
+        host_fp,
+        host_root_pk,
+        op_cert,
+        device.alg_id(),
+        &device.sign_public_key(),
+        &device.agree_public_key(),
+        now,
+        op_cert.exp,
     )
 }
 
@@ -121,7 +149,13 @@ pub fn mint_device_cert(identity: &HostIdentity, now: u64) -> HostDeviceCert {
 /// host `pub registry.devcert.<own>` only (`spindle_helper::permissions::host_permissions`), so
 /// this is the sole subject a well-behaved host can use.
 pub fn device_cert_subject(identity: &HostIdentity) -> String {
-    format!("{DEVICE_CERT_SUBJECT_PREFIX}{}", identity.host_fp)
+    device_cert_subject_for(identity.host_fp)
+}
+
+/// [`device_cert_subject`] from the root fingerprint alone, for callers holding a borrowed
+/// [`crate::connect::HostConnectCredentials`] instead of a whole [`HostIdentity`].
+pub(crate) fn device_cert_subject_for(host_fp: Fingerprint) -> String {
+    format!("{DEVICE_CERT_SUBJECT_PREFIX}{host_fp}")
 }
 
 /// Mints and publishes this process's [`HostDeviceCert`] to `registry.devcert.<host_fp>`, then
