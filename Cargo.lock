@@ -3525,6 +3525,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "spike-s2-nat-lab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "futures-util",
+ "serde_json",
+ "spindle-core",
+ "spindle-net",
+ "tokio",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "spike-s2-signaling"
 version = "0.1.0"
 dependencies = [

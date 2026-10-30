@@ -11,6 +11,7 @@ members = [
     "spikes/s11-vfs-confinement",
     "spikes/s1-callout",
     "spikes/s19-quic-transport",
+    "spikes/s2-nat-lab",
     "spikes/s5-presence",
     "spikes/s2-signaling",
     "spikes/s9-revoke-kick",

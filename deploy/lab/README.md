@@ -17,23 +17,27 @@ It exists to answer what the netns harness could not:
 
 ```
                       registry side — docker network "wan" 172.28.0.0/24
-   nats .10   helper .11   postgres .12   coturn .13   stun .14
-        \          |            |             |           /
-         +---------+------------+-------------+----------+
+   nats .10  helper .11  postgres .12  coturn .13  stun .14  nats-s2 .15
+        \         |           |            |          |          /
+         +--------+-----------+------------+----------+---------+
                                 |
                           wan bridge (Docker)
-                         /                      \
-                 gw-a 172.28.0.21          gw-b 172.28.0.22
-                 MASQUERADE                MASQUERADE + tcp DNAT
-                 (cone | --random-fully)   (cone | --random-fully)
-                         |                      |
-              nat-a 172.28.10.0/24      nat-b 172.28.20.0/24
-                 gw-a .254                  gw-b .254
-                         |                      |
-                 peer-a 172.28.10.2         peer-b 172.28.20.2
-                 tc netem (egress)          tc netem (egress)
-                 quic-peer --mode send      quic-peer --mode recv
+                    /            |             \
+            gw-a .21          gw-b .22          gw-c .23
+            MASQUERADE        MASQUERADE        MASQUERADE
+            (+ signal DNAT)   (+ signal DNAT)
+                 |                |                 |
+       nat-a 172.28.10/24  nat-b 172.28.20/24  nat-c 172.28.30/24
+            gw-a .254          gw-b .254          gw-c .254
+                 |                |                 |
+         peer-a .2 (host)     peer-b .2         peer-c .2 (S2 client)
+         tc netem             tc netem           tc netem
 ```
+
+`nats-s2` is a second, deliberately **unauthenticated** NATS used only by the S2 across-NAT
+harness (`spikes/s2-nat-lab`); the authenticated `nats`/`helper` stack above is untouched and
+still proves the callout path in the live tests. `peer-c` exists so the S2 client is on a private
+network distinct from the host's `peer-a` — signaling and media are no longer same-LAN.
 
 - `peer-a` and `peer-b` have **no interface on `wan`**. Their only route off their private
   network is their gateway container, which is a real second network namespace with its own
@@ -95,9 +99,10 @@ form in `RESULTS.md`.
 
 **Simulated / added over the netns rig**
 
-- Two separate gateway containers, each with its own netns, routing table, conntrack table, and
-  MASQUERADE rule. Peers are routed through them, and each gateway drops private→other-private
-  forwarding so the private host candidates cannot be reached around the NATs.
+- Three gateway containers (`gw-a`/`gw-b`/`gw-c`), each with its own netns, routing table,
+  conntrack table, and MASQUERADE rule. Peers are routed through them, and each gateway drops
+  private→other-private forwarding (for *all* other private subnets) so private host candidates
+  cannot be reached around the NATs.
 - Cone NAT = plain `MASQUERADE` (port-restricted cone filtering). Symmetric NAT =
   `MASQUERADE --random-fully` (a fresh external port per destination).
 - Independent per-side shaping on each peer's egress: delay, loss, reordering.
@@ -139,6 +144,11 @@ deploy/lab/run-matrix.sh
 
 # leave the lab running for manual poking
 KEEP_LAB=1 deploy/lab/run-matrix.sh
+
+# S2 across-NAT measurement using the production signaling stack (host on peer-a, client on
+# peer-c, signaling via nats-s2). See the S2 section below for why the usable-stream phase does
+# not exist across NATs yet.
+deploy/lab/run-s2-nat.sh
 
 # fewer/more attempts, smaller transfer
 RUNS=3 MAX_ATTEMPTS=8 BYTES_MIB=32 WINDOW_MIB=2 deploy/lab/run-matrix.sh
@@ -229,6 +239,27 @@ write-up, exact flags, and what remains unproven are in
 `spikes/s19-quic-transport/RESULTS.md` under "Results — two-container lab (simulated; still one
 kernel)".
 
+## S2 across NATs (production signaling stack)
+
+`run-s2-nat.sh` drives the production `spindle_net::signaling::{SignalingHost, SignalingClient}`
+with the host on `peer-a` (nat-a) and the client on `peer-c` (nat-c), signaling through `nats-s2`.
+The fixed identities and the lab-local `RegistryAuthorizer` live in `spikes/s2-nat-lab`; the
+binaries are built by `Dockerfile.s2lab` and copied into the peers.
+
+**Production ICE gathers a host candidate only — no STUN, no TURN**
+(`crates/spindle-net/src/signaling/ice.rs`: "Loopback/LAN host candidates only in this slice — no
+STUN/TURN gathering"). Across nat-a ↔ nat-c that candidate is the private address, which the
+gateways drop, so ICE cannot select a pair: the `answer→selected`, `selected→QUIC`, and
+`offer→usable` phases are undefined. The offer/answer signaling itself does cross the NATs via
+NATS (the host records offer/answer events), but there is no across-NAT usable-stream number until
+the production stack gains STUN or relay candidate gathering. The production stack also has no
+relay transport, so there is no production S2 relay number; the S19 `quic-peer --transport relay`
+figures are the only relay evidence. Measured 2026-10-30: unshaped **0/10** attempts (all `ICE trickle timed out`, 5108.6 ms median),
+50 ms both peers **0/5** (5200.3 ms median); the host observed **10/10** and **5/5** offer/answer
+pairs and **0** QUIC sessions. Host-side offer→answer (approximate; the production client exposes
+the four phases only on success) was 2.369 ms unshaped and 56.353 ms at 50 ms. Measured evidence
+and the exact failure strings are recorded in `spikes/s2-signaling/RESULTS.md`.
+
 ## File map
 
 - `Dockerfile.lab` — multi-stage build of `quic-peer` + `stun-server` (builder pinned by
@@ -241,6 +272,8 @@ kernel)".
 - `peer-entrypoint.sh` — set the default route to the gateway and apply compose netem.
 - `apply-netem.sh` — apply/clear a netem qdisc; refuses reorder without a delay.
 - `run-matrix.sh` — orchestration, measurement, markdown output.
+- `Dockerfile.s2lab` — scratch image with the two `spikes/s2-nat-lab` binaries.
+- `run-s2-nat.sh` — S2 across-NAT driver (unshaped and 50 ms cells).
 
 ## Relationship to leg 4
 

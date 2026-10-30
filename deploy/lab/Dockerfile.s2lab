@@ -1,0 +1,16 @@
+# Scratch image holding only the S2 across-NAT lab binaries (spikes/s2-nat-lab). Kept separate
+# from the main lab image so the runtime lab image does not grow; the driver extracts these two
+# binaries and copies them into peer-a (host) and peer-c (client). The source under spikes/ is
+# lab-only; no production crate is modified.
+FROM rust:1-slim-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /workspace
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+COPY spikes/ ./spikes/
+RUN cargo build --release -p spike-s2-nat-lab --bin s2-host --bin s2-client
+
+FROM scratch
+COPY --from=builder /workspace/target/release/s2-host /s2-host
+COPY --from=builder /workspace/target/release/s2-client /s2-client

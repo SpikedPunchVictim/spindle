@@ -1,0 +1,31 @@
+[package]
+name = "spike-s2-nat-lab"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# Lab-only across-NAT S2 harness (td-c694b2). Drives the PRODUCTION
+# spindle_net::signaling::{SignalingHost, SignalingClient} with a lab-local ConnectAuthorizer, so
+# the offer/answer/ICE/QUIC path is the graduated code, not a spike reimplementation. The fixed
+# identities are lab stand-ins (no membership store); the NATS server is a lab-local
+# unauthenticated instance because this measurement is about the signaling/media path, not the
+# Auth Callout policy. See RESULTS.md for the full caveats.
+[[bin]]
+name = "s2-host"
+path = "src/bin/s2-host.rs"
+
+[[bin]]
+name = "s2-client"
+path = "src/bin/s2-client.rs"
+
+[dependencies]
+spindle-core = { path = "../../crates/spindle-core" }
+spindle-net = { path = "../../crates/spindle-net" }
+tokio = { workspace = true }
+async-nats = { workspace = true }
+anyhow = { workspace = true }
+serde_json = "1"
+futures-util = "0.3"
+# `X25519PublicKey` appears in the lab authorizer's registry type; spindle-core does not re-export
+# the crate, the same reason crates/spindle-net/Cargo.toml carries this dependency.
+x25519-dalek = { workspace = true }

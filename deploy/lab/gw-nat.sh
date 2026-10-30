@@ -17,7 +17,13 @@ if [ -z "$wan_if" ]; then
   wan_if=$(ip -o -4 addr show | awk -v p="$WAN_PREFIX" 'index($4, p) == 1 { print $2; exit }')
 fi
 : "${PRIVATE_SUBNET:?PRIVATE_SUBNET must be set}"
-: "${OTHER_PRIVATE_SUBNET:?OTHER_PRIVATE_SUBNET must be set}"
+# One or more other private subnets to block (whitespace-separated). gw-c needs two (nat-a and
+# nat-b); the original single-subnet variable remains accepted for the two-gateway topology.
+OTHER_PRIVATE_SUBNETS="${OTHER_PRIVATE_SUBNETS:-${OTHER_PRIVATE_SUBNET:-}}"
+if [ -z "$OTHER_PRIVATE_SUBNETS" ]; then
+  echo "gw-nat: OTHER_PRIVATE_SUBNET(S) must be set" >&2
+  exit 1
+fi
 if [ -z "$wan_if" ]; then
   echo "gw-nat: could not locate the wan interface" >&2
   ip -o -4 addr show >&2
@@ -57,7 +63,9 @@ esac
 iptables -N LAB_FORWARD 2>/dev/null || true
 iptables -F LAB_FORWARD
 iptables -C FORWARD -j LAB_FORWARD 2>/dev/null || iptables -A FORWARD -j LAB_FORWARD
-iptables -A LAB_FORWARD -s "$PRIVATE_SUBNET" -d "$OTHER_PRIVATE_SUBNET" -j DROP
+for other in $OTHER_PRIVATE_SUBNETS; do
+  iptables -A LAB_FORWARD -s "$PRIVATE_SUBNET" -d "$other" -j DROP
+done
 iptables -A LAB_FORWARD -j ACCEPT
 
-echo "gw-nat: mode=$mode wan_if=$wan_if private_subnet=$PRIVATE_SUBNET other_private=$OTHER_PRIVATE_SUBNET"
+echo "gw-nat: mode=$mode wan_if=$wan_if private_subnet=$PRIVATE_SUBNET other_private=$OTHER_PRIVATE_SUBNETS"

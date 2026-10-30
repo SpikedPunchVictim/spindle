@@ -893,3 +893,11 @@ symmetric relay confirmation. **Does not add:** a real two-host link (leg 4 rema
 and loss distributions; the S2 across-NATs offer→usable-stream number (this measures
 `quic-peer`, not `spindle-net`); envelope-`seq` behavior under real reordering; or the production
 signaling/credential paths.
+
+**Cross-reference — S2 across NATs with the production stack (`td-c694b2`).** A separate harness
+(`spikes/s2-nat-lab`, `deploy/lab/run-s2-nat.sh`) put the production `SignalingHost`/`SignalingClient`
+on `peer-a` and on a new third NAT (`nat-c`/`peer-c`). The offer/answer signaling crossed the NATs
+(10/10 unshaped, 5/5 at 50 ms), but production ICE gathers host candidates only (no STUN/TURN), so
+every attempt failed at `ICE trickle timed out` (0/10 and 0/5) and no across-NAT usable-stream
+number exists. The production stack also has no relay transport. See
+`spikes/s2-signaling/RESULTS.md` for the numbers and the blocker.

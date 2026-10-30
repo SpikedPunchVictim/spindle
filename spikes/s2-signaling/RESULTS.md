@@ -468,3 +468,69 @@ exercised by this step's low-traffic pattern per Q5).
   never produced real reordering, so step A's Check 6 finding (reordered vs. retried `seq` are
   indistinguishable) remains unexercised and unresolved by this step, exactly as it was left by
   step A.
+
+---
+
+# S2 across-NAT attempt in the two-container lab — 2026-10-30 (`td-c694b2`)
+
+**Outcome: the across-NAT S2 usable-stream number still does not exist, and the blocker is the
+production code, not the lab.** The graduated `spindle-net` signaling stack drives
+offer/answer/ICE/QUIC correctly, but its ICE gathering has **no STUN and no TURN**:
+`crates/spindle-net/src/signaling/ice.rs` says *"Loopback/LAN host candidates only in this slice —
+no STUN/TURN gathering"* and `start_local_ice` adds exactly one `CandidateHostConfig`. Across two
+NATs the only candidate is the private address, so ICE cannot select a pair regardless of NAT type
+or shaping. `spindle-net` also has no relay transport, so there is no production S2 relay path to
+measure. (This section is the better home than the S19 results file because it is S2's across-NATs
+bar and the production signaling stack; `spikes/s19-quic-transport/RESULTS.md` carries a
+cross-reference.)
+
+## Harness and topology
+
+- `spikes/s2-nat-lab` (new): `s2-host`/`s2-client` bins driving the production
+  `SignalingHost`/`SignalingClient` with a lab-local `RegistryAuthorizer` (the live tests' test
+  double), fixed lab seeds, and the client's required `_INBOX_<device_fp>` prefix. No production
+  crate was modified; the fixed identities stand in for membership, which is not what this
+  measures.
+- `deploy/lab/`: added `nat-c` 172.28.30.0/24, `gw-c` (wan 172.28.0.23), `peer-c`
+  (172.28.30.2), and an unauthenticated `nats-s2` (172.28.0.15) on the wan. Host runs on
+  `peer-a` (172.28.10.2, behind gw-a/nat-a); client on `peer-c` (behind gw-c/nat-c). Every gateway
+  drops private→other-private forwarding for all other private subnets, so a private host
+  candidate cannot be reached around a gateway. Driver: `deploy/lab/run-s2-nat.sh`.
+- The NATS Auth Callout/subject scoping is deliberately not exercised (the live tests cover it);
+  the lab NATS is anonymous. The production signaling types, subjects, envelopes, ICE and QUIC are
+  the real ones.
+
+## Measured (5 s ICE timeout; 5 successes wanted)
+
+| Cell | Netem both peers | Attempts | Successes | Failures | Client failure | Host offers / answers / QUIC usable | Host-side offer→answer ms |
+|------|-------------------|----------|-----------|----------|----------------|--------------------------------------|----------------------------|
+| unshaped | none | 10 | 0 | 10 | `ICE trickle timed out`, 5108.6 ms median (5076.2-5128.0) | 10 / 10 / 0 | 2.369 (0.859-6.905) |
+| delay50 | 50 ms | 5 | 0 | 5 | `ICE trickle timed out`, 5200.3 ms median (5188.1-5236.4) | 5 / 5 / 0 | 56.353 (54.743-61.178) |
+
+- **The offer/answer signaling does cross the NATs.** The host received every offer and published
+  every answer, and every client failure is the ICE phase (`ICE trickle timed out`), not the
+  answer. The host-side offer→answer figure is the host's receipt to its own observed
+  answer-published event — not the client's `ConnectTimings.offer_to_answer` (the production
+  client exposes timings only on success) — but it shows the signaling path works through both
+  NATs, and the 50 ms cell adds the expected delay.
+- **The four phases**: offer→answer is available only in the approximate host-side form above;
+  answer→ICE-selected, ICE→QUIC, and offer→usable are **undefined** because ICE never selects.
+  The loopback S2 numbers (13.40 ms in the Stage 5 note; 12.33 ms re-measured 2026-09-02, total
+  offer→usable) remain the only S2 numbers.
+- **Relay**: no production relay transport exists, so there is no S2 relay number. The S19
+  `quic-peer --transport relay` figures (77.112 MB/s unshaped symmetric, plus the shaped relay
+  variants in `spikes/s19-quic-transport/RESULTS.md`) are the only relay evidence.
+
+## What would close it
+
+Add STUN srflx gathering (and/or TURN) to `crates/spindle-net/src/signaling/ice.rs`, then re-run
+`deploy/lab/run-s2-nat.sh`; the two-NAT topology and harness are ready. Until then the S2
+across-NATs bar is unmeasured.
+
+## `td-c694b2` status after this attempt
+
+- **Item 1 (ICE loopback-only)**: confirmed at the code level and empirically — across nat-a↔nat-c
+  the production stack cannot select an ICE pair at all, unshaped or shaped.
+- **Item 2 (S2 across-NATs number)**: still absent, with the precise blocker now named: no
+  STUN/TURN candidate gathering and no relay transport in `spindle-net`.
+- **Item 3 (envelope `seq` under real reordering)**: unchanged/unmeasured.

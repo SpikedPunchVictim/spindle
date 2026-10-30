@@ -117,6 +117,16 @@ services:
       wan:
         ipv4_address: 172.28.0.14
 
+  # A second, deliberately unauthenticated NATS for the S2 across-NAT harness (spikes/s2-nat-lab).
+  # The production Auth Callout scoping is exercised by the live tests; the across-NAT S2 question
+  # is about the signaling/media path, so the lab binaries connect here. This does not replace the
+  # authenticated `nats` service above.
+  nats-s2:
+    image: nats:2.10-alpine
+    networks:
+      wan:
+        ipv4_address: 172.28.0.15
+
   # ── NAT gateways ─────────────────────────────────────────────────────────────────────────────
   # x.x.x.254 (not .1): Docker reserves the first address of every user-defined subnet for the
   # bridge itself, so a container cannot hold .1. Each gateway's private leg is .254 and its
@@ -134,7 +144,7 @@ services:
       WAN_SUBNET: "172.28.0.0/24"
       PRIVATE_PREFIX: "172.28.10."
       PRIVATE_SUBNET: "172.28.10.0/24"
-      OTHER_PRIVATE_SUBNET: "172.28.20.0/24"
+      OTHER_PRIVATE_SUBNETS: "172.28.20.0/24 172.28.30.0/24"
       WAN_GATEWAY: "172.28.0.1"
       NAT_MODE: "cone"
       SIGNAL_PORT: "15000"
@@ -162,7 +172,7 @@ services:
       WAN_SUBNET: "172.28.0.0/24"
       PRIVATE_PREFIX: "172.28.20."
       PRIVATE_SUBNET: "172.28.20.0/24"
-      OTHER_PRIVATE_SUBNET: "172.28.10.0/24"
+      OTHER_PRIVATE_SUBNETS: "172.28.10.0/24 172.28.30.0/24"
       WAN_GATEWAY: "172.28.0.1"
       NAT_MODE: "cone"
       SIGNAL_PORT: "15000"
@@ -177,6 +187,37 @@ services:
         ipv4_address: 172.28.0.22
       nat-b:
         ipv4_address: 172.28.20.254
+
+  # Third NAT: the S2 client peer sits here, on a private network distinct from the host's
+  # (peer-a / nat-a). Its DROP rule covers both other private subnets, so neither private host
+  # candidate can be reached around a gateway.
+  gw-c:
+    <<: *lab-image
+    entrypoint: ["/usr/local/bin/gw-entrypoint.sh"]
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    environment:
+      WAN_PREFIX: "172.28.0."
+      WAN_SUBNET: "172.28.0.0/24"
+      PRIVATE_PREFIX: "172.28.30."
+      PRIVATE_SUBNET: "172.28.30.0/24"
+      OTHER_PRIVATE_SUBNETS: "172.28.10.0/24 172.28.20.0/24"
+      WAN_GATEWAY: "172.28.0.1"
+      NAT_MODE: "cone"
+      SIGNAL_PORT: "15000"
+    healthcheck:
+      test: ["CMD-SHELL", "iptables -t nat -S LAB_MASQ | grep -q MASQUERADE"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    networks:
+      wan:
+        ipv4_address: 172.28.0.23
+      nat-c:
+        ipv4_address: 172.28.30.254
 
   # ── Peers (private network only; default route = gateway) ───────────────────────────────────
   peer-a:
@@ -198,6 +239,7 @@ services:
       - "stun:172.28.0.14"
       - "coturn:172.28.0.13"
       - "nats:172.28.0.10"
+      - "nats-s2:172.28.0.15"
       - "helper:172.28.0.11"
       - "postgres:172.28.0.12"
     healthcheck:
@@ -228,6 +270,7 @@ services:
       - "stun:172.28.0.14"
       - "coturn:172.28.0.13"
       - "nats:172.28.0.10"
+      - "nats-s2:172.28.0.15"
       - "helper:172.28.0.11"
       - "postgres:172.28.0.12"
     healthcheck:
@@ -238,6 +281,38 @@ services:
     networks:
       nat-b:
         ipv4_address: 172.28.20.2
+
+  # S2 client peer: a third private network, distinct from the host peer-a's nat-a.
+  peer-c:
+    <<: *lab-image
+    entrypoint: ["/usr/local/bin/peer-entrypoint.sh"]
+    cap_add: [NET_ADMIN]
+    environment:
+      PRIVATE_PREFIX: "172.28.30."
+      GW_PRIVATE_IP: "172.28.30.254"
+      NETEM_DELAY_MS: "0"
+      NETEM_LOSS_PCT: "0"
+      NETEM_REORDER_PCT: "0"
+      NETEM_REORDER_CORR: "0"
+    volumes:
+      - ./.artifacts:/lab-artifacts
+    extra_hosts:
+      - "gw-a:172.28.0.21"
+      - "gw-c:172.28.0.23"
+      - "stun:172.28.0.14"
+      - "coturn:172.28.0.13"
+      - "nats-s2:172.28.0.15"
+      - "nats:172.28.0.10"
+      - "helper:172.28.0.11"
+      - "postgres:172.28.0.12"
+    healthcheck:
+      test: ["CMD-SHELL", "ip route show default | grep -q 172.28.30.254"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    networks:
+      nat-c:
+        ipv4_address: 172.28.30.2
 
 networks:
   wan:
@@ -255,6 +330,11 @@ networks:
     ipam:
       config:
         - subnet: 172.28.20.0/24
+  nat-c:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.30.0/24
 
 volumes:
   spindle-postgres-data:
