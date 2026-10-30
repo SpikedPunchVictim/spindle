@@ -213,8 +213,11 @@ transfers, `--window 2`:
   the netns rig's 3/13; successful punches selected NAT-mapped `172.28.0.x` addresses and ran at
   **326.261 MB/s** median (259.670-372.547).
 - **Any nonzero delay prevented punching here** (0/24 at 25 ms each way, 0/6 at 50 ms, 0/10 at
-  10 ms + `reorder 25% 50%`), all with the same 15 s no-pair timeout. **1% loss alone did not**:
-  3/5 punches, 368.437 MB/s median.
+  10 ms + `reorder 25% 50%`, and 0/6 each at 1 ms and 5 ms in the investigation), all with the
+  same 15 s no-pair timeout. **1% loss alone did not**:
+  3/5 punches, 368.437 MB/s median. This is a Linux-conntrack NAT port-allocation race made
+  deterministic by the delay, **not** a delay-tolerance limit: a direct-on-wan pair with the same
+  25 ms punches normally. See the investigation in `spikes/s19-quic-transport/RESULTS.md`.
 - Because punching fails under delay, shaped throughput was also measured over the **relay**
   fallback: 1.912 MB/s at 51 ms RTT (25 ms shaping), 2.703 MB/s at 101 ms (50 ms shaping), and
   **0.347 MB/s under `reorder 25% 50%`** — QUIC survives reordering but collapses, with 55-78

@@ -367,6 +367,14 @@ prototyping trials recorded for the aggregate rate above.
 | 2026-08-25 | Linux container (linuxkit), official run | symmetric (`--random-fully`) | symmetric (`--random-fully`) | FAILED (as expected — punch/relay needed) | 0/1 this run; 0/N across all trials |
 | — | — | full-cone | (any) | **Not implemented** — see "Deviation from the task brief" above | — |
 
+**Shaping caveat (2026-10-30, `td-3c1762`).** Every cell in the matrix above is **unshaped**.
+In the two-container lab (`deploy/lab/`), adding any nonzero egress delay made cone punching fail
+(0/52 both-sides across 1/5/10/25/50 ms), and the investigation there root-caused it to a Linux-conntrack
+NAT port-allocation race, not an ICE/quinn delay limit; see "Results — two-container lab
+(simulated; still one kernel) → Investigation". Do not read the unshaped 3/13 (or the
+two-container 3/12) as a statement about shaped paths: shaping changes the punch rate
+qualitatively in this environment.
+
 ## Results — leg 3: TURN-relay fallback (`--transport relay`)
 
 **2026-08-25.** Verifies the TURN↔quinn adapter itself (loopback, against a real coturn instance),
@@ -665,7 +673,7 @@ netem qdisc counters are the evidence that shaping was active in those cells.
 | delay25 | delay 25 ms | cone:cone | ice | 12 + 12 | 0 | n/a | n/a | n/a | n/a | two independent samples |
 | delay50 | delay 50 ms | cone:cone | ice | 6 | 0 | n/a | n/a | n/a | n/a | |
 | loss1 | loss 1% | cone:cone | ice | 5 | 3 (60%) | 368.437 | 305.837-399.290 | 0.5 | 0\* | netem dropped 22/8 pkts |
-| reorder25 | delay 10 ms reorder 25% 50% | cone:cone | ice | 10 | 0 | n/a | n/a | n/a | n/a | punch fails under any delay |
+| reorder25 | delay 10 ms reorder 25% 50% | cone:cone | ice | 10 | 0 | n/a | n/a | n/a | n/a | punch fails under any delay (NAT race; see investigation) |
 | delay25_relay | delay 25 ms | cone:cone | relay | 3 | 3 | 1.912 | 1.893-1.940 | 51.1 | 1 | relay, **not punch** |
 | delay50_relay | delay 50 ms | cone:cone | relay | 3 | 3 | 2.703 | 2.504-3.328 | 101.5 | 1 | relay, **not punch** |
 | reorder25_relay | delay 10 ms reorder 25% 50% | cone:cone | relay | 3 | 3 | 0.347 | 0.346-0.350 | 21.6 | 78 | relay; QUIC survives |
@@ -685,12 +693,15 @@ netem qdisc counters are the evidence that shaping was active in those cells.
    the earlier rate, it does not prove a stable one.
 
 2. **Any nonzero delay prevented punching here; 1% loss did not.** Pure-delay cells failed
-   0/24 at 25 ms, 0/6 at 50 ms, and the reorder cell (10 ms + reorder) failed 0/10. With 1% loss
+   0/24 at 25 ms, 0/6 at 50 ms, and the reorder cell (10 ms + reorder) failed 0/10 (the
+   investigation adds 1 ms 0/6 and 5 ms 0/6). With 1% loss
    and no delay, 3/5 punched. The failure signature is identical (15 s timeout, `[UNREPLIED]`).
-   **The mechanism is not root-caused**: we observed the correlation, not that the delay itself
-   changes the port-allocation decision. This is the lab's most consequential result for the
-   pass bar: the 50 ms throughput cells could not be measured through the punched path at all
-   in this environment, so their numbers below are relay measurements, not punch numbers.
+   **This is not a delay-tolerance limit and not an ICE/quinn defect**: it is a Linux-conntrack
+   NAT port-allocation race that the delay makes deterministic. The investigation below
+   (`td-3c1762`) shows a direct-on-wan pair with the same 25 ms delay punches normally, and the
+   conntrack captures show which mapping loses. The 50 ms throughput cells still could not be
+   measured through the punched path in this environment, so their numbers are relay
+   measurements, not punch numbers — but the reason is the NAT, not the RTT.
 
 3. **Unshaped baseline through successful punches: 326.261 MB/s median** (259.670-372.547, n=3,
    32 MiB, window 2 MiB). The spread is large because a 32 MiB transfer at these rates lasts
@@ -726,6 +737,141 @@ netem qdisc counters are the evidence that shaping was active in those cells.
    measured as a hard 0/12 punch failure; here it is closed by relay again, through two
    containers rather than netns.
 
+### Investigation (`td-3c1762`): why did any nonzero delay prevent punching?
+
+The delay-cell result (0/52 both-sides delay attempts once the 1/5 ms sweep is included) was
+investigated rather than accepted as a delay-tolerance limit. The
+conclusion is that **it is a Linux-conntrack NAT port-allocation race made deterministic by the
+delay, not a bug in the lab plumbing and not an `rtc-ice`/quinn defect.** Evidence, in order of
+discriminating power:
+
+1. **Delay alone is harmless (no NAT).** Two lab containers were put directly on the `wan`
+   bridge (`172.28.0.31`/`.32`), no gateways in the path, and the same ICE invocation was run
+   with `tc qdisc add dev eth0 root netem delay 25ms` on both:
+   ```bash
+   docker run -d --name diag-recv --network spindle-lab_wan --ip 172.28.0.31 \
+     --cap-add NET_ADMIN spindle-lab:local sleep 300
+   docker run -d --name diag-send --network spindle-lab_wan --ip 172.28.0.32 \
+     --cap-add NET_ADMIN spindle-lab:local sleep 300
+   docker exec diag-recv tc qdisc add dev eth0 root netem delay 25ms   # likewise diag-send
+   # recv: quic-peer --mode recv --transport ice --signal listen:16003 --stun 172.28.0.14:3478 \
+   #   --ice-bind 172.28.0.31 --bytes 8 --window 2 --json
+   # send: quic-peer --mode send --transport ice --signal connect:172.28.0.31:16003 \
+   #   --stun 172.28.0.14:3478 --ice-bind 172.28.0.32 --bytes 8 --window 2 --json
+   ```
+   No-delay control: punched, 383.998 MB/s. With 25 ms both ways: **punched, 11.678 MB/s**
+   (the expected ~50 ms-RTT throughput). So the ICE agent and quinn tolerate the delay; the
+   failure requires the NAT.
+
+2. **No-op qdisc control.** With the NAT lab and `tc qdisc add dev eth0 root netem delay 0ms`
+   on both peers (qdisc present, zero delay), 1/6 attempts punched — baseline-like, not 0/6.
+   The qdisc's presence is not the cause; the delay value is.
+
+   STUN itself also still succeeds under delay: every failing delayed attempt's stderr contains
+   `ice: gathered server-reflexive candidate 172.28.0.21:<port>` (or `172.28.0.22:<port>`), and
+   the conntrack captures contain the STUN mappings. The failure is after gathering, in the
+   check mappings.
+
+3. **Conntrack differential on the NAT lab.** A small driver
+   (`deploy/lab/.artifacts/diag-nat.sh <delay_a> <delay_b> <port>`, gitignored) applies the
+   per-peer delay, sets the signal DNAT, flushes conntrack, samples `/proc/net/nf_conntrack`
+   every 200 ms on both gateways, runs one attempt, and prints the unique UDP flows.
+   - **No-delay success** (8 MiB, punched): every check mapping preserved its own srflx port:
+     ```
+     gw-a: src=172.28.10.2 dst=172.28.0.22 sport=47769 dport=32978
+           reply src=172.28.0.22 dst=172.28.0.21 sport=32978 dport=47769
+     gw-b: src=172.28.20.2 dst=172.28.0.21 sport=32978 dport=47769
+           reply src=172.28.0.21 dst=172.28.0.22 sport=47769 dport=32978
+     ```
+     A's local/external port 47769 and B's 32978 are both the advertised srflx ports; the
+     flows are replied (no `[UNREPLIED]`).
+   - **No-delay failure** (same invocation, different attempt): B's STUN mapping was
+     52759 -> 52759, but B's check to A's srflx was mapped to external **8272**, and gw-b's
+     inbound A->B flow to `172.28.0.22:52759` stayed `[UNREPLIED]`. The inbound check was never
+     associated with B's mapping.
+   - **One-sided delays** (`diag-nat.sh 25 0` and `diag-nat.sh 0 25`, 6 attempts each):
+     A-only **0/6**, B-only **0/6**. In every failure the *delayed* side's outbound check
+     mapping lost its srflx port: A-only mapped A's 57866 to 6060; B-only mapped B's 57958 to
+     34392. The undelayed side's mapping preserved.
+   - **Both-sides delay** (1 ms and 5 ms failures) shows the same non-preservation: A's local
+     `53276` was mapped to `25560` at 1 ms, and `45816` to `5327` at 5 ms, while the inbound
+     flow to the advertised srflx port stayed `[UNREPLIED]`.
+   - **Gateway-egress delay** (25 ms at each gateway's wan egress, after the NAT mapping
+     decision, no peer qdisc): **0/6**, with the same non-preservation. The delay shifts the
+     check ordering whether applied at the peer or at the gateway.
+
+   Mechanism: Linux `MASQUERADE` is not endpoint-independent for a new destination when the
+   external port is already reserved by the half-open inbound flow to the advertised srflx
+   port. The internal host's outbound check then gets a different external port, so the peer's
+   check to the advertised srflx is not delivered to that mapping and stays `[UNREPLIED]`.
+   Without delay, each side's outbound mapping sometimes wins the race (3/12); with any delay
+   the inbound flow consistently wins (0/52 both-sides; 0/6 each one-sided; 0/6 at the gateway).
+   We observe the ordering result but did not
+   instrument the two agents' send timestamps, so the precise scheduling trigger is not proven.
+
+4. **Threshold sweep.** Both sides, 6 attempts each: **1 ms 0/6, 5 ms 0/6** (plus 10 ms 0/10,
+   25 ms 0/24, 50 ms 0/6). There is no timer threshold; the effect appears at the smallest
+   nonzero delay tested.
+
+5. **Timeout control.** `CELLS_ONLY=delay25 RUNS=1 MAX_ATTEMPTS=1 ICE_TIMEOUT_S=120
+   deploy/lab/run-matrix.sh` still fails at quic-peer's hardcoded internal
+   `ice_punch(..., Duration::from_secs(15))` (four call sites, `quic-peer.rs:1661,1690,1862,1903`),
+   not at the runner's 120 s watchdog. Raising the watchdog cannot change the outcome. Whether a
+   longer ICE timeout would recover after the 30 s conntrack `UNREPLIED` entry expires is tested
+   in experiment 8: it does not.
+
+6. **`rtc-ice` constants.** From the vendored `rtc-ice` 0.20.3 source:
+   `DEFAULT_CHECK_INTERVAL = 200 ms`, `MAX_BINDING_REQUEST_TIMEOUT = 4000 ms`,
+   `DEFAULT_SRFLX_ACCEPTANCE_MIN_WAIT = 500 ms`, `DEFAULT_FAILED_TIMEOUT = 25 s` (quic-peer
+   overrides to 15 s). A 1-50 ms RTT is orders of magnitude inside these; the direct-on-wan
+   25 ms success confirms it empirically. No timer in the agent should trip at these RTTs.
+
+7. **Second environment — the original netns rig.** A copy of `s19-nat-run.sh` was patched to
+   use the lab image's prebuilt binaries and to add
+   `tc qdisc add dev vethA-priv/vethB-priv root netem delay 25ms` inside the peers
+   (`deploy/lab/.artifacts/s19-nat-delay.sh`, gitignored), then run with 12 `cone:cone` cells:
+   baseline **1/12 punched** (451.299 MB/s on the success), 25 ms delay **0/12**, the same
+   15.0 s no-pair timeout. The failure mode is not specific to the compose topology, although
+   the baseline rate on this newer kernel (7.0.14-linuxkit) is lower than the 3/13 measured on
+   6.12.76-linuxkit in 2026-08-25.
+
+8. **A longer handshake timeout does not recover.** A scratch build (source untouched; scratch
+   Dockerfile in `deploy/lab/.artifacts/Dockerfile.ice45`, gitignored) `sed`-replaces all four
+   `Duration::from_secs(15)` call sites with 45 s and builds only `quic-peer`; the standard and
+   patched binaries hash differently (`f888b3f9...` vs `9d571bfa...`):
+   ```bash
+   docker build -f deploy/lab/.artifacts/Dockerfile.ice45 -t spindle-ice45:local .
+   cid=$(docker create spindle-ice45:local /quic-peer); docker cp "$cid:/quic-peer" /tmp/quic-peer-45; docker rm "$cid"
+   docker cp /tmp/quic-peer-45 spindle-lab-peer-a-1:/usr/local/bin/quic-peer   # likewise peer-b
+   TIMEOUT_S=60 CT_SAMPLES=300 TCPDUMP=1 deploy/lab/.artifacts/diag-nat.sh 25 25 16602
+   ```
+   One 25 ms both-sides attempt: **failed at the 45.0 s internal timeout, `no pair selected`**
+   (recv srflx `172.28.0.22:34123`, send srflx `172.28.0.21:50250`). The tcpdumps on both
+   gateways show checks only from `1793389918.767` to `1793389920.203` — **1.437 s, 8 unique checks per
+   direction at ~200 ms, then silence for the remaining ~43.5 s**. The bad mapping (A's checks
+   were mapped to external `45260` instead of its srflx `50250`) decremented 29→0 and expired at
+   ~31.4 s, ~30 s after the last check; no new flow and no new check appeared. **Raising the ICE
+   timeout is not a mitigation**: the agent stops checking after the initial checklist, so a
+   longer timeout just waits on a dead mapping. The punch is lost for that attempt; a **fresh
+   retry** (new attempt, new socket/mapping) is the viable mitigation, which is what the matrix's
+   per-cell retry loop already does. A 20 s variant was not run because 45 s did not recover.
+
+**Conclusion and confidence.** The delay does not break ICE or quinn; it changes the ordering
+that decides a Linux-conntrack NAT port-allocation race. The lab's gateways are real Linux
+NATs, the netns rig reproduces the same failure, and the direct-on-wan and no-op-qdisc controls
+exclude the lab's bridge/qdisc plumbing. This is **real NAT behavior of plain `MASQUERADE` in
+this environment**, not a bug to fix in `deploy/lab/` and not a production-code change. Confidence:
+high that it is not a delay-tolerance or lab-plumbing defect; high in the conntrack mapping-race
+mechanism (direct success/failure captures and the one-sided asymmetry); medium in the exact
+reason the race flips deterministically under delay. The lab's "cone" label is the simplification
+that matters: plain Linux `MASQUERADE` is not reliably endpoint-independent, which leg 2 already
+caveated. A true endpoint-independent cone NAT (or a static full-cone forward) should avoid the
+race but was not tested here; the TURN relay does avoid it, so the earlier matrix's relay rows
+are the shaped-path throughput numbers available in this environment — they are not punch
+numbers. A longer ICE handshake timeout does not help (experiment 8: the agent stops checking
+after ~1.4 s, so 45 s just waits on a dead mapping); the mitigation is a **fresh retry**, not a
+longer timeout.
+
 ### A first topology that falsely "succeeded" (methodological finding)
 
 The first version of this lab did not stop the peers reaching each other's **private host
@@ -740,9 +886,10 @@ corrected topology; the pre-fix numbers were discarded rather than reported as N
 ### What this adds, and what it does not
 
 **Adds:** a routed path through two independent NAT containers; per-side delay/loss/reorder;
-real reordering; a cone-punch rate that reproduces the netns rig's ~25%; the measured
-delay-vs-loss punch asymmetry; shaped throughput through both NATs via relay; and symmetric
-relay confirmation. **Does not add:** a real two-host link (leg 4 remains open); real WAN jitter
+real reordering; a cone-punch rate that reproduces the netns rig's ~25%; a root-caused
+explanation of the delay-vs-loss punch asymmetry (Linux-conntrack NAT port-allocation race
+vs. delay, not a delay tolerance limit); shaped throughput through both NATs via relay; and
+symmetric relay confirmation. **Does not add:** a real two-host link (leg 4 remains open); real WAN jitter
 and loss distributions; the S2 across-NATs offer→usable-stream number (this measures
 `quic-peer`, not `spindle-net`); envelope-`seq` behavior under real reordering; or the production
 signaling/credential paths.
