@@ -66,6 +66,16 @@
 //!   comment for why that equality check — not a signature check — is deliberately the whole of
 //!   this admission rule, and for the per-host token-bucket rate limiting it deliberately leaves
 //!   unimplemented.
+//! - [`devcert`] — [`devcert::ingest_device_cert`] / [`devcert::handle_devcert_get`] (DESIGN.md
+//!   §A5/§A5b, decision A10.37): the helper's durable `HostDeviceCert` distribution cache.
+//!   `registry.devcert.<hfp>` ingestion admits a certificate only when the subject token equals
+//!   its own `host_fp` (no signature/chain verification — the helper is an untrusted carrier and
+//!   the client verifies to a pinned root), storing the published bytes verbatim with last-write-
+//!   wins semantics. `helper.devcert.get.<nfp>` serves those bytes only for a host in the
+//!   caller's session record, with a uniform error for "not in your session" and "no certificate
+//!   cached" so it cannot be used to enumerate hosts. See that module's own doc comment for the
+//!   full wire schema, the deliberate non-goals, and the per-host token bucket it leaves
+//!   unimplemented.
 //! - [`self_revoke`] — [`self_revoke::handle_self_revoke`] (DESIGN.md §A4/§A5 subject table and
 //!   §A7b, *[amended v0.9.47]*): `helper.revoke.<nfp>` deposits, where the caller's session
 //!   record retains `root_pk` so a `spindle-self-rev-v1` record can be checked both against the
@@ -99,6 +109,7 @@
 
 pub mod auth_token;
 pub mod authz;
+pub mod devcert;
 pub mod kick;
 pub mod memory_store;
 pub mod metrics;

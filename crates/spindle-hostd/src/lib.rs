@@ -133,9 +133,14 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod connect;
+pub mod devcert;
 pub mod identity;
 pub mod keystore;
 
+pub use devcert::{
+    device_cert_subject, mint_device_cert, publish_device_cert, DevCertPublishError,
+    DEVICE_CERT_SUBJECT_PREFIX,
+};
 pub use identity::{
     format_recovery_phrase, mint_host_identity, parse_recovery_phrase, HostIdentity,
     RecoveryPhraseError, HOST_OP_CERT_TTL_SECS,

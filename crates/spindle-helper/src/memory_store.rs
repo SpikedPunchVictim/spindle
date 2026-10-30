@@ -56,6 +56,11 @@ pub struct InMemoryHelperView {
     /// the epoch is a max-only acceptance gate, while the set unions monotonically and is never
     /// replaced wholesale — see [`HelperView::record_self_revocation`]'s doc comment.
     self_revoked: HashMap<Fingerprint, (u64, HashSet<Fingerprint>)>,
+    /// `host_fp -> HostDeviceCert canonical CBOR` (DESIGN.md §A5b, decision A10.37). An upsert —
+    /// a republish replaces the stored bytes, because the host sends a fresh certificate on every
+    /// registry connect and its `device_fp` changes every restart; see
+    /// [`HelperView::record_device_cert`]'s doc comment.
+    device_certs: HashMap<Fingerprint, Vec<u8>>,
 }
 
 impl InMemoryHelperView {
@@ -70,6 +75,7 @@ impl InMemoryHelperView {
             sessions: HashMap::new(),
             turn_usage: HashMap::new(),
             self_revoked: HashMap::new(),
+            device_certs: HashMap::new(),
         }
     }
 }
@@ -171,6 +177,16 @@ impl HelperView for InMemoryHelperView {
         for subject in revoked_subjects {
             self.revoked.insert((host_fp, *subject), true);
         }
+    }
+
+    fn record_device_cert(&mut self, host_fp: Fingerprint, cert_bytes: Vec<u8>) {
+        // Plain insert: last write wins (A10.37 republish-on-every-connect semantics), and the
+        // bytes are kept verbatim so a fetching client verifies exactly what the host signed.
+        self.device_certs.insert(host_fp, cert_bytes);
+    }
+
+    fn device_cert(&mut self, host_fp: &Fingerprint) -> Option<Vec<u8>> {
+        self.device_certs.get(host_fp).cloned()
     }
 
     fn purge_expired_sessions(&mut self, now: u64) {

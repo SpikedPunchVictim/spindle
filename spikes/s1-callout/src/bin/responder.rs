@@ -87,6 +87,10 @@ struct InMemoryHelperView {
     /// `root_fp -> (high-water epoch, union of self-revoked device_fps)` (DESIGN.md §A7b,
     /// amended v0.9.47); mirrors the graduated store's own field.
     self_revoked: HashMap<Fingerprint, (u64, HashSet<Fingerprint>)>,
+    /// `host_fp -> HostDeviceCert canonical CBOR` (DESIGN.md §A5b, decision A10.37); mirrors the
+    /// graduated store's own field. Present only so the workspace keeps building — S1 has no
+    /// `registry.devcert.<hfp>` or `helper.devcert.get.<nfp>` traffic.
+    device_certs: HashMap<Fingerprint, Vec<u8>>,
 }
 
 impl HelperView for InMemoryHelperView {
@@ -193,6 +197,16 @@ impl HelperView for InMemoryHelperView {
         }
     }
 
+    /// Mirrors `spindle_helper::authz::HelperView::record_device_cert` at spike fidelity: a plain
+    /// last-write-wins map (DESIGN.md §A5b, decision A10.37).
+    fn record_device_cert(&mut self, host_fp: Fingerprint, cert_bytes: Vec<u8>) {
+        self.device_certs.insert(host_fp, cert_bytes);
+    }
+
+    fn device_cert(&mut self, host_fp: &Fingerprint) -> Option<Vec<u8>> {
+        self.device_certs.get(host_fp).cloned()
+    }
+
     fn record_self_revocation(
         &mut self,
         root_fp: &Fingerprint,
@@ -276,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
         sessions: HashMap::new(),
         turn_usage: HashMap::new(),
         self_revoked: HashMap::new(),
+        device_certs: HashMap::new(),
     };
 
     let client = async_nats::ConnectOptions::with_nkey(callout_seed)

@@ -25,22 +25,26 @@
 //! - `app_client` — on the application account, authenticated with `APP_CONN_SEED` (a second
 //!   exempted nkey, distinct from `APP_ACCOUNT_SEED`, which is the account's own *signing* key
 //!   used to sign User JWTs and is never used to open a connection). Answers `helper.turn.get.
-//!   <nfp>`, `helper.presence.get.<nfp>`, and `helper.revoke.<nfp>` (a request/reply deposit of a
-//!   root-signed `spindle-self-rev-v1` record — see `spindle_helper::self_revoke`), publishes
-//!   `host.<hfp>.presence` deltas, and ingests
-//!   `registry.revoke.<hfp>` publishes (leg 2 of DESIGN.md §A4's revoke -> kick -> reject chain —
-//!   see `spindle_helper::revoke`'s module doc; this subject is publish-only, no reply). The rest
-//!   of `registry.*` request/reply remains later work. Optional: if `APP_CONN_SEED` is unset, this
-//!   binary logs a warning per degraded feature and runs with the callout connection only.
+//!   <nfp>`, `helper.presence.get.<nfp>`, `helper.devcert.get.<nfp>` (a request/reply fetch of a
+//!   host's cached `HostDeviceCert` — see `spindle_helper::devcert`), and `helper.revoke.<nfp>`
+//!   (a request/reply deposit of a root-signed `spindle-self-rev-v1` record — see
+//!   `spindle_helper::self_revoke`), publishes `host.<hfp>.presence` deltas, and ingests
+//!   `registry.revoke.<hfp>` (leg 2 of DESIGN.md §A4's revoke -> kick -> reject chain — see
+//!   `spindle_helper::revoke`) and `registry.devcert.<hfp>` (the A10.37 `HostDeviceCert`
+//!   distribution cache — see `spindle_helper::devcert`) publishes. Both registry subjects are
+//!   publish-only, no reply. The rest of `registry.*` request/reply remains later work. Optional:
+//!   if `APP_CONN_SEED` is unset, this binary logs a warning per degraded feature and runs with
+//!   the callout connection only.
 //!
-//! # Reply-inbox check for the three app-account request/reply subjects
+//! # Reply-inbox check for the four app-account request/reply subjects
 //! NATS authorizes the **PUB subject**, not the reply field (measured in td-fc5a30: `nats-server`
-//! does not refuse a foreign `msg.reply`), so `helper.turn.get.*`, `helper.presence.get.*`, and
-//! `helper.revoke.*` each validate `msg.reply` against the caller's granted
-//! `_INBOX_<device_fp>.` inbox via `spindle_helper::session::reply_belongs_to_caller` before
-//! publishing. A mismatched reply is dropped with a `tracing::warn!` and no publish. The
-//! `$SYS.REQ.USER.AUTH` callout reply is the server-issued correlation inbox (the requester is
-//! `nats-server`, not a member) and is the documented out-of-scope exception.
+//! does not refuse a foreign `msg.reply`), so `helper.turn.get.*`, `helper.presence.get.*`,
+//! `helper.devcert.get.*`, and `helper.revoke.*` each validate `msg.reply` against the caller's
+//! granted `_INBOX_<device_fp>.` inbox via
+//! `spindle_helper::session::reply_belongs_to_caller` before publishing. A mismatched reply is
+//! dropped with a `tracing::warn!` and no publish. The `$SYS.REQ.USER.AUTH` callout reply is the
+//! server-issued correlation inbox (the requester is `nats-server`, not a member) and is the
+//! documented out-of-scope exception.
 //!
 //! # Presence (DESIGN.md §A3/§A6, subject parametrized in v0.9.8 the same way `helper.turn.get`
 //! was in v0.9.7)
@@ -116,6 +120,7 @@ use spindle_helper::authz::{
     self, AdmissionMode, AdmissionRecord, AuthzDecision, DeviceConnectPresented, HelperView,
     HostConnectPresented,
 };
+use spindle_helper::devcert;
 use spindle_helper::kick;
 use spindle_helper::memory_store::InMemoryHelperView;
 use spindle_helper::metrics::{self, CalloutOutcome};
@@ -619,6 +624,20 @@ impl HelperView for Store {
         }
     }
 
+    fn record_device_cert(&mut self, host_fp: spindle_core::Fingerprint, cert_bytes: Vec<u8>) {
+        match self {
+            Store::Memory(s) => s.record_device_cert(host_fp, cert_bytes),
+            Store::Pg(s) => s.record_device_cert(host_fp, cert_bytes),
+        }
+    }
+
+    fn device_cert(&mut self, host_fp: &spindle_core::Fingerprint) -> Option<Vec<u8>> {
+        match self {
+            Store::Memory(s) => s.device_cert(host_fp),
+            Store::Pg(s) => s.device_cert(host_fp),
+        }
+    }
+
     fn record_self_revocation(
         &mut self,
         root_fp: &spindle_core::Fingerprint,
@@ -900,6 +919,27 @@ async fn run(config: Config) -> anyhow::Result<()> {
         None => None,
     };
 
+    // `helper.devcert.get.*` — DESIGN.md §A5/§A5b, decision A10.37: a request/reply fetch of a
+    // host's cached `HostDeviceCert`. Same subject-parametrization shape as `helper.turn.get.*`
+    // above: the callout grants a member connection `pub helper.devcert.get.<own_nats_fp>` only,
+    // and `devcert::handle_devcert_get` derives the caller from `msg.subject` and authorizes from
+    // the session record, serving only hosts already in that record.
+    let mut devcert_get_sub: Option<async_nats::Subscriber> = match &app_client {
+        Some(client) => Some(client.subscribe("helper.devcert.get.*").await?),
+        None => None,
+    };
+
+    // `registry.devcert.*` — DESIGN.md §A5b's registry-ingest row (A10.37): the host republishes
+    // its `HostDeviceCert` on its own `registry.devcert.<own_host_fp>` subject on every registry
+    // connect. The callout grants a host `pub registry.devcert.<own_host_fp>` only (see
+    // `permissions::host_permissions`), and `devcert::ingest_device_cert` recovers `<hfp>` from
+    // `msg.subject` and checks it against the certificate's own `host_fp`. Publish-only: no reply
+    // is ever sent on this subject.
+    let mut devcert_sub: Option<async_nats::Subscriber> = match &app_client {
+        Some(client) => Some(client.subscribe("registry.devcert.*").await?),
+        None => None,
+    };
+
     // Per-device pre-crypto and per-root accepted-write token budgets for `helper.revoke.<nfp>`
     // (DESIGN.md §A5's subject table). In-memory and therefore per helper instance — see
     // `self_revoke`'s module doc; they bound abuse of this request/reply path and are not
@@ -1076,6 +1116,43 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     let _ = client.flush().await;
                 }
             }
+            msg = next_or_pending(&mut devcert_get_sub) => {
+                let Some(msg) = msg else {
+                    tracing::warn!("helper.devcert.get.* subscription ended unexpectedly");
+                    devcert_get_sub = None;
+                    continue;
+                };
+                let Some(reply) = msg.reply.clone() else {
+                    continue;
+                };
+                let reply_payload = devcert::handle_devcert_get(
+                    msg.subject.as_str(),
+                    &msg.payload,
+                    now_secs(),
+                    &mut store,
+                );
+                if !session::reply_belongs_to_caller(
+                    reply.as_str(),
+                    msg.subject.as_str(),
+                    "helper.devcert.get.",
+                    &mut store,
+                    now_secs(),
+                ) {
+                    tracing::warn!(
+                        nfp = %redacted_subject_token(msg.subject.as_str(), "helper.devcert.get."),
+                        "dropping helper.devcert.get.<nfp> reply: msg.reply is not the caller's \
+                         granted inbox"
+                    );
+                } else if let Some(client) = &app_client {
+                    if let Err(e) = client.publish(reply, reply_payload.into_bytes().into()).await {
+                        tracing::error!(
+                            error = %e, // redaction-ok: async_nats::PublishError Display is its static kind (or payload sizes) plus a tokio channel-closed source; no subject or payload bytes
+                            "failed to publish helper.devcert.get.<nfp> response"
+                        );
+                    }
+                    let _ = client.flush().await;
+                }
+            }
             msg = next_or_pending(&mut revoke_sub) => {
                 let Some(msg) = msg else {
                     tracing::warn!("registry.revoke.* subscription ended unexpectedly");
@@ -1160,6 +1237,36 @@ async fn run(config: Config) -> anyhow::Result<()> {
                             subject = %redacted_subject_token(msg.subject.as_str(), "registry.revoke."),
                             reason = %reason,
                             "registry.revoke.<hfp> record rejected"
+                        );
+                    }
+                }
+            }
+            msg = next_or_pending(&mut devcert_sub) => {
+                let Some(msg) = msg else {
+                    tracing::warn!("registry.devcert.* subscription ended unexpectedly");
+                    devcert_sub = None;
+                    continue;
+                };
+                // Publish-only subject (DESIGN.md §A5b's registry-ingest row lists no reply) — an
+                // unparseable or hostile message here never takes the responder down, and there is
+                // nothing to publish back either way. Log the host fingerprint (redacted), never
+                // the payload: it is a certificate body.
+                match devcert::ingest_device_cert(msg.subject.as_str(), &msg.payload, &mut store) {
+                    devcert::DevCertIngestOutcome::Accepted { host_fp, cert_len } => {
+                        tracing::info!(
+                            host_fp = %host_fp.redacted(),
+                            cert_len,
+                            "registry.devcert.<hfp> certificate accepted"
+                        );
+                    }
+                    devcert::DevCertIngestOutcome::Rejected(reason) => {
+                        tracing::warn!(
+                            subject = %redacted_subject_token(
+                                msg.subject.as_str(),
+                                "registry.devcert.",
+                            ),
+                            reason = %reason,
+                            "registry.devcert.<hfp> certificate rejected"
                         );
                     }
                 }

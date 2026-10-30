@@ -7,8 +7,10 @@
 //! Tauri shell will call it in-process, with a NATS client and key custody of its own. A server
 //! deployment has neither of those, so this binary is the other shape — the headless one. It owns
 //! the seed-file custody path, the first-run recovery-phrase ceremony, per-start identity minting
-//! (A10.43/A10.44), the CONNECT `auth_token` (via
-//! [`spindle_hostd::connect::connect_host`]), and the run loop.
+//! (A10.43/A10.44), and the run loop. The CONNECT `auth_token` and the per-connect `HostDeviceCert`
+//! publish to `registry.devcert.<host_fp>` (A10.37) both ride on
+//! [`spindle_hostd::connect::connect_host`], so the binary gets the publish cadence — including
+//! republishes after a reconnect — without owning it.
 //! The Tauri shell never executes this file; it keeps calling the library directly, per the crate
 //! manifest's comment.
 //!
@@ -159,7 +161,12 @@ async fn run(config: Config) -> ExitCode {
     // A fresh wall-clock read at the call, not a timestamp captured at process start: the
     // attestation's `ts` is checked against a ±2 minute server-time window (see
     // `connect`'s module docs).
-    let client = match connect_host(
+    //
+    // `_devcert_publisher` is the guard that keeps the device-certificate reconnect-republish
+    // task alive. It must live for as long as the connection does, so it is bound here (same
+    // scope as `client`) and only dropped when `run` returns; see `connect`'s reference-cycle
+    // note for why dropping the client alone would otherwise leave a pump-owned clone behind.
+    let (client, _devcert_publisher) = match connect_host(
         &identity,
         &config.nats_url,
         admission_token_bytes,
@@ -167,15 +174,19 @@ async fn run(config: Config) -> ExitCode {
     )
     .await
     {
-        Ok(client) => client,
+        Ok(connected) => connected,
         Err(error) => {
             tracing::error!(
-                error = %error, // redaction-ok: ConnectError Display is nkeys length/prefix/checksum text (Nkey arm) or async_nats::ConnectError's kind text plus DNS/IO/TLS source text and the NATS server's own refusal text (Nats arm); it never carries the auth_token, the nkey seed, or any Spindle member peer's bytes
+                error = %error, // redaction-ok: ConnectError Display is nkeys length/prefix/checksum text (Nkey arm), async_nats::ConnectError's kind text plus DNS/IO/TLS source text and the NATS server's own refusal text (Nats arm), async_nats::PublishError's fixed kind plus a length/closed-queue source (Publish arm), or the same kind of static text from a failed flush (Flush arm); it never carries the auth_token, the nkey seed, the certificate payload, or any Spindle member peer's bytes
                 "failed to connect the host to NATS"
             );
             return ExitCode::FAILURE;
         }
     };
+
+    // `connect_host` has already published this process's `HostDeviceCert` (A10.37) and flushed
+    // it before returning, so the host's identity is advertised before the daemon starts serving.
+    // Its failure is folded into the connect error arm above; a publish failure is fatal here.
 
     // The issuer is built from the same identity the connection presented, so every capability
     // this host mints chains to the root the Auth Callout just authenticated. See
@@ -229,9 +240,10 @@ async fn run(config: Config) -> ExitCode {
         biased;
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received");
-            // Dropping the daemon drops the NATS client and its SQLite connections. The signaling
-            // run loop has no separate shutdown channel (`HostDaemon::run`'s doc comment), so
-            // there is nothing else to drain.
+            // Dropping the daemon drops the NATS client and its SQLite connections; returning
+            // from `run` also drops `_devcert_publisher`, which aborts the reconnect-republish
+            // pump and releases its client clone. The signaling run loop has no separate shutdown
+            // channel (`HostDaemon::run`'s doc comment), so there is nothing else to drain.
             ExitCode::SUCCESS
         }
         result = daemon.run(options) => match result {

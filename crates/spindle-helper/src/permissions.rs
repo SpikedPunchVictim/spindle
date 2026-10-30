@@ -70,8 +70,8 @@ pub fn universal_denies() -> Vec<String> {
 }
 
 /// Host connection permissions (DESIGN.md §A5): `sub host.<own>.>`, `pub
-/// host.<own>.sess.*.*.h2c`, `pub registry.revoke.<own>`, `allow_responses {max:1, expires:
-/// "2m"}`, plus the universal denies.
+/// host.<own>.sess.*.*.h2c`, `pub registry.revoke.<own>`, `pub registry.devcert.<own>`,
+/// `allow_responses {max:1, expires: "2m"}`, plus the universal denies.
 ///
 /// **Ambiguity RESOLVED in DESIGN.md v0.9.26 (td-40a2d0), in favour of what this module already
 /// did.** §A5's permission-list bullet used to say `pub registry.revoke` with no `.<hfp>` suffix,
@@ -82,17 +82,19 @@ pub fn universal_denies() -> Vec<String> {
 /// publish into every other host's revocation subject, contradicting "helper asserts subject
 /// token == record `host_fp`" a few lines later in the same section.
 ///
-/// **Known unimplemented grant**: as of DESIGN.md v0.9.27, §A5 also specifies `pub
-/// registry.devcert.<own>` for hosts (A10.37 — the host republishes its device certificate on
-/// every connect to the registry). This function does NOT grant it, deliberately: there is no
-/// `registry.devcert.<hfp>` handler in this crate either, so granting publish rights to a subject
-/// nothing consumes would widen the surface for no benefit. §A5b records both halves as
-/// specified-but-unimplemented. Add the grant and the handler together, not separately.
+/// **`registry.devcert.<own>` (DESIGN.md §A5/§A5b, decision A10.37)**: the host republishes its
+/// `HostDeviceCert` on every registry connect, so the same scoping rule applies as for
+/// `registry.revoke.<own>` — a bare `registry.devcert` would let any host overwrite every other
+/// host's cached certificate. The grant and its consumer
+/// ([`crate::devcert::ingest_device_cert`]) land together; the doc paragraph that previously said
+/// this function deliberately withheld the grant (because nothing consumed the subject) is gone,
+/// since both halves now exist.
 pub fn host_permissions(own_host_fp: Fingerprint) -> SubjectPermissions {
     SubjectPermissions {
         publish_allow: vec![
             format!("host.{own_host_fp}.sess.*.*.h2c"),
             format!("registry.revoke.{own_host_fp}"),
+            format!("registry.devcert.{own_host_fp}"),
         ],
         subscribe_allow: vec![format!("host.{own_host_fp}.>")],
         deny: universal_denies(),
@@ -107,7 +109,8 @@ pub fn host_permissions(own_host_fp: Fingerprint) -> SubjectPermissions {
 /// (DESIGN.md §A5): per host `h`, `pub host.<h>.connect`, `pub host.<h>.sess.<own>.*.c2h`, `sub
 /// host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus, once for the whole connection (not
 /// per host): `sub _INBOX_<own>.>`, `pub helper.presence.get.<own_nats_fp>`, `pub
-/// helper.turn.get.<own_nats_fp>`, `pub helper.revoke.<own_nats_fp>`.
+/// helper.turn.get.<own_nats_fp>`, `pub helper.devcert.get.<own_nats_fp>`, `pub
+/// helper.revoke.<own_nats_fp>`.
 ///
 /// `own_nats_fp` is the connection's session-nkey fingerprint (the callout-verified identity
 /// behind this NATS connection — see [`crate::session::SessionRecord`]), **not** `own_device_fp`.
@@ -116,12 +119,14 @@ pub fn host_permissions(own_host_fp: Fingerprint) -> SubjectPermissions {
 /// publisher, not from a self-declared payload field — the same scoping pattern `registry.
 /// revoke.<hfp>` already uses for hosts; v0.9.8 extends the identical parametrization to
 /// `helper.presence.get` (DESIGN.md §A5/§A6 v0.9.8, A12 #46 — see `presence.rs`'s module
-/// doc), and §A5's subject table/amended permission bullet scope `helper.revoke.<nfp>` the same
-/// way (S14 — see [`crate::self_revoke`]). That means all three grants must name the one subject
-/// token this connection is actually allowed to publish on, i.e. its own `nats_fp`, the same
-/// identity `session_record(nats_fp, ...)` is keyed by in `turn.rs`/`presence.rs`/`self_revoke.rs`;
-/// a grant keyed by `own_device_fp` would let the connection publish on a subject the helper
-/// resolves to a session it never proved it owns.
+/// doc), §A5's subject table scopes `helper.devcert.get.<nfp>` the same way (A10.37 — see
+/// [`crate::devcert`]), and §A5's subject table/amended permission bullet scope
+/// `helper.revoke.<nfp>` the same way (S14 — see [`crate::self_revoke`]). That means all four
+/// grants must name the one subject token this connection is actually allowed to publish on, i.e.
+/// its own `nats_fp`, the same identity `session_record(nats_fp, ...)` is keyed by in
+/// `turn.rs`/`presence.rs`/`devcert.rs`/`self_revoke.rs`; a grant keyed by `own_device_fp` would
+/// let the connection publish on a subject the helper resolves to a session it never proved it
+/// owns.
 ///
 /// `hosts` must be non-empty — a connection with no fully-verified member host has no business
 /// calling this (see [`client_connect_only_permissions`] instead).
@@ -130,7 +135,7 @@ pub fn client_member_permissions(
     own_nats_fp: Fingerprint,
     hosts: &[Fingerprint],
 ) -> SubjectPermissions {
-    let mut publish_allow = Vec::with_capacity(hosts.len() * 2 + 3);
+    let mut publish_allow = Vec::with_capacity(hosts.len() * 2 + 4);
     let mut subscribe_allow = Vec::with_capacity(hosts.len() * 2 + 1);
     subscribe_allow.push(format!("_INBOX_{own_device_fp}.>"));
     for h in hosts {
@@ -141,6 +146,7 @@ pub fn client_member_permissions(
     }
     publish_allow.push(format!("helper.presence.get.{own_nats_fp}"));
     publish_allow.push(format!("helper.turn.get.{own_nats_fp}"));
+    publish_allow.push(format!("helper.devcert.get.{own_nats_fp}"));
     publish_allow.push(format!("helper.revoke.{own_nats_fp}"));
     SubjectPermissions {
         publish_allow,
@@ -233,6 +239,7 @@ mod tests {
             vec![
                 format!("host.{own}.sess.*.*.h2c"),
                 format!("registry.revoke.{own}"),
+                format!("registry.devcert.{own}"),
             ]
         );
         assert_eq!(perms.deny, universal_denies());
@@ -257,6 +264,11 @@ mod tests {
             !perms.publish_allow[1].ends_with(".>"),
             "scoped to one host, not a wildcard"
         );
+        assert!(perms.publish_allow[2].starts_with("registry.devcert."));
+        assert!(
+            !perms.publish_allow[2].ends_with(".>"),
+            "registry.devcert is scoped to one host, not a wildcard"
+        );
     }
 
     #[test]
@@ -272,6 +284,7 @@ mod tests {
                 format!("host.{h}.sess.{own}.*.c2h"),
                 format!("helper.presence.get.{nats_fp}"),
                 format!("helper.turn.get.{nats_fp}"),
+                format!("helper.devcert.get.{nats_fp}"),
                 format!("helper.revoke.{nats_fp}"),
             ]
         );
@@ -321,6 +334,23 @@ mod tests {
     }
 
     #[test]
+    fn client_member_permissions_devcert_get_is_scoped_to_nats_fp_not_device_fp() {
+        // Same regression as the turn.get/presence.get tests above, for the A10.37
+        // helper.devcert.get grant (DESIGN.md §A5's client permission bullet).
+        let own_device_fp = fp(b"device-distinct-devcert");
+        let own_nats_fp = fp(b"nats-distinct-devcert");
+        assert_ne!(own_device_fp, own_nats_fp);
+        let h = fp(b"host-f");
+        let perms = client_member_permissions(own_device_fp, own_nats_fp, &[h]);
+        assert!(perms
+            .publish_allow
+            .contains(&format!("helper.devcert.get.{own_nats_fp}")));
+        assert!(!perms
+            .publish_allow
+            .contains(&format!("helper.devcert.get.{own_device_fp}")));
+    }
+
+    #[test]
     fn client_member_permissions_revoke_is_scoped_to_nats_fp_not_device_fp() {
         // Same regression as the turn.get/presence.get tests above, for the S14 helper.revoke
         // grant (DESIGN.md §A5 subject table, amended v0.9.47).
@@ -346,8 +376,8 @@ mod tests {
         let perms = client_member_permissions(own, nats_fp, &[h1, h2]);
         // One shared inbox sub + 2 subs per host (sess.h2c, presence).
         assert_eq!(perms.subscribe_allow.len(), 1 + 2 * 2);
-        // 2 pubs per host (connect, sess.c2h) + the 3 fixed helper.* pubs.
-        assert_eq!(perms.publish_allow.len(), 2 * 2 + 3);
+        // 2 pubs per host (connect, sess.c2h) + the 4 fixed helper.* pubs.
+        assert_eq!(perms.publish_allow.len(), 2 * 2 + 4);
     }
 
     #[test]

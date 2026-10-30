@@ -31,6 +31,11 @@
 //!   NOTHING` and no deletes, so it is the monotone union of every accepted record's entries
 //!   (DESIGN.md §A7b, amended v0.9.47: an empty `revoked` list at a higher epoch revokes nothing
 //!   and un-revokes nothing).
+//! - `host_device_certs` (`0004_*.sql`, DESIGN.md §A5b, decision A10.37) — the helper's
+//!   `registry.devcert.<hfp>` cache: `host_fp`-keyed upsert replacing `cert`/`updated_at` (last
+//!   write wins, because the host republishes on every registry connect). Bytes are stored
+//!   verbatim; the client verifies the chain to a pinned root, so this store never interprets
+//!   them.
 //! - `turn_usage` — a check-and-increment counter keyed by `(root_fp, period)`: an `UPDATE ...
 //!   WHERE count < $quota RETURNING count` either succeeds (admitted, already incremented) or
 //!   returns no row (refused, left unchanged) — a single indexed row's `UPDATE` is atomic under
@@ -454,6 +459,38 @@ impl PgStore {
         tx.commit().await.expect("commit revocation transaction");
     }
 
+    /// Upserts the `registry.devcert.<hfp>` cache entry (DESIGN.md §A5b, decision A10.37).
+    ///
+    /// `updated_at` is the **database's** clock (`EXTRACT(EPOCH FROM now())::BIGINT`), not a
+    /// caller-supplied `now`: [`HelperView::record_device_cert`] carries no timestamp argument —
+    /// unlike the session/TURN methods, whose `now` is load-bearing for expiry and quota — because
+    /// the certificate cache has no expiry rule of its own. The host's own `exp` inside the
+    /// certificate is what the consuming client checks. The upsert replaces both columns, which is
+    /// the whole of "last write wins".
+    async fn record_device_cert_async(&self, host_fp: Fingerprint, cert_bytes: Vec<u8>) {
+        sqlx::query(
+            "INSERT INTO host_device_certs (host_fp, cert, updated_at)
+             VALUES ($1, $2, EXTRACT(EPOCH FROM now())::BIGINT)
+             ON CONFLICT (host_fp) DO UPDATE SET
+                cert = excluded.cert,
+                updated_at = excluded.updated_at",
+        )
+        .bind(fp_bytes(&host_fp))
+        .bind(&cert_bytes)
+        .execute(&self.pool)
+        .await
+        .expect("host_device_certs upsert");
+    }
+
+    async fn device_cert_async(&self, host_fp: &Fingerprint) -> Option<Vec<u8>> {
+        sqlx::query("SELECT cert FROM host_device_certs WHERE host_fp = $1")
+            .bind(fp_bytes(host_fp))
+            .fetch_optional(&self.pool)
+            .await
+            .expect("device_cert query")
+            .map(|row| row.get::<Vec<u8>, _>("cert"))
+    }
+
     async fn self_revocation_epoch_async(&self, root_fp: &Fingerprint) -> Option<u64> {
         sqlx::query("SELECT epoch FROM self_revocation_epochs WHERE root_fp = $1")
             .bind(fp_bytes(root_fp))
@@ -635,6 +672,14 @@ impl HelperView for PgStore {
         run_blocking(self.record_revocation_async(host_fp, epoch, revoked_subjects))
     }
 
+    fn record_device_cert(&mut self, host_fp: Fingerprint, cert_bytes: Vec<u8>) {
+        run_blocking(self.record_device_cert_async(host_fp, cert_bytes))
+    }
+
+    fn device_cert(&mut self, host_fp: &Fingerprint) -> Option<Vec<u8>> {
+        run_blocking(self.device_cert_async(host_fp))
+    }
+
     fn record_self_revocation(
         &mut self,
         root_fp: &Fingerprint,
@@ -738,7 +783,7 @@ mod tests {
                  refusing to run pg_store's contract tests against it. Every test in this module \
                  truncates revocation_epochs, revoked_subjects, admission_records, \
                  burned_admission_nonces, session_records, turn_usage, self_revocation_epochs, \
-                 and self_revocations before it runs; \
+                 self_revocations, and host_device_certs before it runs; \
                  pointing TEST_DATABASE_URL at a non-test database (e.g. the live compose \
                  stack's `spindle`, deploy/docker-compose.yml's POSTGRES_DB) destroys real data. \
                  Point TEST_DATABASE_URL at a dedicated database whose name ends in `_test` \
@@ -846,7 +891,7 @@ mod tests {
         sqlx::query(
             "TRUNCATE revocation_epochs, revoked_subjects, admission_records, \
              burned_admission_nonces, session_records, turn_usage, \
-             self_revocation_epochs, self_revocations",
+             self_revocation_epochs, self_revocations, host_device_certs",
         )
         .execute(&store.pool)
         .await
@@ -922,6 +967,45 @@ mod tests {
         assert!(!store.is_revoked(&host, &subject));
         store.record_revocation(host, 9, &[subject]);
         assert!(store.is_revoked(&host, &subject));
+    }
+
+    /// Mirrors the `registry.devcert.<hfp>` cache contract (DESIGN.md §A5b, decision A10.37):
+    /// absent is `None`, a write round-trips the exact bytes, a second write replaces them (last
+    /// write wins), and entries are scoped per host.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_device_cert_round_trips_last_write_wins_and_is_per_host() {
+        let _guard = TEST_LOCK.lock().await;
+        let Some(mut store) = test_store().await else {
+            return;
+        };
+        let host_a = fp(b"pg-devcert-host-a");
+        let host_b = fp(b"pg-devcert-host-b");
+        let first = vec![0xA1, 0xA2, 0xA3];
+        let second = vec![0xB1, 0xB2, 0xB3, 0xB4];
+
+        assert_eq!(
+            store.device_cert(&host_a),
+            None,
+            "a host that never published has no certificate"
+        );
+        store.record_device_cert(host_a, first.clone());
+        assert_eq!(
+            store.device_cert(&host_a),
+            Some(first),
+            "the published bytes must round-trip verbatim"
+        );
+        assert_eq!(
+            store.device_cert(&host_b),
+            None,
+            "the cache is keyed per host, not global"
+        );
+
+        store.record_device_cert(host_a, second.clone());
+        assert_eq!(
+            store.device_cert(&host_a),
+            Some(second),
+            "a republish must replace the stored bytes"
+        );
     }
 
     /// Mirrors `memory_store`'s self-revocation contract tests (DESIGN.md §A7b, amended

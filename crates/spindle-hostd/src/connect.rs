@@ -63,13 +63,54 @@
 //! logs [`async_nats::Event`]'s own `Display` only. It must never log the `auth_token` or the
 //! session nkey seed: both are credentials, and this crate's redaction policy exempts no
 //! credential.
+//!
+//! # The `HostDeviceCert` publish cadence rides on the same callback [A10.37]
+//!
+//! DESIGN.md A10.37 requires the host to publish its `HostDeviceCert` on **every** registry
+//! connect. This function owns that cadence so a library consumer gets it for free: it mints the
+//! certificate before connecting (from this process's identity, A10.35), keeps its canonical bytes
+//! in an [`Arc`], publishes once after the connect returns, flushes, and republishes the **same
+//! cached bytes** whenever a background pump learns — through the event callback's channel — that
+//! [`async_nats::Event::Connected`] fired again.
+//!
+//! async-nats 0.35 has no separate "reconnected" event variant — `Connected` is emitted on the
+//! initial connect and again after every successful reconnect (`connector.rs` sends it in the same
+//! success branch `handle_reconnect` reaches). The pump discards the first signal it receives
+//! (the initial connect, already covered by the explicit publish below) and publishes on every
+//! later one; signals arrive in the order the callback emitted them, so the first one really is
+//! the initial connect. The bytes are reused rather than re-minted because the certificate chains
+//! to this process's operating key and embeds this process's envelope keys, and neither changes
+//! across a reconnect — re-minting would produce the same bytes again. A restart mints a fresh
+//! identity (A10.43/A10.44), and its fresh bytes replace the helper's cached copy (A10.37).
+//!
+//! A publish-only subject has no broker ack (§A5). The explicit publish's local error is
+//! propagated, and the follow-up [`async_nats::Client::flush`] confirms the server accepted what
+//! was written on this connection; a republish failure is only logged, because a background pump
+//! has no caller to return to. A server-side refusal still surfaces only as a connection
+//! event/close.
+//!
+//! # The reconnect publisher is not allowed to own the client [reference-cycle note]
+//!
+//! [`async_nats::Client`] owns the `ConnectOptions` that own the `event_callback` closure. If that
+//! closure captured a client (or an `Arc<Mutex<Option<Client>>>` holding one), the client would
+//! own itself: dropping every external handle would leave the connection alive forever, and a
+//! long-lived library consumer (the planned Tauri shell, reconnecting in-process) would leak one
+//! live NATS connection per `connect_host` call. The callback therefore holds only an
+//! [`tokio::sync::mpsc::UnboundedSender`] signal; a small pump task spawned after `connect()` owns
+//! the one client clone it needs, and [`DevCertPublisher`]'s `Drop` aborts that task. The caller
+//! holds the guard for the connection's lifetime, so the pump's clone is bounded by the guard and
+//! dropping the guard plus the last client handle really does close the connection.
+
+use std::sync::Arc;
 
 use base64::Engine as _;
 use nkeys::KeyPair;
 use spindle_core::artifacts::issue_host_session_attestation;
 use spindle_core::Fingerprint;
 use spindle_proto::auth_token::encode_host_auth_token;
+use tokio::sync::mpsc;
 
+use crate::devcert::{device_cert_subject, mint_device_cert};
 use crate::HostIdentity;
 
 /// Everything [`connect_host`] can fail with before a client exists. A failure returns no
@@ -87,10 +128,48 @@ pub enum ConnectError {
     /// policy); it never carries the `auth_token` or the nkey seed.
     #[error("host NATS connect failed: {0}")]
     Nats(#[from] async_nats::ConnectError),
+
+    /// The host device certificate could not be handed to the NATS client (a local queue/payload
+    /// error). Carries the same harmless `Display` an [`async_nats::PublishError`] does.
+    #[error("publishing the host device certificate failed: {0}")]
+    Publish(#[from] async_nats::PublishError),
+
+    /// The follow-up flush failed, so the certificate's delivery to the server could not be
+    /// confirmed. async-nats 0.35 does not re-export its flush error type, so its `Display` is
+    /// kept as text; it is static kind text, never payload bytes.
+    #[error("flushing the host device certificate publish failed: {0}")]
+    Flush(String),
+}
+
+/// Keeps the reconnect-republish task alive, and aborts it when dropped.
+///
+/// [`connect_host`] returns one of these alongside the client. Hold it for as long as the
+/// connection should be republished on reconnect; dropping it stops the pump (and aborts its
+/// in-flight publish). It is a separate value rather than something hidden in a wrapper because
+/// the binary needs to bind it before moving the client into [`crate::HostDaemon`], keeping the
+/// guard alive until the process's select returns.
+///
+/// See this module's "reference-cycle note": the guard is what bounds the pump's client clone, so
+/// dropping every client handle *and* this guard closes the connection.
+pub struct DevCertPublisher {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl DevCertPublisher {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self { handle }
+    }
+}
+
+impl Drop for DevCertPublisher {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 /// Connects the headless host to `nats_url` with a fresh per-session nkey and a freshly-minted
-/// host CONNECT `auth_token`.
+/// host CONNECT `auth_token`, and returns the client together with the
+/// [`DevCertPublisher`] guard that keeps its reconnect-republish task alive.
 ///
 /// `now` must be the wall-clock second at the moment of this call (see the module docs' "`now` is
 /// the moment of connect" section). `admission_token_bytes`, when present, is the raw bytes of the
@@ -101,16 +180,36 @@ pub async fn connect_host(
     nats_url: &str,
     admission_token_bytes: Option<Vec<u8>>,
     now: u64,
-) -> Result<async_nats::Client, ConnectError> {
+) -> Result<(async_nats::Client, DevCertPublisher), ConnectError> {
     let session = KeyPair::new_user();
     let nats_fp = nats_fp_for_session(&session)?;
     let token = mint_auth_token(identity, nats_fp, admission_token_bytes.as_deref(), now);
 
+    // A10.37: mint this process's device certificate **before** connecting, so the bytes are ready
+    // to publish both on the explicit connect below and on every later reconnect. See this
+    // module's "The `HostDeviceCert` publish cadence" section.
+    let cert_subject = device_cert_subject(identity);
+    let cert_bytes = Arc::new(mint_device_cert(identity, now).to_canonical_bytes());
+
+    // The callback holds a bare signal channel, never a client — see this module's
+    // "reference-cycle note". It fires for the initial connect too; the pump discards that first
+    // signal because the explicit publish below covers connection one.
+    let (connected_tx, mut connected_rx) = mpsc::unbounded_channel::<()>();
+
     let client = async_nats::ConnectOptions::new()
-        .event_callback(|event| async move {
-            // `Event`'s Display is a fixed description of the event kind. Deliberately not
-            // `{event:?}` or anything that could grow to include connect options.
-            tracing::debug!(event = %event, "host NATS connection event");
+        .event_callback(move |event| {
+            let connected_tx = connected_tx.clone();
+            async move {
+                // `Connected` is emitted for the initial connect and for every successful
+                // reconnect; async-nats 0.35 has no distinct reconnected variant.
+                if matches!(event, async_nats::Event::Connected) {
+                    // A closed receiver means the guard was dropped; nothing to signal.
+                    let _ = connected_tx.send(());
+                }
+                // `Event`'s Display is a fixed description of the event kind. Deliberately not
+                // `{event:?}` or anything that could grow to include connect options.
+                tracing::debug!(event = %event, "host NATS connection event");
+            }
         })
         // One reconnect attempt per disconnect. A reconnect replays the static `token` below
         // (`async-nats-0.35.1/src/connector.rs:193`); the attempt counter resets after every
@@ -122,7 +221,47 @@ pub async fn connect_host(
         .token(token)
         .connect(nats_url)
         .await?;
-    Ok(client)
+
+    // The pump owns the one client clone needed to republish; the returned guard aborts it, which
+    // is what keeps that clone from outliving the caller's client.
+    let pump_client = client.clone();
+    let pump_subject = cert_subject.clone();
+    let pump_bytes = Arc::clone(&cert_bytes);
+    let handle = tokio::spawn(async move {
+        // First signal = the initial connect (events are delivered in order); the explicit publish
+        // below already covers it, so drop it rather than publishing a duplicate.
+        if connected_rx.recv().await.is_none() {
+            return;
+        }
+        while connected_rx.recv().await.is_some() {
+            // Same cached bytes as the first publish: the op key and envelope keys do not change
+            // across a reconnect (see the module docs).
+            let bytes: Vec<u8> = pump_bytes.as_ref().clone();
+            if let Err(error) = pump_client
+                .publish(pump_subject.clone(), bytes.into())
+                .await
+            {
+                tracing::warn!(
+                    error = %error, // redaction-ok: async_nats::PublishError Display is fixed kind text plus a length/closed-queue source; never the certificate bytes
+                    "failed to republish the host device certificate after reconnect"
+                );
+            }
+        }
+    });
+    let publisher = DevCertPublisher::new(handle);
+
+    // The initial publish, then a flush: `publish` only queues, and the flush completes once the
+    // server has accepted everything written on this connection. Both failures are returned so the
+    // caller can refuse to serve with an unpublished certificate. See the module docs for why this
+    // still does not order the publish against the helper's ingest on another connection.
+    let initial_bytes: Vec<u8> = cert_bytes.as_ref().clone();
+    client.publish(cert_subject, initial_bytes.into()).await?;
+    client
+        .flush()
+        .await
+        .map_err(|error| ConnectError::Flush(error.to_string()))?;
+
+    Ok((client, publisher))
 }
 
 /// `nats_fp = SHA-256(raw session public key)` — the same derivation the Auth Callout uses for

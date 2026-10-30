@@ -316,6 +316,41 @@ pub trait HelperView {
     );
 
     // ============================================================================================
+    // HostDeviceCert distribution cache (DESIGN.md §A5/§A5b, decision A10.37). Two methods, both
+    // keyed by the host fingerprint: the write is driven by `registry.devcert.<hfp>` ingestion
+    // ([`crate::devcert::ingest_device_cert`]) and the read by `helper.devcert.get.<nfp>`
+    // ([`crate::devcert::handle_devcert_get`]). Neither stores nor returns anything derived from
+    // the certificate's signature: §A10.37 makes this helper an untrusted carrier, and the client
+    // verifies the root -> op -> device chain to its pinned root. The store is therefore a plain
+    // bytes cache, and its only admission rule lives in the handler, not here.
+    // ============================================================================================
+
+    /// Records (or replaces) the cached `HostDeviceCert` a host published on
+    /// `registry.devcert.<host_fp>` (DESIGN.md §A5b's registry-ingest row, decision A10.37).
+    ///
+    /// **Last write wins, deliberately**: a host republishes its certificate on *every* registry
+    /// connect (A10.37), and its `device_fp` changes on every restart (A4 / A10.43 decision 44),
+    /// so the only useful semantics is "the certificate this host last published". An upsert that
+    /// overwrites rather than a history or a first-wins insert is what makes a rotated or
+    /// re-minted certificate visible to a fetching client at all.
+    ///
+    /// The bytes are stored **verbatim** — the handler has already decoded them as a
+    /// `HostDeviceCert` and checked that its `host_fp` equals the subject token, and no further
+    /// interpretation happens here. Serving the exact published bytes is what lets the client
+    /// re-run its own full chain verification rather than trusting a re-encoding by this helper.
+    fn record_device_cert(&mut self, host_fp: Fingerprint, cert_bytes: Vec<u8>);
+
+    /// Returns the bytes of the certificate `host_fp` last published on
+    /// `registry.devcert.<host_fp>`, or `None` if this helper has never accepted one for that host
+    /// (DESIGN.md §A5b, decision A10.37). Absence is explicit rather than an empty `Vec`, so "this
+    /// host published no certificate" is never conflated with "it published an empty one".
+    ///
+    /// Taking `&mut self` matches every other method on this trait (see the trait-level note);
+    /// the returned bytes are the stored canonical CBOR, exactly as [`Self::record_device_cert`]
+    /// received them, not re-encoded or unwrapped.
+    fn device_cert(&mut self, host_fp: &Fingerprint) -> Option<Vec<u8>>;
+
+    // ============================================================================================
     // Self-revocations (DESIGN.md §A4/§A7b, **[amended v0.9.47]**). These are the durable-store
     // contract for accepted root-signed `spindle-self-rev-v1` records deposited via
     // `helper.revoke.<nfp>`; the handler is [`crate::self_revoke`].
@@ -885,6 +920,10 @@ mod tests {
         sessions: HashMap<Fingerprint, SessionRecord>,
         turn_usage: HashMap<(Fingerprint, u64), u64>,
         self_revoked: HashMap<Fingerprint, (u64, HashSet<Fingerprint>)>,
+        /// `host_fp -> published HostDeviceCert canonical CBOR`, the `registry.devcert.<hfp>`
+        /// cache (DESIGN.md §A5b, decision A10.37). Mirrors the real stores' last-write-wins map
+        /// so the `devcert` handler tests can use this double.
+        device_certs: HashMap<Fingerprint, Vec<u8>>,
         /// Counts `is_revoked` lookups, so an ordering test can prove the per-cap revocation
         /// drop happens in the pre-crypto pass (td-d5800b). Shared via `Rc` because the
         /// `verify_nkey_sig` closure needs to observe it while `view` is mutably borrowed.
@@ -989,6 +1028,14 @@ mod tests {
             for subject in revoked_subjects {
                 self.revoked.insert((host_fp, *subject));
             }
+        }
+
+        fn record_device_cert(&mut self, host_fp: Fingerprint, cert_bytes: Vec<u8>) {
+            self.device_certs.insert(host_fp, cert_bytes);
+        }
+
+        fn device_cert(&mut self, host_fp: &Fingerprint) -> Option<Vec<u8>> {
+            self.device_certs.get(host_fp).cloned()
         }
 
         fn record_self_revocation(

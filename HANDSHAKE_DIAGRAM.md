@@ -541,15 +541,13 @@ specifically so no future caller can accidentally skip it.
   every NATS subject a host owns. `host_device_fp` is the host's own envelope identity for A7
   signaling, verified inside `HostDeviceCert`. A capability's `host_fp` and an envelope's
   `to_fp`/`from_fp` never mean the same fingerprint even when they're both "the host."
-- **`helper.devcert.get.<nfp>` is documented but not wired.** `host_device_cert.rs`'s doc comment
-  (`crates/spindle-core/src/artifacts/host_device_cert.rs:56-58`) describes a client fetching a
-  `HostDeviceCert` via `helper.devcert.get.<nfp>`, but a repo-wide search found no grant for this
-  subject in `permissions.rs` and no handler in `helper.rs` — only `helper.turn.get.*` and
-  `helper.presence.get.*` are actually subscribed. This is a *different*, unrelated gap from the
-  one `permissions.rs` documents explicitly (`registry.devcert.<own>`, A10.37, host-publish side,
-  flagged in code as "known unimplemented"). Both appear genuinely unimplemented as of this
-  reading; treat any code path describing a client-side `HostDeviceCert` fetch as ⚠️ unverified /
-  aspirational until a handler exists.
+- **`helper.devcert.get.<nfp>` is wired end to end (td-65884b).** The subject now has a member grant
+  (`permissions.rs`), a helper handler and `registry.devcert.*` ingest (`spindle_helper::devcert`), and a host
+  publisher (`spindle_hostd::connect::connect_host` mints the `HostDeviceCert` and publishes it on every connect,
+  republishing cached bytes on reconnect). The helper serves a certificate only for hosts in the caller's session
+  record and gives one byte-identical refusal for "not held" and "not cached". What remains is the **consumer**:
+  no client app or `spindle-client-core` code fetches and pins the certificate yet, so treat any client-side
+  `HostDeviceCert` fetch as not-yet-built (Stage 7) rather than unimplemented server-side.
 - **A reply-to subject is not authenticated by NATS itself.** `reply_prefix_ok`
   (`crates/spindle-net/src/signaling/subject.rs:143-146`) exists because
   `spikes/s2-signaling`'s own measurement proved nats-server will deliver a request whose reply

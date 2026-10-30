@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.55) + Execution Plan
+# Spindle — System Design Document (draft v0.9.56) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -262,6 +262,13 @@
 > verify while one after it never will, and any loop exit is process-fatal, with a supervised restart re-minting the
 > credential; the first-run recovery phrase likewise leaves the process only to a terminal or an explicit `0600`
 > file, never a piped stdout/log stream.
+> v0.9.56: one implementation note, no wire change to a signed artifact. `registry.devcert.<hfp>` (host publisher)
+> and `helper.devcert.get.<nfp>` (unsigned helper request/reply) are implemented end to end (td-65884b):
+> `spindle-hostd`'s `connect_host` mints the `HostDeviceCert` from its per-process identity, publishes it and
+> flushes on every connect, and republishes the cached bytes on every reconnect; `spindle-helper` validates
+> subject-token identity on ingest, stores the canonical bytes last-write-wins, and serves the certificate only for
+> hosts in the caller's session record, with one uniform refusal for "not held" and "not cached". §A5b's status
+> rows and §A5's permission bullet are corrected accordingly.
 
 ---
 
@@ -995,9 +1002,9 @@ buckets are an outstanding implementation obligation.
   implementation grants (`permissions::host_permissions`) and what makes the subject safe — a bare grant would let
   any host publish into every other host's revocation subject. **[corrected v0.9.27, closes td-40a2d0]** this
   bullet previously omitted `registry.devcert` entirely, although the subject table above names hosts as its
-  publisher; added here in the same scoped form as `registry.revoke.<own>`. `permissions::host_permissions` does
-  not grant it yet — see §A5b's divergence list — so this closes the documentation half of the gap, not the
-  implementation.
+  publisher; added here in the same scoped form as `registry.revoke.<own>`. **[corrected v0.9.56]** the
+  implementation half now exists too: `permissions::host_permissions` grants
+  `pub registry.devcert.<own>`, and `spindle_hostd::devcert` publishes on it on every connect (td-65884b).
 - Client, for each host `h` in its verified caps: `pub host.<h>.connect`, `pub host.<h>.sess.<own>.*.c2h`,
   `sub host.<h>.sess.<own>.*.h2c`, `sub host.<h>.presence`; plus `sub _INBOX_<own>.>`,
   `pub helper.presence.get.<own nfp>`, `pub helper.turn.get.<own nfp>`, `pub helper.devcert.get.<own nfp>`,
@@ -1126,7 +1133,7 @@ that `nfp`.
 |---------|-----------|------------|---------|--------|
 | `helper.presence.get.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply presence snapshot for the caller's hosts | ✅ |
 | `helper.turn.get.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply TURN credentials; per-root monthly quota | ✅ |
-| `helper.devcert.get.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply fetch of a host device certificate; payload names the target `host_fp`, served only if that host is in the caller's session record, so it cannot enumerate hosts the caller holds no cap for | ❌ no handler exists |
+| `helper.devcert.get.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply fetch of a host device certificate; payload names the target `host_fp`, served only if that host is in the caller's session record, so it cannot enumerate hosts the caller holds no cap for | ✅ handler (`spindle_helper::devcert`) and grant landed with td-65884b; an uncached host and a host outside the session get one byte-identical refusal |
 | `helper.revoke.<nfp>` | device whose session nkey is `nfp` | broker helper | request/reply deposit of a **root-signed** `spindle-self-rev-v1` self-revocation (S14); accepted only if the signer is the `root_fp` in the caller's session record | ✅ handler implemented (`spindle_helper::self_revoke`), grant present; **no client producer yet** — see td-a06afc |
 
 **Registry ingest (APP account)**
@@ -1134,7 +1141,7 @@ that `nfp`.
 | Subject | Publisher | Subscriber | Purpose | Status |
 |---------|-----------|------------|---------|--------|
 | `registry.revoke.<hfp>` | host `hfp` only | broker helper | host-signed revocation/epoch records; durable; helper asserts subject token == record `host_fp`; per-host token bucket | ✅ |
-| `registry.devcert.<hfp>` | host `hfp` only | broker helper | host-signed device certificate; durable; republished on **every** host connect (A10.37); helper asserts subject token == the cert's `host_fp`; per-host token bucket | ❌ no handler exists |
+| `registry.devcert.<hfp>` | host `hfp` only | broker helper | host-signed device certificate; durable; republished on **every** host connect (A10.37); helper asserts subject token == the cert's `host_fp`; per-host token bucket | ✅ publisher (`spindle_hostd::devcert`) and ingest handler landed with td-65884b; the per-host token bucket is still absent (see §A4c) |
 | `registry.admin.>` | operator (mTLS + operator cert) | broker helper | signed admin commands (A3b); replies via `allow_responses` | ❌ no handler exists |
 
 **System plane (`$SYS`) — absent from A5's tables until now**
@@ -1172,32 +1179,29 @@ pass to name the SYS connection as primary with this fallback noted.
    **td-40a2d0**.
 2. **Fixed in v0.9.27 (this pass).** A5's host permission bullet omitted `registry.devcert` entirely, although the
    subject table above names hosts as its publisher. The bullet now grants `pub registry.devcert.<own>` in the
-   same scoped form as `pub registry.revoke.<own>`. `permissions::host_permissions` does not grant it in code yet —
-   that is folded into item 4 below — but the DESIGN-level gap is closed. Closes **td-40a2d0** (item 1 above closed
-   the other half).
+   same scoped form as `pub registry.revoke.<own>`. **[corrected v0.9.56]** `permissions::host_permissions` now
+   grants it in code as well, and `spindle_hostd::devcert` publishes on it (td-65884b), so the DESIGN-level and
+   implementation-level gaps are both closed. Closes **td-40a2d0** (item 1 above closed the other half).
 3. **Fixed in v0.9.27 (this pass).** CONNZ is issued on the **SYS** connection, not the callout connection A5
    previously described; A5's "Helper account bridging" prose is corrected, and the `SYS_CONN_SEED`-unset fallback
    is recorded as a documented degraded mode (see the footnote above).
-4. **❌ Still open: three specified subjects have no implementation**: `helper.devcert.get.<nfp>`,
-   `registry.devcert.<hfp>`, and `registry.admin.>`. Verification found this is stronger than "missing
-   handlers" for the first: `client_member_permissions` (`crates/spindle-helper/src/permissions.rs`,
-   `client_member_permissions`) grants a member connection only `helper.presence.get.<nfp>`,
-   `helper.turn.get.<nfp>`, and `helper.revoke.<nfp>` — `helper.devcert.get.<nfp>` is absent from the
-   permission grant itself, not merely unhandled, even though §A5's callout-permissions bullet lists it as
-   granted. That one is a DESIGN-only aspiration end to end: implementing it costs a permission-grant change
-   plus a handler, not a handler alone. `helper.devcert.get.<nfp>` is addressed by A10.37 below;
-   `registry.admin.>` is the A3b admin plane and needs its own task. **`helper.revoke.<nfp>` left this list
-   in v0.9.48**: grant and handler now exist (`spindle_helper::self_revoke`), though nothing produces the
-   records yet — no client mints or deposits a `spindle-self-rev-v1`, tracked as td-a06afc, and S14's
-   host-side delivery/verification has no route at all (td-bdab3a).
+4. **❌ Still open: `registry.admin.>` has no implementation.** It is the A3b admin plane and needs its own task.
+   **`helper.devcert.get.<nfp>` and `registry.devcert.<hfp>` left this list in v0.9.56**: the grant, the host
+   publisher (`spindle_hostd::devcert`), the ingest handler and the fetch handler (`spindle_helper::devcert`) all
+   exist, proven end to end by `crates/spindle-hostd/tests/live_devcert.rs` (td-65884b). **`helper.revoke.<nfp>`
+   left this list in v0.9.48**: grant and handler now exist (`spindle_helper::self_revoke`), though nothing
+   produces the records yet — no client mints or deposits a `spindle-self-rev-v1`, tracked as td-a06afc, and
+   S14's host-side delivery/verification has no route at all (td-bdab3a).
 
 **A10.37 — Where the `HostDeviceCert` lives**
 
 **DECIDED 2026-09-01: one authority, two caches.** The certificate is minted and owned by the host, cached durably at
 the registry for distribution, and pinned by the client.
 
-- **Authoritative — the host.** The host mints the cert (its **operating** key signs it, per A10.35) and persists it
-  in its own store. The host is its only writer.
+- **Authoritative — the host.** The host mints the cert (its **operating** key signs it, per A10.35) and
+  publishes it on every registry connect. No host-side store exists in this slice: the operating and envelope keys
+  are re-minted per process (A10.43/A10.44), so the certificate is minted with them and is not a value that
+  survives a restart. The host is its only writer.
 - **Distribution cache — the broker helper.** The host publishes on `registry.devcert.<hfp>` **on every connect to
   the registry** (see Open items); the helper stores it durably and serves it on demand via
   `helper.devcert.get.<nfp>`. The helper is an **untrusted carrier by construction**: A10.34 requires the cert to
@@ -1221,7 +1225,9 @@ every member.
 
 **Crate residency (A9c).** Schema in `spindle-proto`; issue/verify in `spindle-core`; host-side persistence in
 `spindle-vfs`; registry-side cache and serving in `spindle-helper`; fetch, pin, and chain verification in
-`spindle-client-core`. The first two already exist; the rest do not.
+`spindle-client-core`. Schema/issue/verify and the registry-side cache plus serving exist; host-side persistence
+is moot today because the envelope key and its certificate are re-minted per process (A10.44), and the client
+fetch/pin half does not exist yet (no client consumes the fetch).
 
 **Rejected alternatives.**
 
