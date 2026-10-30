@@ -99,6 +99,8 @@ fn client_opts() -> ConnectOptions {
         bind_ip: ICE_BIND_IP,
         ice_timeout: Duration::from_secs(10),
         answer_timeout: Duration::from_secs(5),
+        // Host-only gathering: these live tests run on loopback.
+        ice: Default::default(),
     }
 }
 
@@ -108,6 +110,7 @@ fn host_opts() -> HostOptions {
         ice_timeout: Duration::from_secs(10),
         session_close_timeout: Duration::from_secs(5),
         max_concurrent_connects: HostOptions::default().max_concurrent_connects,
+        ice: Default::default(),
     }
 }
 

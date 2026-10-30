@@ -58,6 +58,12 @@ services:
   # `use-auth-secret` / `static-auth-secret` must match the helper's TURN_SECRET below (dual-secret
   # rotation overlap per DESIGN.md §A9b is a production concern, not modeled in this dev stack).
   # Relay port range kept small for dev (49160-49200) — widen for real NAT-traversal testing.
+  #
+  # `denied-peer-ip` (td-c3badf review fix 4): a peer's `relay` candidate is peer-supplied, and
+  # coturn will relay to whatever address it names unless told otherwise. Deny the ranges a Spindle
+  # relay should never target (unspecified, loopback, link-local). The server's own relay address is
+  # deliberately NOT denied: a peer's relayed candidate is an address on this TURN server. Extend
+  # this list (never shorten it) before exposing a relay to untrusted peers.
   coturn:
     image: coturn/coturn
     command:
@@ -68,6 +74,10 @@ services:
       - "--static-auth-secret=${TURN_SECRET:-spindle-turn-dev-only}"
       - "--min-port=49160"
       - "--max-port=49200"
+      - "--denied-peer-ip=0.0.0.0-0.255.255.255"
+      - "--denied-peer-ip=127.0.0.0-127.255.255.255"
+      - "--denied-peer-ip=169.254.0.0-169.254.255.255"
+      - "--denied-peer-ip=::1"
       - "--no-cli"
       - "--no-tls"
       - "--no-dtls"

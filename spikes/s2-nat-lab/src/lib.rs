@@ -16,18 +16,84 @@
 //! requires.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
 use spindle_core::identity::DeviceKey;
 use spindle_core::{Fingerprint, VerifyingKey};
 use spindle_net::framing::{read_frame, write_frame};
 use spindle_net::quic::ControlStream;
 use spindle_net::signaling::{
-    ConnectAuthorizer, ConnectDecision, HostIdentity, SessionHandler, VerifiedDecision,
+    ConnectAuthorizer, ConnectDecision, HostIdentity, IceConfig, SessionHandler, TurnConfig,
+    TurnCredentials, VerifiedDecision,
 };
 use x25519_dalek::PublicKey as X25519PublicKey;
+
+/// Builds the lab's [`IceConfig`] from environment variables, shared by both binaries so the two
+/// sides cannot drift apart (which would silently make one side punch and the other relay).
+///
+/// - `STUN_SERVERS` — comma-separated `ip:port` list; unset/empty means host-only.
+/// - `TURN_SERVER` — `ip:port`; **set means the relay path** (td-c3badf selects the relay
+///   unconditionally when TURN is configured).
+/// - `TURN_SECRET` (+ optional `TURN_LABEL`, `TURN_TTL_SECS`) — coturn `use-auth-secret` REST
+///   credential source, matching the lab compose's `static-auth-secret`.
+/// - `TURN_USERNAME` + `TURN_CREDENTIAL` — static credential pair instead (takes precedence).
+pub fn ice_config_from_env() -> Result<IceConfig> {
+    let mut config = IceConfig::default();
+
+    if let Ok(raw) = std::env::var("STUN_SERVERS") {
+        for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            config.stun_servers.push(
+                entry
+                    .parse()
+                    .with_context(|| format!("STUN_SERVERS entry {entry:?}"))?,
+            );
+        }
+    }
+
+    if let Ok(raw) = std::env::var("TURN_SERVER") {
+        if !raw.trim().is_empty() {
+            let server: SocketAddr = raw
+                .parse()
+                .with_context(|| format!("TURN_SERVER {raw:?} is not a socket address"))?;
+            let credentials = match (
+                std::env::var("TURN_USERNAME"),
+                std::env::var("TURN_CREDENTIAL"),
+            ) {
+                (Ok(username), Ok(credential)) => TurnCredentials::Static {
+                    username,
+                    credential,
+                },
+                _ => {
+                    let secret = std::env::var("TURN_SECRET").context(
+                        "TURN_SECRET (or TURN_USERNAME+TURN_CREDENTIAL) is required when \
+                         TURN_SERVER is set",
+                    )?;
+                    let label =
+                        std::env::var("TURN_LABEL").unwrap_or_else(|_| "s2-lab".to_string());
+                    let ttl_secs: u64 = std::env::var("TURN_TTL_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(3600);
+                    TurnCredentials::RestSecret {
+                        secret,
+                        label,
+                        ttl: Duration::from_secs(ttl_secs),
+                    }
+                }
+            };
+            config.turn = Some(TurnConfig {
+                server,
+                credentials,
+            });
+        }
+    }
+
+    Ok(config)
+}
 
 pub const HOST_FP_BYTES: [u8; 32] = [0xB1; 32];
 

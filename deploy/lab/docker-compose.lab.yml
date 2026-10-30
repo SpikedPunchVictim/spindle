@@ -57,6 +57,9 @@ services:
       wan:
         ipv4_address: 172.28.0.12
 
+  # `denied-peer-ip` mirrors deploy/docker-compose.yml (td-c3badf review fix 4): a peer-supplied
+  # relay candidate must not be able to point the relay at loopback/link-local/unspecified space.
+  # The lab's relayed addresses are 172.28.0.13:*, so these ranges do not block the S2 relay cell.
   coturn:
     image: coturn/coturn
     command:
@@ -67,6 +70,10 @@ services:
       - "--static-auth-secret=${TURN_SECRET:-spindle-turn-dev-only}"
       - "--min-port=49160"
       - "--max-port=49200"
+      - "--denied-peer-ip=0.0.0.0-0.255.255.255"
+      - "--denied-peer-ip=127.0.0.0-127.255.255.255"
+      - "--denied-peer-ip=169.254.0.0-169.254.255.255"
+      - "--denied-peer-ip=::1"
       - "--no-cli"
       - "--no-tls"
       - "--no-dtls"

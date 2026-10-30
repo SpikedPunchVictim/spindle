@@ -5,14 +5,19 @@
 # Both run the PRODUCTION spindle_net::{SignalingHost, SignalingClient} through a lab-local
 # unauthenticated NATS (`nats-s2` on the wan). Cells: unshaped cone:cone and 50 ms both peers.
 #
-# What this can and cannot measure is determined by the production code, not by this script:
-# `spindle-net/src/signaling/ice.rs` gathers a single host candidate and nothing else (no STUN,
-# no TURN), so across NATs the only candidate is the private address and ICE cannot select a pair.
-# The script therefore records the offer/answer signaling phase (which does cross the NATs via
-# NATS) and the ICE failure; it does not invent an across-NAT usable-stream number. The production
-# stack also has no relay transport, so there is no production S2 relay number to measure.
+# Transport is chosen by the production config the peers receive, not by this script:
+#   * default / no TURN_SERVER -- STUN srflx gathering + ICE punch. On this lab's Linux-conntrack
+#     NAT the punch is probabilistic unshaped and fails at any nonzero delay (td-3c1762), so this
+#     cell measures the punch honestly, including its failures.
+#   * TURN_SERVER set -- the production stack (td-c3badf) uses the TURN relay unconditionally;
+#     both cells should complete through coturn. The client reports which transport won.
 #
-# Usage: deploy/lab/run-s2-nat.sh   (KEEP_LAB=1 to leave the lab up; RUNS/MAX_ATTEMPTS overrides)
+# Both peers get the same STUN/TURN environment; a mismatch makes one side wait for a relay
+# candidate the other never sends.
+#
+# Usage: deploy/lab/run-s2-nat.sh   (KEEP_LAB=1 to leave the lab up; RUNS/MAX_ATTEMPTS overrides;
+#                                   REBUILD=1 to rebuild the s2lab image; TURN_SERVER=172.28.0.13:3478
+#                                   to measure the relay path)
 set -uo pipefail
 
 LAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,6 +34,14 @@ DELAYED_MAX_ATTEMPTS="${DELAYED_MAX_ATTEMPTS:-$RUNS}"
 ICE_TIMEOUT_MS="${ICE_TIMEOUT_MS:-5000}"
 ANSWER_TIMEOUT_MS="${ANSWER_TIMEOUT_MS:-5000}"
 KEEP_LAB="${KEEP_LAB:-0}"
+REBUILD="${REBUILD:-0}"
+# The lab's in-repo STUN responder (deploy/lab/docker-compose.lab.yml's `stun` service).
+STUN_SERVER="${STUN_SERVER:-172.28.0.14:3478}"
+# Empty by default (punch). Set to the lab's coturn to measure the relay path.
+TURN_SERVER="${TURN_SERVER:-}"
+# Must match the lab coturn's --static-auth-secret (docker-compose.lab.yml).
+TURN_SECRET="${TURN_SECRET:-spindle-turn-dev-only}"
+TURN_LABEL="${TURN_LABEL:-s2-lab}"
 
 compose() { docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"; }
 
@@ -44,7 +57,7 @@ trap cleanup EXIT
 
 mkdir -p "$ARTIFACTS_DIR"
 
-if ! docker image inspect "$S2_IMAGE" >/dev/null 2>&1; then
+if [ "$REBUILD" = "1" ] || ! docker image inspect "$S2_IMAGE" >/dev/null 2>&1; then
   echo "== building $S2_IMAGE ==" >&2
   docker build -f "$LAB_DIR/Dockerfile.s2lab" -t "$S2_IMAGE" "$LAB_DIR/../.." || exit 1
 fi
@@ -90,7 +103,7 @@ apply_netem() {
 }
 
 start_host() {
-  compose exec -d peer-a sh -c "rm -f /tmp/s2-host.jsonl; NATS_URL='$NATS_URL' BIND_IP='$HOST_BIND' ICE_TIMEOUT_MS='$ICE_TIMEOUT_MS' /usr/local/bin/s2-host >/tmp/s2-host.jsonl 2>&1"
+  compose exec -d peer-a sh -c "rm -f /tmp/s2-host.jsonl; NATS_URL='$NATS_URL' BIND_IP='$HOST_BIND' ICE_TIMEOUT_MS='$ICE_TIMEOUT_MS' STUN_SERVERS='$STUN_SERVER' TURN_SERVER='$TURN_SERVER' TURN_SECRET='$TURN_SECRET' TURN_LABEL='$TURN_LABEL' /usr/local/bin/s2-host >/tmp/s2-host.jsonl 2>&1"
   local i
   for i in $(seq 1 100); do
     if compose exec -T peer-a sh -c 'grep -q host_ready /tmp/s2-host.jsonl 2>/dev/null'; then
@@ -119,6 +132,8 @@ run_cell() {
   compose exec -T peer-c env \
     NATS_URL="$NATS_URL" BIND_IP="$CLIENT_BIND" RUNS="$RUNS" MAX_ATTEMPTS="$max" \
     ICE_TIMEOUT_MS="$ICE_TIMEOUT_MS" ANSWER_TIMEOUT_MS="$ANSWER_TIMEOUT_MS" LABEL="$label" \
+    STUN_SERVERS="$STUN_SERVER" TURN_SERVER="$TURN_SERVER" TURN_SECRET="$TURN_SECRET" \
+    TURN_LABEL="$TURN_LABEL" \
     /usr/local/bin/s2-client \
     >"$ARTIFACTS_DIR/$label-client.jsonl" 2>"$ARTIFACTS_DIR/$label-client.err"
   local rc=$?
@@ -135,27 +150,34 @@ echo ""
 echo "## S2 across-NAT measurement (production SignalingHost/SignalingClient; simulated, one kernel)"
 echo ""
 echo "Host peer-a (172.28.10.2, behind nat-a/gw-a) <-> client peer-c (172.28.30.2, behind nat-c/gw-c)."
-echo "Signaling: $NATS_URL (lab-local unauthenticated NATS). Production ICE is host-candidates-only:"
-echo "no STUN, no TURN, so the only candidate across these NATs is a private address."
+echo "Signaling: $NATS_URL (lab-local unauthenticated NATS)."
+if [ -n "$TURN_SERVER" ]; then
+  echo "Production gathering: STUN $STUN_SERVER + TURN $TURN_SERVER -> relay path (td-c3badf)."
+else
+  echo "Production gathering: STUN $STUN_SERVER, no TURN -> ICE punch (host + srflx candidates)."
+fi
 echo ""
-echo "| Cell | Netem (both peers) | Attempts | Successes | Failures | offer->answer ms (median) | answer->selected ms | selected->QUIC ms | offer->usable ms |"
-echo "|------|--------------------|----------|-----------|----------|---------------------------|---------------------|-------------------|------------------|"
+echo "| Cell | Netem (both peers) | Attempts | Successes | Failures | Transport (ok attempts) | offer->answer ms (median) | answer->selected ms | selected->QUIC ms | offer->usable ms |"
+echo "|------|--------------------|----------|-----------|----------|-------------------------|---------------------------|---------------------|-------------------|------------------|"
 for label in unshaped delay50; do
   f="$ARTIFACTS_DIR/$label-client.jsonl"
   summary=$(jq -c 'select(.attempts != null and .successes != null)' "$f" 2>/dev/null | tail -1)
   if [ -z "$summary" ]; then
-    echo "| $label | - | - | - | - | - | - | - | - |"
+    echo "| $label | - | - | - | - | - | - | - | - | - |"
     continue
   fi
   attempts=$(printf '%s' "$summary" | jq -r '.attempts')
   successes=$(printf '%s' "$summary" | jq -r '.successes')
   failures=$(printf '%s' "$summary" | jq -r '.failures')
+  punch=$(printf '%s' "$summary" | jq -r '.punch_successes // 0')
+  relay=$(printf '%s' "$summary" | jq -r '.relay_successes // 0')
   a=$(printf '%s' "$summary" | jq -r '.offer_to_answer_ms_median // "n/a"')
   b=$(printf '%s' "$summary" | jq -r '.answer_to_selected_ms_median // "n/a"')
   c=$(printf '%s' "$summary" | jq -r '.selected_to_quic_ms_median // "n/a"')
   d=$(printf '%s' "$summary" | jq -r '.offer_to_stream_ms_median // "n/a"')
   if [ "$label" = "unshaped" ]; then netem="none"; else netem="50 ms"; fi
-  echo "| $label | $netem | $attempts | $successes | $failures | $a | $b | $c | $d |"
+  used="punch=${punch}, relay=${relay}"
+  echo "| $label | $netem | $attempts | $successes | $failures | $used | $a | $b | $c | $d |"
 done
 
 echo ""
@@ -180,13 +202,11 @@ for label in unshaped delay50; do
 done
 
 echo ""
-echo "### Why there is no across-NAT usable-stream number"
+echo "### Reading this table"
 echo ""
-echo "Production ICE gathers one host candidate and no STUN/TURN (crates/spindle-net/src/signaling/ice.rs)."
-echo "Across nat-a<->nat-c that candidate is the private address, which the gateways drop; the ICE phase"
-echo "cannot select a pair, so answer->selected / selected->QUIC / offer->usable are undefined. The"
-echo "offer/answer signaling itself does cross the NATs (host events above). The production stack has no"
-echo "relay transport either, so there is no production S2 relay number; the S19 quic-peer relay figures"
-echo "in spikes/s19-quic-transport/RESULTS.md are the only relay evidence."
-echo ""
-echo "Raw artifacts: $ARTIFACTS_DIR"
+echo "Production gathering is STUN srflx + ICE punch unless TURN_SERVER was set, in which case the"
+echo "stack uses coturn's relay unconditionally (crates/spindle-net/src/signaling/{ice,turn}.rs)."
+echo "On this lab's Linux-conntrack NAT, the punch is probabilistic unshaped and fails at any nonzero"
+echo "delay (td-3c1762); failures in a punch cell are ICE 'trickle timed out', not signaling failures"
+echo "(the host-observed counts above prove offers/answers crossed both NATs). A relay cell should"
+echo "complete every attempt with transport=relay. Raw artifacts: $ARTIFACTS_DIR"

@@ -4,9 +4,9 @@
 //! against the live composed stack). Both peer roles live here:
 //!
 //! - [`client::SignalingClient`] — sends the offer, receives the answer, trickles ICE, ends with
-//!   [`crate::quic::QuicClient::from_socket`].
+//!   [`crate::quic::QuicClient::from_socket`] (punch) or `from_abstract_socket` (relay).
 //! - [`host::SignalingHost`] — subscribes for offers, authorizes+verifies+answers, trickles ICE,
-//!   ends with [`crate::quic::QuicServer::from_socket`].
+//!   ends with [`crate::quic::QuicServer::from_socket`] (punch) or `from_abstract_socket` (relay).
 //!
 //! # The NATS client is passed in, not owned
 //!
@@ -36,7 +36,10 @@
 //!   scoping exactly, plus the `_INBOX` reply-prefix check DESIGN.md §A6 requires.
 //! - [`seq`] — [`seq::SeqFloor`], the per-`(sid, direction)` replay-window bookkeeping `seq`'s
 //!   MUST-check needs a caller to maintain.
-//! - [`ice`] — standalone sans-I/O ICE punching (`rtc-ice`), graduated unchanged from the spike.
+//! - [`ice`] — standalone sans-I/O ICE punching (`rtc-ice`), host/STUN server-reflexive/TURN relay
+//!   candidate gathering (`IceConfig`; td-c3badf), graduated from the spike.
+//! - `turn` — TURN relay transport (`rtc-turn` + a `quinn::AsyncUdpSocket` adapter), private to
+//!   this module and selected through [`IceConfig::turn`].
 //! - [`authorize`] — [`authorize::ConnectAuthorizer`] (see above).
 //! - [`error`] — [`error::SignalingError`], every failure this module's functions can produce.
 //! - [`client`] / [`host`] — the two peer roles' actual NATS/ICE/QUIC I/O.
@@ -50,10 +53,15 @@ pub mod seq;
 pub mod subject;
 pub mod wire;
 
+// TURN relay fallback (td-c3badf) is an implementation detail of the ICE/data-path choice: its
+// types surface only through `IceConfig::turn`, not as a public module.
+mod turn;
+
 pub use authorize::{ConnectAuthorizer, ConnectDecision, VerifiedDecision};
 pub use client::{ConnectOptions, HostIdentity, SignalingClient};
 pub use error::SignalingError;
 pub use host::{HostOptions, SessionHandler, SignalingHost};
+pub use ice::{IceConfig, SelectedTransport, TurnConfig, TurnCredentials};
 
 use futures_util::StreamExt;
 use spindle_core::envelope::SessionKey;

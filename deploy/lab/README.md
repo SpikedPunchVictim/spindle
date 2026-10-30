@@ -146,9 +146,10 @@ deploy/lab/run-matrix.sh
 KEEP_LAB=1 deploy/lab/run-matrix.sh
 
 # S2 across-NAT measurement using the production signaling stack (host on peer-a, client on
-# peer-c, signaling via nats-s2). See the S2 section below for why the usable-stream phase does
-# not exist across NATs yet.
+# peer-c, signaling via nats-s2). Default is STUN + ICE punch; set TURN_SERVER to measure the
+# relay path (td-c3badf). See the S2 section below.
 deploy/lab/run-s2-nat.sh
+TURN_SERVER=172.28.0.13:3478 REBUILD=1 deploy/lab/run-s2-nat.sh
 
 # fewer/more attempts, smaller transfer
 RUNS=3 MAX_ATTEMPTS=8 BYTES_MIB=32 WINDOW_MIB=2 deploy/lab/run-matrix.sh
@@ -246,19 +247,30 @@ with the host on `peer-a` (nat-a) and the client on `peer-c` (nat-c), signaling 
 The fixed identities and the lab-local `RegistryAuthorizer` live in `spikes/s2-nat-lab`; the
 binaries are built by `Dockerfile.s2lab` and copied into the peers.
 
-**Production ICE gathers a host candidate only — no STUN, no TURN**
-(`crates/spindle-net/src/signaling/ice.rs`: "Loopback/LAN host candidates only in this slice — no
-STUN/TURN gathering"). Across nat-a ↔ nat-c that candidate is the private address, which the
-gateways drop, so ICE cannot select a pair: the `answer→selected`, `selected→QUIC`, and
-`offer→usable` phases are undefined. The offer/answer signaling itself does cross the NATs via
-NATS (the host records offer/answer events), but there is no across-NAT usable-stream number until
-the production stack gains STUN or relay candidate gathering. The production stack also has no
-relay transport, so there is no production S2 relay number; the S19 `quic-peer --transport relay`
-figures are the only relay evidence. Measured 2026-10-30: unshaped **0/10** attempts (all `ICE trickle timed out`, 5108.6 ms median),
-50 ms both peers **0/5** (5200.3 ms median); the host observed **10/10** and **5/5** offer/answer
-pairs and **0** QUIC sessions. Host-side offer→answer (approximate; the production client exposes
-the four phases only on success) was 2.369 ms unshaped and 56.353 ms at 50 ms. Measured evidence
-and the exact failure strings are recorded in `spikes/s2-signaling/RESULTS.md`.
+Since **td-c3badf**, `spindle-net`'s `IceConfig` gathers a host candidate plus a server-reflexive
+candidate per configured STUN server, and (when TURN is configured) allocates a relay and uses the
+TURN path unconditionally. `run-s2-nat.sh` passes `STUN_SERVER` (default `172.28.0.14:3478`) to
+both peers; `TURN_SERVER=172.28.0.13:3478` switches both peers to the relay. Both peers must get
+the same setting.
+
+Measured 2026-10-30 on this lab (5 s ICE timeout, 5 successes wanted):
+
+| Cell | Transport | Attempts | Successes | offer→answer ms | answer→selected ms | selected→QUIC ms | offer→usable ms |
+|------|-----------|----------|-----------|-----------------|--------------------|------------------|-----------------|
+| unshaped | punch | 40 | 5 | 4.057 | 609.705 | 7.288 | 618.903 |
+| 50 ms both | punch | 5 | 0 | — | — | — | — |
+| unshaped | relay | 5 | 5 | 1.639 | 2.018 | 1.549 | 5.761 |
+| 50 ms both | relay | 5 | 5 | 104.274 | 156.961 | 103.792 | 468.909 |
+
+The punch numbers reproduce td-3c1762 on this NAT (5/40 = 12.5% unshaped, 0% at any delay; earlier
+runs got 1/10, 5/24 and 5/33, hence the larger unshaped attempt budget). The relay path completes every
+shaped attempt; on the relay path `answer→selected` measures "answer verified → TURN allocation +
+CreatePermission complete" (no ICE selection runs). The answer is published with the host candidate
+only, so STUN gathering and TURN allocation do not sit on the offer/answer path. Exact per-attempt
+evidence is in `spikes/s2-signaling/RESULTS.md`.
+
+Before td-c3badf this section recorded the host-only failure: unshaped 0/10 and 50 ms 0/5, all
+`ICE trickle timed out`; that history and its failure strings remain in the same RESULTS section.
 
 ## File map
 

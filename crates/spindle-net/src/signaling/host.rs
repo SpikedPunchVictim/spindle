@@ -26,7 +26,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use spindle_core::identity::DeviceKey;
 use spindle_core::Fingerprint;
@@ -38,8 +38,12 @@ use crate::quic::{ControlStream, QuicServer, SessionCert};
 use super::authorize::{ConnectAuthorizer, ConnectDecision, VerifiedDecision};
 use super::bridge_incoming_ice;
 use super::error::SignalingError;
-use super::ice::{drive_ice_agent_trickle, start_local_ice};
+use super::ice::{
+    await_peer_relay_candidate, drive_ice_agent_trickle, relay_candidate_line, start_local_ice,
+    IceConfig, LocalTrickleEvent, SelectedTransport, StunGather,
+};
 use super::subject::{connect_subject, reply_prefix_ok, session_subject, IceDirection};
+use super::turn;
 use super::wire::{seal_ice, OpenedOffer};
 
 /// What a host does with a session once its QUIC control stream is established — see this
@@ -72,10 +76,13 @@ pub trait SessionHandler: Send + Sync {
 }
 
 /// Tunable knobs for the host's connect/session lifecycle.
-#[derive(Debug, Clone, Copy)]
+///
+/// `Clone` rather than `Copy`: [`Self::ice`] carries a server list and credentials.
+#[derive(Debug, Clone)]
 pub struct HostOptions {
-    /// Local address to bind each session's ICE UDP socket on (loopback/LAN gathering only this
-    /// slice — see [`super::ice`]'s module doc comment).
+    /// Local address to bind each session's ICE UDP socket on. Use a concrete interface address,
+    /// not the wildcard: the wildcard is what gets advertised as this side's host candidate, and
+    /// a peer cannot route to `0.0.0.0`.
     pub bind_ip: IpAddr,
     /// How long to wait for ICE connectivity checks to select a candidate pair.
     pub ice_timeout: Duration,
@@ -109,6 +116,11 @@ pub struct HostOptions {
     /// memory is still consumed and *every* legitimate offer behind the flood is delayed instead of
     /// only the hostile one(s) being dropped.
     pub max_concurrent_connects: usize,
+    /// Candidate gathering (td-c3badf), applied to every session. The default is empty — host
+    /// candidate only, exactly the pre-td-c3badf behaviour. Both peers must configure the same
+    /// kind of path: TURN configured here means this host answers on the relay, so a punch-only
+    /// client would never complete.
+    pub ice: IceConfig,
 }
 
 impl Default for HostOptions {
@@ -118,6 +130,7 @@ impl Default for HostOptions {
             ice_timeout: Duration::from_secs(10),
             session_close_timeout: Duration::from_secs(5),
             max_concurrent_connects: 64,
+            ice: IceConfig::default(),
         }
     }
 }
@@ -403,7 +416,11 @@ where
             .await
             .map_err(|e| SignalingError::Nats(e.to_string()))?;
 
-        let connect_slots = Arc::new(Semaphore::new(opts.max_concurrent_connects));
+        // Copied out before the loop: `opts` itself is cloned into each spawned task (it is no
+        // longer `Copy`), so a borrow of `opts` in the drop path and a move into the closure
+        // cannot both refer to the loop variable.
+        let max_concurrent_connects = opts.max_concurrent_connects;
+        let connect_slots = Arc::new(Semaphore::new(max_concurrent_connects));
 
         while let Some(msg) = sub.next().await {
             // `try_acquire_owned`, never the blocking `acquire`: this loop must never wait for a
@@ -417,17 +434,21 @@ where
                 // and headers are all attacker-supplied and unverified at this point (no signature
                 // has been checked yet).
                 tracing::warn!(
-                    max_concurrent_connects = opts.max_concurrent_connects,
+                    max_concurrent_connects,
                     "connect offer dropped: at max-concurrent-connects cap"
                 );
                 continue;
             };
             let this = self.clone();
+            // `HostOptions` is `Clone` (not `Copy`) because `ice` carries a server list; each
+            // in-flight session gets its own copy, cloned outside the closure so the loop's
+            // `opts` is not moved.
+            let session_opts = opts.clone();
             tokio::spawn(async move {
                 // Held for the whole handler; the slot is released when this task ends, whether
                 // `handle_connect` succeeds, errors, or panics.
                 let _permit = permit;
-                if let Err(error) = this.handle_connect(msg, opts).await {
+                if let Err(error) = this.handle_connect(msg, session_opts).await {
                     // `error.redacted()`, not `%error`: `handle_connect` can fail with any
                     // `SignalingError`, including the four variants that carry peer-supplied
                     // CBOR keys or an untruncated-fingerprint NATS subject — see
@@ -507,8 +528,10 @@ where
             .await
             .map_err(|e| SignalingError::Nats(e.to_string()))?;
 
+        // Publish the host candidate immediately after the answer; STUN gathering and TURN
+        // allocation happen later and must not delay the answer (td-c3badf review fix 1).
         let mut seq: u64 = 1;
-        let candidate_env = seal_ice(
+        let host_env = seal_ice(
             &session_key,
             &self.device,
             self.device_fp,
@@ -516,34 +539,15 @@ where
             &opened.sid,
             seq,
             &IcePayload {
-                candidate: Some(local_ice.candidate_line.clone()),
+                candidate: Some(local_ice.host_candidate_line.clone()),
                 end_of_candidates: false,
             },
         );
         self.nats
-            .publish(
-                h2c_subject.clone(),
-                candidate_env.to_canonical_bytes().into(),
-            )
+            .publish(h2c_subject.clone(), host_env.to_canonical_bytes().into())
             .await
             .map_err(|e| SignalingError::Nats(e.to_string()))?;
         seq += 1;
-        let eoc_env = seal_ice(
-            &session_key,
-            &self.device,
-            self.device_fp,
-            opened.from_fp,
-            &opened.sid,
-            seq,
-            &IcePayload {
-                candidate: None,
-                end_of_candidates: true,
-            },
-        );
-        self.nats
-            .publish(h2c_subject, eoc_env.to_canonical_bytes().into())
-            .await
-            .map_err(|e| SignalingError::Nats(e.to_string()))?;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let bridge = tokio::spawn(bridge_incoming_ice(
@@ -553,7 +557,9 @@ where
             opened.from_fp,
             opened.sid.clone(),
             IceDirection::ClientToHost,
-            session_key,
+            // Cloned because the candidate-publishing paths below still need the key; both copies
+            // zeroize on drop.
+            session_key.clone(),
             opened.sender_sign_pk,
             // ... and envelope fingerprints (this host's envelope identity, the client's).
             self.device_fp,
@@ -561,24 +567,135 @@ where
             tx,
         ));
 
-        let (remote_addr, _stats) = drive_ice_agent_trickle(
-            &mut local_ice.agent,
-            &local_ice.socket,
-            // The host is never the controlling side; the peer's credentials come from the offer
-            // this side just opened.
-            false,
-            &opened.offer.ufrag,
-            &opened.offer.pwd,
-            rx,
-            opts.ice_timeout,
-        )
-        .await?;
-        bridge.abort();
-        tracing::debug!(%remote_addr, "ICE selected a candidate pair; accepting QUIC on the punched socket");
+        // Selected path (td-c3badf): TURN configured means relay, unconditionally; otherwise ICE
+        // punches and quinn takes the punched socket. The client makes the same choice from its
+        // own config — see `super::turn`'s module doc comment.
+        let control = if let Some(turn_config) = opts.ice.turn.as_ref() {
+            // Allocate after the answer is on the wire (td-c3badf review fix 1).
+            // The guard releases the allocation on any error from here to
+            // `into_relay_socket` (failed publish, peer never trickles a relay candidate, ...),
+            // instead of pinning a coturn relay port for its lifetime.
+            let mut allocation =
+                turn::allocate(turn_config, opts.bind_ip, turn::TURN_SETUP_TIMEOUT).await?;
+            let relayed = allocation.relayed_addr()?;
+            let relay_line =
+                relay_candidate_line(relayed, allocation.local_addr()?, turn_config.server)?;
+            let relay_env = seal_ice(
+                &session_key,
+                &self.device,
+                self.device_fp,
+                opened.from_fp,
+                &opened.sid,
+                seq,
+                &IcePayload {
+                    candidate: Some(relay_line),
+                    end_of_candidates: false,
+                },
+            );
+            self.nats
+                .publish(h2c_subject.clone(), relay_env.to_canonical_bytes().into())
+                .await
+                .map_err(|e| SignalingError::Nats(e.to_string()))?;
+            seq += 1;
+            let eoc_env = seal_ice(
+                &session_key,
+                &self.device,
+                self.device_fp,
+                opened.from_fp,
+                &opened.sid,
+                seq,
+                &IcePayload {
+                    candidate: None,
+                    end_of_candidates: true,
+                },
+            );
+            self.nats
+                .publish(h2c_subject.clone(), eoc_env.to_canonical_bytes().into())
+                .await
+                .map_err(|e| SignalingError::Nats(e.to_string()))?;
 
-        let std_socket = local_ice.socket.into_std()?;
-        let server = QuicServer::from_socket(std_socket, &cert, opened.offer.cert_fp)?;
-        let control = server.accept().await?;
+            // The peer may still be allocating when this side finishes; wait up to the TURN setup
+            // bound, not the shorter ICE timeout.
+            let peer_relayed = await_peer_relay_candidate(rx, turn::TURN_SETUP_TIMEOUT).await?;
+            bridge.abort();
+            turn::create_permission(
+                allocation.allocation_mut()?,
+                peer_relayed,
+                turn::TURN_SETUP_TIMEOUT,
+            )
+            .await?;
+            tracing::debug!(
+                peer = %peer_relayed,
+                transport = SelectedTransport::Relay.as_str(),
+                "accepting QUIC over the TURN relay"
+            );
+            let relay_socket = allocation.into_relay_socket(turn_config.server, peer_relayed)?;
+            turn::spawn_driver(relay_socket.clone());
+            let server =
+                QuicServer::from_abstract_socket(relay_socket, &cert, opened.offer.cert_fp)?;
+            server.accept().await?
+        } else {
+            let (local_tx, mut local_rx) = tokio::sync::mpsc::unbounded_channel();
+            let gather = StunGather::new(&opts.ice.stun_servers, Instant::now());
+            let mut drive = Box::pin(drive_ice_agent_trickle(
+                &mut local_ice.agent,
+                &local_ice.socket,
+                // The host is never the controlling side; the peer's credentials come from the
+                // offer this side just opened.
+                false,
+                &opened.offer.ufrag,
+                &opened.offer.pwd,
+                rx,
+                gather,
+                local_tx,
+                opts.ice_timeout,
+            ));
+            let remote_addr = loop {
+                tokio::select! {
+                    result = &mut drive => break result?.0,
+                    Some(event) = local_rx.recv() => {
+                        let payload = match event {
+                            LocalTrickleEvent::Candidate(line) => IcePayload {
+                                candidate: Some(line),
+                                end_of_candidates: false,
+                            },
+                            LocalTrickleEvent::EndOfCandidates => IcePayload {
+                                candidate: None,
+                                end_of_candidates: true,
+                            },
+                        };
+                        let env = seal_ice(
+                            &session_key,
+                            &self.device,
+                            self.device_fp,
+                            opened.from_fp,
+                            &opened.sid,
+                            seq,
+                            &payload,
+                        );
+                        self.nats
+                            .publish(
+                                h2c_subject.clone(),
+                                env.to_canonical_bytes().into(),
+                            )
+                            .await
+                            .map_err(|e| SignalingError::Nats(e.to_string()))?;
+                        seq += 1;
+                    }
+                }
+            };
+            drop(drive);
+            bridge.abort();
+            tracing::debug!(
+                %remote_addr,
+                transport = SelectedTransport::Punch.as_str(),
+                "ICE selected a candidate pair; accepting QUIC on the punched socket"
+            );
+
+            let std_socket = local_ice.socket.into_std()?;
+            let server = QuicServer::from_socket(std_socket, &cert, opened.offer.cert_fp)?;
+            server.accept().await?
+        };
 
         // `opened.from_fp` is authenticated at this point, not merely claimed: `process_offer`
         // resolved it through the authorizer and `open_offer` verified the offer signature against

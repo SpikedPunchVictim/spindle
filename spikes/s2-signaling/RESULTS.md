@@ -534,3 +534,97 @@ across-NATs bar is unmeasured.
 - **Item 2 (S2 across-NATs number)**: still absent, with the precise blocker now named: no
   STUN/TURN candidate gathering and no relay transport in `spindle-net`.
 - **Item 3 (envelope `seq` under real reordering)**: unchanged/unmeasured.
+
+---
+
+# S2 across-NAT after STUN/TURN (td-c3badf) — 2026-10-30
+
+**Outcome: the production signaling stack now completes across the two-NAT lab, and the shaped
+cell completes only over the TURN relay.** The host-only defect this file recorded above is fixed:
+`spindle-net`'s `IceConfig` now gathers one `server_reflexive` candidate per configured STUN server
+on the same bound socket, and — when TURN is configured — allocates a relay, advertises a `relay`
+candidate over the existing trickle channel, and runs QUIC over the TURN relay. The default empty
+`IceConfig` is still host-only, so every loopback live test is unchanged (7/7 `live_signaling`
+tests still pass).
+
+## Method
+
+- Two runs of `deploy/lab/run-s2-nat.sh`, same topology and cells (host `peer-a` behind
+  nat-a/gw-a, client `peer-c` behind nat-c/gw-c, lab NATS `nats-s2`), same 5 s ICE timeout, N=5
+  successes wanted:
+  1. **punch**: `STUN_SERVER=172.28.0.14:3478`, no TURN (`RUNS=5 MAX_ATTEMPTS=50` unshaped so the
+     medians have N=5; `DELAYED_MAX_ATTEMPTS=5` shaped);
+  2. **relay**: `TURN_SERVER=172.28.0.13:3478`, REST secret `spindle-turn-dev-only`, label
+     `s2-lab` (`RUNS=MAX_ATTEMPTS=5`).
+- Raw per-attempt JSON: `deploy/lab/.artifacts/s2r3-punch/` and `deploy/lab/.artifacts/s2r3-relay/`
+  (gitignored). These are the post-review runs: gathering is off the offer/answer path, TURN
+  allocation happens after the answer, and the relay adapter has a refresh/release driver,
+  source/peer filtering, a bounded send backlog, and prompt backlog wakeups. After the
+  allocation-release guard landed, a relay-only confirmation run (`s2r4-relay/`) reproduced 5/5 in
+  both cells: unshaped 2.076 / 1.486 / 1.519 / 7.730 ms, 50 ms 103.348 / 152.641 / 102.988 /
+  462.229 ms (same four phases).
+
+## Measured (medians)
+
+| Cell | Netem both peers | Transport | Attempts | Successes | offer→answer ms | answer→selected ms | selected→QUIC ms | offer→usable ms |
+|------|------------------|-----------|----------|-----------|-----------------|--------------------|------------------|-----------------|
+| unshaped | none | punch | 40 | 5 | 4.057 | 609.705 | 7.288 | 618.903 |
+| delay50 | 50 ms | punch | 5 | 0 | n/a | n/a | n/a | n/a |
+| unshaped | none | relay | 5 | 5 | 1.639 | 2.018 | 1.549 | 5.761 |
+| delay50 | 50 ms | relay | 5 | 5 | 104.274 | 156.961 | 103.792 | 468.909 |
+
+- **Punch reproduces td-3c1762.** Unshaped cone:cone succeeded 5/40 (12.5%; the root-caused
+  probabilistic Linux-conntrack port-allocation race — same phenomenon as the netns/compose ~25%,
+  with run-to-run variance; earlier runs of this cell got 1/10, 5/24 and 5/33). At 50 ms both
+  sides: 0/5, every failure `ICE trickle timed out` (median 5234.2 ms). The host received all 40/5
+  offers and published all 40/5 answers, so the failures are ICE, not signaling.
+- **Relay completes every attempt, shaped included.** 5/5 unshaped and 5/5 at 50 ms, all
+  `transport=relay`; failures: none. Offer→usable medians 5.761 ms unshaped and 468.909 ms shaped.
+- **Gathering is off the answer path (review fix 1).** The answer/offer is published with the host
+  candidate only; STUN runs concurrently with ICE checks inside the drive, and TURN allocation runs
+  after the answer. Shaped offer→answer fell from 257.505 ms (pre-fix, allocation on the critical
+  path) to 104.274 ms, which is now just the NATS round trips.
+- **Phase meaning on the relay path.** `answer→selected` measures "answer verified → TURN
+  allocation and CreatePermission complete", not an ICE selection. The allocation's two coturn
+  round trips now sit there (156.961 ms shaped), not in offer→answer.
+
+## What this slice does and does not prove
+
+- **Done:** STUN srflx gathering concurrent with ICE; relay allocation after the answer + `relay`
+  candidate trickle; permission create; QUIC over a custom `quinn::AsyncUdpSocket` TURN adapter;
+  both roles (`ConnectOptions` and `HostOptions` gain `ice: IceConfig`). Credentials come from
+  config: static pair or the A8 REST secret+label (coturn `use-auth-secret`), TTL bounded to
+  1 s..=24 h. The helper's `helper.turn.get.<nfp>` minting is the production credential source and
+  is **not called** here.
+- **Review fixes in the adapter/gather paths:** STUN responses are matched by transaction id and
+  validated (Binding Success, usable address, same family), so a spoofed response cannot inject a
+  candidate; the relay adapter drops wire packets from anything but the configured TURN server and
+  relayed data attributed to anything but the negotiated peer; `poll_writable` re-registers after a
+  `WouldBlock`, and the send backlog is capped on enqueue while remaining drainable; a driver keeps
+  rtc-turn's allocation/permission timers running; a setup-failure guard releases an allocation
+  that never reaches the relay socket. On teardown `Drop` **enqueues** a zero-lifetime Refresh and
+  sends it once, best-effort — coturn's receipt/acceptance of that release is not verified, and the
+  lab sessions last seconds, so neither the release nor the 300 s/600 s refresh is proven over a
+  long-lived relay.
+- **Not done (scoped follow-up, td-870b25):** punch-first-with-relay-fallback. When TURN is
+  configured this slice selects the relay unconditionally; TURN absent means punch only.
+  `rtc-ice` cannot route connectivity checks through TURN, and a per-attempt fallback needs both
+  peers to agree on the outcome — the conntrack failure is one-sided, so an uncoordinated fallback
+  could leave one peer punched and the other relayed.
+- **Relay refresh not proven over a real 5-minute session.** The driver and release paths are
+  unit-tested (tick clamping, 1 s..=24 h TTL bounds), and the lab relay cells run for seconds, not
+  minutes. A >5-minute relayed transfer (past the 300 s permission lifetime) was **not** run.
+- **Still one kernel:** both peers are containers in Docker Desktop's Linux VM. This is not S19's
+  real-two-host leg, and the relay numbers say nothing about real-WAN relay throughput.
+
+## Tickets
+
+- `td-c3badf`: production STUN srflx + TURN relay (this work). Landed: slice 1 and relay-only
+  slice 2, plus the adversarial-review fixes above, measured here.
+- `td-c694b2`: the across-NATs S2 number now exists for both transports; its reordering item is
+  still unmeasured.
+- `td-3c1762`: the punch numbers above are a further reproduction of its root cause, not new
+  evidence. Earlier punch runs are retained in `deploy/lab/.artifacts/s2r2-*`,
+  `s2-punch-n5/` and `s2-punch/`.
+- `td-870b25`: punch-first arbitration, the helper credential client, and the hostd operator
+  surface.

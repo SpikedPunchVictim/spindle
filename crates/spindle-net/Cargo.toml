@@ -70,6 +70,18 @@ rtc-stun = { workspace = true }
 rtc-shared = { workspace = true }
 sansio = { workspace = true }
 bytes = { workspace = true }
+# TURN relay fallback (td-c3badf, DESIGN.md §A8/A10.8): the same recipe
+# `spikes/s19-quic-transport/src/bin/quic-peer.rs`'s leg 3 proves (`rtc_turn::client::Client` +
+# a custom `quinn::AsyncUdpSocket` that frames outbound QUIC datagrams as TURN Send-indications /
+# ChannelData). Workspace-pinned to the `rtc-ice` release train above; see that entry's comment.
+rtc-turn = { workspace = true }
+# coturn `use-auth-secret` REST credentials (`username = "<expiry>:<label>"`,
+# `password = base64(HMAC-SHA1(secret, username))`) — the credential scheme DESIGN.md §A8 and the
+# deployment's coturn config use. Exact pins from the S19 leg-3 precedent (quic-peer.rs's
+# `mint_turn_credentials`); all three already resolve in this workspace's Cargo.lock.
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
 
 # Exact S19 recipe (spikes/s19-quic-transport/Cargo.toml), reused verbatim rather than
 # re-litigated: `default-features = false` + `["runtime-tokio", "rustls-ring"]` keeps this crate's

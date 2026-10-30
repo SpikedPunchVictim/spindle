@@ -87,6 +87,13 @@ sansio = "1.0.1"
 # `BytesMut` for `TaggedBytesMut`'s message field (the ICE driving loop). Already resolves
 # transitively via `rtc-ice`; declared directly since callers construct `BytesMut` values by hand.
 bytes = "1.12.1"
+# TURN relay fallback for the native QUIC path (DESIGN.md §A8/A10.8/A10.32, td-c3badf). This is
+# what `webrtc` 0.20.3 uses for TURN and is the same sans-I/O `rtc-*` release train as `rtc-ice`
+# above; `spikes/s19-quic-transport/src/bin/quic-peer.rs`'s leg 3 already proves the
+# `rtc_turn::client::Client` + custom `quinn::AsyncUdpSocket` recipe this crate graduates. Pinned
+# to the same version/feature set as the spike's own manifest: `default-features = false` +
+# `["ring"]` keeps the pure-Rust crypto provider (no aws-lc-rs/cmake).
+rtc-turn = { version = "0.20.3", default-features = false, features = ["ring"] }
 
 # Crypto
 ed25519-dalek = "2"

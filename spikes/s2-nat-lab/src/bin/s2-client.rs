@@ -7,9 +7,9 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use spike_s2_nat_lab::{client_device, host_identity, median};
+use spike_s2_nat_lab::{client_device, host_identity, ice_config_from_env, median};
 use spindle_net::framing::{read_frame, write_frame};
-use spindle_net::signaling::{ConnectOptions, SignalingClient};
+use spindle_net::signaling::{ConnectOptions, SelectedTransport, SignalingClient};
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -58,15 +58,18 @@ async fn main() -> Result<()> {
         bind_ip,
         ice_timeout: Duration::from_millis(ice_ms),
         answer_timeout: Duration::from_millis(answer_ms),
+        ice: ice_config_from_env()?,
     };
 
     let mut attempts = 0usize;
     let mut failures = 0usize;
+    let mut punch_successes = 0usize;
+    let mut relay_successes = 0usize;
     let mut rows: Vec<(f64, f64, f64, f64)> = Vec::new();
     while rows.len() < runs && attempts < max_attempts {
         attempts += 1;
         let started = Instant::now();
-        match client.connect_timed(&host, opts).await {
+        match client.connect_timed(&host, opts.clone()).await {
             Ok((mut control, timings)) => {
                 let after_connect = Instant::now();
                 let payload = format!("s2-nat-run-{attempts}").into_bytes();
@@ -80,21 +83,26 @@ async fn main() -> Result<()> {
                 if echoed != payload {
                     bail!("host echoed different bytes than the client wrote");
                 }
-                let offer_to_stream =
-                    (timings.offer_to_quic_complete + after_connect.elapsed()).as_secs_f64()
-                        * 1000.0;
+                let offer_to_stream = (timings.offer_to_quic_complete + after_connect.elapsed())
+                    .as_secs_f64()
+                    * 1000.0;
                 let row = (
                     ms(timings.offer_to_answer),
                     ms(timings.answer_to_ice_selected),
                     ms(timings.ice_selected_to_quic),
                     offer_to_stream,
                 );
+                match timings.transport {
+                    SelectedTransport::Punch => punch_successes += 1,
+                    SelectedTransport::Relay => relay_successes += 1,
+                }
                 println!(
                     "{}",
                     serde_json::json!({
                         "label": label,
                         "attempt": attempts,
                         "status": "ok",
+                        "transport": timings.transport.as_str(),
                         "offer_to_answer_ms": row.0,
                         "answer_to_selected_ms": row.1,
                         "selected_to_quic_ms": row.2,
@@ -132,6 +140,8 @@ async fn main() -> Result<()> {
             "attempts": attempts,
             "successes": rows.len(),
             "failures": failures,
+            "punch_successes": punch_successes,
+            "relay_successes": relay_successes,
             "offer_to_answer_ms_median": median(&a),
             "answer_to_selected_ms_median": median(&b),
             "selected_to_quic_ms_median": median(&c),

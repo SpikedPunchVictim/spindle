@@ -373,6 +373,10 @@ async fn run(config: Config) -> ExitCode {
         ice_timeout: defaults.ice_timeout,
         session_close_timeout: defaults.session_close_timeout,
         max_concurrent_connects: defaults.max_concurrent_connects,
+        // Only `bind_ip` is configurable in this slice, so gathering stays host-only (the
+        // default empty `IceConfig`). STUN/TURN operator configuration is td-c3badf's
+        // follow-up surface, not this binary's.
+        ice: defaults.ice,
     };
 
     // The admission token stays present until a connect **succeeds**. A failed attempt may never
@@ -539,7 +543,9 @@ async fn run(config: Config) -> ExitCode {
             // and so its live sessions — running. That is why renewal is an arm of this inner
             // select rather than an unconditional `continue` of the outer loop: only a successful
             // renewal (or the daemon returning) breaks it.
-            let run = daemon.run(options);
+            // `HostOptions` is `Clone` (not `Copy`) since td-c3badf gave it an `IceConfig`;
+            // this daemon's config is fixed for the process, so each renewal round reuses a copy.
+            let run = daemon.run(options.clone());
             tokio::pin!(run);
             loop {
                 let now = wall_clock_now_secs();

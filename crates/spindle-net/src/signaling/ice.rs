@@ -7,8 +7,22 @@
 //! [`crate::quic::QuicClient::from_socket`] need). Only adapted to this crate's error type and
 //! library conventions (no `println!`/`eprintln!` — callers decide what, if anything, to log).
 //!
-//! Loopback/LAN host candidates only in this slice — no STUN/TURN gathering (matching the spike's
-//! own "Not exercised" scope; see this module's home crate's report for what that leaves unproven).
+//! # Gathering is off the offer/answer path (td-c3badf; td-c3badf review fix 1)
+//!
+//! [`start_local_ice`] only binds the socket, adds the host candidate, and returns — so the offer
+//! or answer can be published immediately. Everything slow happens afterwards:
+//!
+//! - STUN server-reflexive gathering runs **inside the ICE drive loop** ([`drive_ice_agent_trickle`]):
+//!   Binding Requests are sent on the same socket once checks start, responses are matched by
+//!   transaction id and validated ([`parse_binding_response`]), and each mapped address is added to
+//!   the agent and emitted on a local-trickle channel for the caller to sign and publish. ICE
+//!   connectivity checks run concurrently, so a blackholed STUN server cannot delay a host-only
+//!   session; the gather window is bounded ([`STUN_GATHER_WINDOW`]) and then abandoned with a log.
+//! - TURN allocation runs in the caller, after the answer/offer is published (a separate socket,
+//!   see [`super::turn`]); the relay candidate is trickled when the allocation completes.
+//!
+//! With the default (empty) [`IceConfig`] this is exactly the pre-td-c3badf host-only behaviour
+//! (host candidate, end-of-candidates, no extra queries).
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -17,14 +31,119 @@ use bytes::BytesMut;
 use rtc_ice::agent::agent_config::AgentConfig as IceAgentConfig;
 use rtc_ice::agent::Agent as IceAgent;
 use rtc_ice::candidate::candidate_host::CandidateHostConfig;
-use rtc_ice::candidate::{unmarshal_candidate, CandidateConfig};
+use rtc_ice::candidate::candidate_relay::CandidateRelayConfig;
+use rtc_ice::candidate::candidate_server_reflexive::CandidateServerReflexiveConfig;
+use rtc_ice::candidate::{unmarshal_candidate, CandidateConfig, CandidateType};
 use rtc_ice::state::ConnectionState as IceConnectionState;
 use rtc_ice::Event as IceEvent;
 use rtc_shared::{TaggedBytesMut, TransportContext, TransportProtocol};
+use rtc_stun::message::{Getter as _, Message as StunMessage, TransactionId, BINDING_REQUEST};
+use rtc_stun::xoraddr::XorMappedAddress;
 use sansio::Protocol as _;
 use tokio::sync::mpsc;
 
 use super::error::SignalingError;
+
+/// How long one STUN Binding exchange may take before that server is written off (the spike's
+/// value). A STUN failure is soft: the ICE drive keeps running on the candidates it already has,
+/// so this only bounds how long after checks start a late srflx candidate is still accepted.
+const STUN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on the whole post-answer STUN gather window, regardless of how many servers are
+/// configured or how the per-server timeouts interleave. After this the drive stops waiting,
+/// logs what never answered, and sends end-of-candidates.
+const STUN_GATHER_WINDOW: Duration = Duration::from_secs(10);
+
+/// ICE gathering configuration (td-c3badf). [`Default`] — an empty server list and no TURN — is
+/// the pre-td-c3badf **host-only** behaviour, so a caller that does not opt in is byte-for-byte
+/// unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IceConfig {
+    /// STUN servers to gather server-reflexive candidates from, in order. Empty means host-only.
+    ///
+    /// Queried once each, on the same UDP socket that carries ICE checks (so the mapped address is
+    /// the mapping that socket's traffic actually gets), **during** the ICE drive — never before
+    /// the offer/answer is published. A server that fails or times out is logged and skipped; the
+    /// session keeps running on the candidates it already has. Ignored when [`Self::turn`] is set,
+    /// because the relay path is selected unconditionally and does not use srflx candidates.
+    pub stun_servers: Vec<SocketAddr>,
+
+    /// Optional TURN relay (DESIGN.md §A8/A10.8). `None` = punch only, exactly the old behaviour.
+    ///
+    /// When set, the session uses the relay path **unconditionally** rather than running ICE
+    /// first — see the `turn` module's doc comment for why this slice cannot arbitrate
+    /// punch-vs-relay per attempt. Allocation happens after the answer/offer is published, and the
+    /// relay candidate is trickled when it completes. Both peers must configure TURN, or the
+    /// relay-candidate exchange times out.
+    pub turn: Option<TurnConfig>,
+}
+
+/// A TURN server plus the credentials to allocate on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnConfig {
+    pub server: SocketAddr,
+    pub credentials: TurnCredentials,
+}
+
+/// Where a TURN long-term credential comes from.
+#[derive(Clone, PartialEq, Eq)]
+pub enum TurnCredentials {
+    /// A deployment configured with static TURN users: pass the pair through unchanged.
+    Static {
+        username: String,
+        credential: String,
+    },
+
+    /// coturn `use-auth-secret` (DESIGN.md §A8): mint `"<expiry>:<label>"` /
+    /// `base64(HMAC-SHA1(secret, username))` locally. `ttl` must be in `1s..=24h` (a zero TTL is
+    /// already expired; an unbounded one defeats rotation/quota) — out-of-range values are a
+    /// configuration error.
+    ///
+    /// Production's credential source is the helper's `helper.turn.get.<nfp>` request (per
+    /// `root_fp` quota, §A8); this slice does not call the helper. `label` is the deployment/dev
+    /// stand-in for the session's caller identity in that username.
+    RestSecret {
+        secret: String,
+        label: String,
+        ttl: Duration,
+    },
+}
+
+impl std::fmt::Debug for TurnCredentials {
+    /// Credentials are secrets: never render them, including through [`IceConfig`]'s derived
+    /// `Debug` (which calls this implementation).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TurnCredentials::Static { .. } => {
+                f.write_str("Static { username: <redacted>, credential: <redacted> }")
+            }
+            TurnCredentials::RestSecret { ttl, .. } => {
+                write!(
+                    f,
+                    "RestSecret {{ secret: <redacted>, label: <redacted>, ttl: {ttl:?} }}"
+                )
+            }
+        }
+    }
+}
+
+/// Which data path a completed session used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedTransport {
+    /// The ICE connectivity checks selected a punched pair; quinn owns the punched socket.
+    Punch,
+    /// TURN was configured: quinn runs over the `turn` module's relay socket adapter.
+    Relay,
+}
+
+impl SelectedTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SelectedTransport::Punch => "punch",
+            SelectedTransport::Relay => "relay",
+        }
+    }
+}
 
 /// A locally-gathered ICE agent plus the UDP socket it will punch through, not yet driven to a
 /// selected pair (the remote ufrag/pwd aren't known until the offer/answer round trip completes —
@@ -34,13 +153,28 @@ pub struct LocalIce {
     pub socket: tokio::net::UdpSocket,
     pub ufrag: String,
     pub pwd: String,
-    /// This side's own single host candidate, already marshaled (SDP `a=candidate` line body) —
-    /// loopback/LAN only, see the module doc comment.
-    pub candidate_line: String,
+    /// This side's host candidate, already marshaled (SDP `a=candidate` line body). Published
+    /// immediately; server-reflexive candidates follow asynchronously while ICE runs.
+    pub host_candidate_line: String,
 }
 
-/// Binds a UDP socket on `bind_ip` and constructs an [`IceAgent`] with one local host candidate
-/// already added, but connectivity checks NOT yet started.
+/// One local candidate discovered *after* the offer/answer was published, sent from
+/// [`drive_ice_agent_trickle`] to the caller's trickle publisher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalTrickleEvent {
+    Candidate(String),
+    EndOfCandidates,
+}
+
+/// Binds a UDP socket on `bind_ip`, constructs an [`IceAgent`] with its host candidate, and
+/// returns immediately — no STUN/TURN exchange happens here (td-c3badf review fix 1).
+///
+/// Slow gathering must not sit between receiving an offer and publishing the answer (or between
+/// publishing the offer and receiving it): the peer's answer timeout is typically 5 s, while one
+/// blackholed STUN server costs a 5 s timeout and TURN allocation costs two round trips. STUN
+/// gathering therefore runs inside the ICE drive ([`drive_ice_agent_trickle`], concurrent with
+/// connectivity checks) and TURN allocation runs in the caller after the answer/offer is on the
+/// wire (see [`super::turn`]). Connectivity checks are NOT started here.
 pub async fn start_local_ice(
     is_controlling: bool,
     bind_ip: IpAddr,
@@ -67,7 +201,7 @@ pub async fn start_local_ice(
     }
     .new_candidate_host()?;
     agent.add_local_candidate(host_candidate.clone())?;
-    let candidate_line = host_candidate.marshal();
+    let host_candidate_line = host_candidate.marshal();
 
     let credentials = agent.get_local_credentials();
     let ufrag = credentials.ufrag.clone();
@@ -78,8 +212,289 @@ pub async fn start_local_ice(
         socket: udp,
         ufrag,
         pwd,
-        candidate_line,
+        host_candidate_line,
     })
+}
+
+/// Builds the relayed candidate line for an allocation (td-c3badf). Used by the callers after the
+/// answer/offer is published; the allocation itself lives in [`super::turn`].
+pub(crate) fn relay_candidate_line(
+    relayed: SocketAddr,
+    local_addr: SocketAddr,
+    turn_server: SocketAddr,
+) -> Result<String, SignalingError> {
+    let relay_candidate = CandidateRelayConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_string(),
+            address: relayed.ip().to_string(),
+            port: relayed.port(),
+            component: 1,
+            ..Default::default()
+        },
+        rel_addr: local_addr.ip().to_string(),
+        rel_port: local_addr.port(),
+        url: Some(format!("turn:{turn_server}")),
+    }
+    .new_candidate_relay()?;
+    Ok(relay_candidate.marshal())
+}
+
+/// In-flight STUN Binding exchanges, driven from inside [`drive_ice_agent_trickle`] using the same
+/// socket (and therefore the same mapping) as the ICE checks.
+///
+/// A datagram from a configured STUN server is gather traffic and is never handed to the ICE
+/// agent — that includes spoofed or unexpected responses, which are logged and dropped rather than
+/// risking an agent error (td-c3badf review fix 3). A datagram from anywhere else is ICE traffic.
+pub(crate) struct StunGather {
+    servers: Vec<SocketAddr>,
+    pending: Vec<PendingBinding>,
+    deadline: Instant,
+    finished: bool,
+    end_of_candidates_sent: bool,
+}
+
+struct PendingBinding {
+    server: SocketAddr,
+    transaction_id: TransactionId,
+    deadline: Instant,
+}
+
+impl StunGather {
+    /// `servers` empty means there is nothing to gather: the drive sends end-of-candidates
+    /// immediately, preserving the old host-only behaviour.
+    pub(crate) fn new(servers: &[SocketAddr], now: Instant) -> Self {
+        Self {
+            servers: servers.to_vec(),
+            pending: Vec::new(),
+            deadline: now + STUN_GATHER_WINDOW,
+            finished: servers.is_empty(),
+            end_of_candidates_sent: false,
+        }
+    }
+
+    /// Sends one Binding Request per server. A server that cannot even be sent to is logged and
+    /// skipped (soft failure); its absence never fails the session.
+    pub(crate) async fn send_requests(&mut self, socket: &tokio::net::UdpSocket) {
+        let now = Instant::now();
+        for server in self.servers.clone() {
+            let mut request = StunMessage::new();
+            match request.build(&[Box::new(TransactionId::new()), Box::new(BINDING_REQUEST)]) {
+                Ok(()) => {}
+                Err(_error) => {
+                    // rtc-shared's error text is open-ended; log only the fact (a build failure
+                    // here means this crate's own request is malformed, not peer input).
+                    tracing::warn!(
+                        %server,
+                        "failed to build STUN Binding Request; skipping server"
+                    );
+                    continue;
+                }
+            }
+            let transaction_id = request.transaction_id;
+            if let Err(error) = socket.send_to(&request.raw, server).await {
+                tracing::warn!(
+                    %server,
+                    error = %error, // redaction-ok: std::io::Error Display carries an OS error string and the configured UDP address, no peer bytes/paths/full ids
+                    "failed to send STUN Binding Request; skipping server"
+                );
+                continue;
+            }
+            self.pending.push(PendingBinding {
+                server,
+                transaction_id,
+                deadline: now + STUN_TIMEOUT,
+            });
+        }
+        if self.pending.is_empty() {
+            self.finished = true;
+        }
+    }
+
+    /// Classifies one inbound datagram.
+    ///
+    /// Returns `None` when the datagram is not from a configured STUN server (the caller feeds it
+    /// to the ICE agent), and `Some(outcome)` when it is gather traffic the caller must NOT hand to
+    /// the agent. A `Some(Ok(Some(mapped)))` is a validated new srflx address; `Some(Ok(None))` is
+    /// gather traffic that produces no candidate (e.g. a late response for a completed server);
+    /// `Some(Err(_))` is a rejected response worth logging.
+    pub(crate) fn handle_datagram(
+        &mut self,
+        datagram: &[u8],
+        from: SocketAddr,
+        _now: Instant,
+    ) -> Option<Result<Option<SocketAddr>, SignalingError>> {
+        if !self.servers.contains(&from) {
+            return None;
+        }
+
+        let Some(index) = self.pending.iter().position(|p| p.server == from) else {
+            // From a configured server but no exchange is outstanding (already answered, already
+            // timed out, or a repeated response). Gather traffic; never an ICE peer.
+            return Some(Ok(None));
+        };
+
+        let result =
+            parse_binding_response(datagram, self.pending[index].transaction_id, from).map(Some);
+        // Whether the response was valid or rejected, this server's exchange is over. The drive
+        // calls `poll_expiry` next, which notices an empty pending list and emits
+        // end-of-candidates.
+        self.pending.remove(index);
+        Some(result)
+    }
+
+    /// Expires per-server timeouts and the whole window. Returns `true` exactly once, when the
+    /// caller should publish end-of-candidates.
+    pub(crate) fn poll_expiry(&mut self, now: Instant) -> bool {
+        if !self.finished {
+            self.expire(now);
+        }
+        if self.finished && !self.end_of_candidates_sent {
+            self.end_of_candidates_sent = true;
+            return true;
+        }
+        false
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.pending.retain(|pending| {
+            if now >= pending.deadline {
+                tracing::warn!(
+                    server = %pending.server,
+                    "STUN server did not answer; continuing without its server-reflexive candidate"
+                );
+                false
+            } else {
+                true
+            }
+        });
+        if now >= self.deadline {
+            for pending in self.pending.drain(..) {
+                tracing::warn!(
+                    server = %pending.server,
+                    "STUN gather window elapsed; abandoning this server-reflexive candidate"
+                );
+            }
+            self.finished = true;
+        } else if self.pending.is_empty() {
+            self.finished = true;
+        }
+    }
+
+    /// Earliest instant at which [`Self::poll_expiry`] has work to do, for the drive loop's wake
+    /// computation. `None` once finished.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        if self.finished {
+            return None;
+        }
+        self.pending
+            .iter()
+            .map(|pending| pending.deadline)
+            .min()
+            .map(|deadline| deadline.min(self.deadline))
+            .or(Some(self.deadline))
+    }
+}
+
+/// Decodes and validates one STUN Binding Success response.
+///
+/// td-c3badf review fix 3: the spike accepted whatever came back from the server address. Here the
+/// response's transaction id must be the one this side sent, the message class must be Binding
+/// Success, and the mapped address must be usable — same address family as the server, not
+/// unspecified (`0.0.0.0`/`::`), not multicast, and a non-zero port. Otherwise a spoofed or broken
+/// response could inject an arbitrary candidate (or make the ICE agent treat a response as peer
+/// traffic).
+fn parse_binding_response(
+    datagram: &[u8],
+    expected_transaction_id: TransactionId,
+    server: SocketAddr,
+) -> Result<SocketAddr, SignalingError> {
+    let mut response = StunMessage::new();
+    response.raw = datagram.to_vec();
+    response
+        .decode()
+        .map_err(|e| SignalingError::Stun(format!("decoding STUN Binding Response: {e}")))?;
+    if response.typ != rtc_stun::message::BINDING_SUCCESS {
+        return Err(SignalingError::Stun(format!(
+            "unexpected STUN message type {:?} from {server} (expected Binding Success)",
+            response.typ
+        )));
+    }
+    if response.transaction_id != expected_transaction_id {
+        return Err(SignalingError::Stun(format!(
+            "STUN response from {server} has the wrong transaction id"
+        )));
+    }
+
+    let mut mapped = XorMappedAddress::default();
+    mapped.get_from(&response).map_err(|e| {
+        SignalingError::Stun(format!(
+            "reading XOR-MAPPED-ADDRESS from STUN response: {e}"
+        ))
+    })?;
+    let mapped = SocketAddr::new(mapped.ip, mapped.port);
+    if mapped.port() == 0 {
+        return Err(SignalingError::Stun(format!(
+            "STUN server {server} returned a mapped address with port 0"
+        )));
+    }
+    if mapped.ip().is_unspecified() || mapped.ip().is_multicast() {
+        return Err(SignalingError::Stun(format!(
+            "STUN server {server} returned an unusable mapped address {mapped}"
+        )));
+    }
+    if mapped.is_ipv4() != server.is_ipv4() {
+        return Err(SignalingError::Stun(format!(
+            "STUN server {server} returned a mapped address of the wrong address family: {mapped}"
+        )));
+    }
+    Ok(mapped)
+}
+
+/// Waits for the peer's `relay` candidate on the trickle channel and returns its address. Used by
+/// the relay path, which has no ICE selection to wait for; the relayed address travels as an
+/// ordinary trickled `a=candidate` line, so no wire change is needed.
+///
+/// Non-relay candidates are ignored (the peer trickles its host/srflx candidates first), and an
+/// end-of-candidates marker does not end the wait — the relay line may arrive before or after it.
+pub(crate) async fn await_peer_relay_candidate(
+    mut candidate_rx: mpsc::UnboundedReceiver<TrickleEvent>,
+    timeout: Duration,
+) -> Result<SocketAddr, SignalingError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SignalingError::Timeout("TURN relay candidate"));
+        }
+        let event = match tokio::time::timeout(remaining, candidate_rx.recv()).await {
+            Err(_) => return Err(SignalingError::Timeout("TURN relay candidate")),
+            Ok(None) => {
+                return Err(SignalingError::Nats(
+                    "ICE trickle subscription closed before the peer's relay candidate arrived"
+                        .to_string(),
+                ))
+            }
+            Ok(Some(event)) => event,
+        };
+        match event {
+            TrickleEvent::Candidate(line) => match unmarshal_candidate(&line) {
+                Ok(candidate) if candidate.candidate_type() == CandidateType::Relay => {
+                    return Ok(candidate.addr())
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    // Same soft failure as the ICE drive loop: a malformed peer candidate is
+                    // dropped rather than aborting a session another line may still complete.
+                    tracing::warn!(
+                        candidate_len = line.len(),
+                        "failed to unmarshal a trickled candidate while waiting for the relay \
+                         candidate; ignoring"
+                    );
+                }
+            },
+            TrickleEvent::EndOfCandidates => {}
+        }
+    }
 }
 
 /// One decoded, already-verified trickled ICE message, handed from the envelope layer
@@ -94,6 +509,9 @@ pub struct TrickleStats {
     /// How many trickled candidates this side actually fed into `add_remote_candidate` before (or
     /// after) selection.
     pub candidates_applied: u32,
+    /// How many server-reflexive candidates this side gathered *during* the drive and emitted on
+    /// the local-trickle channel (td-c3badf).
+    pub local_candidates_gathered: u32,
     pub end_of_candidates_seen: bool,
     /// How many trickled `candidate` lines failed to unmarshal and were dropped (soft failure —
     /// matches `spikes/s2-signaling`'s `s2-connect.rs` precedent of warning and continuing rather
@@ -121,13 +539,22 @@ pub struct TrickleStats {
 /// `agent.add_remote_candidate` the moment they're decoded — this is the trickle mechanic itself.
 /// Once a pair is selected, this returns immediately; any not-yet-arrived candidate is simply never
 /// applied (harmless — a pair is already selected).
-pub async fn drive_ice_agent_trickle(
+///
+/// `gather` is this side's own STUN exchange (td-c3badf). It runs concurrently with connectivity
+/// checks on the same socket, and every discovered address is added to the local agent and emitted
+/// on `local_candidate_tx` for the caller to sign and trickle. The caller must drain that channel
+/// while awaiting this future (see `signaling::client`/`host`), otherwise discovered candidates are
+/// added locally but never reach the peer.
+#[allow(clippy::too_many_arguments)] // the same explicit-parameter style as `bridge_incoming_ice`
+pub(crate) async fn drive_ice_agent_trickle(
     agent: &mut IceAgent,
     socket: &tokio::net::UdpSocket,
     is_controlling: bool,
     remote_ufrag: &str,
     remote_pwd: &str,
     mut candidate_rx: mpsc::UnboundedReceiver<TrickleEvent>,
+    mut gather: StunGather,
+    local_candidate_tx: mpsc::UnboundedSender<LocalTrickleEvent>,
     timeout: Duration,
 ) -> Result<(SocketAddr, TrickleStats), SignalingError> {
     agent.start_connectivity_checks(
@@ -140,6 +567,11 @@ pub async fn drive_ice_agent_trickle(
     let mut buf = vec![0u8; 2048];
     let deadline = Instant::now() + timeout;
     let mut stats = TrickleStats::default();
+
+    // Fire the Binding Requests now; ICE checks below may select a pair before any answer arrives
+    // (host-only/LAN), and that must not wait on STUN.
+    gather.send_requests(socket).await;
+    emit_end_of_candidates_if_due(&mut gather, &local_candidate_tx);
 
     loop {
         while let Some(transmit) = agent.poll_write() {
@@ -160,37 +592,96 @@ pub async fn drive_ice_agent_trickle(
             return Ok((remote.addr(), stats));
         }
 
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return Err(SignalingError::Timeout("ICE trickle"));
         }
 
         let wake_at = agent
             .poll_timeout()
-            .unwrap_or_else(|| Instant::now() + Duration::from_millis(100));
+            .into_iter()
+            .chain(gather.next_deadline())
+            .min()
+            .unwrap_or_else(|| now + Duration::from_millis(100));
         let sleep_for = wake_at
-            .saturating_duration_since(Instant::now())
+            .saturating_duration_since(now)
             .max(Duration::from_millis(1));
 
         tokio::select! {
             _ = tokio::time::sleep(sleep_for) => {
                 agent.handle_timeout(Instant::now())?;
+                emit_end_of_candidates_if_due(&mut gather, &local_candidate_tx);
             }
             res = socket.recv_from(&mut buf) => {
                 let (n, peer_addr) = res?;
-                agent.handle_read(TaggedBytesMut {
-                    now: Instant::now(),
-                    transport: TransportContext {
-                        local_addr,
-                        peer_addr,
-                        transport_protocol: TransportProtocol::UDP,
-                        ecn: None,
-                    },
-                    message: BytesMut::from(&buf[..n]),
-                })?;
+                let now = Instant::now();
+                match gather.handle_datagram(&buf[..n], peer_addr, now) {
+                    // Not from a configured STUN server: ordinary ICE traffic.
+                    None => {
+                        agent.handle_read(TaggedBytesMut {
+                            now,
+                            transport: TransportContext {
+                                local_addr,
+                                peer_addr,
+                                transport_protocol: TransportProtocol::UDP,
+                                ecn: None,
+                            },
+                            message: BytesMut::from(&buf[..n]),
+                        })?;
+                    }
+                    // Gather traffic is consumed here and never handed to the ICE agent, so a
+                    // spoofed/odd response cannot disturb connectivity checks.
+                    Some(Ok(Some(mapped))) => {
+                        match (CandidateServerReflexiveConfig {
+                            base_config: CandidateConfig {
+                                network: "udp".to_string(),
+                                address: mapped.ip().to_string(),
+                                port: mapped.port(),
+                                component: 1,
+                                ..Default::default()
+                            },
+                            rel_addr: local_addr.ip().to_string(),
+                            rel_port: local_addr.port(),
+                            url: Some(format!("stun:{peer_addr}")),
+                        })
+                        .new_candidate_server_reflexive()
+                        {
+                            Ok(candidate) => match agent.add_local_candidate(candidate.clone()) {
+                                Ok(true) => {
+                                    stats.local_candidates_gathered += 1;
+                                    let _ = local_candidate_tx.send(
+                                        LocalTrickleEvent::Candidate(candidate.marshal()),
+                                    );
+                                    tracing::debug!(%peer_addr, mapped = %mapped, "gathered server-reflexive ICE candidate");
+                                }
+                                Ok(false) => {}
+                                Err(error) => tracing::warn!(
+                                    %peer_addr,
+                                    error = %SignalingError::Ice(error).redacted(),
+                                    "failed to add server-reflexive ICE candidate; ignoring"
+                                ),
+                            },
+                            Err(error) => tracing::warn!(
+                                %peer_addr,
+                                error = %SignalingError::Ice(error).redacted(),
+                                "failed to construct server-reflexive ICE candidate; ignoring"
+                            ),
+                        }
+                    }
+                    Some(Ok(None)) => {}
+                    Some(Err(error)) => tracing::warn!(
+                        %peer_addr,
+                        error = %error.redacted(),
+                        "rejected STUN Binding response; ignoring"
+                    ),
+                }
+                emit_end_of_candidates_if_due(&mut gather, &local_candidate_tx);
             }
-            msg = candidate_rx.recv() => {
+            // `Some(..)` (not `msg`) so a closed trickle channel disables this branch instead of
+            // making it ready with `None` forever — a busy loop.
+            Some(msg) = candidate_rx.recv() => {
                 match msg {
-                    Some(TrickleEvent::Candidate(line)) => match unmarshal_candidate(&line) {
+                    TrickleEvent::Candidate(line) => match unmarshal_candidate(&line) {
                         Ok(c) => {
                             let _ = agent.add_remote_candidate(c);
                             stats.candidates_applied += 1;
@@ -217,10 +708,389 @@ pub async fn drive_ice_agent_trickle(
                             );
                         }
                     },
-                    Some(TrickleEvent::EndOfCandidates) => stats.end_of_candidates_seen = true,
-                    None => {}
+                    TrickleEvent::EndOfCandidates => stats.end_of_candidates_seen = true,
                 }
             }
         }
+    }
+}
+
+/// Expires gather state and, exactly once, tells the caller to publish end-of-candidates. A closed
+/// local-trickle channel means the caller is no longer publishing (it aborted the drive) — not an
+/// error.
+fn emit_end_of_candidates_if_due(
+    gather: &mut StunGather,
+    local_candidate_tx: &mpsc::UnboundedSender<LocalTrickleEvent>,
+) {
+    if gather.poll_expiry(Instant::now()) {
+        let _ = local_candidate_tx.send(LocalTrickleEvent::EndOfCandidates);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::UdpSocket as StdUdpSocket;
+    use std::thread;
+
+    use rtc_stun::message::{Message as StunResponse, BINDING_REQUEST, BINDING_SUCCESS};
+
+    use super::*;
+
+    /// Builds one STUN message with `typ` and (for a success response) a mapped address.
+    fn stun_message(transaction_id: TransactionId, typ: rtc_stun::message::MessageType) -> Vec<u8> {
+        let mut message = StunResponse::new();
+        message
+            .build(&[Box::new(transaction_id), Box::new(typ)])
+            .expect("build STUN message");
+        message.raw
+    }
+
+    fn binding_success(transaction_id: TransactionId, mapped: SocketAddr) -> Vec<u8> {
+        let mut message = StunResponse::new();
+        message
+            .build(&[
+                Box::new(transaction_id),
+                Box::new(BINDING_SUCCESS),
+                Box::new(XorMappedAddress {
+                    ip: mapped.ip(),
+                    port: mapped.port(),
+                }),
+            ])
+            .expect("build Binding Success");
+        message.raw
+    }
+
+    /// A one-shot UDP STUN responder that echoes the request's transaction id and reports the
+    /// request's source address as the XOR-MAPPED-ADDRESS — the same exchange
+    /// `spikes/s19-quic-transport/src/bin/stun-server.rs` performs, reduced to one request.
+    fn spawn_stun_responder() -> (SocketAddr, thread::JoinHandle<()>) {
+        let socket = StdUdpSocket::bind("127.0.0.1:0").expect("bind fake STUN socket");
+        let addr = socket.local_addr().expect("fake STUN local addr");
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let (n, from) = socket.recv_from(&mut buf).expect("receive Binding Request");
+            let mut request = StunResponse::new();
+            request.raw = buf[..n].to_vec();
+            request
+                .decode()
+                .expect("client sent a decodable STUN message");
+            let response = binding_success(
+                request.transaction_id,
+                SocketAddr::new(from.ip(), from.port()),
+            );
+            socket
+                .send_to(&response, from)
+                .expect("send Binding Success");
+        });
+        (addr, handle)
+    }
+
+    /// The compatibility promise (td-c3badf): starting ICE is immediate and host-only — no STUN or
+    /// TURN exchange happens before the offer/answer is published (review fix 1).
+    #[tokio::test]
+    async fn start_local_ice_is_immediate_and_host_only() {
+        let bind_ip = IpAddr::from([127, 0, 0, 1]);
+        let local_ice = start_local_ice(true, bind_ip)
+            .await
+            .expect("local ICE construction");
+
+        assert!(
+            local_ice.host_candidate_line.contains("typ host"),
+            "expected a host candidate, got {:?}",
+            local_ice.host_candidate_line
+        );
+        assert_eq!(
+            local_ice.socket.local_addr().expect("local addr").ip(),
+            bind_ip
+        );
+        let candidate =
+            unmarshal_candidate(&local_ice.host_candidate_line).expect("host candidate");
+        assert_eq!(candidate.candidate_type(), CandidateType::Host);
+    }
+
+    #[test]
+    fn parse_binding_response_accepts_a_valid_response() {
+        let server: SocketAddr = "192.0.2.1:3478".parse().expect("server addr");
+        let mapped: SocketAddr = "198.51.100.7:49152".parse().expect("mapped addr");
+        let transaction_id = TransactionId::new();
+        let raw = binding_success(transaction_id, mapped);
+        assert_eq!(
+            parse_binding_response(&raw, transaction_id, server).expect("valid response"),
+            mapped
+        );
+    }
+
+    #[test]
+    fn parse_binding_response_rejects_a_wrong_transaction_id() {
+        let server: SocketAddr = "192.0.2.1:3478".parse().expect("server addr");
+        let mapped: SocketAddr = "198.51.100.7:49152".parse().expect("mapped addr");
+        let response_tid = TransactionId::new();
+        let expected_tid = TransactionId::new();
+        assert_ne!(response_tid, expected_tid);
+        let raw = binding_success(response_tid, mapped);
+        let error = parse_binding_response(&raw, expected_tid, server).unwrap_err();
+        assert!(
+            matches!(&error, SignalingError::Stun(message) if message.contains("transaction id")),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn parse_binding_response_rejects_a_non_success_message() {
+        let server: SocketAddr = "192.0.2.1:3478".parse().expect("server addr");
+        let transaction_id = TransactionId::new();
+        // A Binding *Request* must not be accepted as a gather response just because the
+        // transaction id happens to match.
+        let raw = stun_message(transaction_id, BINDING_REQUEST);
+        let error = parse_binding_response(&raw, transaction_id, server).unwrap_err();
+        assert!(
+            matches!(&error, SignalingError::Stun(message) if message.contains("message type")),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn parse_binding_response_rejects_unusable_mapped_addresses() {
+        let server: SocketAddr = "192.0.2.1:3478".parse().expect("server addr");
+        let transaction_id = TransactionId::new();
+        let cases = [
+            "0.0.0.0:0".parse().expect("v4 unspecified"),
+            "0.0.0.0:49152".parse().expect("v4 unspecified"),
+            "224.0.0.1:49152".parse().expect("v4 multicast"),
+            "[2001:db8::1]:49152".parse().expect("v6 (wrong family)"),
+        ];
+        for mapped in cases {
+            let raw = binding_success(transaction_id, mapped);
+            let error = parse_binding_response(&raw, transaction_id, server)
+                .expect_err("unusable mapped address must be rejected");
+            assert!(
+                matches!(error, SignalingError::Stun(_)),
+                "unexpected error for {mapped}: {error:?}"
+            );
+        }
+    }
+
+    /// The gather state matches a response by transaction id and server, reports the mapped
+    /// address, and then sends end-of-candidates exactly once.
+    #[tokio::test]
+    async fn stun_gather_matches_a_response_and_emits_end_of_candidates_once() {
+        let (server, responder) = spawn_stun_responder();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind gather socket");
+        let mut gather = StunGather::new(&[server], Instant::now());
+        gather.send_requests(&socket).await;
+
+        let mut buf = [0u8; 1500];
+        let (n, from) = socket.recv_from(&mut buf).await.expect("receive response");
+        let mapped = gather
+            .handle_datagram(&buf[..n], from, Instant::now())
+            .expect("from the configured server")
+            .expect("valid response")
+            .expect("mapped address");
+        assert_eq!(
+            mapped,
+            socket.local_addr().expect("local addr"),
+            "on loopback the mapped address is the socket's own address"
+        );
+        responder.join().expect("responder thread");
+
+        assert!(gather.poll_expiry(Instant::now()), "must emit EOC once");
+        assert!(
+            !gather.poll_expiry(Instant::now()),
+            "EOC must not be emitted twice"
+        );
+    }
+
+    /// A spoofed response (right source address, wrong transaction id) is classified as gather
+    /// traffic and rejected — it must never become a candidate or reach the ICE agent (review fix 3).
+    #[tokio::test]
+    async fn stun_gather_rejects_a_spoofed_transaction_id() {
+        // A real bound socket that never answers, so `send_requests` succeeds and leaves the
+        // exchange outstanding.
+        let server_socket = StdUdpSocket::bind("127.0.0.1:0").expect("bind silent server");
+        let server = server_socket.local_addr().expect("server addr");
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind gather socket");
+        let mut gather = StunGather::new(&[server], Instant::now());
+
+        let fake = binding_success(
+            TransactionId::new(),
+            "198.51.100.7:49152".parse().expect("mapped"),
+        );
+        // Before a request is sent there is no outstanding exchange, so even a well-formed
+        // response from the configured server produces no candidate.
+        assert!(
+            gather
+                .handle_datagram(&fake, server, Instant::now())
+                .expect("from the configured server")
+                .is_ok(),
+            "a response with no outstanding exchange produces no candidate, not an ICE read"
+        );
+
+        // With an outstanding exchange, a wrong transaction id is an explicit rejection.
+        gather.send_requests(&socket).await;
+        let error = gather
+            .handle_datagram(&fake, server, Instant::now())
+            .expect("from the configured server")
+            .expect_err("wrong transaction id must be rejected");
+        assert!(
+            matches!(&error, SignalingError::Stun(message) if message.contains("transaction id")),
+            "got {error:?}"
+        );
+    }
+
+    /// A full drive over loopback with a **blackholed** STUN server still selects a host pair
+    /// promptly: gathering must not gate the ICE phase (review fix 1).
+    #[tokio::test]
+    async fn blackholed_stun_does_not_delay_a_host_only_punch() {
+        let mut a = start_local_ice(true, IpAddr::from([127, 0, 0, 1]))
+            .await
+            .expect("agent a");
+        let mut b = start_local_ice(false, IpAddr::from([127, 0, 0, 1]))
+            .await
+            .expect("agent b");
+
+        let b_line = unmarshal_candidate(&b.host_candidate_line).expect("b candidate");
+        a.agent.add_remote_candidate(b_line).expect("add b");
+        let a_line = unmarshal_candidate(&a.host_candidate_line).expect("a candidate");
+        b.agent.add_remote_candidate(a_line).expect("add a");
+
+        let (b_ufrag, b_pwd) = {
+            let credentials = b.agent.get_local_credentials();
+            (credentials.ufrag.clone(), credentials.pwd.clone())
+        };
+        let (a_ufrag, a_pwd) = {
+            let credentials = a.agent.get_local_credentials();
+            (credentials.ufrag.clone(), credentials.pwd.clone())
+        };
+
+        // Bind but never answer: every STUN request to this address is blackholed.
+        let blackhole = StdUdpSocket::bind("127.0.0.1:0").expect("bind blackhole");
+        let blackhole_addr = blackhole.local_addr().expect("blackhole addr");
+        let now = Instant::now();
+
+        let (_remote_tx_a, remote_rx_a) = mpsc::unbounded_channel();
+        let (_remote_tx_b, remote_rx_b) = mpsc::unbounded_channel();
+        let (local_tx_a, _local_rx_a) = mpsc::unbounded_channel();
+        let (local_tx_b, _local_rx_b) = mpsc::unbounded_channel();
+
+        let both = async {
+            tokio::join!(
+                drive_ice_agent_trickle(
+                    &mut a.agent,
+                    &a.socket,
+                    true,
+                    &b_ufrag,
+                    &b_pwd,
+                    remote_rx_a,
+                    StunGather::new(&[blackhole_addr], now),
+                    local_tx_a,
+                    Duration::from_secs(10),
+                ),
+                drive_ice_agent_trickle(
+                    &mut b.agent,
+                    &b.socket,
+                    false,
+                    &a_ufrag,
+                    &a_pwd,
+                    remote_rx_b,
+                    StunGather::new(&[blackhole_addr], now),
+                    local_tx_b,
+                    Duration::from_secs(10),
+                ),
+            )
+        };
+        let (a_result, b_result) = tokio::time::timeout(Duration::from_secs(3), both)
+            .await
+            .expect("a blackholed STUN server must not delay the host-only punch");
+        let (_, a_stats) = a_result.expect("a selected");
+        let (_, b_stats) = b_result.expect("b selected");
+        assert_eq!(a_stats.local_candidates_gathered, 0);
+        assert_eq!(b_stats.local_candidates_gathered, 0);
+    }
+
+    /// The drive itself sends the Binding Request and emits the validated srflx candidate and
+    /// end-of-candidates on the local-trickle channel (the caller signs/publishes them).
+    #[tokio::test]
+    async fn drive_gathers_and_emits_a_server_reflexive_candidate() {
+        let (server, responder) = spawn_stun_responder();
+        let mut local = start_local_ice(true, IpAddr::from([127, 0, 0, 1]))
+            .await
+            .expect("local ICE");
+
+        let (_remote_tx, remote_rx) = mpsc::unbounded_channel();
+        let (local_tx, mut local_rx) = mpsc::unbounded_channel();
+        let drive = drive_ice_agent_trickle(
+            &mut local.agent,
+            &local.socket,
+            true,
+            "remoteufrag",
+            "remotepassword1234567890ab",
+            remote_rx,
+            StunGather::new(&[server], Instant::now()),
+            local_tx,
+            Duration::from_secs(10),
+        );
+        // The drive has no remote candidate, so it never selects; 1 s is enough for the STUN
+        // exchange, after which the timeout cancels the future.
+        let _ = tokio::time::timeout(Duration::from_secs(1), drive).await;
+        responder.join().expect("responder thread");
+
+        let mut events = Vec::new();
+        while let Ok(event) = local_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                LocalTrickleEvent::Candidate(line) if line.contains("typ srflx")
+            )),
+            "expected an emitted srflx candidate, got {events:?}"
+        );
+        assert!(
+            events.contains(&LocalTrickleEvent::EndOfCandidates),
+            "expected end-of-candidates, got {events:?}"
+        );
+    }
+
+    /// The relay path learns the peer's relayed address from the trickle stream: non-relay
+    /// candidates and the end-of-candidates marker are skipped, and the `relay` candidate's
+    /// address (not its private base address) is returned.
+    #[tokio::test]
+    async fn await_peer_relay_candidate_skips_other_candidates() {
+        let host_line = CandidateHostConfig {
+            base_config: CandidateConfig {
+                network: "udp".to_string(),
+                address: "192.0.2.10".to_string(),
+                port: 5000,
+                component: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()
+        .expect("host candidate")
+        .marshal();
+        let relayed: SocketAddr = "203.0.113.7:49160".parse().expect("relayed addr");
+        let relay_line = relay_candidate_line(
+            relayed,
+            "192.0.2.10:5000".parse().expect("base"),
+            "203.0.113.1:3478".parse().expect("server"),
+        )
+        .expect("relay candidate");
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(TrickleEvent::Candidate(host_line))
+            .expect("send host");
+        tx.send(TrickleEvent::EndOfCandidates).expect("send eoc");
+        tx.send(TrickleEvent::Candidate(relay_line))
+            .expect("send relay");
+
+        let found = await_peer_relay_candidate(rx, Duration::from_secs(1))
+            .await
+            .expect("relay candidate found");
+        assert_eq!(found, relayed);
     }
 }

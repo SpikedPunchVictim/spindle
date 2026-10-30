@@ -99,6 +99,19 @@ pub enum SignalingError {
     #[error("ICE agent error: {0}")]
     Ice(#[from] rtc_shared::error::Error),
 
+    /// One STUN server-reflexive gathering attempt failed (send/recv, timeout, malformed or
+    /// missing `XOR-MAPPED-ADDRESS`, unexpected source). Soft:
+    /// [`super::ice::drive_ice_agent_trickle`] logs this and continues with the candidates it
+    /// already has; gathering runs concurrently with ICE, not before the offer/answer.
+    #[error("STUN gathering failed: {0}")]
+    Stun(String),
+
+    /// TURN relay setup or transport failed (allocating, creating a permission, or a malformed
+    /// wire packet once quinn owns the relay socket). The text can include a TURN server's own
+    /// error reason, so [`SignalingError::redacted`] withholds it.
+    #[error("TURN relay error: {0}")]
+    Turn(String),
+
     /// The offer/answer round trip, or ICE connectivity checks, did not complete before the
     /// caller-supplied timeout elapsed.
     #[error("{0} timed out")]
@@ -135,7 +148,7 @@ impl SignalingError {
 /// A `Display` wrapper that renders a [`SignalingError`] with every peer-controlled byte and
 /// every untruncated identifier replaced by its shape.
 ///
-/// Five of this enum's variants can reach peer-controlled bytes or an untruncated identifier;
+/// Six of this enum's variants can reach peer-controlled bytes or an untruncated identifier;
 /// every other variant's payload is a numeric bound, a `&'static str`, an [`EnvelopeError`]
 /// (whose whole surface is constant text and integers), or — per the `Quic` bullets below — a
 /// `quinn::ConnectionError` shape that never carries a peer byte at all, so the rest render
@@ -152,6 +165,10 @@ impl SignalingError {
 /// - [`SignalingError::SubjectMismatch`] and [`SignalingError::BadSubject`] carry a NATS session
 ///   subject, which spells out `host.<host_fp>.sess.<client_fp>.<sid>.<dir>` — two *untruncated*
 ///   fingerprints, exactly what `spindle_core::Fingerprint::redacted` exists to prevent.
+/// - [`SignalingError::Turn`] can carry an `rtc_shared::error::Error` rendered from a TURN server's
+///   STUN error response. The server is a configured, semi-trusted peer rather than an arbitrary
+///   one, but its `ERROR-CODE` reason phrase is still server-chosen text, so it is withheld like
+///   the peer-controlled strings above.
 /// - [`SignalingError::Quic`] wrapping `quinn::ConnectionError::ApplicationClosed` or
 ///   `::ConnectionClosed`: quinn-proto 0.11.17's `frame::ApplicationClose`/`ConnectionClose`
 ///   `Display` impls (`frame.rs:262-271`, `frame.rs:312-324`) write `String::from_utf8_lossy`
@@ -232,6 +249,13 @@ impl fmt::Display for RedactedSignalingError<'_> {
                 "malformed session subject (withheld: {} bytes)",
                 subject.len()
             ),
+            // A TURN server's ERROR-CODE reason phrase is server-chosen text; the shape is enough
+            // to distinguish setup failure categories in a log.
+            SignalingError::Turn(detail) => write!(
+                f,
+                "TURN relay error (detail withheld: {} bytes)",
+                detail.len()
+            ),
             // The peer picks these `reason` bytes when it sends the CLOSE frame
             // (quinn-proto 0.11.17 `frame.rs:262-271`/`312-324`'s `Display` impls write them via
             // `String::from_utf8_lossy`, untruncated) — the same log-injection surface as the
@@ -263,10 +287,11 @@ mod tests {
     use super::*;
 
     /// The two decode variants can reach a peer-supplied CBOR map key; the two subject variants
-    /// spell out untruncated fingerprints. All four must be withheld by `redacted()`, and every
+    /// spell out untruncated fingerprints, and the TURN variant carries a server-chosen error
+    /// text. All five must be withheld by `redacted()`, and every
     /// other variant must survive it unchanged.
     ///
-    /// The `safe` loop covers every one of this enum's 19 variants except the four in `leaky`
+    /// The `safe` loop covers every one of this enum's 21 variants except the five in `leaky`
     /// above and the `Quic(ApplicationClosed)`/`Quic(ConnectionClosed)` shapes, which
     /// `redacted_display_withholds_quic_close_reasons_but_keeps_the_code` exercises separately —
     /// including [`SignalingError::Ice`] (see the `Ice` bullet on
@@ -288,6 +313,7 @@ mod tests {
             SignalingError::SubjectMismatch {
                 subject: subject.to_string(),
             },
+            SignalingError::Turn(format!("server said: {subject}")),
         ];
         for e in &leaky {
             let plain = e.to_string();
@@ -317,6 +343,7 @@ mod tests {
             // `RedactedSignalingError`) — but the point of this entry is that it renders unchanged
             // like the rest, not that its content is unconditionally trustworthy.
             SignalingError::Ice(rtc_shared::error::Error::ErrTimeout),
+            SignalingError::Stun("no response from 127.0.0.1:3478".to_string()),
             SignalingError::Timeout("ICE trickle"),
             // A `Quic` shape that is neither `ApplicationClosed` nor `ConnectionClosed` — proves
             // the fallback `safe` arm actually covers `Quic`, not just the two rewritten shapes.

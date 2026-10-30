@@ -35,9 +35,10 @@
 //! setup (Auth Callout presentation) — this crate only ever takes an already-connected
 //! `async_nats::Client` as a parameter, never connects one itself (see [`signaling`]'s module doc
 //! comment); the browser-peer WebRTC data-channel transport (`webrtc-rs`, needed only when a
-//! browser peer is on the other end — DESIGN.md §A8); STUN/TURN candidate gathering beyond
-//! loopback/LAN host candidates (see [`signaling::ice`]'s module doc comment); and the client-side
-//! transfer manager.
+//! browser peer is on the other end — DESIGN.md §A8); per-attempt punch-vs-relay arbitration
+//! (STUN srflx gathering and the TURN relay transport themselves are in — see
+//! [`signaling::ice`]'s module doc comment; with TURN configured this crate uses the relay
+//! unconditionally); and the client-side transfer manager.
 
 pub mod framing;
 pub mod metrics;

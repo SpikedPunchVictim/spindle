@@ -54,7 +54,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{NoInitialCipherSuite, QuicClientConfig, QuicServerConfig};
-use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
+use quinn::{AsyncUdpSocket, Connection, Endpoint, RecvStream, SendStream, VarInt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -509,6 +509,30 @@ impl QuicServer {
         Ok(QuicServer { endpoint })
     }
 
+    /// Like [`QuicServer::from_socket`], but over an already-bound [`quinn::AsyncUdpSocket`]
+    /// rather than a raw `std::net::UdpSocket`.
+    ///
+    /// This is the TURN-relay twin (td-c3badf): relayed traffic is encapsulated in TURN framing,
+    /// so the caller cannot hand quinn a raw socket — it hands it `signaling::turn`'s
+    /// `TurnRelaySocket`, which encodes/decodes that framing (`quinn::Endpoint::new` only accepts
+    /// a `std::net::UdpSocket`; `new_with_abstract_socket` is the entry point that accepts an
+    /// `AsyncUdpSocket`). Same single `build_server_config` as every other constructor, so
+    /// mutual fingerprint pinning cannot drift between the punched and relayed paths.
+    pub fn from_abstract_socket(
+        socket: Arc<dyn AsyncUdpSocket>,
+        cert: &SessionCert,
+        expected_client_fp: [u8; 32],
+    ) -> Result<Self, QuicError> {
+        let server_config = build_server_config(cert, expected_client_fp)?;
+        let endpoint = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
+        Ok(QuicServer { endpoint })
+    }
+
     /// The bound local address — useful when `addr` was passed as `0.0.0.0:0`/`[::]:0` (an
     /// ephemeral port, as every test in this slice uses).
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -600,6 +624,35 @@ impl QuicClient {
     ) -> Result<ControlStream, QuicError> {
         let client_config = build_client_config(server_fp, cert)?;
         let endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
+
+        let connection = endpoint
+            .connect_with(client_config, addr, "localhost")?
+            .await?;
+        let (send, recv) = connection.open_bi().await?;
+        Ok(ControlStream {
+            connection,
+            send,
+            recv,
+        })
+    }
+
+    /// Like [`QuicClient::from_socket`], but over an already-bound [`quinn::AsyncUdpSocket`] —
+    /// the client-side twin of [`QuicServer::from_abstract_socket`] (see its doc comment for why
+    /// the TURN-relay path needs it). `addr` is the peer's relayed address; the socket itself is
+    /// bound to this side's TURN client endpoint.
+    pub async fn from_abstract_socket(
+        socket: Arc<dyn AsyncUdpSocket>,
+        addr: SocketAddr,
+        server_fp: [u8; 32],
+        cert: &SessionCert,
+    ) -> Result<ControlStream, QuicError> {
+        let client_config = build_client_config(server_fp, cert)?;
+        let endpoint = Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             None,
             socket,

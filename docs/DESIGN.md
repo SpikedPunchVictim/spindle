@@ -1750,7 +1750,7 @@ spindle/
 | Runtime | tokio, tracing, thiserror (libs) / anyhow (bins) | Node 22 LTS (CLI/admin), evergreen browsers per A7 |
 | Observability | `metrics` (facade, libraries record only) + `metrics-exporter-prometheus` (binaries only; `default-features = false`, `http-listener`) | — (client surfaces degrade state, no exporter) |
 | NATS | async-nats, nkeys (nkey seed auth; helper since Stage 4, host binary since td-539ffa) | nats.ws |
-| WebRTC | webrtc ≥0.20 (browser peers; ice reused standalone for QUIC punching) + quinn (native↔native QUIC) + rcgen (per-session QUIC certs) | browser RTCPeerConnection |
+| WebRTC | webrtc ≥0.20 (browser peers; ice reused standalone for QUIC punching) + quinn (native↔native QUIC) + rcgen (per-session QUIC certs) + `rtc-turn` (TURN relay for the native QUIC path, td-c3badf; same sans-I/O `rtc` release train as `rtc-ice`, S19 leg-3 precedent) | browser RTCPeerConnection |
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
 | Encoding | hand-rolled zero-dep canonical codec in spindle-proto (strict non-canonical rejection; minicbor rejected — decoder abstracts the raw bytes); base64 (base64url presentation of the CONNECT envelope and JWT segments — binaries only) | own canonical encoder in @spindle/proto |
 | Storage | rusqlite (bundled) host-side; sqlx/Postgres helper-side | IndexedDB (caps, resume manifests) |

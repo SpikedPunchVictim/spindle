@@ -491,6 +491,32 @@ fix), and the signaling DNAT needs a private-leg SNAT. See `deploy/lab/README.md
   nothing drives DESIGN v0.9.14's fresh-`seq` retry rule. ICE is traversed across two NATs *for
   the S19 spike's socket path* in this lab, but Stage 5's production signaling path is unchanged.
 
+**Note**: 2026-10-30 — **production STUN + TURN (td-c3badf), and the across-NAT S2 number exists.**
+`spindle-net::signaling` now takes an `IceConfig` on both `ConnectOptions` and `HostOptions`:
+a list of STUN servers (srflx candidates gathered on the same socket; a failing server is logged
+and skipped) and an optional TURN server with static or A8 REST credentials. With TURN configured
+the session uses the relay unconditionally (allocate → advertise a `relay` candidate over the
+existing trickle channel → CreatePermission → QUIC over a `quinn::AsyncUdpSocket` TURN adapter);
+with no config it is host-only, exactly as before. Measured in `deploy/lab/run-s2-nat.sh` (N=5
+medians, same cells): punch 5/40 unshaped (12.5%), 0/5 at 50 ms (td-3c1762 reproduced; all
+`ICE trickle timed out`); relay 5/5 unshaped and 5/5 at 50 ms. Phases, relay: 1.639 / 2.018 /
+1.549 / 5.761 ms unshaped and 104.274 / 156.961 / 103.792 / 468.909 ms shaped
+(offer→answer / answer→relay-ready / relay-ready→QUIC / total); punch unshaped N=5:
+4.057 / 609.705 / 7.288 / 618.903 ms. On the relay path the second phase
+is allocation + CreatePermission, not ICE selection. Review fixes: gathering is off the
+offer/answer path (the answer carries the host candidate; STUN runs inside the ICE drive and TURN
+allocation after the answer, so a blackholed STUN can no longer cause an answer timeout), STUN
+responses are transaction-id/class/address validated, the relay adapter filters its TURN server and
+expected peer, its send path re-registers on `WouldBlock` with a bounded, drainable backlog, and a
+driver refreshes rtc-turn's allocation/permission; a setup-failure guard releases an allocation
+that never reaches the socket, and `Drop` enqueues/sends one zero-lifetime Refresh (best-effort —
+coturn's receipt is unverified, and no real >5-minute relay run was made). Not built:
+punch-first-then-relay arbitration, which needs a
+coordinated decision between peers because `rtc-ice` cannot route checks through TURN and the
+conntrack failure is one-sided; the helper credential client and hostd operator surface are also
+still open (td-870b25). Details: `spikes/s2-signaling/RESULTS.md`'s td-c3badf section; lab README's
+S2 section.
+
 ## Stage 6: spindle-vfs + host-core
 **Goal**: Implement the shares/groups/entitlements engine and the VFS RPC server in
 `spindle-vfs`/`spindle-host-core`, enforcing A4b's permission algebra per request.

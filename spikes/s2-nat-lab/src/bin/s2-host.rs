@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use spike_s2_nat_lab::{
-    client_device, host_device, host_fp, EchoHandler, RegistryAuthorizer,
+    client_device, host_device, host_fp, ice_config_from_env, EchoHandler, RegistryAuthorizer,
 };
 use spindle_net::signaling::{HostOptions, SignalingHost};
 
@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
         ice_timeout: Duration::from_millis(ice_ms),
         session_close_timeout: Duration::from_secs(5),
         max_concurrent_connects: 64,
+        ice: ice_config_from_env()?,
     })
     .await
     .context("SignalingHost::run")?;
