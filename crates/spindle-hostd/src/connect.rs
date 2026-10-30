@@ -54,9 +54,9 @@
 //!
 //! Both the `HostSessionAttestation` and the `HostOpKeyCert` it accompanies are checked against a
 //! ±2 minute server-time window (A7b; see `HOST_SESSION_ATTESTATION_CLOCK_SKEW_SECS` in
-//! `spindle_core::artifacts`). The operating-key certificate is minted once per process at startup
-//! (A10.43; a future A10.45 renewal path would re-issue it), but the attestation is not a
-//! process-start value: the caller must pass the wall clock read at the moment it calls
+//! `spindle_core::artifacts`). The operating-key certificate is minted at startup (A10.43) and
+//! re-issued by A10.45's mid-process renewal, but the attestation is not a process-start value:
+//! the caller must pass the wall clock read at the moment it calls
 //! [`connect_host`]. Passing a startup timestamp would make every reconnect more than two minutes
 //! into the process fail authentication while looking, from this function's signature, like a
 //! perfectly ordinary connect. A supervised caller therefore reads the clock again for each

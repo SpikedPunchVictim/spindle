@@ -3698,6 +3698,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "nkeys",
  "rand 0.8.7",
+ "rustix",
  "spindle-core",
  "spindle-host-core",
  "spindle-net",

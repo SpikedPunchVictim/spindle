@@ -49,10 +49,26 @@
 //! (DNS, I/O, timeout, a `HostDaemon::run` failure) retries with a 1 s-to-30 s exponential backoff.
 //! `SIGINT`/`SIGTERM` return `SUCCESS` at any point, including during the backoff.
 //!
-//! A mid-process certificate renewal (A10.45: re-issue the operating certificate at two-thirds of
-//! its 90-day lifetime) is **not wired here**. A process that outlives `HOST_OP_CERT_TTL_SECS`
-//! will keep presenting an expired certificate; that is a known gap in
-//! [`spindle_hostd::identity`], not a property this binary silently works around.
+//! # Mid-process certificate renewal [A10.45]
+//!
+//! The serving loop also owns renewal. The renewal instant is two-thirds of the operating
+//! certificate's lifetime ([`next_renewal_at`]), leaving a one-third retry window. When it fires,
+//! the binary reloads the root seed from custody (the root is not kept resident between renewals),
+//! mints a **new operating key** and re-issues the op cert under that root, then `continue`s the
+//! outer loop. That is deliberately **a planned reconnect**: `connect_host` re-authenticates with
+//! the new operating key and re-mints/re-publishes the `HostDeviceCert` under it, while the
+//! process's envelope `DeviceKey` (the same `Arc`) is untouched — so both `host_fp` and
+//! `device_fp` are unchanged across a renewal.
+//!
+//! On a failed renewal (seed reload, root change, or issuance) the process keeps serving the
+//! sessions it already has, flips a [`GateableCapIssuer`] gate off so no **new** member capability
+//! is minted, logs the reason, and retries after [`RENEWAL_RETRY_SECS`] (clamped to the
+//! certificate's remaining lifetime). It stops with `ExitCode::FAILURE` only when
+//! `now >= op_cert.exp`: serving an expired certificate is worse than stopping.
+//!
+//! The certificate lifetime is `SPINDLE_HOST_OP_CERT_TTL_SECS`/`--op-cert-ttl-secs` (default
+//! A7b's 90 days, maximum the same). Shortening it shortens the renewal point, the retry window,
+//! and the expiry proportionally, which is what `tests/live_renewal.rs` exercises live.
 //!
 //! # Metrics
 //!
@@ -68,25 +84,28 @@
 mod config;
 
 use std::env;
-use std::io::{IsTerminal as _, Write as _};
+use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rand::rngs::OsRng;
 use rand::RngCore as _;
+use spindle_core::{RootKey, SigningKey, VerifyingKey};
 use spindle_host_core::RootKeyCapIssuer;
 use spindle_hostd::connect::{connect_host, ConnectError, HostConnectCredentials};
 #[cfg(unix)]
-use spindle_hostd::keystore::{check_file_mode, check_parent_mode};
+use spindle_hostd::keystore::{create_secret_file, open_secret_file};
 use spindle_hostd::{
-    format_recovery_phrase, mint_host_identity, parse_recovery_phrase, wall_clock_now_secs,
-    HostDaemon, HostDaemonError, HostIdentity, HostKeyStore, HostOptions, KeyStoreError,
-    SeedFileStore, ROOT_SEED_LEN,
+    format_recovery_phrase, mint_host_identity_with_ttl, parse_recovery_phrase,
+    renew_operating_identity_with_ttl, wall_clock_now_secs, GateableCapIssuer, HostDaemon,
+    HostDaemonError, HostIdentity, HostKeyStore, HostOptions, KeyStoreError, SeedFileStore,
+    ROOT_SEED_LEN,
 };
-use spindle_proto::artifacts::AdmissionToken;
+use spindle_proto::artifacts::{AdmissionToken, HostOpKeyCert};
 
 use crate::config::Config;
 
@@ -107,7 +126,7 @@ async fn main() -> ExitCode {
         Ok(config) => config,
         Err(error) => {
             tracing::error!(
-                error = %error, // redaction-ok: ConfigError Display names flags/env vars, static parse text, and the operator's own --bind-ip/boolean input; ConfigError::unknown_arg truncates at '=' so a --restore-seed value is never embedded
+                error = %error, // redaction-ok: ConfigError Display names flags/env vars, static parse text, and the operator's own --bind-ip/boolean/--op-cert-ttl-secs input (non-secret configuration values); ConfigError::unknown_arg truncates at '=' so a --restore-seed value is never embedded
                 "invalid host daemon configuration; run with --help for usage"
             );
             return ExitCode::FAILURE;
@@ -124,12 +143,17 @@ async fn main() -> ExitCode {
 /// boundary because there is no caller to report to.
 async fn run(config: Config) -> ExitCode {
     let seed_store = SeedFileStore::new(config.seed_file.as_path());
-    let seed = match prepare_root_seed(&config, &seed_store) {
+    let mut seed = match prepare_root_seed(&config, &seed_store) {
         Ok(seed) => seed,
         Err(()) => return ExitCode::FAILURE,
     };
 
-    let identity = mint_host_identity(seed, wall_clock_now_secs());
+    let identity =
+        mint_host_identity_with_ttl(seed, wall_clock_now_secs(), config.op_cert_ttl_secs);
+    // The seed was copied out of the store into this stack array only so it could mint the
+    // identity. Nothing below needs it; a renewal reloads it from custody. Do not leave the copy
+    // resident for the process's life.
+    seed.fill(0);
     tracing::info!(
         host_fp = %identity.host_fp.redacted(),
         device_fp = %identity.device_fp.redacted(),
@@ -179,11 +203,13 @@ async fn run(config: Config) -> ExitCode {
     // starts. Only `root`'s public half survives (inside the borrowed credentials view); the
     // operating key and envelope device key must live for the process's life, because every
     // reconnect re-authenticates with them and A10.44/A10.45 keep `device_fp` stable within one
-    // process. `host_fp`/`device_fp` are `Copy` copies of values already logged.
+    // process. `op_signing`/`op_cert` are mutable because A10.45's renewal replaces them;
+    // `device` is not, because a renewal must not re-mint it. `host_fp`/`device_fp` are `Copy`
+    // copies of values already logged.
     let HostIdentity {
         root,
-        op_signing,
-        op_cert,
+        mut op_signing,
+        mut op_cert,
         device,
         host_fp,
         device_fp,
@@ -191,7 +217,9 @@ async fn run(config: Config) -> ExitCode {
     let host_root_pk = root.public_key();
     // The issuer built below and the credentials view above need only these public/borrowed
     // pieces. Dropping the root private key here means its wrapped `SigningKey` (which zeroizes on
-    // drop) is gone before any reconnect attempt; nothing below signs as the root.
+    // drop) is gone before any reconnect attempt; nothing below signs as the root, including a
+    // renewal (which reloads the seed and drops that root again in
+    // `reload_seed_and_renew`).
     drop(root);
     tracing::debug!(
         host_fp = %host_fp.redacted(),
@@ -200,13 +228,15 @@ async fn run(config: Config) -> ExitCode {
     );
 
     let device = Arc::new(device);
-    let credentials = HostConnectCredentials {
-        host_root_pk,
-        op_signing: &op_signing,
-        op_cert: &op_cert,
-        host_fp,
-        device: &device,
-    };
+
+    // The gate the running daemon's cap issuer observes. A failed renewal flips it off so
+    // existing sessions keep running while no new capability is minted (A10.45); a successful
+    // renewal flips it back before the planned reconnect.
+    let issuance_gate = Arc::new(AtomicBool::new(true));
+
+    // Two-thirds of this process's current operating-certificate lifetime. Recomputed after
+    // every successful renewal; a failed renewal pushes it to the retry instant instead.
+    let mut renew_at = next_renewal_at(op_cert.ts, op_cert.exp);
 
     // Only `bind_ip` is configurable in this slice; the lifecycle durations and the concurrency
     // cap keep `HostOptions`' defaults (taken from one `default()` value rather than restated
@@ -238,6 +268,34 @@ async fn run(config: Config) -> ExitCode {
     let mut reconnects = ReconnectState::default();
 
     loop {
+        // A10.45: serving an expired certificate is worse than stopping. Checked here, after every
+        // successful connect, and on every failed renewal retry — the only ways this loop can wake.
+        if let Err(()) = ensure_op_cert_unexpired(&op_cert, wall_clock_now_secs()) {
+            return ExitCode::FAILURE;
+        }
+
+        // The borrowed view is rebuilt from the *current* operating credentials on every attempt:
+        // a successful renewal replaces `op_signing`/`op_cert`, and the next connection must present
+        // those, not the ones this process started with. `device` is the same `Arc` throughout, so
+        // `device_fp` never moves (A10.44/A10.45).
+        let credentials = HostConnectCredentials {
+            host_root_pk,
+            op_signing: &op_signing,
+            op_cert: &op_cert,
+            host_fp,
+            device: &device,
+        };
+
+        // A non-secret discriminator for the live renewal proof: the certificate this connection
+        // is about to present. A renewal replaces both the operating key and the certificate, so
+        // the post-renewal line must carry a strictly later `op_cert_ts` than the first. Logged
+        // immediately before `connect_host` on every attempt; no key material.
+        tracing::info!(
+            op_cert_ts = op_cert.ts,
+            op_cert_exp = op_cert.exp,
+            "connecting to NATS with the operating-key certificate"
+        );
+
         // A fresh wall-clock read at every attempt, not a timestamp captured at process start: the
         // attestation's `ts` is checked against a ±2 minute server-time window (see `connect`'s
         // module docs), and this loop exists precisely to survive an outage longer than that.
@@ -311,6 +369,8 @@ async fn run(config: Config) -> ExitCode {
                                 "failed to connect the host to NATS; retrying with fresh credentials"
                             );
                         }
+                        let delay =
+                            clamp_to_certificate_expiry(delay, &op_cert, wall_clock_now_secs());
                         if sleep_or_shutdown(delay, shutdown.as_mut()).await {
                             tracing::info!("shutdown signal received");
                             return ExitCode::SUCCESS;
@@ -325,81 +385,185 @@ async fn run(config: Config) -> ExitCode {
         // it before returning, so the host's identity is advertised before the daemon starts
         // serving. Its failure is folded into the connect error arm above.
 
-        // The issuer is rebuilt for every connection from the same identity the connection
-        // presented, so every capability this host mints chains to the root the Auth Callout just
+        // A connect can outlive the certificate it presented; never start serving on one that is
+        // already expired.
+        if let Err(()) = ensure_op_cert_unexpired(&op_cert, wall_clock_now_secs()) {
+            return ExitCode::FAILURE;
+        }
+
+        // The issuer is rebuilt for every connection from the identity the connection presented,
+        // so every capability this host mints chains to the root the Auth Callout just
         // authenticated. It is recreated rather than moved because `HostDaemon` consumes it; the
-        // operating key and certificate are unchanged across reconnects (only the session credential
-        // is fresh). See `HostDaemon::with_cap_issuer`'s doc comment for why the daemon takes this
-        // seam rather than owning key custody itself.
-        let issuer = RootKeyCapIssuer::new(host_root_pk, op_cert.clone(), op_signing.clone());
+        // operating key and certificate change only on an A10.45 renewal (otherwise only the
+        // session credential is fresh). `GateableCapIssuer` shares `issuance_gate` with the
+        // renewal arm below: a failed renewal turns issuance off without taking this daemon, and
+        // the sessions it already serves, down. See `HostDaemon::with_cap_issuer`'s doc comment
+        // for why the daemon takes this seam rather than owning key custody itself.
+        let issuer = GateableCapIssuer::new(
+            RootKeyCapIssuer::new(host_root_pk, op_cert.clone(), op_signing.clone()),
+            Arc::clone(&issuance_gate),
+        );
         let daemon =
             HostDaemon::new_shared(client, Arc::clone(&device), host_fp, config.store.clone())
                 .with_cap_issuer(Box::new(issuer));
 
-        let result = tokio::select! {
-            // `biased` and the shutdown branch first are deliberate: `shutdown_signal` installs
-            // the OS signal handlers on its first poll, and this branch keeps a SIGINT/SIGTERM
-            // from racing the daemon's own startup work below.
-            biased;
-            _ = &mut shutdown => {
-                tracing::info!("shutdown signal received");
-                // Dropping the daemon drops the NATS client and its SQLite connections; dropping
-                // the guard aborts the reconnect-republish pump and releases its client clone. The
-                // signaling run loop has no separate shutdown channel (`HostDaemon::run`'s doc
-                // comment), so there is nothing else to drain.
-                drop(devcert_publisher);
-                return ExitCode::SUCCESS;
+        let outcome = {
+            // The daemon future is one-shot, and a *failed* renewal must keep this same daemon —
+            // and so its live sessions — running. That is why renewal is an arm of this inner
+            // select rather than an unconditional `continue` of the outer loop: only a successful
+            // renewal (or the daemon returning) breaks it.
+            let run = daemon.run(options);
+            tokio::pin!(run);
+            loop {
+                let now = wall_clock_now_secs();
+                let renewal_delay = std::time::Duration::from_secs(renew_at.saturating_sub(now));
+                tokio::select! {
+                    // `biased` and the shutdown branch first are deliberate: `shutdown_signal`
+                    // installs the OS signal handlers on its first poll, and this branch keeps a
+                    // SIGINT/SIGTERM from racing the daemon's own startup work below.
+                    biased;
+                    _ = &mut shutdown => {
+                        tracing::info!("shutdown signal received");
+                        // Dropping the daemon drops the NATS client and its SQLite connections;
+                        // dropping the guard aborts the reconnect-republish pump and releases its
+                        // client clone. The signaling run loop has no separate shutdown channel
+                        // (`HostDaemon::run`'s doc comment), so there is nothing else to drain.
+                        drop(devcert_publisher);
+                        return ExitCode::SUCCESS;
+                    }
+                    result = &mut run => break ServingOutcome::Daemon(result),
+                    _ = tokio::time::sleep(renewal_delay) => {
+                        // A10.45: if the certificate actually expired before this attempt could
+                        // succeed, stop serving rather than present it.
+                        let now = wall_clock_now_secs();
+                        if let Err(()) = ensure_op_cert_unexpired(&op_cert, now) {
+                            return ExitCode::FAILURE;
+                        }
+                        match reload_seed_and_renew(
+                            &seed_store,
+                            &host_root_pk,
+                            now,
+                            config.op_cert_ttl_secs,
+                        ) {
+                            Ok((new_signing, new_cert)) => {
+                                op_signing = new_signing;
+                                op_cert = new_cert;
+                                renew_at = next_renewal_at(op_cert.ts, op_cert.exp);
+                                issuance_gate.store(true, Ordering::Release);
+                                tracing::info!(
+                                    ts = op_cert.ts,
+                                    exp = op_cert.exp,
+                                    "operating-key certificate renewed; reconnecting with fresh \
+                                     credentials (a renewal is a planned reconnect)"
+                                );
+                                break ServingOutcome::Renewed;
+                            }
+                            Err(error) => {
+                                // A10.45's failure rule: keep this daemon serving, refuse to
+                                // issue *new* capabilities, log the reason, retry.
+                                issuance_gate.store(false, Ordering::Release);
+                                let now = wall_clock_now_secs();
+                                if let Err(()) = ensure_op_cert_unexpired(&op_cert, now) {
+                                    return ExitCode::FAILURE;
+                                }
+                                // Wake at the fixed retry instant, or at `exp` if that comes
+                                // first, so the expiry check can never be delayed past the
+                                // certificate's life.
+                                let retry_in = RENEWAL_RETRY_SECS.min(op_cert.exp - now);
+                                renew_at = now.saturating_add(retry_in);
+                                tracing::error!(
+                                    error = %error, // redaction-ok: RenewalError Display wraps KeyStoreError (operator-configured seed path, octal mode or byte count, and io::Error OS text) or static root-change text; it never carries the seed, a private key, or member data
+                                    retry_in_secs = retry_in,
+                                    "operating-key certificate renewal failed; keeping existing \
+                                     sessions alive, refusing to issue new capabilities, and \
+                                     retrying"
+                                );
+                                // Deliberately stay in this select: the daemon and every session
+                                // it already serves are untouched.
+                            }
+                        }
+                    }
+                }
             }
-            result = daemon.run(options) => result,
         };
+
         // The guard must not outlive the connection it serves: the next iteration publishes on a
         // fresh client. Dropping it aborts this iteration's pump and releases its client clone.
         drop(devcert_publisher);
 
-        let delay = match result {
-            Ok(()) => {
-                // The signaling loop only returns `Ok(())` when the NATS client closes. That is now
-                // the normal "connection lost" signal, not a terminal condition: reconnect with a
-                // fresh per-session credential (A4 step 3) while keeping this process's envelope
-                // `device_fp` (A10.44/A10.45). A served connection also resets the backoff.
-                let delay = reconnects.served_and_lost();
-                tracing::warn!(
-                    delay_secs = delay.as_secs(),
-                    "host daemon signaling loop ended because the NATS connection closed; \
-                     reconnecting with fresh credentials"
-                );
-                delay
+        let delay = match outcome {
+            ServingOutcome::Renewed => {
+                // A renewal is a planned reconnect: go straight back to `connect_host`, which
+                // re-authenticates with the new operating key and re-mints/re-publishes the
+                // device certificate under it. No backoff — this connection served healthily.
+                reconnects.served();
+                continue;
             }
-            Err(error) => {
-                // `HostDaemonError`'s `Display` forwards `SignalingError`/`StoreError` bodies,
-                // some of which carry peer-supplied CBOR keys, untruncated subjects, member paths,
-                // or full fingerprints. `HostDaemon::run` has already logged the redacted cause;
-                // this line names which stage failed without repeating the unsafe text.
-                //
-                // Every `run` failure is retryable, and it advances the backoff (only a connection
-                // that actually *served* resets it). There is deliberately no text-matching here for
-                // an authorization refusal: a revoked host is refused at its next CONNECT, where
-                // async-nats's typed error kind is classified; `run`'s error type carries no such kind.
-                let stage = match error {
-                    HostDaemonError::Store(_) => "opening the host store",
-                    HostDaemonError::Signaling(_) => "the signaling run loop",
-                };
-                let delay = reconnects.run_failed();
-                tracing::error!(
-                    stage = stage,
-                    delay_secs = delay.as_secs(),
-                    "host daemon failed; the redacted cause was logged above; reconnecting with \
-                     fresh credentials"
-                );
-                delay
-            }
+            ServingOutcome::Daemon(result) => match result {
+                Ok(()) => {
+                    // The signaling loop only returns `Ok(())` when the NATS client closes. That
+                    // is now the normal "connection lost" signal, not a terminal condition:
+                    // reconnect with a fresh per-session credential (A4 step 3) while keeping this
+                    // process's envelope `device_fp` (A10.44/A10.45). A served connection also
+                    // resets the backoff.
+                    let delay = reconnects.served_and_lost();
+                    tracing::warn!(
+                        delay_secs = delay.as_secs(),
+                        "host daemon signaling loop ended because the NATS connection closed; \
+                         reconnecting with fresh credentials"
+                    );
+                    delay
+                }
+                Err(error) => {
+                    // `HostDaemonError`'s `Display` forwards `SignalingError`/`StoreError`
+                    // bodies, some of which carry peer-supplied CBOR keys, untruncated subjects,
+                    // member paths, or full fingerprints. `HostDaemon::run` has already logged the
+                    // redacted cause; this line names which stage failed without repeating the
+                    // unsafe text.
+                    //
+                    // Every `run` failure is retryable, and it advances the backoff (only a
+                    // connection that actually *served* resets it). There is deliberately no
+                    // text-matching here for an authorization refusal: a revoked host is refused
+                    // at its next CONNECT, where async-nats's typed error kind is classified;
+                    // `run`'s error type carries no such kind.
+                    let stage = match error {
+                        HostDaemonError::Store(_) => "opening the host store",
+                        HostDaemonError::Signaling(_) => "the signaling run loop",
+                    };
+                    let delay = reconnects.run_failed();
+                    tracing::error!(
+                        stage = stage,
+                        delay_secs = delay.as_secs(),
+                        "host daemon failed; the redacted cause was logged above; reconnecting \
+                         with fresh credentials"
+                    );
+                    delay
+                }
+            },
         };
 
+        // Never sleep past the certificate's expiry: the expiry check at the top of the loop must
+        // run at `exp`, even while backing off from a lost connection.
+        let delay = clamp_to_certificate_expiry(delay, &op_cert, wall_clock_now_secs());
         if sleep_or_shutdown(delay, shutdown.as_mut()).await {
             tracing::info!("shutdown signal received");
             return ExitCode::SUCCESS;
         }
     }
+}
+
+/// Shortens a reconnect/backoff wait so it cannot carry the loop past `op_cert.exp`.
+///
+/// A10.45 says the host stops serving when the certificate expires; while disconnected it is
+/// not serving, but the expiry check still lives at the top of the loop, so the loop must wake at
+/// `exp` rather than finishing an ordinary backoff first.
+fn clamp_to_certificate_expiry(
+    delay: std::time::Duration,
+    op_cert: &HostOpKeyCert,
+    now: u64,
+) -> std::time::Duration {
+    let remaining = op_cert.exp.saturating_sub(now);
+    delay.min(std::time::Duration::from_secs(remaining))
 }
 
 /// Waits `delay` or until `shutdown` resolves, returning `true` when a shutdown signal won.
@@ -415,6 +579,94 @@ async fn sleep_or_shutdown<F: std::future::Future<Output = ()>>(
         _ = shutdown => true,
         _ = tokio::time::sleep(delay) => false,
     }
+}
+
+/// How long a failed A10.45 renewal waits before retrying.
+///
+/// A fixed interval rather than the reconnect backoff: renewal has a one-third-of-`exp` window
+/// (30 days at the default 90-day lifetime), so the retry rate should stay flat and small — a
+/// keychain that is transiently locked should recover within a minute, not after an exponentially
+/// growing delay. The sleep is clamped to the certificate's remaining lifetime so the
+/// expiry check always runs at `exp` at the latest.
+const RENEWAL_RETRY_SECS: u64 = 60;
+
+/// Where a served connection ended: the daemon returned, or a renewal succeeded and the caller
+/// should reconnect with the new operating credentials.
+enum ServingOutcome {
+    /// `HostDaemon::run` returned (connection lost or a run failure).
+    Daemon(Result<(), HostDaemonError>),
+    /// A10.45 renewal succeeded; the outer loop must reconnect (a planned reconnect).
+    Renewed,
+}
+
+/// The instant A10.45 says renewal starts: **two-thirds of `exp`**, i.e.
+/// `ts + 2 * (exp - ts) / 3`.
+///
+/// For A7b's 90-day certificate that is day 60, leaving a 30-day retry window. The arithmetic is
+/// done in `u128` so a pathological `exp` cannot overflow the multiplication, and the result
+/// saturates rather than wrapping. A certificate whose `exp` is at or before `ts` renews at `ts`
+/// (the caller's expiry check stops it); this function never panics.
+fn next_renewal_at(ts: u64, exp: u64) -> u64 {
+    let lifetime = u128::from(exp.saturating_sub(ts));
+    let offset = u64::try_from(lifetime * 2 / 3).unwrap_or(u64::MAX);
+    ts.saturating_add(offset)
+}
+
+/// Returns `Ok(())` while `now` is inside the certificate's lifetime, and logs + returns `Err(())`
+/// once it has expired.
+///
+/// A10.45: "it stops serving only when the certificate actually expires". Serving an expired
+/// operating certificate means every capability that embeds it stops verifying, so the process
+/// exits `FAILURE` instead.
+fn ensure_op_cert_unexpired(op_cert: &HostOpKeyCert, now: u64) -> Result<(), ()> {
+    if now < op_cert.exp {
+        return Ok(());
+    }
+    tracing::error!(
+        now = now,
+        exp = op_cert.exp,
+        "the operating-key certificate has expired; exiting rather than serving an expired \
+         credential"
+    );
+    Err(())
+}
+
+/// Why an A10.45 renewal attempt failed.
+#[derive(Debug, thiserror::Error)]
+enum RenewalError {
+    /// The root seed could not be reloaded from custody (absent, wrong length, too-wide mode, or
+    /// an I/O error). `KeyStoreError`'s `Display` names the operator-configured path, mode, and
+    /// byte count; it never carries the seed.
+    #[error("reloading the host root seed failed: {0}")]
+    Seed(#[from] KeyStoreError),
+    /// The seed file changed on disk to a different root between start-up and renewal. Minting a
+    /// certificate under that root would contradict the `host_root_pk` every connection presents,
+    /// so the attempt fails rather than producing a credential the callout cannot verify.
+    #[error("the seed file now encodes a different root identity than this process started with")]
+    RootChanged,
+}
+
+/// Reloads the root seed and mints only the operating half of the identity (A10.45).
+///
+/// The root is loaded **here** and its private key is dropped when this function returns, so it
+/// is never resident between renewals. The envelope `DeviceKey` is not an input: a renewal must
+/// keep `device_fp` unchanged.
+fn reload_seed_and_renew(
+    seed_store: &SeedFileStore,
+    host_root_pk: &VerifyingKey,
+    now: u64,
+    ttl_secs: u64,
+) -> Result<(SigningKey, HostOpKeyCert), RenewalError> {
+    let mut seed = seed_store.load_root_seed()?;
+    if &RootKey::from_seed(seed).public_key() != host_root_pk {
+        seed.fill(0);
+        return Err(RenewalError::RootChanged);
+    }
+    // The seed is reloaded from custody for each renewal; wipe this stack copy as soon as the
+    // operating key and certificate have been minted from it.
+    let renewed = renew_operating_identity_with_ttl(seed, now, ttl_secs);
+    seed.fill(0);
+    Ok(renewed)
 }
 
 /// The reconnect backoff: 1 s, doubling per consecutive failed attempt, capped at 30 s.
@@ -500,10 +752,16 @@ impl ReconnectState {
         self.auth_refusals = 0;
     }
 
+    /// A connection served and ended by a **planned** reconnect (an A10.45 renewal): the next
+    /// reconnect is prompt and the backoff resets.
+    fn served(&mut self) {
+        self.attempt = 0;
+    }
+
     /// `HostDaemon::run` returned `Ok(())` — the host served, then lost its connection. The next
     /// reconnect is prompt, and the returned delay is the first backoff step.
     fn served_and_lost(&mut self) -> std::time::Duration {
-        self.attempt = 0;
+        self.served();
         self.advance()
     }
 
@@ -715,16 +973,21 @@ fn restore_phrase(config: &Config) -> Result<String, ()> {
 }
 
 /// Reads a restore phrase file under the same POSIX discipline as the root seed itself: the
-/// parent directory at most `0700` and the file at most `0600`, checked before the phrase is
-/// copied into this process. A wider entry is refused by naming the path and mode found.
+/// parent directory at most `0700` and the file at most `0600`, with the mode and ownership checks
+/// applied to the descriptor the bytes are read from. Resolving the path once
+/// (`open_secret_file`) is what closes the substitution window a check-then-`read_to_string(path)`
+/// pair leaves open. A wider, symlinked, or foreign-owned entry is refused by naming the path and
+/// the fact found.
 #[cfg(unix)]
 fn read_phrase_file(path: &Path) -> Result<String, KeyStoreError> {
-    check_parent_mode(path)?;
-    check_file_mode(path)?;
-    std::fs::read_to_string(path).map_err(|source| KeyStoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    let mut file = open_secret_file(path)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|source| KeyStoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(text)
 }
 
 /// `#[cfg(not(unix))]` only: mode bits are not meaningful, and the seed-file store this binary
@@ -896,24 +1159,13 @@ fn phrase_sink_for(config: &Config, stdout_is_terminal: bool) -> Result<PhraseSi
     }
 }
 
-/// Opens a new `0600` phrase file inside a `0700` parent (`check_parent_mode`, shared with
-/// [`SeedFileStore`] rather than re-implemented), refusing to overwrite an existing file.
-/// `create_new` makes the existence check atomic, so a second enrollment cannot silently replace
-/// a phrase the operator may already have stored elsewhere.
+/// Opens a new `0600` phrase file inside a `0700` parent, refusing to overwrite an existing file.
+/// [`create_secret_file`] opens and checks the parent once and then creates the entry through
+/// that descriptor with `O_CREAT | O_EXCL | O_NOFOLLOW`, so the existence check is atomic and a
+/// re-pointed path cannot redirect the write.
 #[cfg(unix)]
 fn open_phrase_file(path: &Path) -> Result<std::fs::File, KeyStoreError> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    check_parent_mode(path)?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|source| KeyStoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+    create_secret_file(path)
 }
 
 /// `#[cfg(not(unix))]` only: see [`read_phrase_file`].
@@ -962,6 +1214,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
 
+    use spindle_hostd::HOST_OP_CERT_TTL_SECS;
     use tempfile::TempDir;
 
     use super::*;
@@ -987,6 +1240,7 @@ mod tests {
             restore_seed: None,
             restore_seed_file: None,
             metrics_addr: None,
+            op_cert_ttl_secs: HOST_OP_CERT_TTL_SECS,
         }
     }
 
@@ -1089,6 +1343,50 @@ mod tests {
         }
     }
 
+    /// The read path resolves the phrase file once, through a checked parent descriptor. A
+    /// symlinked entry is refused by `O_NOFOLLOW` rather than followed to a `0600` target.
+    #[test]
+    fn read_phrase_file_rejects_a_symlinked_entry() {
+        let dir = private_dir();
+        let target = dir.path().join("elsewhere.phrase");
+        fs::write(&target, b"any phrase").expect("write link target");
+        set_mode(&target, 0o600);
+        let link = dir.path().join("restore.phrase");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink phrase file");
+
+        match read_phrase_file(&link) {
+            Err(KeyStoreError::SymlinkRefused { path }) => assert_eq!(path, link),
+            other => panic!("expected SymlinkRefused, got {other:?}"),
+        }
+    }
+
+    /// Creating a phrase file uses `O_CREAT | O_EXCL | O_NOFOLLOW` relative to the checked parent,
+    /// so a pre-existing symlink at the name is refused without writing through it.
+    #[test]
+    fn open_phrase_file_refuses_a_preexisting_symlink() {
+        let dir = private_dir();
+        let target = dir.path().join("target.phrase");
+        fs::write(&target, b"original").expect("write link target");
+        set_mode(&target, 0o600);
+        let link = dir.path().join("recovery.phrase");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink phrase file");
+
+        match open_phrase_file(&link) {
+            Err(KeyStoreError::Io { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists)
+            }
+            other => panic!("expected Io(AlreadyExists), got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(&target).expect("link target is untouched"),
+            b"original"
+        );
+        assert_eq!(
+            fs::read_link(&link).expect("the link itself survives"),
+            target
+        );
+    }
+
     #[test]
     fn an_empty_restore_phrase_file_is_rejected() {
         let dir = private_dir();
@@ -1100,6 +1398,113 @@ mod tests {
         assert!(
             parse_recovery_phrase(&text).is_err(),
             "an empty phrase must never restore a seed"
+        );
+    }
+
+    /// A10.45's cadence is **two-thirds of `exp`**, which is day 60 of A7b's 90-day certificate;
+    /// the remaining third is the retry window.
+    #[test]
+    fn renewal_starts_at_two_thirds_of_the_certificate_lifetime() {
+        assert_eq!(next_renewal_at(1_000, 1_090), 1_060);
+        assert_eq!(next_renewal_at(0, 9), 6, "6 s into a 9 s certificate");
+
+        let ts = 1_700_000_000;
+        let exp = ts + HOST_OP_CERT_TTL_SECS;
+        assert_eq!(
+            next_renewal_at(ts, exp),
+            ts + 2 * HOST_OP_CERT_TTL_SECS / 3,
+            "the default certificate renews at day 60, not day 90"
+        );
+        assert_eq!(
+            HOST_OP_CERT_TTL_SECS,
+            90 * 24 * 60 * 60,
+            "A7b's bound this cadence is defined against"
+        );
+    }
+
+    /// A certificate with no lifetime (or an inverted one) renews at its own `ts`; the callers'
+    /// expiry check, not this arithmetic, decides what to do then.
+    #[test]
+    fn a_zero_or_inverted_lifetime_renews_at_the_certificate_start() {
+        assert_eq!(next_renewal_at(500, 500), 500);
+        assert_eq!(next_renewal_at(500, 400), 500);
+    }
+
+    /// The renewal instant is inclusive of `ts` and never leaves `u64`, even for a pathological
+    /// certificate lifetime.
+    #[test]
+    fn the_renewal_instant_stays_inside_the_certificate_window() {
+        assert_eq!(next_renewal_at(0, u64::MAX), u64::MAX / 3 * 2);
+        assert_eq!(next_renewal_at(u64::MAX - 2, u64::MAX), u64::MAX - 1);
+    }
+
+    /// A10.45 stops serving at `exp`, not before and not after.
+    #[test]
+    fn an_operating_certificate_is_refused_at_and_after_its_expiry() {
+        let identity = mint_host_identity_with_ttl([0x11; ROOT_SEED_LEN], 1_000, 9);
+
+        assert!(ensure_op_cert_unexpired(&identity.op_cert, 1_008).is_ok());
+        assert!(
+            ensure_op_cert_unexpired(&identity.op_cert, 1_009).is_err(),
+            "now == exp means the certificate has expired"
+        );
+        assert!(ensure_op_cert_unexpired(&identity.op_cert, 1_010).is_err());
+    }
+
+    /// The renewal path reloads the seed itself, and refuses a seed file that now names a
+    /// different root: certifying under it would contradict the `host_root_pk` every connection
+    /// presents.
+    #[test]
+    fn a_renewal_reloads_the_seed_and_refuses_a_different_root() {
+        let dir = private_dir();
+        let seed_path = dir.path().join("host.seed");
+        fs::write(&seed_path, [0x31; ROOT_SEED_LEN]).expect("write seed file");
+        set_mode(&seed_path, 0o600);
+        let store = SeedFileStore::new(seed_path);
+
+        let same_root = RootKey::from_seed([0x31; ROOT_SEED_LEN]).public_key();
+        let (signing, cert) = reload_seed_and_renew(&store, &same_root, 1_000, 9)
+            .expect("the seed file still names the process's root");
+        assert_eq!(cert.host_op_pk, signing.verifying_key().as_bytes().to_vec());
+        assert_eq!(cert.exp, 1_009);
+
+        let different_root = RootKey::from_seed([0x32; ROOT_SEED_LEN]).public_key();
+        assert!(
+            matches!(
+                reload_seed_and_renew(&store, &different_root, 1_000, 9),
+                Err(RenewalError::RootChanged)
+            ),
+            "a swapped seed file must fail the renewal, not certify a foreign root"
+        );
+    }
+
+    /// A reconnect backoff must not carry the loop past `exp`; the loop wakes at expiry and the
+    /// top-of-loop check stops it.
+    #[test]
+    fn a_backoff_wait_is_clamped_to_the_certificate_expiry() {
+        use std::time::Duration;
+
+        let identity = mint_host_identity_with_ttl([0x12; ROOT_SEED_LEN], 1_000, 90);
+        let backoff = Duration::from_secs(30);
+
+        assert_eq!(
+            clamp_to_certificate_expiry(backoff, &identity.op_cert, 1_000),
+            backoff,
+            "a wait that ends before `exp` is unchanged"
+        );
+        assert_eq!(
+            clamp_to_certificate_expiry(backoff, &identity.op_cert, 1_070),
+            Duration::from_secs(20),
+            "the wait ends at `exp`, not after it"
+        );
+        assert_eq!(
+            clamp_to_certificate_expiry(backoff, &identity.op_cert, 1_090),
+            Duration::ZERO
+        );
+        assert_eq!(
+            clamp_to_certificate_expiry(backoff, &identity.op_cert, 2_000),
+            Duration::ZERO,
+            "an already-expired certificate never yields a positive wait"
         );
     }
 

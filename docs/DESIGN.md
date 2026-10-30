@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.57) + Execution Plan
+# Spindle — System Design Document (draft v0.9.58) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -288,6 +288,27 @@
 > **served** and was then lost (not merely after a successful CONNECT). `max_reconnects(1)` remains: it bounds
 > the client-internal retry whose stale token fails fast, which is what makes `HostDaemon::run` return promptly
 > to the supervisor.
+> v0.9.58: one implementation change, no wire change. `spindle-hostd`'s headless binary now
+> implements **A10.45's mid-process certificate renewal** (td-81ef38). Renewal starts at
+> **two-thirds of the operating certificate's lifetime** (`ts + 2 * (exp - ts) / 3`, day 60 of
+> A7b's 90 days), leaving a 30-day retry window. At that instant the binary reloads the root seed
+> from `SeedFileStore` (the root is not kept resident between renewals), mints a **new operating
+> key** and re-issues the op cert under that root (`identity::renew_operating_identity` and its
+> explicit-lifetime form, the same primitive `mint_host_identity` uses so the two cannot drift),
+> and then continues its outer loop.
+> That continuation is a **planned reconnect**: `connect_host` re-authenticates with the new
+> operating key and re-mints/re-publishes the `HostDeviceCert` under it, while the process's
+> envelope `DeviceKey` (the same `Arc`) is untouched — so `host_fp` and `device_fp` are both
+> unchanged across a renewal. On a failed renewal (seed reload, changed root, or issuance) the
+> host keeps the sessions it already has, switches a `GateableCapIssuer` gate off so **no new
+> capability is minted**, logs the reason, and retries every 60 s (clamped to `exp`); it stops
+> serving with `ExitCode::FAILURE` only once `now >= op_cert.exp`. A new
+> `SPINDLE_HOST_OP_CERT_TTL_SECS`/`--op-cert-ttl-secs` knob (3 s..=90 days, default 90 days)
+> shortens the renewal point, retry window, and expiry together, for live exercise and operator
+> rotation; the 3 s floor keeps two-thirds of the lifetime strictly before expiry. Live proof: `tests/live_renewal.rs` runs the shipped binary at a 9 s lifetime
+> (renewing at 6 s) against the compose stack and requires a second `host daemon starting` line
+> with the same redacted `host_fp` and `device_fp`, a process that never exited, and a clean
+> SIGINT exit.
 
 ---
 
@@ -513,6 +534,11 @@ signer, result).
   persisted.** The operating key and the host's own envelope `DeviceKey` are **generated fresh
   and certified under the root** — the `HostOpKeyCert` and device-certificate chain A4 already
   defines — so they need no custody of their own and rotate without touching the seed.
+  **[added v0.9.58, td-f5f970]** The implementation additionally refuses **symlinked** or
+  **foreign-owned** seed entries and, for the same substitution reason, the one-shot
+  recovery-phrase files. This is hardening around A10.41's rule, not a replacement for it: the
+  `0600`/`0700` mode requirement above remains normative, and the extra refusals only reject
+  entries whose mode bits alone cannot establish who controls them.
   **[added v0.9.38, A10.43; corrected and extended v0.9.39, A10.44]** "Generated fresh" means **at every
   process start**, and it governs **both** keys the sentence above names, not only the operating key. The
   operating key and the host's envelope `DeviceKey` are alike re-minted from the OS CSPRNG each time the

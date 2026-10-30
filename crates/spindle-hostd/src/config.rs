@@ -30,6 +30,8 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
+use spindle_hostd::HOST_OP_CERT_TTL_SECS;
+
 /// Runtime configuration for one host process.
 #[derive(Debug)]
 pub(crate) struct Config {
@@ -65,6 +67,13 @@ pub(crate) struct Config {
     /// `SPINDLE_METRICS_ADDR` / `--metrics-addr`. `Some` installs the Prometheus exporter in
     /// `main`; `None` leaves every metrics macro a no-op.
     pub(crate) metrics_addr: Option<String>,
+    /// `SPINDLE_HOST_OP_CERT_TTL_SECS` / `--op-cert-ttl-secs`. Lifetime of every operating-key
+    /// certificate this process mints, in seconds. Defaults to A7b's 90-day
+    /// [`HOST_OP_CERT_TTL_SECS`], which is also the maximum: the knob exists to shorten every
+    /// window proportionally (renewal point, retry window, and expiry), not to lengthen the
+    /// design's bound. The minimum is [`MIN_OP_CERT_TTL_SECS`] (3 s), so the two-thirds renewal
+    /// point still leaves at least one second before expiry instead of landing on `ts`.
+    pub(crate) op_cert_ttl_secs: u64,
 }
 
 /// Everything [`Config::from_env_and_args`] can reject.
@@ -80,6 +89,11 @@ pub(crate) enum ConfigError {
     BadBindIp { given: String },
     #[error("invalid value {given:?} for --init / SPINDLE_HOST_INIT (expected 1|true|0|false)")]
     BadBoolean { given: String },
+    #[error(
+        "invalid value {given:?} for --op-cert-ttl-secs / SPINDLE_HOST_OP_CERT_TTL_SECS (expected \
+         a whole number of seconds in {min}..={max}, where {max} is the 90-day A7b lifetime)"
+    )]
+    BadOpCertTtl { given: String, min: u64, max: u64 },
     #[error(
         "--init, --restore-seed-file, and SPINDLE_HOST_RESTORE_SEED cannot be combined; choose \
          one enrollment path"
@@ -129,6 +143,11 @@ the env var if both are set:
     --metrics-addr <addr>       SPINDLE_METRICS_ADDR         (optional; Prometheus scrape listener,
                                                              e.g. 127.0.0.1:9100. Unset → no
                                                              recorder is installed)
+    --op-cert-ttl-secs <n>      SPINDLE_HOST_OP_CERT_TTL_SECS (optional; operating-certificate
+                                                             lifetime in seconds, 3..=7776000,
+                                                             default 7776000 = 90 days. Shortening
+                                                             it shortens the renewal point, the
+                                                             retry window, and the expiry together)
     -h, --help                  show this message
 
 A first run (no seed file) requires exactly one of --init, --restore-seed-file <path>, or
@@ -150,6 +169,7 @@ impl Config {
         let restore_seed = env::var("SPINDLE_HOST_RESTORE_SEED").ok();
         let mut restore_seed_file = None;
         let mut metrics_addr = env::var("SPINDLE_METRICS_ADDR").ok();
+        let mut op_cert_ttl_secs = env::var("SPINDLE_HOST_OP_CERT_TTL_SECS").ok();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -203,6 +223,11 @@ impl Config {
                             ConfigError::FlagMissingValue("metrics-addr".to_string())
                         })?)
                 }
+                "--op-cert-ttl-secs" => {
+                    op_cert_ttl_secs = Some(args.next().ok_or_else(|| {
+                        ConfigError::FlagMissingValue("op-cert-ttl-secs".to_string())
+                    })?)
+                }
                 other => return Err(ConfigError::unknown_arg(other)),
             }
         }
@@ -216,6 +241,10 @@ impl Config {
         let init = match init {
             Some(given) => parse_bool(&given)?,
             None => false,
+        };
+        let op_cert_ttl_secs = match op_cert_ttl_secs {
+            Some(given) => parse_op_cert_ttl(&given)?,
+            None => HOST_OP_CERT_TTL_SECS,
         };
         if init && (restore_seed.is_some() || restore_seed_file.is_some()) {
             return Err(ConfigError::ConflictingEnrollment);
@@ -239,8 +268,42 @@ impl Config {
             restore_seed,
             restore_seed_file: restore_seed_file.map(PathBuf::from),
             metrics_addr,
+            op_cert_ttl_secs,
         })
     }
+}
+
+/// Shortest operating-certificate lifetime the knob accepts, in seconds.
+///
+/// A10.45's renewal point is two-thirds of `exp`, so a 1 s certificate would renew at `ts` and a
+/// 2 s one at `ts + 1`, leaving a host either reconnecting continuously or with a one-second
+/// window in which a connect slower than that exits the process at expiry. Three seconds puts
+/// the renewal point at `ts + 2` and keeps a full second before expiry — small enough to exercise
+/// the path live (the live tests use 9 s), large enough not to be self-defeating.
+const MIN_OP_CERT_TTL_SECS: u64 = 3;
+
+/// The rejection value for every form [`parse_op_cert_ttl`] refuses.
+fn invalid_op_cert_ttl(given: &str) -> ConfigError {
+    ConfigError::BadOpCertTtl {
+        given: given.to_string(),
+        min: MIN_OP_CERT_TTL_SECS,
+        max: HOST_OP_CERT_TTL_SECS,
+    }
+}
+
+/// Parses the operating-certificate lifetime: a whole number of seconds in
+/// [`MIN_OP_CERT_TTL_SECS`]`..=`A7b's 90-day bound. Zero (and the one- and two-second lifetimes
+/// that make the two-thirds renewal point coincide with, or sit one second before, expiry) is
+/// refused, and anything above the design bound is a configuration mistake rather than a longer
+/// rotation policy — the knob's documented purpose is shortening every window proportionally.
+fn parse_op_cert_ttl(given: &str) -> Result<u64, ConfigError> {
+    let seconds = given
+        .parse::<u64>()
+        .map_err(|_| invalid_op_cert_ttl(given))?;
+    if !(MIN_OP_CERT_TTL_SECS..=HOST_OP_CERT_TTL_SECS).contains(&seconds) {
+        return Err(invalid_op_cert_ttl(given));
+    }
+    Ok(seconds)
 }
 
 /// Parses the `1`/`true`/`0`/`false` forms `SPINDLE_HOST_INIT` accepts. Case-sensitive, matching
@@ -267,7 +330,7 @@ mod tests {
     /// and must not inherit whatever the developer's shell exported.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const ENV_NAMES: [&str; 9] = [
+    const ENV_NAMES: [&str; 10] = [
         "SPINDLE_NATS_URL",
         "SPINDLE_HOST_SEED_FILE",
         "SPINDLE_HOST_STORE",
@@ -277,6 +340,7 @@ mod tests {
         "SPINDLE_HOST_INIT",
         "SPINDLE_HOST_RESTORE_SEED",
         "SPINDLE_METRICS_ADDR",
+        "SPINDLE_HOST_OP_CERT_TTL_SECS",
     ];
 
     /// Clears every variable this module reads, applies `vars`, and restores the previous
@@ -336,6 +400,10 @@ mod tests {
         assert_eq!(config.restore_seed, None);
         assert_eq!(config.restore_seed_file, None);
         assert_eq!(config.metrics_addr, None);
+        assert_eq!(
+            config.op_cert_ttl_secs, HOST_OP_CERT_TTL_SECS,
+            "an unset knob must keep A7b's 90-day lifetime"
+        );
     }
 
     #[test]
@@ -350,6 +418,7 @@ mod tests {
             ),
             ("SPINDLE_HOST_INIT", "true"),
             ("SPINDLE_METRICS_ADDR", "127.0.0.1:9100"),
+            ("SPINDLE_HOST_OP_CERT_TTL_SECS", "9"),
         ]);
         let _env = CleanEnv::new(&vars);
         let config = parse(&[]).expect("full env configuration parses");
@@ -368,6 +437,7 @@ mod tests {
         );
         assert!(config.init);
         assert_eq!(config.metrics_addr.as_deref(), Some("127.0.0.1:9100"));
+        assert_eq!(config.op_cert_ttl_secs, 9);
     }
 
     #[test]
@@ -389,6 +459,8 @@ mod tests {
             "/tmp/flag/recovery.txt",
             "--metrics-addr",
             "127.0.0.1:9200",
+            "--op-cert-ttl-secs",
+            "30",
         ])
         .expect("flags parse");
 
@@ -406,6 +478,67 @@ mod tests {
         );
         assert!(config.init);
         assert_eq!(config.metrics_addr.as_deref(), Some("127.0.0.1:9200"));
+        assert_eq!(config.op_cert_ttl_secs, 30);
+    }
+
+    /// The knob exists to exercise renewal live and to let an operator tighten rotation, so its
+    /// valid range is three seconds (the smallest lifetime whose two-thirds renewal point still
+    /// leaves a second before expiry) through A7b's 90-day bound.
+    #[test]
+    fn the_operating_certificate_lifetime_accepts_three_seconds_through_ninety_days() {
+        {
+            let mut env = REQUIRED_ENV.to_vec();
+            env.push(("SPINDLE_HOST_OP_CERT_TTL_SECS", "9"));
+            let _env = CleanEnv::new(&env);
+            assert_eq!(
+                parse(&[]).expect("env lifetime").op_cert_ttl_secs,
+                9,
+                "the environment spelling must be parsed"
+            );
+        }
+
+        let _env = CleanEnv::new(&REQUIRED_ENV);
+        for valid in [
+            MIN_OP_CERT_TTL_SECS,
+            9,
+            HOST_OP_CERT_TTL_SECS / 2,
+            HOST_OP_CERT_TTL_SECS,
+        ] {
+            let value = valid.to_string();
+            let config = parse(&["--op-cert-ttl-secs", value.as_str()]).expect("valid lifetime");
+            assert_eq!(config.op_cert_ttl_secs, valid, "value {valid}");
+        }
+    }
+
+    #[test]
+    fn zero_sub_three_and_absurd_operating_certificate_lifetimes_are_rejected() {
+        for invalid in [
+            "0".to_string(),
+            (MIN_OP_CERT_TTL_SECS - 1).to_string(),
+            (MIN_OP_CERT_TTL_SECS - 2).to_string(),
+            (HOST_OP_CERT_TTL_SECS + 1).to_string(),
+            u64::MAX.to_string(),
+            "not-a-number".to_string(),
+        ] {
+            let _env = CleanEnv::new(&REQUIRED_ENV);
+            match parse(&["--op-cert-ttl-secs", invalid.as_str()]) {
+                Err(ConfigError::BadOpCertTtl { given, min, max }) => {
+                    assert_eq!(given, invalid);
+                    assert_eq!(min, MIN_OP_CERT_TTL_SECS);
+                    assert_eq!(max, HOST_OP_CERT_TTL_SECS);
+                }
+                other => panic!("expected BadOpCertTtl for {invalid:?}, got {other:?}"),
+            }
+        }
+
+        // The environment spelling is validated by the same parser.
+        let mut env = REQUIRED_ENV.to_vec();
+        env.push(("SPINDLE_HOST_OP_CERT_TTL_SECS", "0"));
+        let _env = CleanEnv::new(&env);
+        match parse(&[]) {
+            Err(ConfigError::BadOpCertTtl { given, .. }) => assert_eq!(given, "0"),
+            other => panic!("expected BadOpCertTtl, got {other:?}"),
+        }
     }
 
     #[test]

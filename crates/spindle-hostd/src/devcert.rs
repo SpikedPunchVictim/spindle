@@ -106,7 +106,8 @@ pub enum DevCertPublishError {
 /// the device certificate to outlive the op cert that signs it. For an identity straight out of
 /// [`crate::mint_host_identity`] this is the same instant as `now + HOST_OP_CERT_TTL_SECS`
 /// (A7b/A10.45), but deriving it from the op cert keeps the invariant when the two are minted at
-/// different times, and leaves a future A10.45 renewal path free to renew only the op cert.
+/// different times — which is exactly what A10.45's renewal does: it renews only the op cert,
+/// and the device certificate re-minted on the following connect inherits the new `exp`.
 pub fn mint_device_cert(identity: &HostIdentity, now: u64) -> HostDeviceCert {
     mint_device_cert_from_parts(
         &identity.op_signing,

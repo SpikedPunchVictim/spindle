@@ -90,6 +90,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 
+# `rustix` backs the descriptor-based (rather than path-based) seed-custody checks in
+# `src/keystore.rs`: `open`/`openat`/`fstat` for the seed file and its parent directory, and
+# `process::geteuid` for the ownership half of that rule. It is the same pin and the same
+# target-scoped shape as `crates/spindle-host-core/Cargo.toml`'s free-space probe, plus the
+# `process` feature this crate needs for `geteuid`. Already in the tree via
+# `cap-std`/`cap-primitives` (1.1.4 in `Cargo.lock`); promoted to a direct dependency rather than
+# reaching through that private graph, exactly as host-core's own comment explains.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs", "process"] }
+
 # `tests/live_hostd.rs`'s own remaining code (Stage 4 part 2, td-539ffa): the `#[ignore]`d live
 # test that drives `HostDaemon` — and therefore the production `HostConnectAuthorizer<
 # SqliteDeviceLookup>` — against `deploy/docker-compose.yml`'s real NATS Auth Callout, in place of

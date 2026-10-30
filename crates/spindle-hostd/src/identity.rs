@@ -13,11 +13,13 @@
 //! - **A10.44** — the envelope [`DeviceKey`] is ephemeral too, for the same reason and per the
 //!   same rule ("exactly one of them is persisted"). That is why `device_fp` churns at every
 //!   start and per-device certified state is re-certified each start.
-//! - **A10.45** — mid-process certificate renewal (re-issuing the op cert and re-signing the
-//!   device cert at two-thirds of the 90-day `exp`) is **not implemented here**. This module
-//!   only mints at start. That is a known gap: a process alive past `HOST_OP_CERT_TTL_SECS`
-//!   presents an expired op cert, so the renewal path A10.45 specifies must be built before a
-//!   long-lived headless daemon can rely on this identity remaining valid for its whole life.
+//! - **A10.45** — mid-process renewal is the *operating half only*
+//!   ([`renew_operating_identity`]): a new operating key and a new op cert under the same root,
+//!   with `exp = now + HOST_OP_CERT_TTL_SECS`. The envelope [`DeviceKey`] is deliberately not an
+//!   input and is never re-minted, so `device_fp` stays stable across renewals. The binary owns
+//!   the timing (two-thirds of `exp`), the seed reload, and the reconnect that re-signs the
+//!   device certificate under the new operating key; this module only provides the issuance
+//!   primitive both start-up and renewal share.
 //!
 //! # Why the recovery phrase is grouped base32
 //!
@@ -72,19 +74,27 @@ pub struct HostIdentity {
 /// since the Unix epoch).
 ///
 /// This function only *derives* and *generates*; it never persists anything (A10.41: only the
-/// seed is persisted) and never renews mid-process (A10.45: not implemented here — see this
-/// module's doc comment).
+/// seed is persisted). The operating half goes through
+/// [`renew_operating_identity_with_ttl`] (which [`renew_operating_identity`] also wraps), so
+/// start-up and A10.45's mid-process renewal cannot drift.
 pub fn mint_host_identity(root_seed: [u8; ROOT_SEED_LEN], now: u64) -> HostIdentity {
+    mint_host_identity_with_ttl(root_seed, now, HOST_OP_CERT_TTL_SECS)
+}
+
+/// [`mint_host_identity`] with an explicit operating-certificate lifetime.
+///
+/// The daemon's `SPINDLE_HOST_OP_CERT_TTL_SECS`/`--op-cert-ttl-secs` knob selects it; the default
+/// remains A7b's [`HOST_OP_CERT_TTL_SECS`]. It is public because the binary owns configuration
+/// while this module owns issuance, and both start-up and renewal must use the same value.
+pub fn mint_host_identity_with_ttl(
+    root_seed: [u8; ROOT_SEED_LEN],
+    now: u64,
+    ttl_secs: u64,
+) -> HostIdentity {
     let root = RootKey::from_seed(root_seed);
 
-    // A10.43: a fresh operating key at every process start, certified by the root below.
-    let op_signing = SigningKey::generate(&mut OsRng);
-    let op_cert = issue_host_op_key_cert(
-        &root,
-        &op_signing.verifying_key(),
-        now,
-        now + HOST_OP_CERT_TTL_SECS,
-    );
+    // A10.43/A10.45: one issuance primitive for start-up and renewal.
+    let (op_signing, op_cert) = renew_operating_identity_with_ttl(root_seed, now, ttl_secs);
 
     // A10.44: the envelope DeviceKey is ephemeral per process, not per renewal.
     let device = DeviceKey::generate();
@@ -100,6 +110,43 @@ pub fn mint_host_identity(root_seed: [u8; ROOT_SEED_LEN], now: u64) -> HostIdent
         host_fp,
         device_fp,
     }
+}
+
+/// A10.45's mid-process renewal: mints a **new operating key** and a new operating-key
+/// certificate under the root loaded from `root_seed`, without touching the envelope
+/// [`DeviceKey`].
+///
+/// This is exactly the operating half of [`mint_host_identity`], at the certificate's default
+/// [`HOST_OP_CERT_TTL_SECS`] lifetime: `exp = now + HOST_OP_CERT_TTL_SECS`. The caller supplies
+/// the seed (reloaded from custody) and the renewal instant; it keeps the process's existing
+/// envelope key, so `device_fp` does not change. Re-signing the device certificate under the
+/// returned operating key is the reconnect path's job, not this function's.
+pub fn renew_operating_identity(
+    root_seed: [u8; ROOT_SEED_LEN],
+    now: u64,
+) -> (SigningKey, HostOpKeyCert) {
+    renew_operating_identity_with_ttl(root_seed, now, HOST_OP_CERT_TTL_SECS)
+}
+
+/// [`renew_operating_identity`] with an explicit lifetime, for the binary's
+/// `SPINDLE_HOST_OP_CERT_TTL_SECS` knob. `exp` is `now + ttl_secs` (saturating), the same rule the
+/// default-lifetime form uses.
+pub fn renew_operating_identity_with_ttl(
+    root_seed: [u8; ROOT_SEED_LEN],
+    now: u64,
+    ttl_secs: u64,
+) -> (SigningKey, HostOpKeyCert) {
+    // The root is loaded here and dropped with this function: A10.45 says it loads at each
+    // renewal, so it is never resident between renewals in the caller either.
+    let root = RootKey::from_seed(root_seed);
+    let op_signing = SigningKey::generate(&mut OsRng);
+    let op_cert = issue_host_op_key_cert(
+        &root,
+        &op_signing.verifying_key(),
+        now,
+        now.saturating_add(ttl_secs),
+    );
+    (op_signing, op_cert)
 }
 
 /// Renders a root seed as the human recovery phrase of DESIGN.md A10.41: lowercase RFC 4648
@@ -215,6 +262,49 @@ mod tests {
         );
         assert_eq!(identity.op_cert.ts, NOW);
         assert_eq!(identity.op_cert.exp, NOW + HOST_OP_CERT_TTL_SECS);
+    }
+
+    /// A10.45's renewal mints a *new* operating key and certifies it under the root the seed
+    /// names, with the default lifetime; it takes no envelope key, so `device_fp` cannot move.
+    #[test]
+    fn renewal_mints_a_new_operating_key_under_the_same_root() {
+        let (first_signing, first_cert) = renew_operating_identity(SEED, NOW);
+        let (second_signing, second_cert) = renew_operating_identity(SEED, NOW);
+
+        assert_ne!(
+            first_signing.to_bytes(),
+            second_signing.to_bytes(),
+            "a renewal must mint a fresh operating key, not reuse the old one"
+        );
+        assert_eq!(
+            first_cert.host_op_pk,
+            first_signing.verifying_key().as_bytes().to_vec()
+        );
+        assert_eq!(
+            second_cert.host_op_pk,
+            second_signing.verifying_key().as_bytes().to_vec()
+        );
+        assert_eq!(first_cert.ts, NOW);
+        assert_eq!(first_cert.exp, NOW + HOST_OP_CERT_TTL_SECS);
+
+        let root_pk = RootKey::from_seed(SEED).public_key();
+        for cert in [&first_cert, &second_cert] {
+            verify_host_op_key_cert(cert, &root_pk, &root_fp_of(&root_pk), NOW)
+                .expect("a renewed op cert must chain to the seed's root");
+        }
+    }
+
+    /// The configurable lifetime reaches the mint, so shortening it for a live exercise really
+    /// shortens the certificate rather than only the renewal timer.
+    #[test]
+    fn an_explicit_ttl_bounds_the_minted_certificate() {
+        let identity = mint_host_identity_with_ttl(SEED, NOW, 9);
+        assert_eq!(identity.op_cert.ts, NOW);
+        assert_eq!(identity.op_cert.exp, NOW + 9);
+
+        let (signing, cert) = renew_operating_identity_with_ttl(SEED, NOW, 9);
+        assert_eq!(cert.host_op_pk, signing.verifying_key().as_bytes().to_vec());
+        assert_eq!(cert.exp, NOW + 9);
     }
 
     #[test]

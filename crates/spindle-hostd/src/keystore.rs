@@ -24,10 +24,34 @@
 //! know: the seed may already have been readable by someone else. A10.41(c) scopes this rule to
 //! POSIX: where no meaningful mode bits exist the seed-file store is not a supported configuration
 //! at all, and every operation on non-Unix targets returns [`KeyStoreError::UnsupportedPlatform`].
+//!
+//! # Descriptor-based checks close the substitution window
+//!
+//! A10.41's mode rule stays exactly as specified; this store enforces it on a descriptor rather
+//! than on the path. Statting a path and then re-opening it for reading is two independent
+//! resolutions of the same name, so the entry can be swapped between the check and the read. The
+//! parent directory is opened once (`O_NOFOLLOW`), `fstat`ed, and the seed is opened *through that
+//! descriptor* (`openat`); both the seed and its parent must also be owned by the calling effective
+//! uid. Without the ownership half, an attacker with write access to a non-sticky, group-writable
+//! ancestor could rename the `0700` directory and substitute their own `0700` directory holding a
+//! `0600` seed of their choosing: the mode checks would pass and the host would load an
+//! attacker-chosen root. Ownership is the fact such a substitution cannot forge, so a mismatched
+//! uid is a refusal ([`KeyStoreError::NotOwned`]), never a correction.
+//!
+//! The same discipline backs the binary's one-shot recovery-phrase files through
+//! [`open_secret_file`] and [`create_secret_file`]: a check followed by a separate
+//! `read_to_string(path)`/`open(path)` would leave the identical window open.
 
 use std::path::PathBuf;
 
 use thiserror::Error;
+
+#[cfg(unix)]
+use rustix::fs::{fstat, openat, Mode, OFlags};
+#[cfg(unix)]
+use rustix::io::Errno;
+#[cfg(unix)]
+use std::io::{Read as _, Write as _};
 
 /// Length in bytes of a host root seed. DESIGN.md A10.41 persists this value verbatim; it is the
 /// seed `spindle_core::RootKey::from_seed` accepts.
@@ -53,9 +77,10 @@ pub trait HostKeyStore: Send + Sync {
 
 /// Everything [`HostKeyStore`] operations can fail with.
 ///
-/// Error messages name the path and, for mode failures, the octal mode found, because DESIGN.md
-/// A10.41 requires a refusal to be diagnosable — an operator has to be able to see which entry is
-/// wrong and why, rather than guess after a bare "permission denied".
+/// Error messages name the path and, for mode failures, the octal mode found (or, for ownership
+/// failures, the uid found), because DESIGN.md A10.41 requires a refusal to be diagnosable — an
+/// operator has to be able to see which entry is wrong and why, rather than guess after a bare
+/// "permission denied".
 #[derive(Debug, Error)]
 pub enum KeyStoreError {
     /// No seed file exists. Deliberately distinct from every I/O failure: A10.41(b) forbids
@@ -75,8 +100,9 @@ pub enum KeyStoreError {
     )]
     ParentMissing { path: PathBuf },
 
-    /// The parent directory is wider than the required `0700`. Reused by [`check_parent_mode`]
-    /// for the one-shot recovery-phrase files, whose directory is held to the same rule.
+    /// The parent directory is wider than the required `0700`. Also returned for the one-shot
+    /// recovery-phrase files ([`open_secret_file`]/[`create_secret_file`]), whose directory is
+    /// held to the same rule.
     #[error(
         "directory {} has mode 0o{:o}, wider than the required 0o700; refusing to use it rather \
          than silently correcting it, since the secret it holds may already have been read",
@@ -85,8 +111,9 @@ pub enum KeyStoreError {
     )]
     ParentModeTooWide { path: PathBuf, mode: u32 },
 
-    /// The secret file is wider than the required `0600`. Reused by [`check_file_mode`] for the
-    /// one-shot recovery-phrase files, which are held to the same rule as the seed file.
+    /// The secret file is wider than the required `0600`. Also returned for the one-shot
+    /// recovery-phrase files ([`open_secret_file`]/[`create_secret_file`]), which are held to the
+    /// same rule as the seed file.
     #[error(
         "file {} has mode 0o{:o}, wider than the required 0o600; refusing to read it rather than \
          silently correcting it, since the secret may already have been read",
@@ -94,6 +121,33 @@ pub enum KeyStoreError {
         mode
     )]
     SeedFileModeTooWide { path: PathBuf, mode: u32 },
+
+    /// The seed file or its parent directory belongs to a uid other than this process's effective
+    /// uid.
+    ///
+    /// A10.41's mode rule is the normative requirement; this ownership check is hardening around
+    /// it, because a `0700` directory and a `0600` file say nothing about *who* owns them. An
+    /// entry owned by another account is one this host cannot trust regardless of its mode — see
+    /// this module's "substitution window" section.
+    #[error(
+        "{} is owned by uid {uid}, not the user running the host; refusing to use an entry \
+         another account controls, whatever its mode says",
+        .path.display()
+    )]
+    NotOwned { path: PathBuf, uid: u32 },
+
+    /// A symbolic link was found where the seed file or its parent directory was expected.
+    ///
+    /// A dedicated variant rather than [`KeyStoreError::Io`] carrying `ELOOP`: "too many levels of
+    /// symbolic links" names neither the entry nor the policy, and this is a refusal an operator
+    /// may need to act on. Naming the path and the rule is the difference between a diagnosis and
+    /// a puzzle. Some BSDs report `EMLINK` from `O_NOFOLLOW` instead of `ELOOP`, so both map here.
+    #[error(
+        "{} is a symbolic link; the host seed file and its parent directory must be real entries, \
+         not links",
+        .path.display()
+    )]
+    SymlinkRefused { path: PathBuf },
 
     /// The file exists but is not exactly [`ROOT_SEED_LEN`] bytes.
     #[error(
@@ -134,9 +188,9 @@ pub enum KeyStoreError {
 /// Headless host seed custody: the raw 32-byte seed in a file whose mode is `0600`, inside a
 /// parent directory whose mode is at most `0700` (DESIGN.md A10.41).
 ///
-/// Construction is infallible; the mode checks run on every load and store, so a directory whose
-/// permissions get widened while the host is running is caught on the next read rather than
-/// trusted from a check done once at start-up.
+/// Construction is infallible; the mode, owner, and link checks run on every load and store, so a
+/// directory whose permissions get widened while the host is running is caught on the next read
+/// rather than trusted from a check done once at start-up.
 pub struct SeedFileStore {
     path: PathBuf,
 }
@@ -156,93 +210,115 @@ impl SeedFileStore {
 #[cfg(unix)]
 impl HostKeyStore for SeedFileStore {
     fn load_root_seed(&self) -> Result<[u8; ROOT_SEED_LEN], KeyStoreError> {
-        self.ensure_parent_is_private()?;
-
-        let metadata = match std::fs::metadata(&self.path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        // One descriptor for the directory, and the seed opened relative to it: the directory
+        // whose mode and owner were checked is the directory the seed is read from. Statting a
+        // path and then re-opening it (the previous implementation) left a window in which the
+        // name could be re-pointed at a different entry.
+        let dir = open_private_dir(parent_dir(&self.path))?;
+        let fd = match openat(
+            &dir,
+            secret_file_name(&self.path)?,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => {
                 return Err(KeyStoreError::Absent {
                     path: self.path.clone(),
                 });
             }
-            Err(source) => {
+            Err(Errno::LOOP) | Err(Errno::MLINK) => {
+                return Err(KeyStoreError::SymlinkRefused {
+                    path: self.path.clone(),
+                });
+            }
+            Err(errno) => {
                 return Err(KeyStoreError::Io {
                     path: self.path.clone(),
-                    source,
+                    source: errno.into(),
                 });
             }
         };
 
-        // Check the mode *before* reading the secret, so a seed that is already world-readable is
-        // never copied into this process merely to discover that it should not have been read.
-        // `metadata.mode()` carries file-type bits as well; mask them off before comparing.
-        let mode = metadata.mode() & 0o7777;
-        if mode & !0o600 != 0 {
-            return Err(KeyStoreError::SeedFileModeTooWide {
-                path: self.path.clone(),
-                mode,
-            });
-        }
+        // Both checks read the descriptor the bytes will be read from, and both run before a
+        // single seed byte is copied into this process.
+        let stat = check_secret_fd(&self.path, &fd)?;
 
-        let bytes = std::fs::read(&self.path).map_err(|source| KeyStoreError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
-        let len = bytes.len();
-        let seed: [u8; ROOT_SEED_LEN] =
-            bytes.try_into().map_err(|_| KeyStoreError::WrongLength {
+        // The length comes from the same descriptor, so it is the length the read below is
+        // bounded by; `read_exact` refuses a file that shrank after the `fstat`.
+        let len = usize::try_from(stat.st_size).unwrap_or(usize::MAX);
+        if len != ROOT_SEED_LEN {
+            return Err(KeyStoreError::WrongLength {
                 path: self.path.clone(),
                 len,
                 expected: ROOT_SEED_LEN,
+            });
+        }
+        let mut file = std::fs::File::from(fd);
+        let mut seed = [0u8; ROOT_SEED_LEN];
+        file.read_exact(&mut seed)
+            .map_err(|source| KeyStoreError::Io {
+                path: self.path.clone(),
+                source,
             })?;
         Ok(seed)
     }
 
     fn store_root_seed(&self, seed: &[u8; ROOT_SEED_LEN]) -> Result<(), KeyStoreError> {
-        self.ensure_parent_is_private()?;
+        let dir = open_private_dir(parent_dir(&self.path))?;
 
-        // `create_new` is the enforcement of "never overwrite a seed": it is atomic in the
+        // `O_EXCL` is the enforcement of "never overwrite a seed": it is atomic in the
         // filesystem, so two concurrent first runs cannot both believe they won the race and
-        // silently replace one another's `host_fp`. `mode(0o600)` is the requested permission;
-        // the process umask may narrow it further, which is fine — narrower is never "wider".
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&self.path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        // silently replace one another's `host_fp`. POSIX `O_CREAT | O_EXCL` refuses a
+        // pre-existing symbolic link as `EEXIST` — without following it — so that refusal
+        // surfaces as `AlreadyExists`; `O_NOFOLLOW` guarantees no descriptor can ever name a
+        // link's target. `Mode::from_bits_truncate(0o600)` is the requested permission; the
+        // process umask may narrow it further, which is fine — narrower is never "wider".
+        let fd = match openat(
+            &dir,
+            secret_file_name(&self.path)?,
+            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::EXIST) => {
                 return Err(KeyStoreError::AlreadyExists {
                     path: self.path.clone(),
                 });
             }
-            Err(source) => {
+            Err(Errno::LOOP) | Err(Errno::MLINK) => {
+                return Err(KeyStoreError::SymlinkRefused {
+                    path: self.path.clone(),
+                });
+            }
+            Err(errno) => {
                 return Err(KeyStoreError::Io {
                     path: self.path.clone(),
-                    source,
+                    source: errno.into(),
                 });
             }
         };
 
-        std::io::Write::write_all(&mut file, seed).map_err(|source| KeyStoreError::Io {
+        // Confirm on the descriptor that the entry just created belongs to this process before
+        // writing the secret into it. `O_EXCL` makes a foreign pre-existing entry impossible on a
+        // well-behaved filesystem; the check is here so that a directory or file server that
+        // reports a different owner is a refusal, not a write.
+        let stat = fstat(&fd).map_err(|errno| KeyStoreError::Io {
+            path: self.path.clone(),
+            source: errno.into(),
+        })?;
+        check_owner(&self.path, stat.st_uid)?;
+
+        let mut file = std::fs::File::from(fd);
+        file.write_all(seed).map_err(|source| KeyStoreError::Io {
             path: self.path.clone(),
             source,
         })
     }
 }
 
-#[cfg(unix)]
-impl SeedFileStore {
-    /// A10.41's parent-directory half of the mode rule. Called before any read or write, so an
-    /// over-wide directory is refused identically at load and store time.
-    fn ensure_parent_is_private(&self) -> Result<(), KeyStoreError> {
-        check_parent_mode(&self.path)
-    }
-}
-
 /// The directory `path` lives in. A bare relative file name has an empty parent; treat that as
-/// the current directory rather than statting an empty path.
+/// the current directory rather than opening an empty path.
 #[cfg(unix)]
 fn parent_dir(path: &std::path::Path) -> &std::path::Path {
     path.parent()
@@ -250,64 +326,254 @@ fn parent_dir(path: &std::path::Path) -> &std::path::Path {
         .unwrap_or_else(|| std::path::Path::new("."))
 }
 
-/// A10.41's parent-directory half of the mode rule, for a secret file at `path`.
+/// Opens `dir` and applies A10.41's parent-directory half of the mode rule (at most `0700`) to
+/// the descriptor it returns, together with this module's ownership hardening.
 ///
-/// Exposed so the binary can hold the one-shot recovery-phrase files (`--recovery-phrase-file`,
-/// `--restore-seed-file`) to the seed file's `0700` directory rule without re-implementing it or
-/// drifting from the diagnostics [`SeedFileStore`] already emits. The check is a refusal that
-/// names the directory and the mode found; it never `chmod`s anything on the operator's behalf.
+/// Returning the descriptor rather than dropping it lets callers open the secret *through* it
+/// (`openat`): the directory that passed the check is the directory the secret is read from or
+/// created in, with no window in which the path could be re-pointed. `NOFOLLOW` refuses a final
+/// component that is a symbolic link. The mode and uid are read from the descriptor, never from
+/// a separate path lookup.
 #[cfg(unix)]
-pub fn check_parent_mode(path: &std::path::Path) -> Result<(), KeyStoreError> {
-    let parent = parent_dir(path);
-    let metadata = match std::fs::metadata(parent) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+fn open_private_dir(dir: &std::path::Path) -> Result<rustix::fd::OwnedFd, KeyStoreError> {
+    let fd = match rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => {
             return Err(KeyStoreError::ParentMissing {
-                path: parent.to_path_buf(),
+                path: dir.to_path_buf(),
             });
         }
-        Err(source) => {
+        Err(Errno::NOTDIR) => {
+            // `O_DIRECTORY` reports a final component that is a link to a directory as `ENOTDIR`
+            // on some kernels instead of `ELOOP`. The refusal is already decided; this read-only
+            // `lstat` only picks the diagnostic, never the outcome.
+            let is_link = std::fs::symlink_metadata(dir)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false);
+            return Err(if is_link {
+                KeyStoreError::SymlinkRefused {
+                    path: dir.to_path_buf(),
+                }
+            } else {
+                KeyStoreError::ParentMissing {
+                    path: dir.to_path_buf(),
+                }
+            });
+        }
+        Err(Errno::LOOP) | Err(Errno::MLINK) => {
+            return Err(KeyStoreError::SymlinkRefused {
+                path: dir.to_path_buf(),
+            });
+        }
+        Err(errno) => {
             return Err(KeyStoreError::Io {
-                path: parent.to_path_buf(),
-                source,
+                path: dir.to_path_buf(),
+                source: errno.into(),
             });
         }
     };
-    if !metadata.is_dir() {
-        return Err(KeyStoreError::ParentMissing {
-            path: parent.to_path_buf(),
-        });
-    }
 
-    let mode = metadata.mode() & 0o7777;
+    let stat = fstat(&fd).map_err(|errno| KeyStoreError::Io {
+        path: dir.to_path_buf(),
+        source: errno.into(),
+    })?;
+    // `st_mode` is `u16` on some targets and `u32` on others; the diagnostic field is `u32`.
+    let mode = (stat.st_mode & 0o7777) as u32;
     if mode & !0o700 != 0 {
         return Err(KeyStoreError::ParentModeTooWide {
-            path: parent.to_path_buf(),
+            path: dir.to_path_buf(),
             mode,
+        });
+    }
+    check_owner(dir, stat.st_uid)?;
+    Ok(fd)
+}
+
+/// The final component of `path`, i.e. the name `openat` resolves inside the checked parent
+/// directory.
+#[cfg(unix)]
+fn secret_file_name(path: &std::path::Path) -> Result<&std::ffi::OsStr, KeyStoreError> {
+    path.file_name().ok_or_else(|| KeyStoreError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "seed path has no final component to open",
+        ),
+    })
+}
+
+/// This module's ownership half of the hardening: the seed and the directory holding it must
+/// belong to the calling effective uid.
+///
+/// `uid` is a parameter rather than read here so the refusal can be exercised without root; the
+/// production call sites pass the `st_uid` of the descriptor they are about to use.
+#[cfg(unix)]
+fn check_owner(path: &std::path::Path, uid: u32) -> Result<(), KeyStoreError> {
+    if uid != rustix::process::geteuid().as_raw() {
+        return Err(KeyStoreError::NotOwned {
+            path: path.to_path_buf(),
+            uid,
         });
     }
     Ok(())
 }
 
-/// A10.41's file half of the mode rule: `path` must carry no permission bit outside `0600`.
+/// Applies A10.41's file half of the mode rule — no permission bit outside `0600` — and this
+/// module's ownership rule to an already-open secret descriptor, returning its `fstat`.
 ///
-/// Exposed for the same reason as [`check_parent_mode`]. The mode is checked before any secret
-/// is read, so a file that is already group/world-readable is never copied into the process
-/// merely to discover that it should not have been read.
+/// Reading the checks off the descriptor is what makes them describe the object that will
+/// actually be read. The mode check runs before any secret byte is copied into the process, so a
+/// file that is already group/world-readable is never read merely to discover that it should not
+/// have been. `st_mode` carries file-type bits as well; they are masked off before comparing.
 #[cfg(unix)]
-pub fn check_file_mode(path: &std::path::Path) -> Result<(), KeyStoreError> {
-    let metadata = std::fs::metadata(path).map_err(|source| KeyStoreError::Io {
+fn check_secret_fd(
+    path: &std::path::Path,
+    fd: &rustix::fd::OwnedFd,
+) -> Result<rustix::fs::Stat, KeyStoreError> {
+    let stat = fstat(fd).map_err(|errno| KeyStoreError::Io {
         path: path.to_path_buf(),
-        source,
+        source: errno.into(),
     })?;
-    let mode = metadata.mode() & 0o7777;
+    let mode = (stat.st_mode & 0o7777) as u32;
     if mode & !0o600 != 0 {
         return Err(KeyStoreError::SeedFileModeTooWide {
             path: path.to_path_buf(),
             mode,
         });
     }
-    Ok(())
+    check_owner(path, stat.st_uid)?;
+    Ok(stat)
+}
+
+/// Opens a one-shot secret file (the recovery-phrase and restore-phrase files) for reading under
+/// the same descriptor discipline as the seed: the parent is opened and checked once
+/// ([`open_private_dir`]), the entry is opened *through that descriptor* (`openat`, `O_NOFOLLOW`),
+/// and [`check_secret_fd`] applies the `0600` mode and ownership rules to the descriptor the bytes
+/// will come from.
+///
+/// This exists because the binary target is a separate crate from this library: its previous
+/// `check_parent_mode` + `check_file_mode` + `read_to_string(path)` sequence resolved the name
+/// three times, leaving the same substitution window `SeedFileStore` closes. The caller reads
+/// through the returned handle (or converts it to text), never by path.
+///
+/// Errors keep the phrase path's existing variants: a missing parent is
+/// [`KeyStoreError::ParentMissing`], a wide parent [`KeyStoreError::ParentModeTooWide`], a
+/// symlinked entry [`KeyStoreError::SymlinkRefused`], a wide or foreign-owned file
+/// [`KeyStoreError::SeedFileModeTooWide`]/[`KeyStoreError::NotOwned`], and every other failure
+/// [`KeyStoreError::Io`].
+#[cfg(unix)]
+pub fn open_secret_file(path: &std::path::Path) -> Result<std::fs::File, KeyStoreError> {
+    let dir = open_private_dir(parent_dir(path))?;
+    let fd = match openat(
+        &dir,
+        secret_file_name(path)?,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::LOOP) | Err(Errno::MLINK) => {
+            return Err(KeyStoreError::SymlinkRefused {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(errno) => {
+            return Err(KeyStoreError::Io {
+                path: path.to_path_buf(),
+                source: errno.into(),
+            });
+        }
+    };
+    check_secret_fd(path, &fd)?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// Creates a new one-shot secret file (the recovery-phrase and restore-phrase files) under the
+/// same descriptor discipline as the seed: a checked parent descriptor, then
+/// `openat(O_CREAT | O_EXCL | O_NOFOLLOW, 0600)` relative to it, then an ownership check on the
+/// descriptor that will be written through.
+///
+/// `O_EXCL` preserves the existing "never overwrite an existing phrase file" behaviour; on a
+/// well-behaved filesystem it also refuses a pre-existing symbolic link at the name without
+/// following it. That refusal is reported as [`KeyStoreError::Io`] with `EEXIST` — the variant and
+/// message the path-based `create_new` produced — because this helper is shared with the restore
+/// phrase file, for which [`KeyStoreError::AlreadyExists`]'s "host seed file" wording would be
+/// wrong.
+#[cfg(unix)]
+pub fn create_secret_file(path: &std::path::Path) -> Result<std::fs::File, KeyStoreError> {
+    let dir = open_private_dir(parent_dir(path))?;
+    let fd = match openat(
+        &dir,
+        secret_file_name(path)?,
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    ) {
+        Ok(fd) => fd,
+        // `O_EXCL` reports a pre-existing entry, including a symlink, as `EEXIST`; the
+        // `Io(AlreadyExists)` diagnostic is exactly what the path-based `create_new` produced.
+        Err(errno) => {
+            return Err(KeyStoreError::Io {
+                path: path.to_path_buf(),
+                source: errno.into(),
+            });
+        }
+    };
+
+    let stat = fstat(&fd).map_err(|errno| KeyStoreError::Io {
+        path: path.to_path_buf(),
+        source: errno.into(),
+    })?;
+    check_owner(path, stat.st_uid)?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// A10.41's parent-directory half of the mode rule, for a secret file at `path`.
+///
+/// Retained for callers that only need to *check* a directory; it is not used by the I/O paths.
+/// The binary's one-shot recovery-phrase files (`--recovery-phrase-file`, `--restore-seed-file`)
+/// go through [`open_secret_file`]/[`create_secret_file`], which open and check the directory once
+/// and then open the entry relative to that descriptor — a `check` followed by a separate
+/// `open(path)` would reintroduce the substitution window. The check is a refusal that names the
+/// directory and the mode found; it never `chmod`s anything on the operator's behalf. It opens the
+/// directory (refusing a symlinked final component) and reads the mode and owner from that
+/// descriptor, so the answer describes the entry the kernel resolved.
+#[cfg(unix)]
+pub fn check_parent_mode(path: &std::path::Path) -> Result<(), KeyStoreError> {
+    open_private_dir(parent_dir(path)).map(drop)
+}
+
+/// A10.41's file half of the mode rule: `path` must carry no permission bit outside `0600` and
+/// must belong to the calling effective uid.
+///
+/// Retained for callers that only need to *check* a file, mirroring [`check_parent_mode`]; the
+/// I/O paths use [`open_secret_file`]. The file is opened `O_NOFOLLOW` and the mode and owner are
+/// read from that descriptor, before any secret is read, so a file that is already
+/// group/world-readable is never copied into the process merely to discover that it should not
+/// have been read.
+#[cfg(unix)]
+pub fn check_file_mode(path: &std::path::Path) -> Result<(), KeyStoreError> {
+    let fd = match rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::LOOP) | Err(Errno::MLINK) => {
+            return Err(KeyStoreError::SymlinkRefused {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(errno) => {
+            return Err(KeyStoreError::Io {
+                path: path.to_path_buf(),
+                source: errno.into(),
+            });
+        }
+    };
+    check_secret_fd(path, &fd).map(drop)
 }
 
 /// `#[cfg(not(unix))]` only: A10.41(c) makes mode-bit checks meaningless here, and the seed-file
@@ -333,9 +599,6 @@ impl HostKeyStore for SeedFileStore {
         Err(KeyStoreError::UnsupportedPlatform)
     }
 }
-
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -504,6 +767,123 @@ mod tests {
         match SeedFileStore::new(&path).load_root_seed() {
             Err(KeyStoreError::ParentMissing { .. }) => {}
             other => panic!("expected ParentMissing, got {other:?}"),
+        }
+    }
+
+    /// The seed file itself is a link. A `0600` link target (and a private parent) would pass
+    /// every mode check, so `O_NOFOLLOW` is what refuses it — and the diagnostic names the link,
+    /// not the target.
+    #[test]
+    fn refuses_a_symlinked_seed_file() {
+        let dir = private_dir();
+        let target = dir.path().join("elsewhere.seed");
+        fs::write(&target, seed(8)).expect("write link target");
+        set_mode(&target, 0o600);
+        let link = dir.path().join("host.seed");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink seed file");
+
+        match SeedFileStore::new(&link).load_root_seed() {
+            Err(KeyStoreError::SymlinkRefused { path: found }) => assert_eq!(found, link),
+            other => panic!("expected SymlinkRefused, got {other:?}"),
+        }
+    }
+
+    /// The substitution attack: the seed's parent is a link to a directory that would pass the
+    /// `0700` and ownership checks. Opening the parent with `O_NOFOLLOW` (rather than following
+    /// it) refuses before the seed is ever named.
+    #[test]
+    fn refuses_a_symlinked_parent_directory() {
+        let dir = private_dir();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).expect("create real seed directory");
+        set_mode(&real, 0o700);
+        let path = real.join("host.seed");
+        fs::write(&path, seed(9)).expect("write seed");
+        set_mode(&path, 0o600);
+        let link = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink parent");
+
+        match SeedFileStore::new(link.join("host.seed")).load_root_seed() {
+            Err(KeyStoreError::SymlinkRefused { path: found }) => assert_eq!(found, link),
+            other => panic!("expected SymlinkRefused, got {other:?}"),
+        }
+    }
+
+    /// A pre-existing symlink at the seed path must not be written through, and must not be
+    /// replaced: `O_CREAT | O_EXCL` refuses it atomically as `EEXIST` (surfaced as
+    /// `AlreadyExists`), and the target keeps its bytes.
+    #[test]
+    fn store_refuses_a_preexisting_symlink() {
+        let dir = private_dir();
+        let target = dir.path().join("target.seed");
+        fs::write(&target, seed(10)).expect("write link target");
+        set_mode(&target, 0o600);
+        let link = dir.path().join("host.seed");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink seed file");
+
+        match SeedFileStore::new(&link).store_root_seed(&seed(11)) {
+            Err(KeyStoreError::AlreadyExists { path: found }) => assert_eq!(found, link),
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(&target).expect("link target is untouched"),
+            seed(10).to_vec()
+        );
+        assert_eq!(
+            fs::read_link(&link).expect("the link itself survives"),
+            target
+        );
+    }
+
+    /// Unit coverage for the ownership refusal at the helper boundary. The helper takes the uid
+    /// as an argument precisely so this runs as an ordinary user; the live case — a real seed
+    /// file whose `st_uid` differs from the caller's — needs `chown` and is the root-gated test
+    /// below.
+    #[test]
+    fn ownership_check_names_the_foreign_uid() {
+        let dir = private_dir();
+        let path = dir.path().join("host.seed");
+        fs::write(&path, seed(12)).expect("write seed");
+        set_mode(&path, 0o600);
+
+        let euid = rustix::process::geteuid().as_raw();
+        check_owner(&path, euid).expect("the test process owns the file it just created");
+
+        let foreign = euid.wrapping_add(1);
+        match check_owner(&path, foreign) {
+            Err(KeyStoreError::NotOwned { path: found, uid }) => {
+                assert_eq!(found, path);
+                assert_eq!(uid, foreign);
+            }
+            other => panic!("expected NotOwned, got {other:?}"),
+        }
+    }
+
+    /// The live counterpart of [`ownership_check_names_the_foreign_uid`]: a real `0600` seed in a
+    /// private, caller-owned directory whose `st_uid` is someone else's. Only root can `chown`
+    /// a file to another uid, so this is gated on `TEST_RUN_AS_ROOT`; without that variable it
+    /// returns immediately rather than pretending to have exercised the path. The descriptor
+    /// plumbing that supplies `st_uid` is exercised by every other test here.
+    #[test]
+    fn refuses_a_seed_file_owned_by_another_uid_when_running_as_root() {
+        if std::env::var_os("TEST_RUN_AS_ROOT").is_none() {
+            return;
+        }
+        let dir = private_dir();
+        let path = dir.path().join("host.seed");
+        fs::write(&path, seed(13)).expect("write seed");
+        set_mode(&path, 0o600);
+
+        let foreign = rustix::process::geteuid().as_raw().wrapping_add(1);
+        rustix::fs::chown(&path, Some(rustix::process::Uid::from_raw(foreign)), None)
+            .expect("chown requires root");
+
+        match SeedFileStore::new(&path).load_root_seed() {
+            Err(KeyStoreError::NotOwned { path: found, uid }) => {
+                assert_eq!(found, path);
+                assert_eq!(uid, foreign);
+            }
+            other => panic!("expected NotOwned, got {other:?}"),
         }
     }
 }
