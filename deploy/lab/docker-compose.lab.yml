@@ -64,6 +64,9 @@ services:
     image: coturn/coturn
     command:
       - "-n"
+      # Verbose logging: the td-870b25 long-hold run reads the allocation/permission refresh
+      # transactions from this container's stdout. Lab-only; the dev stack's coturn is unchanged.
+      - "-v"
       - "--listening-port=3478"
       - "--realm=spindle.local"
       - "--use-auth-secret"

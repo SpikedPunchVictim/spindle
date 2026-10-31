@@ -62,6 +62,7 @@ pub use client::{ConnectOptions, HostIdentity, SignalingClient};
 pub use error::SignalingError;
 pub use host::{HostOptions, SessionHandler, SignalingHost};
 pub use ice::{IceConfig, SelectedTransport, TurnConfig, TurnCredentials};
+pub use turn::{MAX_TURN_TTL, MIN_TURN_TTL};
 
 use futures_util::StreamExt;
 use spindle_core::envelope::SessionKey;
@@ -72,6 +73,30 @@ use tokio::sync::mpsc;
 use ice::TrickleEvent;
 use seq::SeqFloor;
 use subject::IceDirection;
+
+/// Upper bound on the QUIC handshake once a data path has been selected (td-870b25).
+///
+/// Without it a **split** — one peer punched, the other fell back to the relay because the shared
+/// punch window is not coordinated on the wire — leaves the punch side's `QuicServer::accept`
+/// waiting forever on a socket the peer will never use. The client side would fail on quinn's idle
+/// timeout, but the host task would hold its socket and concurrency permit for the process's
+/// lifetime. Both roles bound the handshake so a split fails the attempt (and the caller retries)
+/// instead of hanging. Ten seconds is generous for a handshake that completes in milliseconds even
+/// at the lab's 50 ms RTT.
+pub(crate) const QUIC_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Lowercase hex rendering of a session id (`sid`) for diagnostics (td-870b25). The sid is a random
+/// identifier carried in every session envelope, not a secret; a harness needs it to correlate the
+/// two peers' per-attempt transport reports.
+pub(crate) fn sid_hex(sid: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut rendered = String::with_capacity(sid.len() * 2);
+    for byte in sid {
+        // Writing to a `String` cannot fail.
+        let _ = write!(rendered, "{byte:02x}");
+    }
+    rendered
+}
 
 /// Drains `sub` for the lifetime of this task, decoding+verifying each message as a trickled ICE
 /// envelope (`k1`, DESIGN.md §A7) bound to exactly the expected `(host_fp, client_fp, sid,

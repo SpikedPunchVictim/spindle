@@ -18,21 +18,27 @@
 //! leaving coturn to hold a relay port for its full lifetime. Remaining limits: single remote, no
 //! GSO/GRO/ECN, and a send backlog cap ([`MAX_RETRY_WIRE`]) rather than unbounded buffering.
 //!
-//! # How a relay is selected in this slice (td-c3badf)
+//! # How a relay is selected (td-c3badf, punch-first since td-870b25)
 //!
-//! When `IceConfig::turn` is set, the session **uses the relay unconditionally** and does not run
-//! ICE connectivity checks. That is a deliberate slice boundary, not an oversight:
+//! When `IceConfig::turn` is set, the session runs an **ICE attempt first**, in parallel with the
+//! TURN allocation, for a shared local window ([`super::ice::IceConfig::punch_window`]). A pair
+//! present at the deadline check wins and this allocation is released; if the window expires
+//! without one, the caller switches to the relay. With no TURN configured the session is
+//! punch-only.
+//!
+//! That shape is forced by two facts:
 //!
 //! - `rtc_ice::agent::Agent` cannot route its checks through TURN. A relayed candidate in the
 //!   agent would make it send checks from the local base socket straight to the peer's relayed
 //!   address, bypassing the TURN server, so a relay pair can never be selected through ICE here.
-//! - Punch-first-with-relay-fallback needs both peers to agree on the outcome. A one-sided ICE
-//!   failure (the Linux-conntrack mapping race `td-3c1762` root-caused is exactly one-sided) could
-//!   leave one peer on the punched socket and the other on the relay, and the existing wire
-//!   payload has no field to coordinate the decision.
-//!
-//! So the operator chooses: TURN configured ⇒ relay; TURN absent ⇒ punch (the pre-td-c3badf
-//! behaviour). The follow-up for punch-then-fallback-with-agreement is scoped on td-c3badf.
+//!   Callers therefore withhold relay candidates from the agent and wait on them separately.
+//! - Punch-first needs both peers to decide the same way. There is no wire field coordinating the
+//!   choice (a signed wire decision was rejected for now: it freezes a format before any client
+//!   exists). Instead both peers run the same local window and their deadlines differ by about one
+//!   offer/answer RTT. A split — one peer punched, the other relayed — is a measured risk, not an
+//!   assumed impossibility: the Linux-conntrack mapping race `td-3c1762` root-caused is one-sided.
+//!   A split shows up as a failed QUIC handshake; the attempt fails and the caller retries rather
+//!   than hanging.
 //!
 //! # Credential source
 //!
@@ -78,8 +84,12 @@ pub(crate) const TURN_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Accepted range for a REST credential's embedded expiry (review fix 6): a zero/negative TTL is
 /// already expired, and an unreasonably long one defeats the quota/rotation model. coturn's own
 /// default allocation lifetime is 10 minutes; 24 h is a deliberately generous ceiling.
-const MIN_TURN_TTL: Duration = Duration::from_secs(1);
-const MAX_TURN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+///
+/// Public so a configuration layer (e.g. `spindle-hostd`'s `--turn-ttl-secs` validation) rejects
+/// exactly the range the credential-minting path (`resolve_credentials`) enforces instead of
+/// restating these numbers.
+pub const MIN_TURN_TTL: Duration = Duration::from_secs(1);
+pub const MAX_TURN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Cap on the adapter's internal "wire packet could not be sent yet" backlog. Beyond this the
 /// relay is not keeping up and quinn must see an error rather than growing memory without bound

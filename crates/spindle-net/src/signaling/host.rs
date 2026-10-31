@@ -24,7 +24,7 @@
 //! [`HostOptions::session_close_timeout`], before letting the `ControlStream` (and so the
 //! `Connection`) actually drop.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,12 +39,14 @@ use super::authorize::{ConnectAuthorizer, ConnectDecision, VerifiedDecision};
 use super::bridge_incoming_ice;
 use super::error::SignalingError;
 use super::ice::{
-    await_peer_relay_candidate, drive_ice_agent_trickle, relay_candidate_line, start_local_ice,
-    IceConfig, LocalTrickleEvent, SelectedTransport, StunGather,
+    await_peer_relay_candidate, decide_after_window, drive_ice_agent_trickle, punch_deadline,
+    relay_candidate_line, split_relay_candidates, start_local_ice, AbortOnDrop, IceConfig,
+    LocalTrickleEvent, SelectedTransport, StunGather, WindowDecision, DEADLINE_SETTLE,
 };
 use super::subject::{connect_subject, reply_prefix_ok, session_subject, IceDirection};
 use super::turn;
 use super::wire::{seal_ice, OpenedOffer};
+use super::{sid_hex, QUIC_HANDSHAKE_TIMEOUT};
 
 /// What a host does with a session once its QUIC control stream is established — see this
 /// module's doc comment for why this is an injected trait rather than a direct call into
@@ -117,9 +119,11 @@ pub struct HostOptions {
     /// only the hostile one(s) being dropped.
     pub max_concurrent_connects: usize,
     /// Candidate gathering (td-c3badf), applied to every session. The default is empty — host
-    /// candidate only, exactly the pre-td-c3badf behaviour. Both peers must configure the same
-    /// kind of path: TURN configured here means this host answers on the relay, so a punch-only
-    /// client would never complete.
+    /// candidate only, exactly the pre-td-c3badf behaviour. With STUN servers the host gathers
+    /// server-reflexive candidates; with TURN configured it runs the punch-first window and falls
+    /// back to the relay. Both peers must configure the same kind of path: a TURN-configured host
+    /// falls back to the relay at its window, so a punch-only client that has not selected by then
+    /// cannot complete.
     pub ice: IceConfig,
 }
 
@@ -400,6 +404,35 @@ where
         self.host_fp
     }
 
+    /// Seals and publishes one trickled ICE payload, advancing `seq` on success. Factored out so
+    /// the punch-only, punch-first and fallback paths share one wire shape and one sequencing rule
+    /// (DESIGN.md §A6: each candidate is its own signed/sealed `KIND_ICE` envelope, never batched).
+    async fn publish_ice(
+        &self,
+        subject: String,
+        session_key: &spindle_core::envelope::SessionKey,
+        to_fp: Fingerprint,
+        sid: &[u8],
+        seq: &mut u64,
+        payload: IcePayload,
+    ) -> Result<(), SignalingError> {
+        let env = seal_ice(
+            session_key,
+            &self.device,
+            self.device_fp,
+            to_fp,
+            sid,
+            *seq,
+            &payload,
+        );
+        self.nats
+            .publish(subject, env.to_canonical_bytes().into())
+            .await
+            .map_err(|e| SignalingError::Nats(e.to_string()))?;
+        *seq += 1;
+        Ok(())
+    }
+
     /// Subscribes on `host.<self>.connect` and handles connect offers for as long as the
     /// subscription stays open (i.e. until the NATS connection is dropped/closed by the caller —
     /// this method has no separate shutdown signal of its own). Each accepted offer is handled in
@@ -531,26 +564,21 @@ where
         // Publish the host candidate immediately after the answer; STUN gathering and TURN
         // allocation happen later and must not delay the answer (td-c3badf review fix 1).
         let mut seq: u64 = 1;
-        let host_env = seal_ice(
+        self.publish_ice(
+            h2c_subject.clone(),
             &session_key,
-            &self.device,
-            self.device_fp,
             opened.from_fp,
             &opened.sid,
-            seq,
-            &IcePayload {
+            &mut seq,
+            IcePayload {
                 candidate: Some(local_ice.host_candidate_line.clone()),
                 end_of_candidates: false,
             },
-        );
-        self.nats
-            .publish(h2c_subject.clone(), host_env.to_canonical_bytes().into())
-            .await
-            .map_err(|e| SignalingError::Nats(e.to_string()))?;
-        seq += 1;
+        )
+        .await?;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let bridge = tokio::spawn(bridge_incoming_ice(
+        let bridge = AbortOnDrop::new(tokio::spawn(bridge_incoming_ice(
             c2h_sub,
             // Subject tokens (host root fp, client device fp) ...
             self.host_fp,
@@ -565,75 +593,343 @@ where
             self.device_fp,
             opened.from_fp,
             tx,
-        ));
+        )));
 
-        // Selected path (td-c3badf): TURN configured means relay, unconditionally; otherwise ICE
-        // punches and quinn takes the punched socket. The client makes the same choice from its
-        // own config — see `super::turn`'s module doc comment.
+        // ── Punch-first with a shared local window (td-870b25) ──────────────────────────────
+        //
+        // The mirror of the client's policy. The window starts **here**, at the first poll of the
+        // ICE drive, which the host reaches after it has published both the answer **and** its host
+        // candidate. The client starts its window after verifying that answer and publishing its
+        // own host candidate, so the two deadlines differ by the answer's one-way NATS leg plus the
+        // client's verification/decryption — less than one RTT, not a full round trip. A pair
+        // present at the deadline check wins and the allocation is released; otherwise the ICE
+        // agent is torn down and the session uses the relay. No TURN configured is exactly the old
+        // punch-only path.
         let control = if let Some(turn_config) = opts.ice.turn.as_ref() {
-            // Allocate after the answer is on the wire (td-c3badf review fix 1).
-            // The guard releases the allocation on any error from here to
-            // `into_relay_socket` (failed publish, peer never trickles a relay candidate, ...),
-            // instead of pinning a coturn relay port for its lifetime.
-            let mut allocation =
-                turn::allocate(turn_config, opts.bind_ip, turn::TURN_SETUP_TIMEOUT).await?;
-            let relayed = allocation.relayed_addr()?;
-            let relay_line =
-                relay_candidate_line(relayed, allocation.local_addr()?, turn_config.server)?;
-            let relay_env = seal_ice(
-                &session_key,
-                &self.device,
-                self.device_fp,
-                opened.from_fp,
-                &opened.sid,
-                seq,
-                &IcePayload {
-                    candidate: Some(relay_line),
-                    end_of_candidates: false,
-                },
-            );
-            self.nats
-                .publish(h2c_subject.clone(), relay_env.to_canonical_bytes().into())
-                .await
-                .map_err(|e| SignalingError::Nats(e.to_string()))?;
-            seq += 1;
-            let eoc_env = seal_ice(
-                &session_key,
-                &self.device,
-                self.device_fp,
-                opened.from_fp,
-                &opened.sid,
-                seq,
-                &IcePayload {
-                    candidate: None,
-                    end_of_candidates: true,
-                },
-            );
-            self.nats
-                .publish(h2c_subject.clone(), eoc_env.to_canonical_bytes().into())
-                .await
-                .map_err(|e| SignalingError::Nats(e.to_string()))?;
+            // Validated before any network work: out-of-range (or clock-overflowing) positive
+            // values are a configuration error, never a panic at `Instant + Duration`
+            // (td-870b25 review). Zero is the explicit relay-only mode.
+            let window_deadline = punch_deadline(opts.ice.punch_window, Instant::now())?;
+            let relay_only = opts.ice.punch_window.is_zero();
+            if relay_only {
+                tracing::debug!("punch_window is zero: relay-only mode, skipping the ICE attempt");
+            }
 
-            // The peer may still be allocating when this side finishes; wait up to the TURN setup
-            // bound, not the shorter ICE timeout.
-            let peer_relayed = await_peer_relay_candidate(rx, turn::TURN_SETUP_TIMEOUT).await?;
-            bridge.abort();
-            turn::create_permission(
-                allocation.allocation_mut()?,
-                peer_relayed,
-                turn::TURN_SETUP_TIMEOUT,
-            )
-            .await?;
-            tracing::debug!(
-                peer = %peer_relayed,
-                transport = SelectedTransport::Relay.as_str(),
-                "accepting QUIC over the TURN relay"
-            );
-            let relay_socket = allocation.into_relay_socket(turn_config.server, peer_relayed)?;
-            turn::spawn_driver(relay_socket.clone());
-            let server =
-                QuicServer::from_abstract_socket(relay_socket, &cert, opened.offer.cert_fp)?;
-            server.accept().await?
+            let allocation_config = turn_config.clone();
+            let bind_ip = opts.bind_ip;
+            let mut allocation_task = tokio::spawn(async move {
+                turn::allocate(&allocation_config, bind_ip, turn::TURN_SETUP_TIMEOUT).await
+            });
+
+            let (ice_tx, ice_rx) = tokio::sync::mpsc::unbounded_channel();
+            // Bounded (capacity 1): the fallback needs only the first valid relay candidate, and a
+            // peer streaming `typ relay` lines must not be able to grow a buffer during the
+            // window. The tee uses `try_send` and drops anything beyond the first (td-870b25 review).
+            let (relay_tx, relay_rx) = tokio::sync::mpsc::channel(1);
+            let tee = AbortOnDrop::new(tokio::spawn(split_relay_candidates(rx, ice_tx, relay_tx)));
+
+            let (local_tx, mut local_rx) = tokio::sync::mpsc::unbounded_channel();
+            let gather = StunGather::new(&opts.ice.stun_servers, Instant::now());
+            let mut drive = Box::pin(drive_ice_agent_trickle(
+                &mut local_ice.agent,
+                &local_ice.socket,
+                // The host is never the controlling side; the peer's credentials come from the
+                // offer this side just opened.
+                false,
+                &opened.offer.ufrag,
+                &opened.offer.pwd,
+                ice_rx,
+                gather,
+                local_tx,
+                opts.ice_timeout,
+            ));
+
+            let mut allocation: Option<turn::AllocationGuard> = None;
+            let mut allocation_settled = false;
+            let mut drive_finished = false;
+            let mut drive_error: Option<SignalingError> = None;
+            let mut selected_at: Option<Instant> = None;
+            let mut remote_addr: Option<SocketAddr> = None;
+
+            loop {
+                tokio::select! {
+                    // `biased` polls branches in source order and stops at the first ready one, so
+                    // the drive branch (below) is always polled — and its result consumed — before
+                    // the deadline branch. Without this, a `select!` that finds both ready can
+                    // discard the drive's selected-pair result and then the deadline branch would
+                    // poll a completed future (a resume-after-completion panic) (td-870b25
+                    // review fix 1). Source order is therefore load-bearing: drive before deadline.
+                    biased;
+                    Some(event) = local_rx.recv() => {
+                        let payload = match event {
+                            LocalTrickleEvent::Candidate(line) => IcePayload {
+                                candidate: Some(line),
+                                end_of_candidates: false,
+                            },
+                            LocalTrickleEvent::EndOfCandidates => IcePayload {
+                                candidate: None,
+                                end_of_candidates: true,
+                            },
+                        };
+                        self.publish_ice(
+                            h2c_subject.clone(),
+                            &session_key,
+                            opened.from_fp,
+                            &opened.sid,
+                            &mut seq,
+                            payload,
+                        )
+                        .await?;
+                    }
+                    joined = &mut allocation_task, if !allocation_settled => {
+                        allocation_settled = true;
+                        match joined {
+                            Ok(Ok(guard)) => {
+                                let relayed = guard.relayed_addr()?;
+                                let relay_line = relay_candidate_line(
+                                    relayed,
+                                    guard.local_addr()?,
+                                    turn_config.server,
+                                )?;
+                                self.publish_ice(
+                                    h2c_subject.clone(),
+                                    &session_key,
+                                    opened.from_fp,
+                                    &opened.sid,
+                                    &mut seq,
+                                    IcePayload {
+                                        candidate: Some(relay_line),
+                                        end_of_candidates: false,
+                                    },
+                                )
+                                .await?;
+                                allocation = Some(guard);
+                                tracing::debug!(
+                                    relayed = %relayed,
+                                    "TURN allocation ready; relay candidate trickled"
+                                );
+                            }
+                            Ok(Err(error)) => {
+                                tracing::warn!(
+                                    error = %error.redacted(),
+                                    "TURN allocation failed; continuing punch-only"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error, // redaction-ok: tokio::task::JoinError Display is "task <id> panicked/cancelled" text; no peer bytes, paths, or full ids
+                                    "TURN allocation task failed; continuing punch-only"
+                                );
+                            }
+                        }
+                    }
+                    result = &mut drive, if !drive_finished && !relay_only => {
+                        drive_finished = true;
+                        match result {
+                            Ok((addr, _stats)) => {
+                                // A pair selected at/after the deadline can only be observed here
+                                // because this branch won a `select!` against the deadline; record
+                                // it at the deadline so the same "present at the deadline check
+                                // wins" rule applies (td-870b25 review).
+                                selected_at = Some(Instant::now().min(window_deadline));
+                                remote_addr = Some(addr);
+                                break;
+                            }
+                            Err(error) => {
+                                // The window, not an early ICE failure, is the coordination point.
+                                drive_error = Some(error);
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep_until(window_deadline.into()) => {
+                        // A publish body in flight when the deadline fired suspends this loop, so
+                        // the drive may already hold a selected pair this `select!` never observed.
+                        // Give it one bounded final poll; a pair found here is recorded at the
+                        // deadline and wins (td-870b25 review fix 1). A drive that already
+                        // finished (with an error) must not be polled again.
+                        if !drive_finished && !relay_only {
+                            if let Ok(result) =
+                                tokio::time::timeout(DEADLINE_SETTLE, &mut drive).await
+                            {
+                                match result {
+                                    Ok((addr, _stats)) => {
+                                        selected_at = Some(window_deadline);
+                                        remote_addr = Some(addr);
+                                    }
+                                    Err(error) => drive_error = Some(error),
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                if drive_finished
+                    && drive_error.is_some()
+                    && allocation_settled
+                    && allocation.is_none()
+                {
+                    break;
+                }
+            }
+
+            // Settle a pending allocation before a decision that may choose the relay (see the
+            // client's twin). A selected pair does not wait on it.
+            if selected_at.is_none() && !allocation_settled {
+                allocation_settled = true;
+                match (&mut allocation_task).await {
+                    Ok(Ok(guard)) => {
+                        let relayed = guard.relayed_addr()?;
+                        let relay_line =
+                            relay_candidate_line(relayed, guard.local_addr()?, turn_config.server)?;
+                        self.publish_ice(
+                            h2c_subject.clone(),
+                            &session_key,
+                            opened.from_fp,
+                            &opened.sid,
+                            &mut seq,
+                            IcePayload {
+                                candidate: Some(relay_line),
+                                end_of_candidates: false,
+                            },
+                        )
+                        .await?;
+                        allocation = Some(guard);
+                        tracing::debug!(
+                            relayed = %relayed,
+                            "TURN allocation ready; relay candidate trickled"
+                        );
+                    }
+                    Ok(Err(error)) => tracing::warn!(
+                        error = %error.redacted(),
+                        "TURN allocation failed; continuing punch-only"
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = %error, // redaction-ok: tokio::task::JoinError Display is "task <id> panicked/cancelled" text; no peer bytes, paths, or full ids
+                        "TURN allocation task failed; continuing punch-only"
+                    ),
+                }
+            }
+
+            // The policy, applied once at the one place it matters.
+            match decide_after_window(true, allocation.is_some(), selected_at, window_deadline) {
+                WindowDecision::Punch => {
+                    if let Some(remote_addr) = remote_addr {
+                        if allocation_settled {
+                            drop(allocation.take());
+                        } else {
+                            tokio::spawn(async move {
+                                if let Ok(Ok(guard)) = allocation_task.await {
+                                    drop(guard);
+                                }
+                            });
+                        }
+                        tee.abort();
+                        bridge.abort();
+                        tracing::debug!(
+                            sid = %sid_hex(&opened.sid),
+                            transport = SelectedTransport::Punch.as_str(),
+                            %remote_addr,
+                            "transport selected"
+                        );
+                        drop(drive);
+                        let std_socket = local_ice.socket.into_std()?;
+                        let server =
+                            QuicServer::from_socket(std_socket, &cert, opened.offer.cert_fp)?;
+                        tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, server.accept())
+                            .await
+                            .map_err(|_| SignalingError::Timeout("QUIC handshake"))??
+                    } else {
+                        // No pair and no relay. In relay-only mode there is no punch attempt to
+                        // continue: the attempt cannot complete without the allocation it asked
+                        // for.
+                        if relay_only {
+                            return Err(SignalingError::Turn(
+                                "relay-only punch window: no relay allocation is available"
+                                    .to_string(),
+                            ));
+                        }
+                        if let Some(error) = drive_error {
+                            return Err(error);
+                        }
+                        let remote_addr = loop {
+                            tokio::select! {
+                                result = &mut drive => break result?.0,
+                                Some(event) = local_rx.recv() => {
+                                    let payload = match event {
+                                        LocalTrickleEvent::Candidate(line) => IcePayload {
+                                            candidate: Some(line),
+                                            end_of_candidates: false,
+                                        },
+                                        LocalTrickleEvent::EndOfCandidates => IcePayload {
+                                            candidate: None,
+                                            end_of_candidates: true,
+                                        },
+                                    };
+                                    self.publish_ice(
+                                        h2c_subject.clone(),
+                                        &session_key,
+                                        opened.from_fp,
+                                        &opened.sid,
+                                        &mut seq,
+                                        payload,
+                                    )
+                                    .await?;
+                                }
+                            }
+                        };
+                        drop(drive);
+                        tee.abort();
+                        bridge.abort();
+                        tracing::debug!(
+                            sid = %sid_hex(&opened.sid),
+                            transport = SelectedTransport::Punch.as_str(),
+                            %remote_addr,
+                            "transport selected"
+                        );
+                        let std_socket = local_ice.socket.into_std()?;
+                        let server =
+                            QuicServer::from_socket(std_socket, &cert, opened.offer.cert_fp)?;
+                        tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, server.accept())
+                            .await
+                            .map_err(|_| SignalingError::Timeout("QUIC handshake"))??
+                    }
+                }
+                WindowDecision::Relay => {
+                    let mut allocation = allocation
+                        .take()
+                        .expect("a Relay decision requires a live allocation");
+                    // Stop/tear down the ICE agent: its socket is not the data path.
+                    drop(drive);
+                    let peer_relayed =
+                        await_peer_relay_candidate(relay_rx, turn::TURN_SETUP_TIMEOUT).await?;
+                    tee.abort();
+                    bridge.abort();
+                    turn::create_permission(
+                        allocation.allocation_mut()?,
+                        peer_relayed,
+                        turn::TURN_SETUP_TIMEOUT,
+                    )
+                    .await?;
+                    tracing::debug!(
+                        sid = %sid_hex(&opened.sid),
+                        transport = SelectedTransport::Relay.as_str(),
+                        %peer_relayed,
+                        "transport selected"
+                    );
+                    let relay_socket =
+                        allocation.into_relay_socket(turn_config.server, peer_relayed)?;
+                    turn::spawn_driver(relay_socket.clone());
+                    let server = QuicServer::from_abstract_socket(
+                        relay_socket,
+                        &cert,
+                        opened.offer.cert_fp,
+                    )?;
+                    tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, server.accept())
+                        .await
+                        .map_err(|_| SignalingError::Timeout("QUIC handshake"))??
+                }
+            }
         } else {
             let (local_tx, mut local_rx) = tokio::sync::mpsc::unbounded_channel();
             let gather = StunGather::new(&opts.ice.stun_servers, Instant::now());
@@ -664,37 +960,32 @@ where
                                 end_of_candidates: true,
                             },
                         };
-                        let env = seal_ice(
+                        self.publish_ice(
+                            h2c_subject.clone(),
                             &session_key,
-                            &self.device,
-                            self.device_fp,
                             opened.from_fp,
                             &opened.sid,
-                            seq,
-                            &payload,
-                        );
-                        self.nats
-                            .publish(
-                                h2c_subject.clone(),
-                                env.to_canonical_bytes().into(),
-                            )
-                            .await
-                            .map_err(|e| SignalingError::Nats(e.to_string()))?;
-                        seq += 1;
+                            &mut seq,
+                            payload,
+                        )
+                        .await?;
                     }
                 }
             };
             drop(drive);
             bridge.abort();
             tracing::debug!(
-                %remote_addr,
+                sid = %sid_hex(&opened.sid),
                 transport = SelectedTransport::Punch.as_str(),
-                "ICE selected a candidate pair; accepting QUIC on the punched socket"
+                %remote_addr,
+                "transport selected"
             );
 
             let std_socket = local_ice.socket.into_std()?;
             let server = QuicServer::from_socket(std_socket, &cert, opened.offer.cert_fp)?;
-            server.accept().await?
+            tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, server.accept())
+                .await
+                .map_err(|_| SignalingError::Timeout("QUIC handshake"))??
         };
 
         // `opened.from_fp` is authenticated at this point, not merely claimed: `process_offer`

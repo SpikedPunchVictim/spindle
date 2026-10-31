@@ -11,12 +11,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use spike_s2_nat_lab::{
-    client_device, host_device, host_fp, ice_config_from_env, EchoHandler, RegistryAuthorizer,
+    client_device, host_device, host_fp, ice_config_from_env, init_tracing, EchoHandler,
+    RegistryAuthorizer,
 };
 use spindle_net::signaling::{HostOptions, SignalingHost};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `transport selected` (with the session id) is a debug event on the production host; the JSON
+    // subscriber makes it observable per attempt, including failed handshakes (td-870b25).
+    init_tracing();
     let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://172.28.0.15:4222".into());
     let bind_ip: IpAddr = std::env::var("BIND_IP")
         .context("BIND_IP (this peer's private IP) is required")?

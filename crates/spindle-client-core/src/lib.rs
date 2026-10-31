@@ -13,7 +13,17 @@
 //!   and its tests need no broker. **No app wires this yet** — the module's functions have no
 //!   production caller; the Tauri client shell and the primary device's key-custody flow are
 //!   later slices.
+//! - [`turn_credentials`] — fetching a coturn credential from the helper on
+//!   `helper.turn.get.<own nfp>` through the [`turn_credentials::TurnCredentialTransport`] seam.
+//!   Identity comes from the callout-granted subject token, the helper mints per `root_fp` against
+//!   its quota, and the returned ICE URIs are handed back verbatim for the caller to turn into a
+//!   transport config. **No app wires this yet** either; the module is the library-level client
+//!   half.
 
 pub mod self_revocation;
+pub mod turn_credentials;
 
 pub use self_revocation::{deposit_self_revocation, mint_self_revocation, DepositError};
+pub use turn_credentials::{
+    fetch_turn_credentials, TurnCredentialError, TurnCredentialTransport, TurnCredentialsReply,
+};

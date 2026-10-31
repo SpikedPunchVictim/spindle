@@ -364,20 +364,12 @@ async fn run(config: Config) -> ExitCode {
     // every successful renewal; a failed renewal pushes it to the retry instant instead.
     let mut renew_at = next_renewal_at(op_cert.ts, op_cert.exp);
 
-    // Only `bind_ip` is configurable in this slice; the lifecycle durations and the concurrency
-    // cap keep `HostOptions`' defaults (taken from one `default()` value rather than restated
-    // here, so a future default change cannot silently disagree with this binary).
-    let defaults = HostOptions::default();
-    let options = HostOptions {
-        bind_ip: config.bind_ip,
-        ice_timeout: defaults.ice_timeout,
-        session_close_timeout: defaults.session_close_timeout,
-        max_concurrent_connects: defaults.max_concurrent_connects,
-        // Only `bind_ip` is configurable in this slice, so gathering stays host-only (the
-        // default empty `IceConfig`). STUN/TURN operator configuration is td-c3badf's
-        // follow-up surface, not this binary's.
-        ice: defaults.ice,
-    };
+    // The operator's ICE gathering settings are immutable for the process, so build the options
+    // once here. Every daemon in the reconnect loop — including each planned post-renewal one —
+    // clones this value, and every knob not named as configurable keeps `HostOptions`' default
+    // (taken from one `default()` value rather than restated here, so a future default change
+    // cannot silently disagree with this binary).
+    let options = host_options_from_config(&config);
 
     // The admission token stays present until a connect **succeeds**. A failed attempt may never
     // have reached the callout (server down, DNS, timeout), and in `invite`/`closed` admission a
@@ -682,6 +674,22 @@ async fn run(config: Config) -> ExitCode {
             tracing::info!("shutdown signal received");
             return ExitCode::SUCCESS;
         }
+    }
+}
+
+/// Builds this process's [`HostOptions`]: `bind_ip` and the operator's STUN/TURN settings
+/// ([`Config::ice_config`]) are configurable; the lifecycle durations and the connect-concurrency
+/// cap keep [`HostOptions::default`]'s values.
+///
+/// Kept separate from `run` so the operator-to-daemon threading is unit-testable without a broker.
+fn host_options_from_config(config: &Config) -> HostOptions {
+    let defaults = HostOptions::default();
+    HostOptions {
+        bind_ip: config.bind_ip,
+        ice_timeout: defaults.ice_timeout,
+        session_close_timeout: defaults.session_close_timeout,
+        max_concurrent_connects: defaults.max_concurrent_connects,
+        ice: config.ice_config(),
     }
 }
 
@@ -1376,6 +1384,8 @@ mod tests {
             op_cert_ttl_secs: HOST_OP_CERT_TTL_SECS,
             reconcile_once: false,
             reconcile_interval_secs: None,
+            stun_servers: Vec::new(),
+            turn: None,
         }
     }
 
@@ -1541,6 +1551,63 @@ mod tests {
         assert!(
             parse_recovery_phrase(&text).is_err(),
             "an empty phrase must never restore a seed"
+        );
+    }
+
+    /// The operator's STUN/TURN settings thread all the way into `HostOptions.ice`, and an empty
+    /// configuration keeps `HostOptions`' pre-surface behaviour exactly.
+    #[test]
+    fn operator_ice_settings_thread_into_host_options() {
+        use std::time::Duration;
+
+        use spindle_net::signaling::{IceConfig, TurnConfig, TurnCredentials};
+
+        let dir = private_dir();
+        let mut config = test_config(dir.path());
+        let defaults = HostOptions::default();
+
+        let empty = host_options_from_config(&config);
+        assert_eq!(
+            empty.ice,
+            IceConfig::default(),
+            "no STUN/TURN settings must produce the library's host-only default"
+        );
+        assert_eq!(empty.bind_ip, config.bind_ip);
+        assert_eq!(empty.ice_timeout, defaults.ice_timeout);
+        assert_eq!(empty.session_close_timeout, defaults.session_close_timeout);
+        assert_eq!(
+            empty.max_concurrent_connects,
+            defaults.max_concurrent_connects
+        );
+
+        let stun: SocketAddr = "192.0.2.1:3478".parse().expect("STUN server");
+        let turn: SocketAddr = "203.0.113.1:3478".parse().expect("TURN server");
+        config.stun_servers = vec![stun];
+        config.turn = Some(TurnConfig {
+            server: turn,
+            credentials: TurnCredentials::RestSecret {
+                secret: "secret".to_string(),
+                label: "label".to_string(),
+                ttl: Duration::from_secs(60),
+            },
+        });
+
+        let configured = host_options_from_config(&config);
+        assert_eq!(
+            configured.ice,
+            IceConfig {
+                stun_servers: vec![stun],
+                turn: Some(TurnConfig {
+                    server: turn,
+                    credentials: TurnCredentials::RestSecret {
+                        secret: "secret".to_string(),
+                        label: "label".to_string(),
+                        ttl: Duration::from_secs(60),
+                    },
+                }),
+                ..IceConfig::default()
+            },
+            "the built IceConfig must reach HostOptions.ice unchanged"
         );
     }
 

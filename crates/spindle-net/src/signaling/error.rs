@@ -117,6 +117,17 @@ pub enum SignalingError {
     #[error("{0} timed out")]
     Timeout(&'static str),
 
+    /// A caller-supplied [`crate::signaling::IceConfig`] value is outside its documented bounds
+    /// (currently only the punch window). Rejected before any network work, so a misconfigured
+    /// caller gets an immediate, actionable error instead of an attempt that can never complete —
+    /// or, for a value that overflows `Instant`, a panic at `Instant + Duration`.
+    #[error("punch window {window:?} is outside the supported range {min:?}..={max:?}")]
+    PunchWindow {
+        window: std::time::Duration,
+        min: std::time::Duration,
+        max: std::time::Duration,
+    },
+
     /// The QUIC handshake/control-stream setup failed (`crate::quic::QuicError`, including a
     /// fingerprint-pinning rejection).
     #[error("QUIC error: {0}")]

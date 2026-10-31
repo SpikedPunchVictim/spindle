@@ -27,11 +27,13 @@
 //! truncated at `=` by [`ConfigError::unknown_arg`], so the removal cannot turn into a leak.
 
 use std::env;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use spindle_hostd::reconcile_surface::MIN_SWEEP_INTERVAL_SECS;
 use spindle_hostd::HOST_OP_CERT_TTL_SECS;
+use spindle_net::signaling::{IceConfig, TurnConfig, TurnCredentials, MAX_TURN_TTL, MIN_TURN_TTL};
 
 /// Runtime configuration for one host process.
 #[derive(Debug)]
@@ -87,6 +89,20 @@ pub(crate) struct Config {
     /// The ledger -> counters reconcile is deliberately **not** schedulable — see `HELP` and
     /// `reconcile_surface`'s module doc comment.
     pub(crate) reconcile_interval_secs: Option<u64>,
+    /// `SPINDLE_STUN_SERVERS` / `--stun-servers`. STUN servers this host queries for
+    /// server-reflexive candidates, in the operator's order, with duplicates collapsed. Empty is
+    /// the historical host-candidate-only behaviour.
+    pub(crate) stun_servers: Vec<SocketAddr>,
+    /// `SPINDLE_TURN_SERVER` / `--turn-server` plus exactly one credential form
+    /// (`SPINDLE_TURN_USERNAME`+`SPINDLE_TURN_CREDENTIAL`, or
+    /// `SPINDLE_TURN_SECRET`+`SPINDLE_TURN_LABEL`+`SPINDLE_TURN_TTL_SECS`). `None` means no relay.
+    /// `Some` makes TURN available to the library. Selection is the library's A10.54 punch-first
+    /// policy: attempt a punch for the shared `punch_window` (3 s default), then fall back to
+    /// relay; both peers must configure TURN and the same window. This surface deliberately
+    /// exposes no window knob. Credentials are redacted in
+    /// [`TurnConfig`]/[`TurnCredentials`]' `Debug` implementations; this struct never holds a
+    /// credential outside that type.
+    pub(crate) turn: Option<TurnConfig>,
 }
 
 /// Everything [`Config::from_env_and_args`] can reject.
@@ -117,6 +133,45 @@ pub(crate) enum ConfigError {
          other or with --reconcile-once; choose one action"
     )]
     ConflictingEnrollment,
+    #[error(
+        "invalid value {given:?} for --stun-servers / SPINDLE_STUN_SERVERS (expected a \
+         comma-separated list of host:port socket addresses; empty entries are not allowed)"
+    )]
+    BadStunServers { given: String },
+    #[error(
+        "invalid value {given:?} for --turn-server / SPINDLE_TURN_SERVER (expected a host:port \
+         socket address)"
+    )]
+    BadTurnServer { given: String },
+    #[error(
+        "invalid value {given:?} for --turn-ttl-secs / SPINDLE_TURN_TTL_SECS (expected a whole \
+         number of seconds in {min}..={max})"
+    )]
+    BadTurnTtl { given: String, min: u64, max: u64 },
+    #[error(
+        "--turn-server / SPINDLE_TURN_SERVER requires exactly one credential form: the static pair \
+         --turn-username + --turn-credential (SPINDLE_TURN_USERNAME + SPINDLE_TURN_CREDENTIAL), or \
+         the REST-secret form --turn-secret + --turn-label (SPINDLE_TURN_SECRET + \
+         SPINDLE_TURN_LABEL)"
+    )]
+    MissingTurnCredentials,
+    #[error(
+        "TURN credentials were configured without --turn-server / SPINDLE_TURN_SERVER; set the \
+         server or remove the credentials"
+    )]
+    TurnCredentialsWithoutServer,
+    #[error(
+        "static TURN credentials (--turn-username/--turn-credential, SPINDLE_TURN_USERNAME/\
+         SPINDLE_TURN_CREDENTIAL) and REST-secret credentials (--turn-secret/--turn-label, \
+         SPINDLE_TURN_SECRET/SPINDLE_TURN_LABEL) cannot be combined; choose one form"
+    )]
+    MixedTurnCredentials,
+    #[error(
+        "incomplete TURN credential form: the static pair needs both --turn-username and \
+         --turn-credential (SPINDLE_TURN_USERNAME, SPINDLE_TURN_CREDENTIAL); the REST-secret form \
+         needs both --turn-secret and --turn-label (SPINDLE_TURN_SECRET, SPINDLE_TURN_LABEL)"
+    )]
+    IncompleteTurnCredentials,
     /// Only the part of the argument before the first `=` is ever kept — see
     /// [`ConfigError::unknown_arg`], which is the only way this variant is constructed.
     #[error("unrecognized argument: {0} (any `=<value>` suffix is withheld — it may be a secret)")]
@@ -193,7 +248,38 @@ the env var if both are set:
                                                              store connection, and takes short
                                                              Immediate transactions, so it can
                                                              briefly block session writes)
+    --stun-servers <a:3478,...> SPINDLE_STUN_SERVERS        (optional; comma-separated STUN
+                                                             server socket addresses used to gather
+                                                             server-reflexive candidates. Entries
+                                                             are trimmed, empty entries are
+                                                             rejected, duplicates are collapsed.
+                                                             Unset means host candidates only; an
+                                                             exported empty list is an error)
+    --turn-server <addr>        SPINDLE_TURN_SERVER         (optional; TURN relay server. When
+                                                             set, the library punches first for
+                                                             its punch window (3 s default here)
+                                                             and falls back to relay)
+    --turn-username <name>      SPINDLE_TURN_USERNAME       (static TURN credentials: both
+    --turn-credential <secret>  SPINDLE_TURN_CREDENTIAL       --turn-username and
+                                                             --turn-credential are required)
+    --turn-secret <secret>      SPINDLE_TURN_SECRET         (coturn use-auth-secret REST
+    --turn-label <label>        SPINDLE_TURN_LABEL            credentials: both --turn-secret and
+    --turn-ttl-secs <n>         SPINDLE_TURN_TTL_SECS         --turn-label are required; <n> is
+                                                             the minted credential lifetime in
+                                                             seconds, 1..=86400, default 3600)
     -h, --help                  show this message
+
+A TURN server requires exactly one credential form: the static pair, or the REST-secret
+secret+label pair. A partial form, a mix of both forms, or credentials without --turn-server is a
+configuration error. STUN and TURN may each be set alone, both together, or neither; with neither,
+the daemon gathers host candidates only (the historical behaviour).
+
+When TURN is configured, the library punches first for the shared punch window (3 s default; this
+daemon exposes no window knob and uses that default) and falls back to relay when the window
+expires without a selected pair. Both peers must configure TURN and use the same window: a split
+outcome fails the QUIC handshake and the caller retries. Configure STUN as well for the punch to
+cross a NAT; the relay fallback works without it. Credentials come only from the operator's static
+pair or REST secret: this daemon has no helper-minted credentials (helper.turn.get.<nfp>) yet.
 
 A first run (no seed file) requires exactly one of --init, --restore-seed-file <path>, or
 SPINDLE_HOST_RESTORE_SEED. There is deliberately no inline --restore-seed <phrase> flag: a phrase
@@ -223,6 +309,13 @@ impl Config {
         let mut op_cert_ttl_secs = env::var("SPINDLE_HOST_OP_CERT_TTL_SECS").ok();
         let mut reconcile_once = env::var("SPINDLE_HOST_RECONCILE_ONCE").ok();
         let mut reconcile_interval_secs = env::var("SPINDLE_HOST_RECONCILE_INTERVAL_SECS").ok();
+        let mut stun_servers = env::var("SPINDLE_STUN_SERVERS").ok();
+        let mut turn_server = env::var("SPINDLE_TURN_SERVER").ok();
+        let mut turn_username = env::var("SPINDLE_TURN_USERNAME").ok();
+        let mut turn_credential = env::var("SPINDLE_TURN_CREDENTIAL").ok();
+        let mut turn_secret = env::var("SPINDLE_TURN_SECRET").ok();
+        let mut turn_label = env::var("SPINDLE_TURN_LABEL").ok();
+        let mut turn_ttl_secs = env::var("SPINDLE_TURN_TTL_SECS").ok();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -287,6 +380,45 @@ impl Config {
                         ConfigError::FlagMissingValue("reconcile-interval-secs".to_string())
                     })?)
                 }
+                "--stun-servers" => {
+                    stun_servers =
+                        Some(args.next().ok_or_else(|| {
+                            ConfigError::FlagMissingValue("stun-servers".to_string())
+                        })?)
+                }
+                "--turn-server" => {
+                    turn_server =
+                        Some(args.next().ok_or_else(|| {
+                            ConfigError::FlagMissingValue("turn-server".to_string())
+                        })?)
+                }
+                "--turn-username" => {
+                    turn_username = Some(args.next().ok_or_else(|| {
+                        ConfigError::FlagMissingValue("turn-username".to_string())
+                    })?)
+                }
+                "--turn-credential" => {
+                    turn_credential = Some(args.next().ok_or_else(|| {
+                        ConfigError::FlagMissingValue("turn-credential".to_string())
+                    })?)
+                }
+                "--turn-secret" => {
+                    turn_secret =
+                        Some(args.next().ok_or_else(|| {
+                            ConfigError::FlagMissingValue("turn-secret".to_string())
+                        })?)
+                }
+                "--turn-label" => {
+                    turn_label =
+                        Some(args.next().ok_or_else(|| {
+                            ConfigError::FlagMissingValue("turn-label".to_string())
+                        })?)
+                }
+                "--turn-ttl-secs" => {
+                    turn_ttl_secs = Some(args.next().ok_or_else(|| {
+                        ConfigError::FlagMissingValue("turn-ttl-secs".to_string())
+                    })?)
+                }
                 other => return Err(ConfigError::unknown_arg(other)),
             }
         }
@@ -313,6 +445,34 @@ impl Config {
             Some(given) => Some(parse_reconcile_interval(&given)?),
             None => None,
         };
+        let stun_servers = match stun_servers {
+            Some(given) => parse_stun_servers(&given)?,
+            None => Vec::new(),
+        };
+        let turn_server = match turn_server {
+            Some(given) => {
+                Some(
+                    given
+                        .parse::<SocketAddr>()
+                        .map_err(|_| ConfigError::BadTurnServer {
+                            given: given.clone(),
+                        })?,
+                )
+            }
+            None => None,
+        };
+        let turn_ttl_secs = match turn_ttl_secs {
+            Some(given) => Some(parse_turn_ttl(&given)?),
+            None => None,
+        };
+        let turn = resolve_turn(
+            turn_server,
+            turn_username,
+            turn_credential,
+            turn_secret,
+            turn_label,
+            turn_ttl_secs,
+        )?;
         if init && (restore_seed.is_some() || restore_seed_file.is_some()) {
             return Err(ConfigError::ConflictingEnrollment);
         }
@@ -360,7 +520,128 @@ impl Config {
             op_cert_ttl_secs,
             reconcile_once,
             reconcile_interval_secs,
+            stun_servers,
+            turn,
         })
+    }
+
+    /// The library [`IceConfig`] these operator settings describe.
+    ///
+    /// Empty settings (the default) produce `IceConfig::default()`, so a host with no STUN/TURN
+    /// configuration behaves exactly as it did before this surface existed. The built value is
+    /// immutable for the process and is threaded into every `HostOptions` the reconnect loop
+    /// builds (see `main::host_options_from_config`).
+    pub(crate) fn ice_config(&self) -> IceConfig {
+        IceConfig {
+            stun_servers: self.stun_servers.clone(),
+            turn: self.turn.clone(),
+            // No punch-policy knob belongs to this surface: any library default (e.g. a
+            // punch-first window) is taken from `IceConfig::default()` rather than restated here.
+            ..IceConfig::default()
+        }
+    }
+}
+
+/// Default lifetime of a locally-minted REST-secret TURN credential, in seconds. Matches the
+/// reference stack's helper `TURN_TTL_SECS` (`deploy/docker-compose.yml`).
+const DEFAULT_TURN_TTL_SECS: u64 = 3600;
+
+/// Parses `SPINDLE_STUN_SERVERS` / `--stun-servers`: a comma-separated list of `host:port` socket
+/// addresses. Entries are trimmed, empty entries are rejected rather than skipped (a trailing or
+/// doubled comma is a typo, not "no server"), and duplicates are collapsed while keeping the
+/// operator's order.
+fn parse_stun_servers(given: &str) -> Result<Vec<SocketAddr>, ConfigError> {
+    let mut servers: Vec<SocketAddr> = Vec::new();
+    for entry in given.split(',') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return Err(ConfigError::BadStunServers {
+                given: given.to_string(),
+            });
+        }
+        let server = trimmed
+            .parse::<SocketAddr>()
+            .map_err(|_| ConfigError::BadStunServers {
+                given: given.to_string(),
+            })?;
+        if !servers.contains(&server) {
+            servers.push(server);
+        }
+    }
+    Ok(servers)
+}
+
+/// Parses `SPINDLE_TURN_TTL_SECS` / `--turn-ttl-secs`: a whole number of seconds inside the range
+/// the library's REST-secret credential minting accepts. The bounds are the library's exported
+/// [`MIN_TURN_TTL`]/[`MAX_TURN_TTL`], not a copy, so config validation and mint-time validation
+/// cannot drift apart. Out-of-range values are configuration errors rather than a clamped or "no
+/// expiry" credential.
+fn parse_turn_ttl(given: &str) -> Result<u64, ConfigError> {
+    let invalid = || ConfigError::BadTurnTtl {
+        given: given.to_string(),
+        min: MIN_TURN_TTL.as_secs(),
+        max: MAX_TURN_TTL.as_secs(),
+    };
+    let seconds = given.parse::<u64>().map_err(|_| invalid())?;
+    if !(MIN_TURN_TTL..=MAX_TURN_TTL).contains(&Duration::from_secs(seconds)) {
+        return Err(invalid());
+    }
+    Ok(seconds)
+}
+
+/// Resolves the TURN settings into the one credential form the operator configured.
+///
+/// `Ok(None)` means no TURN at all (nothing set). A TURN server requires exactly one complete
+/// form: the static username/credential pair, or the REST-secret secret/label pair (with the
+/// default TTL when `ttl_secs` is unset). A partial form, a mix of both forms, or credentials
+/// without a server are hard errors: each would otherwise either send coturn a half credential or
+/// silently drop an operator's setting. The config is resolved once, at startup, so the library's
+/// per-session credential path never sees a configuration it would have to reject.
+fn resolve_turn(
+    server: Option<SocketAddr>,
+    username: Option<String>,
+    credential: Option<String>,
+    secret: Option<String>,
+    label: Option<String>,
+    ttl_secs: Option<u64>,
+) -> Result<Option<TurnConfig>, ConfigError> {
+    // The TTL is only part of the REST-secret form. Setting it alone is an incomplete REST form,
+    // not a silently ignored extra: the operator plainly intended REST credentials.
+    let static_any = username.is_some() || credential.is_some();
+    let rest_any = secret.is_some() || label.is_some() || ttl_secs.is_some();
+    if static_any && rest_any {
+        return Err(ConfigError::MixedTurnCredentials);
+    }
+
+    let credentials = if static_any {
+        let (Some(username), Some(credential)) = (username, credential) else {
+            return Err(ConfigError::IncompleteTurnCredentials);
+        };
+        Some(TurnCredentials::Static {
+            username,
+            credential,
+        })
+    } else if rest_any {
+        let (Some(secret), Some(label)) = (secret, label) else {
+            return Err(ConfigError::IncompleteTurnCredentials);
+        };
+        Some(TurnCredentials::RestSecret {
+            secret,
+            label,
+            ttl: Duration::from_secs(ttl_secs.unwrap_or(DEFAULT_TURN_TTL_SECS)),
+        })
+    } else {
+        None
+    };
+
+    match (server, credentials) {
+        (Some(server), Some(credentials)) => Ok(Some(TurnConfig {
+            server,
+            credentials,
+        })),
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(ConfigError::TurnCredentialsWithoutServer),
+        (Some(_), None) => Err(ConfigError::MissingTurnCredentials),
     }
 }
 
@@ -442,7 +723,7 @@ mod tests {
     /// and must not inherit whatever the developer's shell exported.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const ENV_NAMES: [&str; 12] = [
+    const ENV_NAMES: [&str; 19] = [
         "SPINDLE_NATS_URL",
         "SPINDLE_HOST_SEED_FILE",
         "SPINDLE_HOST_STORE",
@@ -455,6 +736,13 @@ mod tests {
         "SPINDLE_HOST_OP_CERT_TTL_SECS",
         "SPINDLE_HOST_RECONCILE_ONCE",
         "SPINDLE_HOST_RECONCILE_INTERVAL_SECS",
+        "SPINDLE_STUN_SERVERS",
+        "SPINDLE_TURN_SERVER",
+        "SPINDLE_TURN_USERNAME",
+        "SPINDLE_TURN_CREDENTIAL",
+        "SPINDLE_TURN_SECRET",
+        "SPINDLE_TURN_LABEL",
+        "SPINDLE_TURN_TTL_SECS",
     ];
 
     /// Clears every variable this module reads, applies `vars`, and restores the previous
@@ -523,6 +811,20 @@ mod tests {
             config.reconcile_interval_secs, None,
             "an unset interval must leave startup and serving unchanged"
         );
+        assert_eq!(
+            config.stun_servers,
+            Vec::<SocketAddr>::new(),
+            "an unset STUN list must stay empty (host candidates only)"
+        );
+        assert_eq!(
+            config.turn, None,
+            "an unset TURN server must keep the host punch-only"
+        );
+        assert_eq!(
+            config.ice_config(),
+            IceConfig::default(),
+            "empty settings must produce exactly the library's pre-STUN/TURN configuration"
+        );
     }
 
     #[test]
@@ -542,6 +844,14 @@ mod tests {
             // `SPINDLE_HOST_INIT=true` (an enrollment action), and the dedicated reconcile-settings
             // test below covers its environment spelling with no enrollment action present.
             ("SPINDLE_HOST_RECONCILE_INTERVAL_SECS", "120"),
+            (
+                "SPINDLE_STUN_SERVERS",
+                "192.0.2.1:3478, [2001:db8::1]:3478,192.0.2.1:3478",
+            ),
+            ("SPINDLE_TURN_SERVER", "203.0.113.1:3478"),
+            ("SPINDLE_TURN_SECRET", "rest-secret"),
+            ("SPINDLE_TURN_LABEL", "host-a"),
+            ("SPINDLE_TURN_TTL_SECS", "120"),
         ]);
         let _env = CleanEnv::new(&vars);
         let config = parse(&[]).expect("full env configuration parses");
@@ -566,6 +876,26 @@ mod tests {
         assert_eq!(config.op_cert_ttl_secs, 9);
         assert!(!config.reconcile_once);
         assert_eq!(config.reconcile_interval_secs, Some(120));
+        assert_eq!(
+            config.stun_servers,
+            vec![
+                "192.0.2.1:3478".parse().expect("v4 STUN"),
+                "[2001:db8::1]:3478".parse().expect("v6 STUN"),
+            ],
+            "the environment list is trimmed and its duplicate collapsed"
+        );
+        assert_eq!(
+            config.turn,
+            Some(TurnConfig {
+                server: "203.0.113.1:3478".parse().expect("TURN server"),
+                credentials: TurnCredentials::RestSecret {
+                    secret: "rest-secret".to_string(),
+                    label: "host-a".to_string(),
+                    ttl: Duration::from_secs(120),
+                },
+            }),
+            "the environment spelling selects the REST-secret form"
+        );
     }
 
     #[test]
@@ -589,6 +919,14 @@ mod tests {
             "127.0.0.1:9200",
             "--op-cert-ttl-secs",
             "30",
+            "--stun-servers",
+            "192.0.2.9:3478,192.0.2.9:3478",
+            "--turn-server",
+            "203.0.113.9:3478",
+            "--turn-username",
+            "static-user",
+            "--turn-credential",
+            "static-credential",
         ])
         .expect("flags parse");
 
@@ -609,6 +947,364 @@ mod tests {
         assert_eq!(config.op_cert_ttl_secs, 30);
         assert!(!config.reconcile_once);
         assert_eq!(config.reconcile_interval_secs, None);
+        assert_eq!(
+            config.stun_servers,
+            vec!["192.0.2.9:3478".parse().expect("STUN server")],
+            "flag list is deduplicated"
+        );
+        assert_eq!(
+            config.turn,
+            Some(TurnConfig {
+                server: "203.0.113.9:3478".parse().expect("TURN server"),
+                credentials: TurnCredentials::Static {
+                    username: "static-user".to_string(),
+                    credential: "static-credential".to_string(),
+                },
+            }),
+            "the static pair selects the Static form"
+        );
+    }
+
+    /// TURN settings follow the same precedence as every other setting: the environment alone
+    /// selects the REST-secret form, and a flag overrides only the value it names (here the STUN
+    /// list, the server, and the TTL), leaving the environment's secret/label in place.
+    #[test]
+    fn turn_settings_come_from_the_environment_and_flags_override_it() {
+        let mut vars = REQUIRED_ENV.to_vec();
+        vars.extend([
+            ("SPINDLE_STUN_SERVERS", "192.0.2.1:3478"),
+            ("SPINDLE_TURN_SERVER", "203.0.113.1:3478"),
+            ("SPINDLE_TURN_SECRET", "env-secret"),
+            ("SPINDLE_TURN_LABEL", "env-label"),
+            ("SPINDLE_TURN_TTL_SECS", "120"),
+        ]);
+        let _env = CleanEnv::new(&vars);
+        let config = parse(&[
+            "--stun-servers",
+            "198.51.100.2:3478,198.51.100.3:3478",
+            "--turn-server",
+            "203.0.113.2:3478",
+            "--turn-ttl-secs",
+            "300",
+        ])
+        .expect("flags override their environment spellings");
+
+        assert_eq!(
+            config.stun_servers,
+            vec![
+                "198.51.100.2:3478".parse().expect("STUN server"),
+                "198.51.100.3:3478".parse().expect("STUN server"),
+            ],
+            "the flag replaces the whole STUN list"
+        );
+        assert_eq!(
+            config.turn,
+            Some(TurnConfig {
+                server: "203.0.113.2:3478".parse().expect("TURN server"),
+                credentials: TurnCredentials::RestSecret {
+                    secret: "env-secret".to_string(),
+                    label: "env-label".to_string(),
+                    ttl: Duration::from_secs(300),
+                },
+            }),
+            "the flag TTL overrides the environment TTL; the env secret/label are unchanged"
+        );
+    }
+
+    /// The STUN list and the TURN relay are independent: either may be set alone, both together,
+    /// or neither (which is exactly the historical host-candidate-only configuration).
+    #[test]
+    fn stun_and_turn_may_be_configured_together_either_alone_or_neither() {
+        let _env = CleanEnv::new(&REQUIRED_ENV);
+
+        let neither = parse(&[]).expect("neither is valid");
+        assert!(neither.stun_servers.is_empty());
+        assert_eq!(neither.turn, None);
+
+        let stun_only = parse(&["--stun-servers", "192.0.2.1:3478"]).expect("STUN alone is valid");
+        assert_eq!(
+            stun_only.stun_servers,
+            vec!["192.0.2.1:3478".parse().expect("STUN server")]
+        );
+        assert_eq!(stun_only.turn, None);
+
+        let turn_only = parse(&[
+            "--turn-server",
+            "203.0.113.1:3478",
+            "--turn-username",
+            "user",
+            "--turn-credential",
+            "credential",
+        ])
+        .expect("TURN alone is valid");
+        assert!(turn_only.stun_servers.is_empty());
+        assert!(turn_only.turn.is_some());
+
+        let both = parse(&[
+            "--stun-servers",
+            "192.0.2.1:3478",
+            "--turn-server",
+            "203.0.113.1:3478",
+            "--turn-username",
+            "user",
+            "--turn-credential",
+            "credential",
+        ])
+        .expect("STUN and TURN together are valid");
+        assert_eq!(both.stun_servers.len(), 1);
+        assert!(both.turn.is_some());
+    }
+
+    /// A TURN server needs exactly one credential form. Partial forms, both forms at once, and
+    /// credentials without a server are all refused rather than sent to coturn half-configured or
+    /// silently dropped.
+    #[test]
+    fn partial_mixed_and_serverless_turn_credentials_are_rejected() {
+        {
+            let _env = CleanEnv::new(&REQUIRED_ENV);
+            let cases: [(&[&str], &str); 8] = [
+                (&["--turn-server", "203.0.113.1:3478"], "missing"),
+                (
+                    &["--turn-server", "203.0.113.1:3478", "--turn-username", "u"],
+                    "incomplete",
+                ),
+                (
+                    &[
+                        "--turn-server",
+                        "203.0.113.1:3478",
+                        "--turn-credential",
+                        "c",
+                    ],
+                    "incomplete",
+                ),
+                (
+                    &["--turn-server", "203.0.113.1:3478", "--turn-secret", "s"],
+                    "incomplete",
+                ),
+                (
+                    &["--turn-server", "203.0.113.1:3478", "--turn-label", "l"],
+                    "incomplete",
+                ),
+                (
+                    &["--turn-server", "203.0.113.1:3478", "--turn-ttl-secs", "60"],
+                    "incomplete",
+                ),
+                (
+                    &[
+                        "--turn-server",
+                        "203.0.113.1:3478",
+                        "--turn-username",
+                        "u",
+                        "--turn-credential",
+                        "c",
+                        "--turn-secret",
+                        "s",
+                        "--turn-label",
+                        "l",
+                    ],
+                    "mixed",
+                ),
+                (
+                    &["--turn-username", "u", "--turn-credential", "c"],
+                    "serverless",
+                ),
+            ];
+
+            for (args, expected) in cases {
+                let error = parse(args).expect_err("invalid TURN configuration");
+                let actual = match &error {
+                    ConfigError::MissingTurnCredentials => "missing",
+                    ConfigError::IncompleteTurnCredentials => "incomplete",
+                    ConfigError::MixedTurnCredentials => "mixed",
+                    ConfigError::TurnCredentialsWithoutServer => "serverless",
+                    other => panic!("unexpected error for {args:?}: {other:?}"),
+                };
+                assert_eq!(actual, expected, "wrong error for {args:?}");
+                let message = error.to_string();
+                assert!(
+                    message.contains("SPINDLE_TURN_") || message.contains("--turn-"),
+                    "the error must name the setting spellings: {message}"
+                );
+            }
+        }
+
+        // The same rule applies to the environment spelling: a complete pair with no server is
+        // serverless credentials, not a partial form.
+        let mut vars = REQUIRED_ENV.to_vec();
+        vars.extend([("SPINDLE_TURN_SECRET", "s"), ("SPINDLE_TURN_LABEL", "l")]);
+        let _env = CleanEnv::new(&vars);
+        assert!(matches!(
+            parse(&[]).expect_err("credentials without a server are invalid"),
+            ConfigError::TurnCredentialsWithoutServer
+        ));
+    }
+
+    /// A malformed STUN or TURN address is a startup error from either source; the error names the
+    /// setting, not a silently skipped server.
+    #[test]
+    fn bad_stun_and_turn_socket_addresses_are_rejected_from_either_source() {
+        {
+            let _env = CleanEnv::new(&REQUIRED_ENV);
+            match parse(&["--stun-servers", "not-an-address"]) {
+                Err(ConfigError::BadStunServers { given }) => assert_eq!(given, "not-an-address"),
+                other => panic!("expected BadStunServers, got {other:?}"),
+            }
+            match parse(&["--turn-server", "not-an-address"]) {
+                Err(ConfigError::BadTurnServer { given }) => assert_eq!(given, "not-an-address"),
+                other => panic!("expected BadTurnServer, got {other:?}"),
+            }
+        }
+
+        let mut vars = REQUIRED_ENV.to_vec();
+        vars.extend([
+            ("SPINDLE_STUN_SERVERS", "192.0.2.1"),
+            ("SPINDLE_TURN_SERVER", "203.0.113.1"),
+        ]);
+        let _env = CleanEnv::new(&vars);
+        match parse(&[]) {
+            Err(ConfigError::BadStunServers { given }) => assert_eq!(given, "192.0.2.1"),
+            other => panic!("expected BadStunServers, got {other:?}"),
+        }
+        match parse(&["--stun-servers", "192.0.2.1:3478"]) {
+            Err(ConfigError::BadTurnServer { given }) => assert_eq!(given, "203.0.113.1"),
+            other => panic!("expected BadTurnServer, got {other:?}"),
+        }
+    }
+
+    /// `SPINDLE_STUN_SERVERS` entries are trimmed and deduplicated; an empty entry (a trailing or
+    /// doubled comma, or an exported empty string) is a typo and is refused rather than skipped.
+    #[test]
+    fn stun_lists_are_trimmed_deduplicated_and_reject_empty_entries() {
+        {
+            let _env = CleanEnv::new(&REQUIRED_ENV);
+            let config = parse(&[
+                "--stun-servers",
+                " 192.0.2.1:3478 , 192.0.2.2:3478 , 192.0.2.1:3478 ",
+            ])
+            .expect("whitespace is trimmed and the duplicate collapsed");
+            assert_eq!(
+                config.stun_servers,
+                vec![
+                    "192.0.2.1:3478".parse().expect("first"),
+                    "192.0.2.2:3478".parse().expect("second"),
+                ],
+                "the operator's order is kept"
+            );
+
+            for invalid in [
+                "192.0.2.1:3478,",
+                "192.0.2.1:3478,,192.0.2.2:3478",
+                "192.0.2.1:3478, not-an-address",
+                "",
+            ] {
+                match parse(&["--stun-servers", invalid]) {
+                    Err(ConfigError::BadStunServers { given }) => assert_eq!(given, invalid),
+                    other => panic!("expected BadStunServers for {invalid:?}, got {other:?}"),
+                }
+            }
+        }
+
+        let mut vars = REQUIRED_ENV.to_vec();
+        vars.push(("SPINDLE_STUN_SERVERS", ""));
+        let _env = CleanEnv::new(&vars);
+        assert!(matches!(
+            parse(&[]).expect_err("an empty exported list is not 'no servers'"),
+            ConfigError::BadStunServers { .. }
+        ));
+    }
+
+    /// The REST-secret TTL accepts the same range the library's credential minting enforces:
+    /// 1 second through 24 hours, with 1 hour as the default when the knob is unset.
+    #[test]
+    fn rest_secret_turn_ttls_accept_one_second_through_twenty_four_hours() {
+        // The bounds are the library's, not a copy: these assert the invariants hostd relies on
+        // rather than restating a second set of numbers that could drift.
+        assert!(MIN_TURN_TTL < MAX_TURN_TTL);
+        assert!(
+            (MIN_TURN_TTL..=MAX_TURN_TTL).contains(&Duration::from_secs(DEFAULT_TURN_TTL_SECS)),
+            "the default TTL must be inside the library's accepted range"
+        );
+
+        {
+            let _env = CleanEnv::new(&REQUIRED_ENV);
+            let ttl_of = |config: Config| match config.turn {
+                Some(TurnConfig {
+                    credentials: TurnCredentials::RestSecret { ttl, .. },
+                    ..
+                }) => ttl,
+                other => panic!("expected REST-secret TURN credentials, got {other:?}"),
+            };
+
+            let defaulted = parse(&[
+                "--turn-server",
+                "203.0.113.1:3478",
+                "--turn-secret",
+                "s",
+                "--turn-label",
+                "l",
+            ])
+            .expect("REST credentials without a TTL use the default");
+            assert_eq!(
+                ttl_of(defaulted),
+                Duration::from_secs(DEFAULT_TURN_TTL_SECS)
+            );
+
+            for valid in [MIN_TURN_TTL.as_secs(), 3_600, MAX_TURN_TTL.as_secs()] {
+                let value = valid.to_string();
+                let config = parse(&[
+                    "--turn-server",
+                    "203.0.113.1:3478",
+                    "--turn-secret",
+                    "s",
+                    "--turn-label",
+                    "l",
+                    "--turn-ttl-secs",
+                    value.as_str(),
+                ])
+                .expect("in-range TTL");
+                assert_eq!(ttl_of(config), Duration::from_secs(valid), "value {valid}");
+            }
+
+            let invalid_ttls = [
+                "0".to_string(),
+                (MAX_TURN_TTL + Duration::from_secs(1))
+                    .as_secs()
+                    .to_string(),
+                "-1".to_string(),
+                "not-a-number".to_string(),
+            ];
+            for invalid in &invalid_ttls {
+                match parse(&[
+                    "--turn-server",
+                    "203.0.113.1:3478",
+                    "--turn-secret",
+                    "s",
+                    "--turn-label",
+                    "l",
+                    "--turn-ttl-secs",
+                    invalid.as_str(),
+                ]) {
+                    Err(ConfigError::BadTurnTtl { given, min, max }) => {
+                        assert_eq!(given, *invalid);
+                        assert_eq!((min, max), (MIN_TURN_TTL.as_secs(), MAX_TURN_TTL.as_secs()));
+                    }
+                    other => panic!("expected BadTurnTtl for {invalid:?}, got {other:?}"),
+                }
+            }
+        }
+
+        let mut vars = REQUIRED_ENV.to_vec();
+        vars.extend([
+            ("SPINDLE_TURN_SERVER", "203.0.113.1:3478"),
+            ("SPINDLE_TURN_SECRET", "s"),
+            ("SPINDLE_TURN_LABEL", "l"),
+            ("SPINDLE_TURN_TTL_SECS", "0"),
+        ]);
+        let _env = CleanEnv::new(&vars);
+        match parse(&[]) {
+            Err(ConfigError::BadTurnTtl { given, .. }) => assert_eq!(given, "0"),
+            other => panic!("expected BadTurnTtl, got {other:?}"),
+        }
     }
 
     /// Both reconcile knobs are readable from the environment alone, and a flag overrides the

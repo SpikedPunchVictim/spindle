@@ -626,5 +626,200 @@ tests still pass).
 - `td-3c1762`: the punch numbers above are a further reproduction of its root cause, not new
   evidence. Earlier punch runs are retained in `deploy/lab/.artifacts/s2r2-*`,
   `s2-punch-n5/` and `s2-punch/`.
-- `td-870b25`: punch-first arbitration, the helper credential client, and the hostd operator
-  surface.
+- `td-870b25`: punch-first arbitration (landed; A10.54, this file's newest section), the hostd
+  operator surface, and the helper-credential client's **app wiring** (the client half landed in
+  `spindle-client-core::turn_credentials`; only URI→transport conversion and the call site remain).
+
+---
+
+# Punch-first with a shared local window (td-870b25) — 2026-10-30
+
+**Outcome: success on this lab — zero transport splits and zero one-sided selections in 50 attempts
+with TURN configured on both peers.** The shared local window selected the same transport on both
+sides in every observed attempt: the unshaped cell punched 5/40 (12.5%, reproducing td-3c1762) and
+**both** sides selected `punch` on each of those five; the other 35 attempts and all 10 shaped
+attempts fell back to `relay` on both sides. The cost is the full 3 s window spent on every relay
+attempt (offer→usable ≈ 3.0 s unshaped, ≈ 3.4 s at 50 ms, versus 5.8 ms / 468.9 ms for the
+td-c3badf relay-only path).
+
+## Policy under test
+
+`IceConfig` gained `punch_window` (default **3 s**, exposed so tests and lab runs can shorten it).
+With `turn` configured, both roles allocate TURN in parallel with an ICE attempt bounded by that
+window:
+
+- a pair present at the deadline check → use the punched socket and release the relay allocation
+  (the existing `AllocationGuard`; the window bounds how long to wait, not whether an
+  already-selected pair is used);
+- window expiry → stop/tear down the ICE agent, then `CreatePermission` + the relay socket (the
+  previous relay path);
+- allocation failure → log and continue punch-only;
+- no TURN configured → exactly the pre-td-870b25 punch-only path.
+
+The window starts at each side's first ICE poll after the offer/answer exchange: the host once it
+has published the answer **and** its host candidate, the client once it has verified the answer and
+published its host candidate. The two deadlines therefore differ by the answer's one-way NATS leg
+plus the client's verification/decryption — less than one RTT, not a full round trip — and both
+peers must use the same `punch_window` (positive values validated to 100 ms..=60 s; `0` is the
+explicit relay-only mode, used by the long-relay refresh proof, which skips the ICE attempt). Both
+roles log
+`transport selected` with the session id before the QUIC handshake, so the two sides can be joined
+per attempt even when the handshake fails.
+
+There is no wire field coordinating the choice (the user decision rejected a signed wire decision
+for now). A **split** — one peer punched, the other relayed — is the asymmetry `td-8da43e` warned
+about: td-3c1762's conntrack mapping failure is one-sided. A split fails the QUIC handshake. Both
+roles now bound the handshake at 10 s, so the attempt fails and the caller retries instead of the
+host task hanging; the trickle bridge, candidate tee, ICE agent and allocation are torn down on
+every path (RAII `AbortOnDrop` replaced the relay path's explicit `bridge.abort()`, which was
+skipped whenever allocation or a publish failed).
+
+## Method
+
+- `deploy/lab/run-s2-nat.sh`, same two-NAT topology as the td-c3badf section (host on `peer-a`
+  behind nat-a/gw-a, client on `peer-c` behind nat-c/gw-c, lab NATS `nats-s2`),
+  `STUN_SERVER=172.28.0.14:3478`, `TURN_SERVER=172.28.0.13:3478` on **both** peers,
+  `PUNCH_WINDOW_MS=3000` (the production default), 5 s ICE timeout.
+- Cells: unshaped `RUNS=40 MAX_ATTEMPTS=40`; 50 ms both peers `RUNS=40 DELAYED_MAX_ATTEMPTS=10`.
+- Each peer was built with a JSON `tracing` subscriber (lab-only) that carries the production
+  `transport selected` event. The harness joins the two sides by session id and reports, per cell:
+  attempts / successes / failures, each side's transport counts, joined sessions, **splits** (both
+  sides selected, different transports), and one-sided sessions (one side selected, the other did
+  not).
+- Raw artifacts: `deploy/lab/.artifacts/s2punch-first/` (gitignored).
+
+## Measured
+
+| Cell | Netem both peers | Attempts | Successes | Failures | Client transports | Host transports | Joined | Splits | One-sided | Punch phases (n) | Relay phases (n) |
+|------|------------------|----------|-----------|----------|-------------------|------------------|--------|--------|-----------|------------------|------------------|
+| unshaped | none | 40 | 40 | 0 | punch 5 / relay 35 | punch 5 / relay 35 | 40 | **0** | **0** | 4.846 / 613.567 / 7.075 / 636.005 ms (n=5) | 10.105 / 3011.243 / 10.990 / 3037.235 ms (n=35) |
+| delay50 | 50 ms | 10 | 10 | 0 | punch 0 / relay 10 | punch 0 / relay 10 | 10 | **0** | **0** | — | 113.277 / 3059.521 / 112.363 / 3394.280 ms (n=10) |
+
+Phase columns are medians of `offer→answer / answer→selected / selected→QUIC / offer→usable`, in
+ms. On a relay attempt `answer→selected` measures "answer verified → TURN allocation and
+CreatePermission complete", not an ICE selection.
+
+The five unshaped punch attempts were #3, #5, #22, #29 and #34 (session ids in the harness
+output); each reported `client=punch host=punch`. Every other attempt reported
+`client=relay host=relay`. The per-attempt lines and raw JSON are in
+`deploy/lab/.artifacts/s2punch-first/` (gitignored).
+
+**Review follow-up (2026-10-30).** This run predates three review fixes to the selection policy:
+a pair **present at the deadline check** now wins (the deadline branch gives the drive a bounded
+10 ms final poll, and `decide_after_window` uses `<=`, so a publish body in flight at the boundary
+cannot lose an already-selected pair to the deadline branch); `punch_window` is validated to
+100 ms..=60 s (`SignalingError::PunchWindow`, never an `Instant + Duration` panic); and the
+relay-candidate fan-out is a bounded capacity-1 channel fed by `try_send`, so a peer cannot grow it
+by streaming `typ relay` lines. The first fix can only turn a would-be relay into a punch, so it
+cannot introduce a split the measured policy did not have, but a **confirmation run is pending** —
+deferred because another agent's long-relay session uses the same `spindle-lab` compose project,
+whose fixed 172.28.x subnets and image tags make a concurrent isolated copy unsafe. Unit tests pin
+the at-deadline → punch policy and the bounds.
+
+## Reading the result
+
+- **Agreement held in this lab, on this sample.** In 50 attempts the two peers never selected
+  different transports, and no attempt was one-sided (one side selecting while the other did not).
+  That is the failure mode the wire-less policy was most exposed to: td-3c1762's conntrack mapping
+  race is one-sided, so a host-side selection with a client-side timeout would have shown up as a
+  split or one-sided session. It did not.
+- **What zero splits does not prove.** Only 5 of the 50 punch attempts actually selected a pair, so
+  the agreement claim rests on a small punch sample. This is one kernel (Docker Desktop's Linux
+  VM) with Linux-conntrack NATs; a real consumer NAT or a WAN loss/jitter distribution this lab
+  cannot produce may behave differently. Zero observed splits is evidence for the policy here, not
+  proof of universal agreement; A10.54 records it as revisit-able on such evidence.
+- **The cost is the window.** Every relay attempt waits the full 3 s before falling back. Relay
+  offer→usable is ~3.0 s unshaped and ~3.4 s at 50 ms, against 5.8 ms / 468.9 ms for the old
+  relay-only path. A shorter `punch_window` trades that latency for a higher chance of cutting off
+  a punch that is still converging; the 3 s default covers the lab's ~614 ms punch selection with
+  large margin.
+- **A punch win is fast when it happens.** Unshaped punch: ICE selects at 613.567 ms after the
+  answer and QUIC completes 7 ms later (636.005 ms offer→usable), versus ~3.0 s for the relay
+  fallback in the same cell. The 50 ms cell had no punch wins, as td-3c1762 predicts.
+- **Handshake failure semantics were not exercised by a split** (there were none). The 10 s
+  handshake bound and the RAII teardown are unit-/code-level guarantees in this run; a synthetic
+  split would be needed to drive the failure path end to end. The old relay path's bridge-task leak
+  on allocation/publish failure was found by inspection while replacing it, not by a lab failure.
+
+---
+
+# Long-lived relayed session: 300 s permission / 600 s allocation refresh (td-870b25) — 2026-10-30
+
+**Outcome: both the 300 s permission refresh and the 600 s allocation refresh are now proven on a
+real relayed session. The session nevertheless died at ~603 s, and the cause is a separate
+ChannelBind stale-nonce/channel-number refresh bug — not the allocation or permission refresh.**
+The 11-minute survival goal is therefore **not** met; the failure is captured below and was not
+retried blindly.
+
+## Method
+
+```bash
+CELLS_ONLY=hold HOLD_SECS=660 KEEP_ALIVE_SECS=10 HOLD_READ_TIMEOUT_SECS=30 \
+  TURN_SERVER=172.28.0.13:3478 PUNCH_WINDOW_MS=0 \
+  deploy/lab/run-s2-nat.sh
+```
+
+- One session, no reconnection: host `peer-a` (172.28.10.2, behind nat-a/gw-a), client `peer-c`
+  (172.28.30.2, behind nat-c/gw-c), production `SignalingHost`/`SignalingClient`, lab NATS
+  `nats-s2`, STUN `172.28.0.14:3478`, coturn `172.28.0.13:3478` (`use-auth-secret`, REST
+  credentials). `PUNCH_WINDOW_MS=0` forces relay selection; the client reported
+  `transport=relay` on every heartbeat.
+- The client exchanged one control-stream frame every 10 s (`HOLD_SECS=660`, 11 min; past coturn's
+  default 300 s permission and 600 s allocation lifetimes) and printed a heartbeat with `t_s`,
+  `rtt_ms` and `transport`. The host echoed each frame (`host_frame` events).
+- Coturn was run with `-v` in the lab compose; its stdout was captured to
+  `deploy/lab/.artifacts/s2/hold-coturn.log` (gitignored). Client/host JSON are in the same
+  directory (`hold-client.jsonl`, `hold-host.jsonl`).
+
+## Measured
+
+- **Relay path**: allocation `172.28.0.13:49184` (client), peer relay `172.28.0.13:49198`; every
+  heartbeat reported `transport=relay`, RTT ~6-112 ms on the unshaped lab path.
+- **Heartbeats**: 60/61 succeeded; first at **0.0019 s**, last successful at **592.478 s**.
+  The 61st exchange got no echo within 30 s and was recorded as failed at **632.483 s**
+  (`"failure":"no echo within 30s"`). The host had echoed the 61st frame at **603.559 s**
+  (`host_frame` last `t_ms` = 603558.75), but the reply did not reach the client; the host's next
+  read failed with `connection lost`.
+- **Coturn evidence** (all timestamps UTC; session created 05:32:01):
+  - `05:32:01.773 ALLOCATE processed, success`, `lifetime=600`, relay ports 49184/49198.
+  - `CREATE_PERMISSION processed, success` with `peer lifetime updated: 300` at 05:32:01,
+    05:34:01, 05:36:01, 05:38:01, 05:40:01 and 05:42:01 — every 120 s, matching `rtc-turn`'s
+    `PERM_REFRESH_INTERVAL=120s` / `PERM_LIFETIME=300s`. **The 300 s permission refresh is
+    proven.**
+  - `REFRESH processed, success`, `lifetime=600` at **05:37:01.776** (300 s after allocation) and
+    again at **05:42:01.803** (600 s). `rtc-turn` schedules the allocation refresh at
+    `lifetime/2`. **The 600 s allocation refresh is proven.**
+  - `CHANNEL_BIND processed, success`, `peer lifetime updated: 600` at 05:37:03.
+  - At **05:42:04.274** coturn returned **`438: Stale nonce`**; from 05:42:04.305 onward it
+    repeatedly returned **`CHANNEL_BIND ... error 400: You cannot use the same peer with
+    different channel number`**. The client logged `bind() failed: ChannelBind error response
+    (error 400: )` (`rtc-turn::client::relay:516`) and `dropping malformed TURN packet ...
+    wire_len 34` (`spindle-net::signaling::turn`).
+
+## Why the session died at ~603 s (the finding)
+
+`rtc-turn` 0.20.3 refreshes a channel by re-sending ChannelBind with the binding's channel
+number. On a **438 Stale nonce** response, `handle_channel_bind_response` updates the nonce but
+deletes the binding (`binding_mgr.delete_by_addr`). The next `send_to` finds no binding, and
+`BindingManager::create` assigns a **new** channel number. Coturn still held the old channel for
+that peer — the channel binding had just been refreshed at 05:37:03 with `peer lifetime 600`,
+valid until 05:47:03 — so it rejected the new number with 400 ("same peer with different channel
+number"). The `spindle-net` TURN adapter only decodes ChannelData/Send/Data, so it logged the
+34-byte error response as a malformed packet and never surfaced or recovered from the 400; the
+channel binding never recovered, the host's 603.6 s echo was lost, and the client's 30 s read
+timeout fired. The allocation and permission refreshes at 05:42:01 had both succeeded seconds
+earlier, so this is a **channel-binding refresh** defect, not the allocation/permission path.
+
+## What is proven, and what is not
+
+- **Proven:** the 300 s permission refresh (CREATE_PERMISSION every 120 s, lifetime 300, data
+  flowing at 592 s) and the 600 s allocation refresh (REFRESH at 300 s and 600 s, lifetime 600).
+- **Not proven:** an 11-minute relayed session. It died at ~603 s on the ChannelBind stale-nonce
+  retry. A production fix needs either `rtc-turn` to retry a stale-nonce ChannelBind with the
+  **same** channel number (or reuse the existing binding), or `spindle-net`'s adapter to handle
+  ChannelBind error responses and recover; alternatively the relay could avoid ChannelBind and use
+  Send indications only, but that is a production behavior change and was not done here.
+- **Limits:** one kernel (Docker Desktop's Linux VM), simulated NATs, one 660 s run, liveness
+  frames rather than a throughput measurement; coturn 4.17.2. This is not S19's real-two-host leg.
+  The allocation/permission refresh path is now live-proven; the channel-binding refresh remains
+  the blocker for a long-lived relayed session.

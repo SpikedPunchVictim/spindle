@@ -495,7 +495,9 @@ fix), and the signaling DNAT needs a private-leg SNAT. See `deploy/lab/README.md
 `spindle-net::signaling` now takes an `IceConfig` on both `ConnectOptions` and `HostOptions`:
 a list of STUN servers (srflx candidates gathered on the same socket; a failing server is logged
 and skipped) and an optional TURN server with static or A8 REST credentials. With TURN configured
-the session uses the relay unconditionally (allocate → advertise a `relay` candidate over the
+the session used the relay unconditionally at that time — **superseded by the 2026-10-30 punch-first
+note below and A10.54**, which makes the relay the fallback after a shared punch window (allocate →
+advertise a `relay` candidate over the
 existing trickle channel → CreatePermission → QUIC over a `quinn::AsyncUdpSocket` TURN adapter);
 with no config it is host-only, exactly as before. Measured in `deploy/lab/run-s2-nat.sh` (N=5
 medians, same cells): punch 5/40 unshaped (12.5%), 0/5 at 50 ms (td-3c1762 reproduced; all
@@ -513,9 +515,67 @@ that never reaches the socket, and `Drop` enqueues/sends one zero-lifetime Refre
 coturn's receipt is unverified, and no real >5-minute relay run was made). Not built:
 punch-first-then-relay arbitration, which needs a
 coordinated decision between peers because `rtc-ice` cannot route checks through TURN and the
-conntrack failure is one-sided; the helper credential client and hostd operator surface are also
-still open (td-870b25). Details: `spikes/s2-signaling/RESULTS.md`'s td-c3badf section; lab README's
+conntrack failure is one-sided; the helper credential **client** landed separately in
+`spindle-client-core::turn_credentials` (only app wiring / URI→transport conversion remains), and
+the hostd operator surface was also still open at that point (td-870b25). Details:
+`spikes/s2-signaling/RESULTS.md`'s td-c3badf section; lab README's
 S2 section.
+
+**Note**: 2026-10-30 — **helper-minted TURN credentials: the client half (td-870b25).**
+`spindle-client-core::turn_credentials` adds `TurnCredentialTransport` (the same narrow
+request/reply seam as `RevokeTransport`), `fetch_turn_credentials(transport, nats_fp)`, and
+`TurnCredentialsReply { uris, username, credential, ttl_secs }`. It publishes `{}` to
+`helper.turn.get.<nfp>` and decodes the helper's success or its uniform `{"error": ...}` refusal;
+a success carrying an empty `uris`/`username`/`credential` or `ttl == 0` is a malformed reply, not a
+usable credential. Identity is the callout-granted subject token, never the body; the helper mints
+from that session record's `root_fp` against the durable monthly quota. `Debug` on the reply
+redacts `username` (it embeds the root fingerprint) and `credential`, keeping `uris`/`ttl_secs`
+visible. The module takes no `spindle-net`/coturn dependency and **no app wires it yet** — turning `uris` into a transport
+config and calling the fetch from an engine are the client app's work. Proven live twice against
+`deploy/docker-compose.yml` with a fresh random identity each run
+(`crates/spindle-client-core/tests/live_turn_credentials.rs`): a random member connected through
+the real callout, fetched via `helper.turn.get.<nfp>`, and received `ttl_secs = 3600` (the stack's
+`TURN_TTL_SECS`), `username = "1793424321:pattu3xkwr7lqx72v5jqcbluy64issdsgyueqgyxcy5xyaerheaa"`
+(the `<expiry>:<session root_fp>` shape), the configured
+`turn:127.0.0.1:3478?transport=udp|tcp` URIs, and a non-empty 28-character base64 credential
+(HMAC-SHA1 output). Punch-first arbitration and the hostd operator surface on td-870b25 remain
+open; Stage 5's Status is unchanged.
+
+**Note**: 2026-10-30 — **punch-first with a shared local window (td-870b25), and the asymmetry measured.**
+The TURN path in `spindle-net::signaling` is now a **fallback** rather than a mode. With
+`IceConfig::turn` set, both roles allocate TURN in parallel with an ICE attempt bounded by
+`IceConfig::punch_window` (default 3 s; positive values validated to **100 ms..=60 s** —
+out-of-range or clock-overflowing values are `SignalingError::PunchWindow`, never a panic; **zero**
+is the explicit relay-only mode, skipping the ICE attempt and using the relay immediately once the
+allocation is ready): a pair **present at the
+deadline check** wins (the window bounds how long to wait, not whether an already-selected pair
+counts; a publish body in flight at the boundary can suspend the `select!`, so the deadline branch
+gives the drive one bounded 10 ms final poll before deciding) and the existing `AllocationGuard`
+releases the allocation; an expired window tears down the ICE agent and switches to the relay
+(CreatePermission + relay socket, as before); a failed allocation logs and continues punch-only.
+With no TURN configured behaviour is the old punch-only path. The window starts at each side's first
+ICE poll after the offer/answer exchange (host: answer **and host candidate** published; client:
+answer verified and host candidate published), so the two deadlines differ by the answer's one-way
+leg plus verification — less than one RTT, not a full round trip; both peers must use the same
+`punch_window`. `SelectedTransport` reports the path used. A split (one peer punched, the other
+relayed) fails the QUIC handshake; both roles bound the handshake at 10 s so the attempt fails and
+the caller retries instead of the host task hanging, and the trickle bridge, candidate tee, ICE
+agent and allocation are torn down on every path (the pre-change relay path leaked its bridge
+whenever allocation or a publish failed). The relay-candidate tee is a **bounded capacity-1**
+channel fed with `try_send`, so an authenticated peer cannot grow a buffer by streaming `typ relay`
+lines while this side is still inside its punch window. Measured in
+`deploy/lab/run-s2-nat.sh` with TURN on both peers and the production 3 s window — unshaped 40
+attempts: **40/40 succeeded, 5 punch / 35 relay, 0 splits, 0 one-sided** (punch phases 4.846 /
+613.567 / 7.075 / 636.005 ms; relay phases 10.105 / 3011.243 / 10.990 / 3037.235 ms); 50 ms both
+peers 10 attempts: **10/10 succeeded, 0 punch / 10 relay, 0 splits, 0 one-sided** (relay phases
+113.277 / 3059.521 / 112.363 / 3394.280 ms). That run predates the review fixes above (the
+deadline-check final poll and the `<=` policy); those can only turn a would-be relay into a punch,
+so they cannot introduce a split, but a confirmation run is **pending** — deferred because another
+agent's long-relay session uses the same `spindle-lab` compose project, whose fixed 172.28.x
+subnets and image tags make a concurrent isolated copy unsafe. The peer-selected transports agreed
+in every measured attempt; the 5 punch samples are small and zero splits is not proof of universal
+agreement, so the policy stays revisit-able (A10.54). The split count is the input to `td-8da43e`.
+Details: `spikes/s2-signaling/RESULTS.md`.
 
 ## Stage 6: spindle-vfs + host-core
 **Goal**: Implement the shares/groups/entitlements engine and the VFS RPC server in
@@ -957,6 +1017,15 @@ enumerated list (lint-enforced engine-api-only imports).
 - **Config coherence.** `--reconcile-once` combined with `--init`, `--restore-seed-file`, or `SPINDLE_HOST_RESTORE_SEED` is `ConflictingEnrollment`; `--reconcile-interval-secs` and `--metrics-addr` are warned as ignored (the one-shot exits before either matters) rather than silently dropped.
 - **Tests.** Config: `reconcile_settings_come_from_the_environment_and_flags_override_it`, `invalid_reconcile_intervals_are_rejected`, `the_one_shot_reconcile_needs_only_the_store`, `reconcile_once_cannot_be_combined_with_an_enrollment_action`, plus the defaults/env/flags coverage those extend. One-shot: `one_shot_sweep_removes_a_deleted_uploads_row_and_reconciles_both_counters` (real temp store and share root, uploaded file deleted out of band, row gone and both counters at zero), `one_failed_share_does_not_stop_the_remaining_shares` (deleted root counted per share), `one_shot_refuses_a_missing_store_and_does_not_create_it`. Repair open: `open_for_reconcile_refuses_a_zero_byte_file_without_mutating_it`, `open_for_reconcile_refuses_a_foreign_database_without_mutating_it`, `open_for_reconcile_refuses_a_foreign_database_with_a_nonzero_user_version`, `open_for_reconcile_refuses_a_missing_path_without_creating_it`, `open_for_reconcile_opens_a_store_whose_share_root_has_been_deleted`. Locks: `the_same_share_maps_to_the_same_lock_and_different_shares_do_not`, `clones_of_the_registry_share_the_same_lock_cells`, `a_held_share_lock_serializes_a_second_acquirer`, `ledger_share_for_resolves_delete_paths_inside_mounted_shares`, `a_delete_waits_for_the_share_lock_before_the_pipeline_runs`. Scheduled sweep: `a_sweep_tick_repairs_ledger_drift_but_does_not_reconcile_counters`, `dropping_the_stop_sender_ends_the_scheduled_sweep`, `a_sub_minimum_interval_is_clamped_to_the_documented_floor`.
 - **Still open (NOT this ticket).** The scoped reconcile-on-quota-denial idea recorded on td-042e4f remains uncovered: reconciling just the member/share before returning `denied:quota_exceeded` (with a cooldown) is unbuilt.
+
+**Note**: 2026-10-30 — **td-870b25 hostd slice landed** (operator STUN/TURN surface; the library's punch-first selection landed alongside under A10.54, DESIGN v0.9.59).
+
+- **Config surface.** `SPINDLE_STUN_SERVERS` / `--stun-servers` is a comma-separated list of `SocketAddr`s (entries trimmed, empty entries rejected, duplicates collapsed, operator order kept). `SPINDLE_TURN_SERVER` / `--turn-server` plus exactly one credential form: static `SPINDLE_TURN_USERNAME` + `SPINDLE_TURN_CREDENTIAL` (`--turn-username`, `--turn-credential`), or coturn REST-secret `SPINDLE_TURN_SECRET` + `SPINDLE_TURN_LABEL` + `SPINDLE_TURN_TTL_SECS` (`--turn-secret`, `--turn-label`, `--turn-ttl-secs`, default 3600, accepted range 1..=86400 — the same bounds `spindle-net`'s private `MIN_TURN_TTL`/`MAX_TURN_TTL` enforce at mint time). A partial form, a mix of both forms, and credentials without a server are startup errors naming both spellings. STUN and TURN may each be set alone, both together, or neither; with neither, `IceConfig::default()` is built and the daemon behaves exactly as before this surface. Secrets live only inside `TurnConfig`/`TurnCredentials`, whose `Debug` redacts them.
+- **Wiring.** `Config::ice_config` builds the library `IceConfig` once; `host_options_from_config` threads it into `HostOptions.ice` for **every** daemon the reconnect loop constructs (including each planned post-renewal reconnect), with all other knobs taken from `HostOptions::default()`. The HELP text states the landed policy: with TURN configured the library punches first for the shared `punch_window` (3 s default), then falls back to relay; both peers must configure TURN and the same window. This daemon exposes no window knob and has no helper-minted (`helper.turn.get.<nfp>`) credentials.
+- **Tests.** Config: `optional_settings_take_their_documented_defaults` (empty `IceConfig`), `every_field_is_readable_from_the_environment_alone`, `flags_override_the_environment`, `turn_settings_come_from_the_environment_and_flags_override_it`, `stun_and_turn_may_be_configured_together_either_alone_or_neither`, `partial_mixed_and_serverless_turn_credentials_are_rejected`, `bad_stun_and_turn_socket_addresses_are_rejected_from_either_source`, `stun_lists_are_trimmed_deduplicated_and_reject_empty_entries`, `rest_secret_turn_ttls_accept_one_second_through_twenty_four_hours`; builder: `operator_ice_settings_thread_into_host_options`.
+- **Punch-first policy (td-870b25 / td-8da43e; A10.54, DESIGN v0.9.59).** Selection lives in the library, not this binary: with `IceConfig::turn` set it attempts a punch for the shared `punch_window` (3 s default) and falls back to relay when no pair is selected. Both peers must configure TURN and the same window; a split outcome fails the QUIC handshake and the caller retries. The lab measured **0 split outcomes across 40 unshaped + 10 shaped attempts**. This hostd surface adds no window knob and inherits `IceConfig::default()`. Still open: wiring the client half that landed in `spindle-client-core::turn_credentials`
+(URI→transport conversion and the call site; this daemon still takes operator config only) and a
+long-lived relayed-session proof of the allocation/permission refresh path. This slice changed no DESIGN text.
 
 ## Stage 8: engine-web + apps/web + hardened delivery
 **Goal**: Implement `@spindle/engine-web` (nats.ws + browser WebRTC) and the `apps/web` browser

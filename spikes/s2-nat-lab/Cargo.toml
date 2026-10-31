@@ -26,6 +26,10 @@ async-nats = { workspace = true }
 anyhow = { workspace = true }
 serde_json = "1"
 futures-util = "0.3"
+# The production library's `transport selected` events carry the session id; a JSON subscriber on
+# each peer lets the harness correlate the two sides' choices per attempt, including failed
+# handshakes (td-870b25).
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # `X25519PublicKey` appears in the lab authorizer's registry type; spindle-core does not re-export
 # the crate, the same reason crates/spindle-net/Cargo.toml carries this dependency.
 x25519-dalek = { workspace = true }

@@ -146,8 +146,8 @@ deploy/lab/run-matrix.sh
 KEEP_LAB=1 deploy/lab/run-matrix.sh
 
 # S2 across-NAT measurement using the production signaling stack (host on peer-a, client on
-# peer-c, signaling via nats-s2). Default is STUN + ICE punch; set TURN_SERVER to measure the
-# relay path (td-c3badf). See the S2 section below.
+# peer-c, signaling via nats-s2). Default is STUN + ICE punch; set TURN_SERVER to measure
+# punch-first with the relay fallback (td-870b25). See the S2 section below.
 deploy/lab/run-s2-nat.sh
 TURN_SERVER=172.28.0.13:3478 REBUILD=1 deploy/lab/run-s2-nat.sh
 
@@ -248,10 +248,15 @@ The fixed identities and the lab-local `RegistryAuthorizer` live in `spikes/s2-n
 binaries are built by `Dockerfile.s2lab` and copied into the peers.
 
 Since **td-c3badf**, `spindle-net`'s `IceConfig` gathers a host candidate plus a server-reflexive
-candidate per configured STUN server, and (when TURN is configured) allocates a relay and uses the
-TURN path unconditionally. `run-s2-nat.sh` passes `STUN_SERVER` (default `172.28.0.14:3478`) to
-both peers; `TURN_SERVER=172.28.0.13:3478` switches both peers to the relay. Both peers must get
-the same setting.
+candidate per configured STUN server. Since **td-870b25**, configuring TURN makes it the
+**fallback** rather than a mode: both peers run an ICE attempt for a shared `PUNCH_WINDOW_MS`
+(default 3000, the production default) while allocating TURN in parallel; a pair selected in the
+window wins and the allocation is released, an expired window switches to the relay. A failed
+allocation logs and continues punch-only. `run-s2-nat.sh` passes `STUN_SERVER` (default
+`172.28.0.14:3478`) and `PUNCH_WINDOW_MS` to both peers; `TURN_SERVER=172.28.0.13:3478` enables the
+punch-first path. Both peers must get the same setting. Both roles log `transport selected` with
+the session id, so the report joins the two sides per attempt and counts splits (different
+transports), which fail the QUIC handshake.
 
 Measured 2026-10-30 on this lab (5 s ICE timeout, 5 successes wanted):
 
@@ -268,6 +273,12 @@ shaped attempt; on the relay path `answer→selected` measures "answer verified 
 CreatePermission complete" (no ICE selection runs). The answer is published with the host candidate
 only, so STUN gathering and TURN allocation do not sit on the offer/answer path. Exact per-attempt
 evidence is in `spikes/s2-signaling/RESULTS.md`.
+
+The TURN rows above predate punch-first and are **superseded** for TURN-configured peers by the
+td-870b25 cells in the same RESULTS file: with `PUNCH_WINDOW_MS=3000` on both peers, 40 unshaped
+attempts gave 5 punch / 35 relay and 10 shaped attempts gave 10 relay, with **0 splits and 0
+one-sided selections**. Punch offer→usable was 636.005 ms unshaped; relay offer→usable was
+3037.235 ms unshaped (the 3 s window plus ~11 ms) and 3394.280 ms at 50 ms.
 
 Before td-c3badf this section recorded the host-only failure: unshaped 0/10 and 50 ms 0/5, all
 `ICE trickle timed out`; that history and its failure strings remain in the same RESULTS section.
