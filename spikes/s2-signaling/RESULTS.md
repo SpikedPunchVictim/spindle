@@ -846,6 +846,14 @@ deletes it, and `BindingManager` is `pub(crate)`, so no public API can repair th
 error code (never the server's reason text), instead of only reporting the downstream symptom as
 "dropping malformed TURN packet".
 
+**Refresh path (td-8cc6d4, 2026-11-17).** The same vendored crate consumed a `438` on the
+allocation Refresh: it updated the nonce, kept the old lifetime, and rescheduled the next attempt
+`lifetime / 2` later — at allocation expiry. The patch retries once with the nonce the 438
+carried, bounded by a per-relay flag. Covered by
+`allocation_refresh_stale_nonce_retries_and_keeps_the_relay` (2 s allocation, forced 438, retry
+must arrive within 750 ms, data must still flow); removing the retry makes the test fail at
+`1.007 s`, i.e. it catches the next scheduled refresh rather than a retry.
+
 ### Deterministic regression
 
 Two tests in `crates/spindle-net/src/signaling/turn.rs` drive the real adapter

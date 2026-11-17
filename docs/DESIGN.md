@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.61) + Execution Plan
+# Spindle — System Design Document (draft v0.9.62) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -356,6 +356,13 @@
 > 32 KiB `max_control_line`. A10.53's device-arm deferral is lifted now that its first consumer
 > (the client session, td-7c80c5) exists; the TypeScript twin remains deferred until a browser
 > producer exists.
+> v0.9.62: one implementation fix in the same vendored `rtc-turn` patch, no wire change. A `438`
+> on the allocation **Refresh** used to be consumed: the nonce was updated, the lifetime was not,
+> and the next refresh was scheduled `lifetime / 2` later — at the point the allocation expires
+> (td-8cc6d4). The patched handler now retries once with the nonce the 438 carried, bounded by a
+> per-relay flag that a successful refresh resets, so a second consecutive 438 falls through
+> instead of looping. A fast fake-TURN test (2 s allocation) forces the 438, asserts the retry
+> arrives within 750 ms, and then proves data still flows; it fails with the retry removed.
 
 ---
 

@@ -1134,7 +1134,7 @@ mod tests {
     use rtc_stun::message::{
         Message as StunMessage, MessageType, Setter, TransactionId, CLASS_ERROR_RESPONSE,
         CLASS_INDICATION, CLASS_REQUEST, CLASS_SUCCESS_RESPONSE, METHOD_ALLOCATE,
-        METHOD_CHANNEL_BIND, METHOD_CREATE_PERMISSION, METHOD_SEND,
+        METHOD_CHANNEL_BIND, METHOD_CREATE_PERMISSION, METHOD_REFRESH, METHOD_SEND,
     };
     use rtc_stun::textattrs::TextAttribute;
     use rtc_stun::xoraddr::XorMappedAddress;
@@ -1145,6 +1145,8 @@ mod tests {
     enum FakeTurnEvent {
         /// A ChannelBind request: its channel number and the NONCE attribute it carried.
         Bind(u16, String),
+        /// A Refresh request and the NONCE it carried.
+        Refresh(String),
         /// An error response the server sent (numeric code).
         ErrorSent(u16),
         SendIndication,
@@ -1155,6 +1157,14 @@ mod tests {
     enum BindReply {
         StaleNonce,
         BadRequest,
+    }
+
+    /// How the fake server answers allocation refreshes (td-8cc6d4).
+    #[derive(Clone, Copy)]
+    enum RefreshReply {
+        Success,
+        /// First Refresh gets a 438 with `nonce-2`; later ones succeed.
+        StaleNonceOnce,
     }
 
     /// `XOR-RELAYED-ADDRESS` setter for the fake server's Allocate success.
@@ -1211,10 +1221,13 @@ mod tests {
         socket: tokio::net::UdpSocket,
         events: tokio::sync::mpsc::UnboundedSender<FakeTurnEvent>,
         bind_reply: BindReply,
+        lifetime_secs: u32,
+        refresh_reply: RefreshReply,
     ) -> std::io::Result<()> {
         let mut buf = [0u8; 2048];
         let mut allocations = 0u32;
         let mut binds = 0u32;
+        let mut refreshes = 0u32;
         let mut announced_channel: Option<u16> = None;
         loop {
             let (n, from) = socket.recv_from(&mut buf).await?;
@@ -1273,7 +1286,7 @@ mod tests {
                                 Box::new(RelayAddressAttr(
                                     "203.0.113.9:50000".parse().expect("relayed"),
                                 )),
-                                Box::new(LifetimeAttr(600)),
+                                Box::new(LifetimeAttr(lifetime_secs)),
                             ],
                         )
                     };
@@ -1284,6 +1297,36 @@ mod tests {
                         MessageType::new(METHOD_CREATE_PERMISSION, CLASS_SUCCESS_RESPONSE),
                         vec![],
                     );
+                    socket.send_to(&raw, from).await?;
+                } else if msg.typ.method == METHOD_REFRESH {
+                    refreshes += 1;
+                    let nonce = msg
+                        .get(ATTR_NONCE)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_default();
+                    events.send(FakeTurnEvent::Refresh(nonce)).ok();
+                    let stale =
+                        matches!(refresh_reply, RefreshReply::StaleNonceOnce) && refreshes == 1;
+                    let raw = if stale {
+                        events.send(FakeTurnEvent::ErrorSent(438)).ok();
+                        stun_response(
+                            &msg,
+                            MessageType::new(METHOD_REFRESH, CLASS_ERROR_RESPONSE),
+                            vec![
+                                Box::new(ErrorCodeAttribute {
+                                    code: CODE_STALE_NONCE,
+                                    reason: b"forced by test".to_vec(),
+                                }),
+                                Box::new(TextAttribute::new(ATTR_NONCE, "nonce-2".to_string())),
+                            ],
+                        )
+                    } else {
+                        stun_response(
+                            &msg,
+                            MessageType::new(METHOD_REFRESH, CLASS_SUCCESS_RESPONSE),
+                            vec![Box::new(LifetimeAttr(lifetime_secs))],
+                        )
+                    };
                     socket.send_to(&raw, from).await?;
                 } else if msg.typ.method == METHOD_CHANNEL_BIND {
                     let attr = msg
@@ -1413,7 +1456,13 @@ mod tests {
             .expect("bind fake TURN server");
         let server_addr = server.local_addr().expect("server addr");
         let (events, rx) = tokio::sync::mpsc::unbounded_channel();
-        let server_task = tokio::spawn(fake_turn_server(server, events, BindReply::StaleNonce));
+        let server_task = tokio::spawn(fake_turn_server(
+            server,
+            events,
+            BindReply::StaleNonce,
+            600,
+            RefreshReply::Success,
+        ));
         let cfg = TurnConfig {
             server: server_addr,
             credentials: TurnCredentials::Static {
@@ -1492,7 +1541,13 @@ mod tests {
             .expect("bind fake TURN server");
         let server_addr = server.local_addr().expect("server addr");
         let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let server_task = tokio::spawn(fake_turn_server(server, events, BindReply::BadRequest));
+        let server_task = tokio::spawn(fake_turn_server(
+            server,
+            events,
+            BindReply::BadRequest,
+            600,
+            RefreshReply::Success,
+        ));
         let cfg = TurnConfig {
             server: server_addr,
             credentials: TurnCredentials::Static {
@@ -1542,6 +1597,7 @@ mod tests {
                         panic!("a failed bind must not be retried in a spin");
                     }
                     FakeTurnEvent::ErrorSent(_) => {}
+                    FakeTurnEvent::Refresh(_) => {}
                     FakeTurnEvent::SendIndication => saw_indication = true,
                     FakeTurnEvent::ChannelData(..) => {}
                 }
@@ -1554,6 +1610,94 @@ mod tests {
         );
 
         receive_pong(&socket).await;
+        server_task.abort();
+    }
+
+    /// td-8cc6d4: a 438 on the allocation Refresh must retry once with the new nonce instead of
+    /// being consumed and rescheduled at allocation expiry. A 2 s allocation makes the refresh
+    /// fire after 1 s, so this stays a fast test.
+    #[tokio::test]
+    async fn allocation_refresh_stale_nonce_retries_and_keeps_the_relay() {
+        let peer: SocketAddr = TEST_PEER.parse().expect("peer");
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake TURN server");
+        let server_addr = server.local_addr().expect("server addr");
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server_task = tokio::spawn(fake_turn_server(
+            server,
+            events,
+            BindReply::StaleNonce,
+            2, // allocation lifetime: refresh timer fires after 1 s
+            RefreshReply::StaleNonceOnce,
+        ));
+        let cfg = TurnConfig {
+            server: server_addr,
+            credentials: TurnCredentials::Static {
+                username: "user".to_string(),
+                credential: "pass".to_string(),
+            },
+        };
+        let mut guard = allocate(&cfg, IpAddr::from([127, 0, 0, 1]), Duration::from_secs(5))
+            .await
+            .expect("allocate");
+        create_permission(
+            guard.allocation_mut().expect("live allocation"),
+            peer,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("permission");
+        let socket = guard
+            .into_relay_socket(server_addr, peer)
+            .expect("relay socket");
+        spawn_driver(socket.clone());
+
+        // First Refresh carries the nonce from the 401 challenge.
+        let FakeTurnEvent::Refresh(first_nonce) = next_event(&mut rx).await else {
+            panic!("expected the scheduled allocation refresh");
+        };
+        pump_once(&socket).await; // process the 438; the patched client queues a retry
+
+        // The driver flushes the retry and the server answers it. Poll until the second Refresh.
+        // It must be the immediate retry, not the next scheduled refresh (a full lifetime/2 away).
+        let started = Instant::now();
+        let mut second = None;
+        for _ in 0..200 {
+            pump_once(&socket).await;
+            while let Ok(event) = rx.try_recv() {
+                if let FakeTurnEvent::Refresh(nonce) = event {
+                    second = Some(nonce);
+                    break;
+                }
+            }
+            if second.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let second_nonce = second.expect("the 438 must be retried");
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "the second Refresh took {:?}; that is the next scheduled refresh, not a retry",
+            started.elapsed()
+        );
+        assert_ne!(
+            first_nonce, second_nonce,
+            "the retry must use the nonce carried by the 438"
+        );
+
+        // The allocation survived: data still flows end to end.
+        let observed = send_until(&socket, &mut rx, b"after-refresh", |event| {
+            matches!(event, FakeTurnEvent::ChannelData(..))
+        })
+        .await;
+        let FakeTurnEvent::ChannelData(_, payload) = observed else {
+            unreachable!()
+        };
+        assert_eq!(payload, b"after-refresh");
+        receive_pong(&socket).await;
+
         server_task.abort();
     }
 }

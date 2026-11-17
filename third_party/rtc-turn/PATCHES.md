@@ -29,6 +29,11 @@ remains, so upgrading does not fix it either.
 - Any other error → state `Failed`; the send path uses Send Indications, so data keeps flowing
   and the bind is not retried in a spin.
 
+`src/client/relay.rs`, `handle_refresh_allocation_response` (td-8cc6d4): a 438 on the allocation
+Refresh now **retries once** with the nonce the response carried (`RelayState::refresh_retried`
+bounds it; a successful refresh resets the flag). Upstream consumed the 438, left the lifetime
+unchanged, and the next attempt was scheduled `lifetime / 2` later — at allocation expiry.
+
 ## Maintenance
 
 Drop this fork when upstream ships the fix (and verify the regression test in

@@ -45,6 +45,9 @@ pub(crate) struct RelayState {
     perm_map: HashMap<SocketAddr, Permission>,
     refresh_alloc_timer: Instant,
     refresh_perms_timer: Instant,
+    /// spindle patch (td-8cc6d4): one in-flight stale-nonce retry for the allocation refresh.
+    /// Reset on a successful refresh, so a later expiry is retried too.
+    refresh_retried: bool,
 }
 
 impl RelayState {
@@ -64,6 +67,7 @@ impl RelayState {
             perm_map: HashMap::new(),
             refresh_alloc_timer: Instant::now().add(lifetime / 2),
             refresh_perms_timer: Instant::now().add(PERM_REFRESH_INTERVAL),
+            refresh_retried: false,
         }
     }
 
@@ -386,6 +390,7 @@ impl Relay<'_> {
 
     pub(super) fn handle_refresh_allocation_response(&mut self, res: Message) -> Result<()> {
         let mut released = false;
+        let mut retry_lifetime = None;
         let result = if let Some(relay) = self.client.relays.get_mut(&self.relayed_addr) {
             if res.typ.class == CLASS_ERROR_RESPONSE {
                 let mut code = ErrorCodeAttribute::default();
@@ -394,7 +399,14 @@ impl Relay<'_> {
                     Err(Error::Other(format!("{}", res.typ)))
                 } else if code.code == CODE_STALE_NONCE {
                     relay.set_nonce_from_msg(&res);
-                    //Error::ErrTryAgain
+                    // spindle patch (td-8cc6d4): a 438 used to be consumed silently, and the
+                    // next refresh was scheduled a full `lifetime / 2` away — at allocation
+                    // expiry. Retry once with the nonce the 438 carried; a second 438 in a row
+                    // falls through rather than looping.
+                    if !relay.refresh_retried {
+                        relay.refresh_retried = true;
+                        retry_lifetime = Some(relay.lifetime);
+                    }
                     Ok(())
                 } else {
                     Err(Error::Other(format!("{} (error {})", res.typ, code)))
@@ -405,6 +417,7 @@ impl Relay<'_> {
                 updated_lifetime.get_from(&res)?;
 
                 relay.lifetime = updated_lifetime.0;
+                relay.refresh_retried = false;
                 debug!("updated lifetime: {} seconds", relay.lifetime.as_secs());
 
                 // A zero lifetime is the server confirming deallocation — the reply to the
@@ -422,6 +435,10 @@ impl Relay<'_> {
         if released {
             self.client.relays.remove(&self.relayed_addr);
             debug!("allocation released; relay {} dropped", self.relayed_addr);
+        }
+
+        if let Some(lifetime) = retry_lifetime {
+            self.refresh_allocation(lifetime)?;
         }
 
         result
