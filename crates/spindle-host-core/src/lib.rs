@@ -169,7 +169,10 @@ pub use authorize::{
     CapIssuer, DeviceLookup, HostConnectAuthorizer, LookupError, RedactedLookupError,
     RootKeyCapIssuer, SqliteDeviceLookup, MEMBER_CAP_DEFAULT_TTL_SECS,
 };
-pub use invite::{InviteIssuer, INVITE_DEFAULT_TTL_SECS, INVITE_NONCE_LEN};
+pub use invite::{
+    redeem_invite, InviteIssuer, RedeemInviteError, RedeemedInvite, INVITE_DEFAULT_TTL_SECS,
+    INVITE_NONCE_LEN,
+};
 pub use revoke::{
     revoke_device_and_mint, revoke_member_and_mint, RevocationPublication, RevokeError,
 };

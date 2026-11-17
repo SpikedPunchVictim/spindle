@@ -233,6 +233,19 @@ pub enum StoreError {
         to: MemberStatus,
     },
 
+    /// An invite nonce is already recorded against a different member. Redeeming a nonce is a
+    /// single-use operation keyed to the member it was burned for; a second member presenting the
+    /// same nonce is a replay attack or a corrupted record, never an idempotent re-presentation.
+    /// Carries only the two numeric ids.
+    #[error(
+        "invite nonce was already redeemed for member {stored:?}, not {supplied:?} (redemption is \
+         idempotent only for the same member)"
+    )]
+    InviteRedeemedByAnotherMember {
+        stored: MemberId,
+        supplied: MemberId,
+    },
+
     /// DESIGN.md §A4b: "no overlapping roots (rejected at add-time by resolved real path *and*
     /// device+inode/file-id ...)".
     #[error(
@@ -398,6 +411,7 @@ impl fmt::Display for RedactedStoreError<'_> {
             | StoreError::MemberRootPkFingerprintMismatch { .. }
             | StoreError::MemberRootPkAlreadySet { .. }
             | StoreError::InvalidStatusTransition { .. }
+            | StoreError::InviteRedeemedByAnotherMember { .. }
             | StoreError::PersistedSharesOverlap { .. }
             | StoreError::TooManyShares { .. }
             | StoreError::TooManyExcludeGlobs { .. }
@@ -907,6 +921,25 @@ impl Store {
             groups,
             created: created as u64,
         }))
+    }
+
+    /// Finds a member by their identity-root fingerprint (`members.root_fp` is UNIQUE). Used by
+    /// invite redemption: the invite's `subject` is the invitee's `root_fp`, so this is the only
+    /// identifier the presenting side needs.
+    pub fn member_id_by_root_fp(
+        &self,
+        root_fp: &Fingerprint,
+    ) -> Result<Option<MemberId>, StoreError> {
+        self.check_not_poisoned()?;
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT member_id FROM members WHERE root_fp = ?1",
+                params![root_fp.as_bytes()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(id.map(|id| MemberId(id as u64)))
     }
 
     /// Records a member's Ed25519 identity-root public key (`members.root_pk`, SCHEMA_V10). The
@@ -2667,6 +2700,81 @@ impl Store {
                 )?;
             Ok(IssuedCapRecord {
                 member_id: MemberId(stored_member_id as u64),
+                issued_cap: stored_cap,
+                redeemed_at: stored_redeemed_at as u64,
+            })
+        })
+    }
+
+    /// Atomic invite redemption (DESIGN.md §A4: "the host stores `nonce -> {member_id,
+    /// issued_cap}` atomically; re-presentation of the same nonce within `exp` replays the stored
+    /// cap"). Burns the nonce and activates the invited member in **one** transaction, so a crash
+    /// between the two can neither strand an active member without a recorded cap nor burn a
+    /// nonce that never produced a member.
+    ///
+    /// Idempotency is scoped to the same member: re-presenting the nonce after the member is
+    /// `Active` returns the originally stored record; the same nonce for a different member is
+    /// [`StoreError::InviteRedeemedByAnotherMember`]. A `Revoked` member cannot be reactivated
+    /// ([`StoreError::InvalidStatusTransition`]). The caller supplies the capability bytes to
+    /// store; on replay the stored bytes win, so a caller cannot change the answer by minting a
+    /// new cap.
+    pub fn redeem_invite(
+        &mut self,
+        nonce: &[u8],
+        member_id: MemberId,
+        issued_cap: &[u8],
+        now: u64,
+    ) -> Result<IssuedCapRecord, StoreError> {
+        self.check_not_poisoned()?;
+        self.with_mut_transaction("redeem_invite", |tx| {
+            tx.execute(
+                "INSERT INTO invite_nonces (nonce, member_id, issued_cap, redeemed_at) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (nonce) DO NOTHING",
+                params![nonce, member_id.0 as i64, issued_cap, now as i64],
+            )?;
+            let (stored_member_id, stored_cap, stored_redeemed_at): (i64, Vec<u8>, i64) = tx
+                .query_row(
+                    "SELECT member_id, issued_cap, redeemed_at FROM invite_nonces WHERE nonce = ?1",
+                    params![nonce],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+            let stored_member_id = MemberId(stored_member_id as u64);
+            if stored_member_id != member_id {
+                return Err(StoreError::InviteRedeemedByAnotherMember {
+                    stored: stored_member_id,
+                    supplied: member_id,
+                });
+            }
+
+            let current: Option<String> = tx
+                .query_row(
+                    "SELECT status FROM members WHERE member_id = ?1",
+                    params![member_id.0 as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(current) = current else {
+                return Err(StoreError::MemberNotFound(member_id));
+            };
+            match parse_status(&current) {
+                MemberStatus::Invited => {
+                    tx.execute(
+                        "UPDATE members SET status = ?1 WHERE member_id = ?2",
+                        params![status_str(MemberStatus::Active), member_id.0 as i64],
+                    )?;
+                }
+                // A replay after a successful redemption is the idempotent case.
+                MemberStatus::Active => {}
+                MemberStatus::Revoked => {
+                    return Err(StoreError::InvalidStatusTransition {
+                        from: MemberStatus::Revoked,
+                        to: MemberStatus::Active,
+                    })
+                }
+            }
+
+            Ok(IssuedCapRecord {
+                member_id: stored_member_id,
                 issued_cap: stored_cap,
                 redeemed_at: stored_redeemed_at as u64,
             })

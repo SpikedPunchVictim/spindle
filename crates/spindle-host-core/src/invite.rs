@@ -62,10 +62,12 @@
 use crate::authorize::wall_clock_now_secs;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use spindle_core::artifacts::issue_capability;
+use spindle_core::artifacts::{issue_capability, verify_capability, ArtifactError};
 use spindle_core::{Fingerprint, SigningKey, VerifyingKey};
-use spindle_proto::artifacts::{CapKind, HostOpKeyCert};
+use spindle_proto::artifacts::{CapKind, Capability, HostOpKeyCert};
 use spindle_proto::invite::{InvitePayload, InviteWireError, TlsPin, INVITE_CURRENT_V};
+use spindle_vfs::model::MemberId;
+use spindle_vfs::store::{Store, StoreError};
 
 /// An invite capability's default lifetime: DESIGN.md §A4's invite bullet — `exp` in hours,
 /// "default 24 h, owner-adjustable". `24 * 60 * 60 == 86_400` seconds.
@@ -207,6 +209,81 @@ impl InviteIssuer {
     }
 }
 
+/// The result of a successful (or idempotently replayed) invite redemption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedeemedInvite {
+    pub member_id: MemberId,
+    /// The capability recorded for this nonce. On the first redemption this is the caller's
+    /// `issued_cap`; on a replay it is the originally stored value, so the same answer is
+    /// returned even if the caller mints a different capability.
+    pub issued_cap: Vec<u8>,
+    pub redeemed_at: u64,
+}
+
+/// Why [`redeem_invite`] refused. `Display` deliberately omits the wrapped artifact/store error
+/// details: those can carry fingerprints or paths, and every caller that logs this type must not
+/// turn a refusal into a disclosure.
+#[derive(Debug, thiserror::Error)]
+pub enum RedeemInviteError {
+    #[error("invite capability failed verification")]
+    Verify(#[source] ArtifactError),
+    #[error("capability is not an invite (kind {0:?})")]
+    NotAnInvite(CapKind),
+    #[error("invite subject does not match the presenting root fingerprint")]
+    SubjectMismatch,
+    #[error("no member on this host has the presenting root fingerprint")]
+    MemberNotEnrolled,
+    #[error("store refused the redemption")]
+    Store(#[source] StoreError),
+}
+
+impl From<ArtifactError> for RedeemInviteError {
+    fn from(error: ArtifactError) -> Self {
+        Self::Verify(error)
+    }
+}
+
+impl From<StoreError> for RedeemInviteError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+/// Redeems an invite capability (DESIGN.md §A4): verifies the host-signed chain and expiry,
+/// requires kind `invite`, binds `subject` to the presenting root fingerprint (A10.46 — invites
+/// are addressed, not bearer), resolves the pre-created `invited` member, then burns the nonce,
+/// records `issued_cap`, and activates the member in one store transaction.
+///
+/// The caller supplies `issued_cap` (the host mints the member capability); this function owns
+/// verification, member resolution, and the atomic store transition, not policy about what the
+/// capability contains. A replay of the same nonce for the same member returns the originally
+/// stored capability. The store additionally refuses a nonce presented for a different member and
+/// a `revoked` member, both without partial writes.
+pub fn redeem_invite(
+    store: &mut Store,
+    invite: &Capability,
+    presenting_root_fp: &Fingerprint,
+    issued_cap: &[u8],
+    now: u64,
+) -> Result<RedeemedInvite, RedeemInviteError> {
+    verify_capability(invite, now)?;
+    if invite.kind != CapKind::Invite {
+        return Err(RedeemInviteError::NotAnInvite(invite.kind));
+    }
+    if invite.subject.as_slice() != presenting_root_fp.as_bytes() {
+        return Err(RedeemInviteError::SubjectMismatch);
+    }
+    let member_id = store
+        .member_id_by_root_fp(presenting_root_fp)?
+        .ok_or(RedeemInviteError::MemberNotEnrolled)?;
+    let record = store.redeem_invite(&invite.nonce, member_id, issued_cap, now)?;
+    Ok(RedeemedInvite {
+        member_id: record.member_id,
+        issued_cap: record.issued_cap,
+        redeemed_at: record.redeemed_at,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +317,262 @@ mod tests {
             "wss://registry.example:443".to_string(),
             "tls://registry.example:4222".to_string(),
         ]
+    }
+
+    // ---- redemption (td-75436c) -----------------------------------------------------------
+
+    use spindle_vfs::model::MemberStatus;
+
+    struct RedemptionFixture {
+        store: Store,
+        issuer: InviteIssuer,
+        invitee: RootKey,
+        member_id: MemberId,
+        payload: InvitePayload,
+    }
+
+    fn redemption_fixture() -> RedemptionFixture {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let issuer = realistic_invite_issuer(NOW);
+        let invitee = RootKey::from_seed([0xA0; 32]);
+        let subject = invitee.root_fp();
+        let member_id = store
+            .add_member(subject, "invitee", 0)
+            .expect("add invited member");
+        store
+            .set_member_root_pk(member_id, &invitee.public_key().to_bytes())
+            .expect("bind member root key");
+        let payload = issuer
+            .issue_invite(subject, 0, baseline_endpoints(), TlsPin::WebPki)
+            .expect("issue invite");
+        RedemptionFixture {
+            store,
+            issuer,
+            invitee,
+            member_id,
+            payload,
+        }
+    }
+
+    #[test]
+    fn redemption_activates_the_member_and_records_the_cap() {
+        let mut f = redemption_fixture();
+        let issued_cap = vec![0xAA; 424];
+        let redeemed = redeem_invite(
+            &mut f.store,
+            &f.payload.cap,
+            &f.invitee.root_fp(),
+            &issued_cap,
+            NOW,
+        )
+        .expect("redeem");
+
+        assert_eq!(redeemed.member_id, f.member_id);
+        assert_eq!(redeemed.issued_cap, issued_cap);
+        assert_eq!(redeemed.redeemed_at, NOW);
+        let member = f
+            .store
+            .get_member(f.member_id)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(member.status, MemberStatus::Active);
+    }
+
+    /// A replay within `exp` returns the originally stored cap even if the caller mints a
+    /// different one — the burn table's answer is the stable one.
+    #[test]
+    fn replay_returns_the_stored_cap_not_the_new_one() {
+        let mut f = redemption_fixture();
+        let first = redeem_invite(
+            &mut f.store,
+            &f.payload.cap,
+            &f.invitee.root_fp(),
+            &[0xAA; 424],
+            NOW,
+        )
+        .expect("first redemption");
+        let replay = redeem_invite(
+            &mut f.store,
+            &f.payload.cap,
+            &f.invitee.root_fp(),
+            &[0xBB; 100],
+            NOW + 1,
+        )
+        .expect("idempotent replay");
+
+        assert_eq!(replay.issued_cap, first.issued_cap);
+        assert_eq!(replay.redeemed_at, first.redeemed_at);
+    }
+
+    #[test]
+    fn an_expired_invite_is_refused_without_activating() {
+        let mut f = redemption_fixture();
+        let after_exp = f.payload.cap.exp + 1;
+        let error = redeem_invite(
+            &mut f.store,
+            &f.payload.cap,
+            &f.invitee.root_fp(),
+            &[0xAA; 32],
+            after_exp,
+        )
+        .expect_err("expired invite");
+        assert!(matches!(error, RedeemInviteError::Verify(_)), "{error:?}");
+        let member = f
+            .store
+            .get_member(f.member_id)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(member.status, MemberStatus::Invited);
+    }
+
+    #[test]
+    fn a_subject_mismatch_is_refused_and_does_not_consume_the_nonce() {
+        let mut f = redemption_fixture();
+        let other = RootKey::from_seed([0xA1; 32]);
+        let error = redeem_invite(
+            &mut f.store,
+            &f.payload.cap,
+            &other.root_fp(),
+            &[0xAA; 32],
+            NOW,
+        )
+        .expect_err("wrong subject");
+        assert!(matches!(error, RedeemInviteError::SubjectMismatch));
+
+        // The correct presenter can still redeem the same invite afterwards: the refused attempt
+        // burned nothing.
+        redeem_invite(
+            &mut f.store,
+            &f.payload.cap,
+            &f.invitee.root_fp(),
+            &[0xAA; 32],
+            NOW,
+        )
+        .expect("correct presenter still redeems");
+    }
+
+    #[test]
+    fn an_unenrolled_root_fingerprint_is_refused() {
+        let mut f = redemption_fixture();
+        let stranger = RootKey::from_seed([0xA2; 32]);
+        // Mint an invite addressed to the stranger so verification and the subject check pass;
+        // the refusal must come from the member lookup.
+        let payload = f
+            .issuer
+            .issue_invite(stranger.root_fp(), 0, baseline_endpoints(), TlsPin::WebPki)
+            .expect("issue");
+        let error = redeem_invite(
+            &mut f.store,
+            &payload.cap,
+            &stranger.root_fp(),
+            &[0xAA; 32],
+            NOW,
+        )
+        .expect_err("no member");
+        assert!(matches!(error, RedeemInviteError::MemberNotEnrolled));
+    }
+
+    #[test]
+    fn a_tampered_signature_is_refused() {
+        let mut f = redemption_fixture();
+        let mut tampered = f.payload.cap.clone();
+        tampered.sig[0] ^= 0xFF;
+        let error = redeem_invite(
+            &mut f.store,
+            &tampered,
+            &f.invitee.root_fp(),
+            &[0xAA; 32],
+            NOW,
+        )
+        .expect_err("tampered signature");
+        assert!(matches!(error, RedeemInviteError::Verify(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_member_capability_is_not_an_invite() {
+        let mut f = redemption_fixture();
+        // A genuinely signed `member` capability (mutating an invite's kind would only fail the
+        // signature): verification must pass and the kind check must be what refuses it.
+        let root = RootKey::from_seed([0x90; 32]);
+        let op_signing = SigningKey::from_bytes(&[0x91; 32]);
+        let op_cert =
+            issue_host_op_key_cert(&root, &op_signing.verifying_key(), NOW, NOW + 90 * 86_400);
+        let member_cap = issue_capability(
+            &root.public_key(),
+            &op_cert,
+            &op_signing,
+            CapKind::Member,
+            f.invitee.root_fp(),
+            0,
+            NOW + 3_600,
+            vec![0x11; 32],
+        );
+        let error = redeem_invite(
+            &mut f.store,
+            &member_cap,
+            &f.invitee.root_fp(),
+            &[0xAA; 32],
+            NOW,
+        )
+        .expect_err("member cap");
+        assert!(matches!(
+            error,
+            RedeemInviteError::NotAnInvite(CapKind::Member)
+        ));
+    }
+
+    /// A nonce already burnt for one member cannot be presented for another, and the refusal
+    /// leaves the second member `Invited` (the insert and the activation share one transaction).
+    #[test]
+    fn the_same_nonce_cannot_be_redeemed_for_a_different_member() {
+        let mut f = redemption_fixture();
+        redeem_invite(
+            &mut f.store,
+            &f.payload.cap,
+            &f.invitee.root_fp(),
+            &[0xAA; 32],
+            NOW,
+        )
+        .expect("first redemption");
+
+        let second = RootKey::from_seed([0xA3; 32]);
+        let second_id = f
+            .store
+            .add_member(second.root_fp(), "second", 0)
+            .expect("second member");
+        let error = f
+            .store
+            .redeem_invite(&f.payload.cap.nonce, second_id, &[0xBB; 32], NOW)
+            .expect_err("different member");
+        assert!(matches!(
+            error,
+            StoreError::InviteRedeemedByAnotherMember { .. }
+        ));
+        let member = f.store.get_member(second_id).expect("get").expect("exists");
+        assert_eq!(member.status, MemberStatus::Invited);
+    }
+
+    #[test]
+    fn a_revoked_member_cannot_be_reactivated_by_redemption() {
+        let mut f = redemption_fixture();
+        f.store
+            .set_member_status(f.member_id, MemberStatus::Revoked)
+            .expect("revoke");
+        let error = redeem_invite(
+            &mut f.store,
+            &f.payload.cap,
+            &f.invitee.root_fp(),
+            &[0xAA; 32],
+            NOW,
+        )
+        .expect_err("revoked member");
+        assert!(matches!(error, RedeemInviteError::Store(_)), "{error:?}");
+        let member = f
+            .store
+            .get_member(f.member_id)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(member.status, MemberStatus::Revoked);
     }
 
     /// The exact baseline whose size [`MEASURED_INVITE_BYTES`] names.

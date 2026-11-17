@@ -102,6 +102,9 @@ const EXPECTED_MAPPING: &[(&str, Behavior)] = &[
 const OTHER_LITERAL_SITES: &[(&str, Behavior)] = &[
     ("set_member_status", Behavior::Deferred),
     ("burn_invite_nonce", Behavior::Deferred),
+    // td-75436c: burns the nonce and activates the member in one write transaction; Deferred,
+    // like `burn_invite_nonce`, under the existing contract.
+    ("redeem_invite", Behavior::Deferred),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
