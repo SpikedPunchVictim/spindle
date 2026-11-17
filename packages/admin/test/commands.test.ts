@@ -7,8 +7,8 @@
 
 import { describe, expect, it } from "vitest";
 
-import { AdminCommand, ADMIN_COMMAND_CURRENT_V, bytesToHex, hexToBytes } from "@spindle/proto";
-import { ed25519Sign } from "@spindle/crypto";
+import { AdminCommand, ADMIN_COMMAND_CURRENT_V, CborValue, bytesToHex, hexToBytes } from "@spindle/proto";
+import { ed25519Sign, verifyAdminCommand } from "@spindle/crypto";
 
 import { buildAdminCommand } from "../src/commands.js";
 import { AdminError } from "../src/errors.js";
@@ -30,6 +30,11 @@ interface VectorDoc {
 }
 
 const doc = loadVectorFile("admin-command.json") as VectorDoc;
+
+// Without this, an empty/renamed `cases` makes the loop below silently vacuous.
+if (doc.cases.length !== 3) {
+  throw new Error(`expected 3 admin-command vector cases, found ${doc.cases.length}`);
+}
 
 const NONCE = new Uint8Array(16).fill(0xaa);
 const SIGNER_FP = new Uint8Array(32).fill(0xbb);
@@ -126,6 +131,11 @@ describe("buildAdminCommand: golden vectors", () => {
     expect(bytesToHex(command.sig)).toBe(
       bytesToHex(await ed25519Sign(seed, AdminCommand.signingInput(command))),
     );
+    // The production verifier, not just the deterministic re-sign: this is what catches a
+    // verifier-side regression.
+    await expect(
+      verifyAdminCommand(command, publicKey, command.signer_fp, 1_755_907_260n),
+    ).resolves.toBeUndefined();
   });
 });
 
@@ -240,5 +250,17 @@ describe("buildAdminCommand: producer invariants", () => {
         for (const needle of forbidden) expect(message).not.toContain(needle);
       }
     }
+  });
+
+  it("rejects args that do not survive a canonical decode round-trip", async () => {
+    // Duplicate map keys: canonicalEncode sorts but does not de-duplicate, and the decoder (both
+    // here and in Rust) rejects the result. The builder must refuse before signing.
+    const duplicate = CborValue.map([
+      ["host_fp", CborValue.text("a")],
+      ["host_fp", CborValue.text("b")],
+    ]);
+    await expect(
+      buildAdminCommand({ ...base, args: duplicate, signer: signerFor() }),
+    ).rejects.toMatchObject({ kind: "InvalidValue", field: "args" });
   });
 });

@@ -13,6 +13,8 @@ import {
   AdminCommand,
   ADMIN_COMMAND_CURRENT_V,
   ADMIN_COMMAND_MIN_V,
+  canonicalDecode,
+  canonicalEncode,
   type CborValue,
 } from "@spindle/proto";
 
@@ -112,6 +114,14 @@ export async function buildAdminCommand(params: BuildAdminCommandParams): Promis
   requireLength(fingerprint, KEY_LEN, "signer_fingerprint");
   if (!bytesEqual(signerFp, fingerprint)) throw AdminError.signerFingerprintMismatch();
 
+  // Canonical round-trip: rejects duplicate map keys, excessive nesting, and non-CborValue
+  // shapes, and guarantees the command we sign decodes under the same rules the helper applies.
+  try {
+    canonicalDecode(canonicalEncode(args));
+  } catch {
+    throw AdminError.invalidValue("args");
+  }
+
   const unsigned: AdminCommand = {
     v,
     cmd,
@@ -124,7 +134,13 @@ export async function buildAdminCommand(params: BuildAdminCommandParams): Promis
   };
 
   // `AdminCommand.signingInput` already carries the `spindle-adm-cmd-v1` domain tag.
-  const signature = await signer.sign(AdminCommand.signingInput(unsigned));
+  let signingInput: Uint8Array;
+  try {
+    signingInput = AdminCommand.signingInput(unsigned);
+  } catch {
+    throw AdminError.invalidValue("command");
+  }
+  const signature = await signer.sign(signingInput);
   requireLength(signature, SIGNATURE_LEN, "sig");
 
   return { ...unsigned, sig: signature };

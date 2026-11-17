@@ -143,7 +143,12 @@ export class AdminClient {
       signer: this.#signer,
     });
 
-    const payload = AdminCommand.toCanonicalBytes(command);
+    let payload: Uint8Array;
+    try {
+      payload = AdminCommand.toCanonicalBytes(command);
+    } catch {
+      throw AdminError.invalidValue("command");
+    }
 
     let raw: Uint8Array;
     try {

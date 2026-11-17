@@ -77,24 +77,37 @@ export class FileKeySigner implements Signer {
    * `node:fs/promises` is imported dynamically so this module stays importable in a browser
    * bundle; only code that actually opens a file needs Node. */
   static async open(path: string, opts: FileKeySignerOptions = {}): Promise<FileKeySigner> {
-    const { readFile, stat } = await import("node:fs/promises");
+    const { open: openFile } = await import("node:fs/promises");
+    const { constants } = await import("node:fs");
 
-    const info = await stat(path);
-    if (!info.isFile()) {
-      throw new Error(`refusing to load key file \`${path}\`: not a regular file`);
-    }
-    // Windows has no POSIX mode bits to enforce. On every other platform, a key file readable by
-    // anyone else is refused rather than chmod'ed — a silent fix would conceal that the seed may
-    // already have been read.
-    if (process.platform !== "win32" && (info.mode & 0o077) !== 0) {
-      const mode = (info.mode & 0o777).toString(8).padStart(3, "0");
-      throw new Error(
-        `refusing to load key file \`${path}\`: mode ${mode} grants group/other access (expected 0600)`,
-      );
-    }
-
-    const raw = new Uint8Array(await readFile(path));
+    // One descriptor does the ownership/mode check and the read, so a path swap between the two
+    // cannot substitute different bytes. O_NOFOLLOW where the platform has it refuses a symlink
+    // outright; Windows has no POSIX modes/owner to enforce.
+    const flags =
+      constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW);
+    const handle = await openFile(path, flags);
+    let buffer: Buffer | undefined;
+    let raw: Uint8Array | undefined;
     try {
+      const info = await handle.stat();
+      if (!info.isFile()) {
+        throw new Error(`refusing to load key file \`${path}\`: not a regular file`);
+      }
+      if (process.platform !== "win32" && (info.mode & 0o077) !== 0) {
+        const mode = (info.mode & 0o777).toString(8).padStart(3, "0");
+        throw new Error(
+          `refusing to load key file \`${path}\`: mode ${mode} grants group/other access (expected 0600)`,
+        );
+      }
+      const uid = process.getuid?.();
+      if (uid !== undefined && info.uid !== uid) {
+        throw new Error(
+          `refusing to load key file \`${path}\`: owned by uid ${info.uid}, not the running uid ${uid}`,
+        );
+      }
+
+      buffer = await handle.readFile();
+      raw = new Uint8Array(buffer);
       if (raw.length !== 32) {
         throw new Error(`refusing to load key file \`${path}\`: expected a 32-byte seed`);
       }
@@ -103,13 +116,15 @@ export class FileKeySigner implements Signer {
       if (publicKey.length !== FINGERPRINT_LEN) {
         throw new Error("Ed25519 public key has an unexpected length");
       }
-      const fingerprint = opts.signerFp ?? (await rootFpOf(publicKey));
+      const fingerprint = (opts.signerFp ?? (await rootFpOf(publicKey))).slice();
       if (fingerprint.length !== FINGERPRINT_LEN) {
         throw new Error("operator fingerprint has an unexpected length");
       }
       return new FileKeySigner(seed, publicKey, fingerprint, opts.backend);
     } finally {
-      raw.fill(0);
+      raw?.fill(0);
+      buffer?.fill(0);
+      await handle.close();
     }
   }
 

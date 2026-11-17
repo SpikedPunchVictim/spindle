@@ -1,7 +1,7 @@
 // The documented admin command surface and its NATS subjects (DESIGN.md §A3b / §A5, ADR-007).
 //
 // DESIGN.md fixes the wildcard permission `registry.admin.>` but does not spell out a per-command
-// subject mapping, and no helper handler exists yet (DESIGN.md:1280). This module is the
+// subject mapping, and no helper handler exists yet (DESIGN.md §A5 status column / §A9 divergence list). This module is the
 // library's single, explicit statement of that surface:
 //
 //   registry.admin.<cmd>     for every `cmd` in ADMIN_COMMAND_NAMES

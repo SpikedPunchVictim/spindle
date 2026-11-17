@@ -1,7 +1,7 @@
 // File-custody signer tests: key loading rules, no seed exposure, deterministic Ed25519
 // signatures, and a real sign -> Rust-derived-verifier round trip.
 
-import { mkdtemp, rm, writeFile, chmod } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, chmod, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -134,6 +134,27 @@ describe("FileKeySigner", () => {
         signer,
       }),
     ).rejects.toMatchObject({ kind: "SignerFingerprintMismatch" });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "refuses a symlink to an otherwise valid seed",
+    async () => {
+      const file = await seedFile(SEED);
+      const dir = await tempDir();
+      const link = path.join(dir, "operator.seed");
+      await symlink(file, link);
+      await expect(FileKeySigner.open(link)).rejects.toThrow(/not a regular file|ELOOP/);
+    },
+  );
+
+  it("copies a caller-supplied fingerprint instead of retaining it", async () => {
+    const file = await seedFile(SEED);
+    const fp = new Uint8Array(32).fill(0x11);
+    const signer = await FileKeySigner.open(file, { signerFp: fp });
+    fp.fill(0);
+    expect(bytesToHex(await signer.fingerprint())).toBe(
+      bytesToHex(new Uint8Array(32).fill(0x11)),
+    );
   });
 
   it("refuses a file with group/other access (POSIX)", async () => {

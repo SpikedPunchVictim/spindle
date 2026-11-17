@@ -18,7 +18,7 @@
 //
 // What is deliberately NOT implemented (reported, not guessed):
 // - a live NATS adapter, operator credentials, or the mTLS profile (A10.19 keeps transport out of
-//   this package; `registry.admin.>` has no helper handler yet — DESIGN.md:1280);
+//   this package; `registry.admin.>` has no helper handler yet — DESIGN.md §A5 status column / §A9 divergence list);
 // - admission-invite *minting* (`AdmissionToken` signing) — a sibling A3b slice, not part of this
 //   ticket's command client;
 // - verification — `@spindle/crypto`'s `verifyAdminCommand` is the single verifier and is used by

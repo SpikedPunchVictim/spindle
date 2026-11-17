@@ -1,6 +1,6 @@
 // Admin reply envelope (provisional).
 //
-// DESIGN.md:1280 records that `registry.admin.>` has no handler yet, and neither DESIGN.md nor
+// DESIGN.md §A5's status column and §A9's divergence list record that `registry.admin.>` has no handler yet, and neither DESIGN.md nor
 // ADR-007 specifies a reply wire shape. This module defines the smallest canonical-CBOR envelope
 // the client needs to distinguish success from a typed refusal:
 //
@@ -124,6 +124,7 @@ export function encodeAdminReply(reply: AdminReply): Uint8Array {
     if (reply.result !== undefined) entries.push(["result", reply.result]);
   } else {
     if (reply.error === undefined) throw AdminError.invalidValue("reply.error");
+    if (reply.result !== undefined) throw AdminError.invalidValue("reply.result");
     const errorEntries: Array<[string, CborValue]> = [
       ["code", CborValue.text(reply.error.code)],
     ];
