@@ -24,6 +24,9 @@ WORKDIR /workspace
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY spikes/ ./spikes/
+# `[patch.crates-io]` points rtc-turn at this in-repo fork (td-67f0c5); cargo needs it present
+# even when the built binary does not depend on rtc-turn.
+COPY third_party/ ./third_party/
 
 # Only the two binaries this lab needs. The spike crate's deps are pure Rust (ring, rcgen,
 # rtc-*, quinn) — no cmake/C compiler beyond the base image.

@@ -1,4 +1,4 @@
-# Spindle — System Design Document (draft v0.9.59) + Execution Plan
+# Spindle — System Design Document (draft v0.9.60) + Execution Plan
 
 > **How to read this file.** Part A is the codified design (what will become `docs/DESIGN.md` and ADR-001…006 in the
 > project). Part B is the execution plan. Part C records the Opus review disposition. Part D is the change log.
@@ -328,6 +328,22 @@
 > the handshake at 10 s so the attempt fails and the caller retries instead of the host task
 > hanging, and the trickle bridge, candidate tee and allocation are torn down on every path (the
 > old relay path leaked its bridge whenever allocation or a publish failed).
+> v0.9.60: one implementation change, no wire change. TURN relayed sessions no longer die on a
+> ChannelBind **438 Stale nonce** (td-67f0c5). `rtc-turn` 0.20.3 deletes the channel binding on
+> any failed bind; the next send allocates a **new channel number** for the same peer, which
+> coturn rejects with `400 same peer, different channel number` until the old channel expires, so
+> relayed data stopped for the rest of the allocation. 0.21.1's source still deletes the binding,
+> and `BindingManager` is private, so the workspace builds a patched 0.20.3 from
+> `third_party/rtc-turn` via `[patch.crates-io]` (A9c manifest amended): a failed bind keeps the
+> binding — 438 leaves it `Idle` so the next send re-binds the **same** channel number with the
+> refreshed nonce, and any other error leaves it `Failed`, whose send path uses Send Indications
+> (no retry spin). `spindle-net`'s adapter now decodes TURN error responses and logs method plus
+> numeric code, never the server's reason text. Two fake-TURN tests force 438 and 400 and prove
+> same-channel rebinding, continued inbound decoding, and no re-bind loop; both fail with the
+> patch reverted. Live: a 700 s forced-relay session across the lab's two NATs completed with
+> 70/70 heartbeats (last 690.7 s) and coturn `CHANNEL_BIND` successes at 0/300/600 s; that run
+> did not happen to reproduce a mid-session 438, so the retry proof is the deterministic test
+> (details in `spikes/s2-signaling/RESULTS.md`).
 
 ---
 
@@ -1769,7 +1785,7 @@ spindle/
 | Runtime | tokio, tracing, thiserror (libs) / anyhow (bins) | Node 22 LTS (CLI/admin), evergreen browsers per A7 |
 | Observability | `metrics` (facade, libraries record only) + `metrics-exporter-prometheus` (binaries only; `default-features = false`, `http-listener`) | — (client surfaces degrade state, no exporter) |
 | NATS | async-nats, nkeys (nkey seed auth; helper since Stage 4, host binary since td-539ffa) | nats.ws |
-| WebRTC | webrtc ≥0.20 (browser peers; ice reused standalone for QUIC punching) + quinn (native↔native QUIC) + rcgen (per-session QUIC certs) + `rtc-turn` (TURN relay for the native QUIC path, td-c3badf; same sans-I/O `rtc` release train as `rtc-ice`, S19 leg-3 precedent) | browser RTCPeerConnection |
+| WebRTC | webrtc ≥0.20 (browser peers; ice reused standalone for QUIC punching) + quinn (native↔native QUIC) + rcgen (per-session QUIC certs) + `rtc-turn` (TURN relay for the native QUIC path, td-c3badf; same sans-I/O `rtc` release train as `rtc-ice`, S19 leg-3 precedent; spindle builds a patched 0.20.3 from `third_party/rtc-turn` — stale-nonce ChannelBind recovery, td-67f0c5) | browser RTCPeerConnection |
 | Crypto | ed25519-dalek 2, x25519-dalek 2, sha2, hkdf, aes-gcm, rand (OsRng), subtle, zeroize | WebCrypto + @noble/curves fallback |
 | Encoding | hand-rolled zero-dep canonical codec in spindle-proto (strict non-canonical rejection; minicbor rejected — decoder abstracts the raw bytes); base64 (base64url presentation of the CONNECT envelope and JWT segments — binaries only) | own canonical encoder in @spindle/proto |
 | Storage | rusqlite (bundled) host-side; sqlx/Postgres helper-side | IndexedDB (caps, resume manifests) |

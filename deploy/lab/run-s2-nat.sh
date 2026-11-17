@@ -197,7 +197,21 @@ run_hold() {
     >"$ARTIFACTS_DIR/hold-client.jsonl" 2>"$ARTIFACTS_DIR/hold-client.err"
   local rc=$?
   stop_host
-  [ -n "$coturn_log_pid" ] && kill "$coturn_log_pid" 2>/dev/null || true
+  if [ -n "$coturn_log_pid" ]; then
+    kill "$coturn_log_pid" 2>/dev/null || true
+    # Wait for the reader to exit before the file is rewritten below; a live reader would write
+    # the post-stop drain back at its old offset and corrupt the artifact.
+    wait "$coturn_log_pid" 2>/dev/null || true
+  fi
+  # coturn block-buffers stdout when it is not a TTY, so the `docker logs -f` stream above stops
+  # at an arbitrary buffer boundary (td-67f0c5: the 600 s ChannelBind lines stayed in its stdio
+  # buffer). Stop the container to flush, replace the artifact with the complete log, then start
+  # it again for KEEP_LAB inspection or any caller that runs a cell afterwards.
+  if [ -n "$coturn_id" ]; then
+    docker stop "$coturn_id" >/dev/null 2>&1 || true
+    docker logs "$coturn_id" >"$ARTIFACTS_DIR/hold-coturn.log" 2>&1 || true
+    docker start "$coturn_id" >/dev/null 2>&1 || true
+  fi
   compose exec -T peer-a cat /tmp/s2-host.jsonl >"$ARTIFACTS_DIR/hold-host.jsonl" 2>/dev/null || true
   echo "   client exit=$rc" >&2
 }

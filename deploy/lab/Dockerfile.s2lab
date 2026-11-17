@@ -9,6 +9,9 @@ WORKDIR /workspace
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY spikes/ ./spikes/
+# `[patch.crates-io]` points rtc-turn at this in-repo fork (td-67f0c5); cargo needs it present
+# even when the built binary does not depend on rtc-turn.
+COPY third_party/ ./third_party/
 RUN cargo build --release -p spike-s2-nat-lab --bin s2-host --bin s2-client
 
 FROM scratch

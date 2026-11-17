@@ -1024,8 +1024,11 @@ enumerated list (lint-enforced engine-api-only imports).
 - **Wiring.** `Config::ice_config` builds the library `IceConfig` once; `host_options_from_config` threads it into `HostOptions.ice` for **every** daemon the reconnect loop constructs (including each planned post-renewal reconnect), with all other knobs taken from `HostOptions::default()`. The HELP text states the landed policy: with TURN configured the library punches first for the shared `punch_window` (3 s default), then falls back to relay; both peers must configure TURN and the same window. This daemon exposes no window knob and has no helper-minted (`helper.turn.get.<nfp>`) credentials.
 - **Tests.** Config: `optional_settings_take_their_documented_defaults` (empty `IceConfig`), `every_field_is_readable_from_the_environment_alone`, `flags_override_the_environment`, `turn_settings_come_from_the_environment_and_flags_override_it`, `stun_and_turn_may_be_configured_together_either_alone_or_neither`, `partial_mixed_and_serverless_turn_credentials_are_rejected`, `bad_stun_and_turn_socket_addresses_are_rejected_from_either_source`, `stun_lists_are_trimmed_deduplicated_and_reject_empty_entries`, `rest_secret_turn_ttls_accept_one_second_through_twenty_four_hours`; builder: `operator_ice_settings_thread_into_host_options`.
 - **Punch-first policy (td-870b25 / td-8da43e; A10.54, DESIGN v0.9.59).** Selection lives in the library, not this binary: with `IceConfig::turn` set it attempts a punch for the shared `punch_window` (3 s default) and falls back to relay when no pair is selected. Both peers must configure TURN and the same window; a split outcome fails the QUIC handshake and the caller retries. The lab measured **0 split outcomes across 40 unshaped + 10 shaped attempts**. This hostd surface adds no window knob and inherits `IceConfig::default()`. Still open: wiring the client half that landed in `spindle-client-core::turn_credentials`
-(URI→transport conversion and the call site; this daemon still takes operator config only) and a
-long-lived relayed-session proof of the allocation/permission refresh path. This slice changed no DESIGN text.
+(URI→transport conversion and the call site; this daemon still takes operator config only). The
+long-lived relayed-session proof landed with td-67f0c5: 70/70 heartbeats over 690.7 s on a forced
+relay, with the ChannelBind stale-nonce recovery covered by deterministic tests (DESIGN v0.9.60;
+`spikes/s2-signaling/RESULTS.md`). The punch-first slice above changed no DESIGN text; the TURN
+fix is recorded as DESIGN v0.9.60.
 
 ## Stage 8: engine-web + apps/web + hardened delivery
 **Goal**: Implement `@spindle/engine-web` (nats.ws + browser WebRTC) and the `apps/web` browser

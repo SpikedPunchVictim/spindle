@@ -823,3 +823,80 @@ earlier, so this is a **channel-binding refresh** defect, not the allocation/per
   frames rather than a throughput measurement; coturn 4.17.2. This is not S19's real-two-host leg.
   The allocation/permission refresh path is now live-proven; the channel-binding refresh remains
   the blocker for a long-lived relayed session.
+
+## Fix and re-run — 2026-11-17 (td-67f0c5)
+
+**Outcome: an 11-minute relayed session now completes (70/70 heartbeats, host echoed 70), and the
+438/400 ChannelBind failure shape has a deterministic sub-second regression test. The live run did
+not itself reproduce a mid-session 438 — see the honesty note below.**
+
+### Fix
+
+`rtc-turn` 0.20.3 deletes the channel binding on any failed ChannelBind. 0.21.1's source still
+deletes it, and `BindingManager` is `pub(crate)`, so no public API can repair the binding from
+`spindle-net`. The workspace therefore builds a patched 0.20.3 from `third_party/rtc-turn`
+(`[patch.crates-io]`; rationale and maintenance note in `third_party/rtc-turn/PATCHES.md`):
+
+- `438 Stale nonce` → keep the binding, state `Idle`; the next send re-binds the **same channel
+  number** with the nonce the 438 carried.
+- Any other ChannelBind error → keep the binding, state `Failed`; sends use Send Indications, so
+  data continues and the bind is not retried in a spin.
+
+`spindle-net`'s adapter also decodes TURN error responses now and logs the method plus numeric
+error code (never the server's reason text), instead of only reporting the downstream symptom as
+"dropping malformed TURN packet".
+
+### Deterministic regression
+
+Two tests in `crates/spindle-net/src/signaling/turn.rs` drive the real adapter
+(`allocate` → `create_permission` → `TurnRelaySocket`) against a fake TURN server:
+
+- `channel_bind_stale_nonce_rebinds_the_same_channel_and_data_recovers`: server forces a 438 on
+  the first ChannelBind; test asserts the retry uses the same channel number and that ChannelData
+  flows both ways afterwards (inbound "pong" reaches `poll_recv`).
+- `channel_bind_bad_request_keeps_the_binding_and_stops_retrying`: server forces a 400; test
+  asserts no further ChannelBind is sent and inbound ChannelData still decodes.
+
+Both tests were DEMONSTRATED to fail with the patch reverted (`left: 16384, right: 16385`; "a
+failed bind must not be retried in a spin") and pass with it. They run in <1 s, so this no longer
+needs an 11-minute coturn session to check. Coverage limit: both force the 438 on the **first**
+bind (`Idle → Request`), while the original failure was a 438 on the periodic ChannelBind refresh.
+Both enter the same state-independent handler, but no test drives the `Refresh → bind` transition
+because rtc-turn's 300 s timer is not controllable here — and the live run below did not hit a
+mid-session 438 either.
+
+### Live re-run
+
+```bash
+KEEP_LAB=1 CELLS_ONLY=hold HOLD_SECS=700 KEEP_ALIVE_SECS=10 HOLD_READ_TIMEOUT_SECS=30 \
+  TURN_SERVER=172.28.0.13:3478 PUNCH_WINDOW_MS=0 REBUILD=1 \
+  ARTIFACTS_DIR="$PWD/deploy/lab/.artifacts/s2-hold-fix2" deploy/lab/run-s2-nat.sh
+```
+
+- Client: **70/70 heartbeats**, `transport=relay`, first 0.00047 s, last **690.707 s**, no failure;
+  every heartbeat from 600.6 s through 690.7 s succeeded (RTT 3.6–16.5 ms). Host echoed 70 frames;
+  client exit 0.
+- Coturn (full log read after stopping the container — see the buffering note):
+  `ALLOCATE` at 07:43:42; `CHANNEL_BIND processed, success` at 0 s, **300 s (07:48:42.49)** and
+  **600 s (07:53:42.79)**; `REFRESH processed, success` at 300 s and 600 s; no `400` anywhere.
+  The two `438` lines at 07:55:22 appear at teardown, after the data path had ended (the
+  zero-lifetime Refresh releases are the likely source); no `400` was logged anywhere.
+- The retained `hold-coturn.log` is the **131-line pre-flush capture**: the 600 s `CHANNEL_BIND`
+  and later lines above were read from `docker logs` after `docker stop` and are not in that
+  file. `run-s2-nat.sh` now performs that stop/dump/restart so the next run's artifact is complete.
+- A first fixed-build run (`s2-hold-fix`) also completed: 66/66 heartbeats, last 650.745 s, host
+  66 echoes.
+
+**Honesty note.** This run's 600 s allocation `REFRESH` succeeded and the ChannelBind refresh
+0.58 s later also succeeded, so the live session never hit a mid-session 438. It therefore proves
+the >11-minute liveness goal and that the fix does not regress the normal path, but it does **not**
+by itself prove the stale-nonce retry; that proof is the deterministic fake-server test above. The
+original failure was timing-dependent: it needed the nonce to expire between the allocation
+refresh and the channel refresh.
+
+**Lab note (cost an hour to discover):** coturn stdout is block-buffered when not a TTY. Logs
+written after ~600 s stayed in coturn's stdio buffer; `docker logs` showed nothing past that point
+until the container was stopped (131 → 146 lines). Read coturn evidence only after `docker stop`.
+
+**Limits:** one kernel (Docker Desktop's Linux VM), simulated NATs, liveness frames rather than
+throughput. Not S19's real-two-host leg.

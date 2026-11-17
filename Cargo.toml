@@ -154,3 +154,15 @@ unicode-normalization = "0.1"
 
 # OS / shell
 keyring = "2"
+
+# Vendored dependency patches.
+#
+# `rtc-turn` 0.20.3 cannot recover from a stale-nonce ChannelBind: it deletes the binding on
+# 438, the next send allocates a new channel number for the same peer, and coturn rejects it
+# with 400 until the original binding expires — relayed data never resumes (td-67f0c5).
+# 0.21.1 still has the same delete and exposes no rebind API, so the fix is a two-branch state
+# change in `handle_channel_bind_response`. See third_party/rtc-turn/PATCHES.md; drop this when
+# upstream releases a fix.
+[patch.crates-io]
+rtc-turn = { path = "third_party/rtc-turn" }
+

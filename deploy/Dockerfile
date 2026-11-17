@@ -26,6 +26,9 @@ WORKDIR /workspace
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ ./crates/
 COPY spikes/ ./spikes/
+# `[patch.crates-io]` points rtc-turn at this in-repo fork (td-67f0c5); cargo needs it present
+# even when the built binary does not depend on rtc-turn.
+COPY third_party/ ./third_party/
 
 RUN cargo build --release -p spindle-helper
 

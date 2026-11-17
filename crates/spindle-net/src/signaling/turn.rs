@@ -49,6 +49,19 @@
 //! production the credential source is the helper's `helper.turn.get.<nfp>` request, which mints
 //! and quota-checks per `root_fp` (§A8); wiring a client for that request is future work. The
 //! REST-config path here is the deployment/dev stand-in and is explicitly what the lab uses.
+//!
+//! # ChannelBind stale-nonce recovery (td-67f0c5)
+//!
+//! `rtc-turn` 0.20.3 (and 0.21.1) deletes the channel binding on any failed ChannelBind response.
+//! On a 438 stale nonce the next send then allocates a *new* channel number for the same peer;
+//! coturn still holds the old channel and rejects the new one with 400 (`same peer, different
+//! channel number`) until the original binding expires, so relayed data stops for the rest of the
+//! allocation. `BindingManager` is private and `Relay` exposes no rebind API, so this workspace
+//! builds a patched copy of the crate from `third_party/rtc-turn` (`[patch.crates-io]` in the root
+//! manifest): a failed bind keeps the binding, `Idle` for a stale nonce (re-bind the same number
+//! with the refreshed nonce) and `Failed` for any other error (Send Indications, no retry spin).
+//! The two adapter-level regression tests below drive that recovery against a fake TURN server;
+//! see `third_party/rtc-turn/PATCHES.md` and drop the fork when upstream fixes it.
 
 use std::collections::VecDeque;
 use std::io::{self, IoSliceMut};
@@ -581,6 +594,46 @@ fn is_expected_peer(peer: SocketAddr, expected_peer: SocketAddr) -> bool {
     peer == expected_peer
 }
 
+/// True when a STUN message header carries the error-response class.
+///
+/// The class lives in the 16-bit message type at 0x0100 (`C1`) and 0x0010 (`C0`); error is
+/// `0b11`. Method bits never occupy those positions, so this needs no decode.
+fn is_stun_error_response(wire: &[u8]) -> bool {
+    wire.len() >= 20 && wire[0] & 0x01 != 0 && wire[1] & 0x10 != 0
+}
+
+/// Surfaces a TURN error response the sans-I/O client consumed internally.
+///
+/// `rtc-turn` handles ChannelBind/Refresh error responses itself and only reports them through
+/// the `log` crate, which this workspace does not bridge to `tracing`; without this the operator
+/// sees nothing when coturn rejects a refresh or a bind. Only the numeric method and error code
+/// are logged — the response's reason text is server-controlled and unaudited (td-67f0c5).
+fn log_turn_error_response(wire: &[u8]) {
+    use rtc_stun::error_code::ErrorCodeAttribute;
+    use rtc_stun::message::{is_stun_message, Getter, Message};
+
+    // Filtering on the header before decoding keeps this off the hot path for every ChannelData
+    // / Data Indication after a bind has failed.
+    if !is_stun_message(wire) || !is_stun_error_response(wire) {
+        return;
+    }
+    let mut msg = Message::new();
+    msg.raw = wire.to_vec();
+    if msg.decode().is_err() {
+        return;
+    }
+    let mut error = ErrorCodeAttribute::default();
+    let code = error
+        .get_from(&msg)
+        .map(|()| error.code.0)
+        .unwrap_or_default();
+    tracing::warn!(
+        method = %msg.typ.method,
+        code,
+        "TURN server returned an error response"
+    );
+}
+
 /// Sleep length for [`spawn_driver`] given rtc-turn's next deadline. When a send backlog exists,
 /// retry at the minimum tick so a `WouldBlock`-buffered packet is not stuck behind a long refresh
 /// deadline. Otherwise clamp, so a clock jump or a broken/zero deadline cannot hot-spin and a
@@ -731,6 +784,9 @@ impl AsyncUdpSocket for TurnRelaySocket {
                     // A malformed wire packet from the TURN server is dropped, not fatal: the
                     // relay stays usable for well-formed traffic (mirrors the spike's adapter,
                     // and this crate's soft-failure policy for peer-controlled ICE candidates).
+                    // Error responses are surfaced first: rtc-turn consumes them internally and
+                    // would otherwise leave no trace in this crate's logs.
+                    log_turn_error_response(&raw[..n]);
                     if inner
                         .client
                         .handle_read(TaggedBytesMut {
@@ -1033,5 +1089,471 @@ mod tests {
         let stranger: SocketAddr = "203.0.113.8:49160".parse().expect("stranger");
         assert!(is_expected_peer(peer, peer));
         assert!(!is_expected_peer(stranger, peer));
+    }
+
+    /// The header-only filter must admit every error-response class and nothing else. This pins
+    /// the C0/C1 mask; a wrong bit would silently suppress operator diagnostics without failing
+    /// any data-path test.
+    #[test]
+    fn stun_error_class_predicate_matches_only_error_responses() {
+        let header = |typ: u16| {
+            let mut wire = [0u8; 20];
+            wire[..2].copy_from_slice(&typ.to_be_bytes());
+            wire
+        };
+        assert!(!is_stun_error_response(&header(0x0001)), "Binding request");
+        assert!(!is_stun_error_response(&header(0x0011)), "indication");
+        assert!(!is_stun_error_response(&header(0x0101)), "success response");
+        assert!(is_stun_error_response(&header(0x0111)), "Binding error");
+        assert!(
+            is_stun_error_response(&header(0x0119)),
+            "ChannelBind error (high method bits must not alias the class bits)"
+        );
+        assert!(
+            !is_stun_error_response(&[0u8; 19]),
+            "a short datagram is never a STUN response"
+        );
+    }
+
+    // ── td-67f0c5: ChannelBind failure recovery, without an 11-minute coturn session ─────────
+    //
+    // These tests drive the real adapter (allocate -> create_permission -> TurnRelaySocket)
+    // against a fake TURN server that forces the two ChannelBind failure shapes. A test fails
+    // if the vendored rtc-turn patch is dropped: on 438 the binding is deleted, the next send
+    // takes a new channel number, and on 400 every later send repeats that (spindle's adapter
+    // used to log the resulting inbound ChannelData as "malformed" because rtc-turn could no
+    // longer map its channel number back to the peer).
+
+    use rtc_stun::attributes::{
+        ATTR_CHANNEL_NUMBER, ATTR_LIFETIME, ATTR_NONCE, ATTR_REALM, ATTR_XOR_RELAYED_ADDRESS,
+    };
+    use rtc_stun::error_code::{
+        ErrorCodeAttribute, CODE_BAD_REQUEST, CODE_STALE_NONCE, CODE_UNAUTHORIZED,
+    };
+    use rtc_stun::fingerprint::FINGERPRINT;
+    use rtc_stun::message::{
+        Message as StunMessage, MessageType, Setter, TransactionId, CLASS_ERROR_RESPONSE,
+        CLASS_INDICATION, CLASS_REQUEST, CLASS_SUCCESS_RESPONSE, METHOD_ALLOCATE,
+        METHOD_CHANNEL_BIND, METHOD_CREATE_PERMISSION, METHOD_SEND,
+    };
+    use rtc_stun::textattrs::TextAttribute;
+    use rtc_stun::xoraddr::XorMappedAddress;
+
+    const TEST_PEER: &str = "203.0.113.7:40000";
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum FakeTurnEvent {
+        /// A ChannelBind request: its channel number and the NONCE attribute it carried.
+        Bind(u16, String),
+        /// An error response the server sent (numeric code).
+        ErrorSent(u16),
+        SendIndication,
+        ChannelData(u16, Vec<u8>),
+    }
+
+    #[derive(Clone, Copy)]
+    enum BindReply {
+        StaleNonce,
+        BadRequest,
+    }
+
+    /// `XOR-RELAYED-ADDRESS` setter for the fake server's Allocate success.
+    struct RelayAddressAttr(SocketAddr);
+
+    impl Setter for RelayAddressAttr {
+        fn add_to(&self, m: &mut StunMessage) -> rtc_shared::error::Result<()> {
+            XorMappedAddress {
+                ip: self.0.ip(),
+                port: self.0.port(),
+            }
+            .add_to_as(m, ATTR_XOR_RELAYED_ADDRESS)
+        }
+    }
+
+    /// `LIFETIME` setter; rtc-turn rejects an Allocate success whose lifetime is zero.
+    struct LifetimeAttr(u32);
+
+    impl Setter for LifetimeAttr {
+        fn add_to(&self, m: &mut StunMessage) -> rtc_shared::error::Result<()> {
+            m.add(ATTR_LIFETIME, &self.0.to_be_bytes());
+            Ok(())
+        }
+    }
+
+    fn stun_response(
+        request: &StunMessage,
+        typ: MessageType,
+        extra: Vec<Box<dyn Setter>>,
+    ) -> Vec<u8> {
+        let mut setters: Vec<Box<dyn Setter>> = vec![
+            Box::new(TransactionId(request.transaction_id.0)),
+            Box::new(typ),
+        ];
+        setters.extend(extra);
+        setters.push(Box::new(FINGERPRINT));
+        let mut msg = StunMessage::new();
+        msg.build(&setters).expect("build STUN response");
+        msg.raw
+    }
+
+    fn channel_data(channel: u16, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; 4 + payload.len()];
+        out[0..2].copy_from_slice(&channel.to_be_bytes());
+        out[2..4].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        out[4..].copy_from_slice(payload);
+        out
+    }
+
+    /// Minimal TURN server: one allocation, one permission, then a ChannelBind policy chosen by
+    /// `bind_reply`. It reports what it saw so the test can assert on channel numbers rather than
+    /// on client internals.
+    async fn fake_turn_server(
+        socket: tokio::net::UdpSocket,
+        events: tokio::sync::mpsc::UnboundedSender<FakeTurnEvent>,
+        bind_reply: BindReply,
+    ) -> std::io::Result<()> {
+        let mut buf = [0u8; 2048];
+        let mut allocations = 0u32;
+        let mut binds = 0u32;
+        let mut announced_channel: Option<u16> = None;
+        loop {
+            let (n, from) = socket.recv_from(&mut buf).await?;
+            if n >= 4 && buf[0] & 0xC0 == 0x40 {
+                let channel = u16::from_be_bytes([buf[0], buf[1]]);
+                let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+                let payload = buf[4..4 + len].to_vec();
+                events
+                    .send(FakeTurnEvent::ChannelData(channel, payload))
+                    .ok();
+                socket
+                    .send_to(&channel_data(channel, b"pong"), from)
+                    .await?;
+                continue;
+            }
+
+            let mut msg = StunMessage::new();
+            msg.raw = buf[..n].to_vec();
+            msg.decode().expect("decode STUN request");
+
+            if msg.typ.class == CLASS_INDICATION && msg.typ.method == METHOD_SEND {
+                events.send(FakeTurnEvent::SendIndication).ok();
+                // A binding that failed must still deliver inbound data on its channel.
+                if matches!(bind_reply, BindReply::BadRequest) {
+                    if let Some(channel) = announced_channel {
+                        socket
+                            .send_to(&channel_data(channel, b"pong"), from)
+                            .await?;
+                    }
+                }
+            } else if msg.typ.class == CLASS_REQUEST {
+                if msg.typ.method == METHOD_ALLOCATE {
+                    allocations += 1;
+                    let raw = if allocations == 1 {
+                        // Anonymous Allocate gets the long-term-credential challenge.
+                        stun_response(
+                            &msg,
+                            MessageType::new(METHOD_ALLOCATE, CLASS_ERROR_RESPONSE),
+                            vec![
+                                Box::new(ErrorCodeAttribute {
+                                    code: CODE_UNAUTHORIZED,
+                                    reason: b"Unauthorized".to_vec(),
+                                }),
+                                Box::new(TextAttribute::new(
+                                    ATTR_REALM,
+                                    "spindle.test".to_string(),
+                                )),
+                                Box::new(TextAttribute::new(ATTR_NONCE, "nonce-1".to_string())),
+                            ],
+                        )
+                    } else {
+                        stun_response(
+                            &msg,
+                            MessageType::new(METHOD_ALLOCATE, CLASS_SUCCESS_RESPONSE),
+                            vec![
+                                Box::new(RelayAddressAttr(
+                                    "203.0.113.9:50000".parse().expect("relayed"),
+                                )),
+                                Box::new(LifetimeAttr(600)),
+                            ],
+                        )
+                    };
+                    socket.send_to(&raw, from).await?;
+                } else if msg.typ.method == METHOD_CREATE_PERMISSION {
+                    let raw = stun_response(
+                        &msg,
+                        MessageType::new(METHOD_CREATE_PERMISSION, CLASS_SUCCESS_RESPONSE),
+                        vec![],
+                    );
+                    socket.send_to(&raw, from).await?;
+                } else if msg.typ.method == METHOD_CHANNEL_BIND {
+                    let attr = msg
+                        .get(ATTR_CHANNEL_NUMBER)
+                        .expect("CHANNEL-NUMBER present");
+                    let channel = u16::from_be_bytes([attr[0], attr[1]]);
+                    let nonce = msg
+                        .get(ATTR_NONCE)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_default();
+                    announced_channel = Some(channel);
+                    binds += 1;
+                    events.send(FakeTurnEvent::Bind(channel, nonce)).ok();
+                    let raw = if binds == 1 {
+                        let (code, nonce) = match bind_reply {
+                            BindReply::StaleNonce => (CODE_STALE_NONCE, "nonce-2"),
+                            BindReply::BadRequest => (CODE_BAD_REQUEST, "nonce-1"),
+                        };
+                        events.send(FakeTurnEvent::ErrorSent(code.0)).ok();
+                        stun_response(
+                            &msg,
+                            MessageType::new(METHOD_CHANNEL_BIND, CLASS_ERROR_RESPONSE),
+                            vec![
+                                Box::new(ErrorCodeAttribute {
+                                    code,
+                                    reason: b"forced by test".to_vec(),
+                                }),
+                                Box::new(TextAttribute::new(ATTR_NONCE, nonce.to_string())),
+                            ],
+                        )
+                    } else {
+                        stun_response(
+                            &msg,
+                            MessageType::new(METHOD_CHANNEL_BIND, CLASS_SUCCESS_RESPONSE),
+                            vec![],
+                        )
+                    };
+                    socket.send_to(&raw, from).await?;
+                }
+            }
+        }
+    }
+
+    fn transmit<'a>(contents: &'a [u8], destination: SocketAddr) -> Transmit<'a> {
+        Transmit {
+            destination,
+            ecn: None,
+            contents,
+            segment_size: None,
+            src_ip: None,
+        }
+    }
+
+    /// Runs one poll of the adapter's receive path, which is what feeds the sans-I/O TURN client
+    /// its responses. The return value is ignored: these packets are control responses.
+    async fn pump_once(socket: &TurnRelaySocket) {
+        let mut buf = [0u8; 2048];
+        let mut bufs = [IoSliceMut::new(&mut buf)];
+        let mut meta = [RecvMeta::default()];
+        let _ = std::future::poll_fn(|cx| {
+            let _ = socket.poll_recv(cx, &mut bufs, &mut meta);
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    async fn next_event(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<FakeTurnEvent>,
+    ) -> FakeTurnEvent {
+        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("fake TURN server should respond")
+            .expect("fake TURN server task alive")
+    }
+
+    /// Sends `datagram` until the fake server reports a frame matching `want`. Repeated sends are
+    /// harmless: while a bind is in flight rtc-turn emits Send Indications, and the server reports
+    /// the eventual ChannelBind/ChannelData.
+    async fn send_until(
+        socket: &TurnRelaySocket,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<FakeTurnEvent>,
+        datagram: &[u8],
+        want: impl Fn(&FakeTurnEvent) -> bool,
+    ) -> FakeTurnEvent {
+        let peer: SocketAddr = TEST_PEER.parse().expect("peer");
+        for _ in 0..500 {
+            socket
+                .try_send(&transmit(datagram, peer))
+                .expect("relay send");
+            pump_once(socket).await;
+            while let Ok(event) = rx.try_recv() {
+                if want(&event) {
+                    return event;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("fake TURN server never observed the expected frame");
+    }
+
+    async fn receive_pong(socket: &TurnRelaySocket) {
+        let peer: SocketAddr = TEST_PEER.parse().expect("peer");
+        let mut buf = [0u8; 64];
+        let mut bufs = [IoSliceMut::new(&mut buf)];
+        let mut meta = [RecvMeta::default()];
+        let received = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta)),
+        )
+        .await
+        .expect("inbound relayed data should resume")
+        .expect("poll_recv");
+        assert_eq!(received, 1);
+        assert_eq!(meta[0].addr, peer);
+        assert_eq!(&buf[..meta[0].len], b"pong");
+    }
+
+    async fn setup_relay() -> (
+        Arc<TurnRelaySocket>,
+        tokio::sync::mpsc::UnboundedReceiver<FakeTurnEvent>,
+        SocketAddr,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let peer: SocketAddr = TEST_PEER.parse().expect("peer");
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake TURN server");
+        let server_addr = server.local_addr().expect("server addr");
+        let (events, rx) = tokio::sync::mpsc::unbounded_channel();
+        let server_task = tokio::spawn(fake_turn_server(server, events, BindReply::StaleNonce));
+        let cfg = TurnConfig {
+            server: server_addr,
+            credentials: TurnCredentials::Static {
+                username: "user".to_string(),
+                credential: "pass".to_string(),
+            },
+        };
+        let mut guard = allocate(&cfg, IpAddr::from([127, 0, 0, 1]), Duration::from_secs(5))
+            .await
+            .expect("allocate");
+        create_permission(
+            guard.allocation_mut().expect("live allocation"),
+            peer,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("permission");
+        let socket = guard
+            .into_relay_socket(server_addr, peer)
+            .expect("relay socket");
+        (socket, rx, peer, server_task)
+    }
+
+    #[tokio::test]
+    async fn channel_bind_stale_nonce_rebinds_the_same_channel_and_data_recovers() {
+        let (socket, mut rx, _peer, server_task) = setup_relay().await;
+
+        // First send creates the binding; the server answers 438 with a new nonce.
+        socket
+            .try_send(&transmit(b"first", TEST_PEER.parse().expect("peer")))
+            .expect("relay send");
+        let FakeTurnEvent::Bind(first_channel, first_nonce) = next_event(&mut rx).await else {
+            panic!("expected the first ChannelBind");
+        };
+        assert_eq!(first_nonce, "nonce-1");
+
+        pump_once(&socket).await; // process the 438
+
+        let retried = send_until(&socket, &mut rx, b"second", |event| {
+            matches!(event, FakeTurnEvent::Bind(..))
+        })
+        .await;
+        let FakeTurnEvent::Bind(retried_channel, retried_nonce) = retried else {
+            unreachable!()
+        };
+        assert_eq!(
+            first_channel, retried_channel,
+            "a 438 must re-bind the existing channel; a new channel number gets 400 from coturn"
+        );
+        assert_eq!(
+            retried_nonce, "nonce-2",
+            "the retry must use the nonce carried by the 438, not the stale one"
+        );
+
+        // After the retry succeeds, data uses ChannelData on that same channel and inbound
+        // ChannelData maps back to the peer again.
+        let observed = send_until(&socket, &mut rx, b"third", |event| {
+            matches!(event, FakeTurnEvent::ChannelData(..))
+        })
+        .await;
+        let FakeTurnEvent::ChannelData(channel, payload) = observed else {
+            unreachable!()
+        };
+        assert_eq!(channel, first_channel);
+        assert_eq!(payload, b"third");
+
+        receive_pong(&socket).await;
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn channel_bind_bad_request_keeps_the_binding_and_stops_retrying() {
+        let peer: SocketAddr = TEST_PEER.parse().expect("peer");
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake TURN server");
+        let server_addr = server.local_addr().expect("server addr");
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server_task = tokio::spawn(fake_turn_server(server, events, BindReply::BadRequest));
+        let cfg = TurnConfig {
+            server: server_addr,
+            credentials: TurnCredentials::Static {
+                username: "user".to_string(),
+                credential: "pass".to_string(),
+            },
+        };
+        let mut guard = allocate(&cfg, IpAddr::from([127, 0, 0, 1]), Duration::from_secs(5))
+            .await
+            .expect("allocate");
+        create_permission(
+            guard.allocation_mut().expect("live allocation"),
+            peer,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("permission");
+        let socket = guard
+            .into_relay_socket(server_addr, peer)
+            .expect("relay socket");
+
+        socket
+            .try_send(&transmit(b"first", peer))
+            .expect("relay send");
+        let FakeTurnEvent::Bind(_, _) = next_event(&mut rx).await else {
+            panic!("expected the first ChannelBind");
+        };
+        let FakeTurnEvent::ErrorSent(code) = next_event(&mut rx).await else {
+            panic!("expected the forced error response");
+        };
+        assert_eq!(code, 400);
+        pump_once(&socket).await; // process the 400
+
+        // Further sends fall back to Send Indications; they must not re-bind (the old channel is
+        // still valid server-side, and a new number would be answered 400 forever). The first
+        // sends also give the adapter time to consume the 400 response, so a deleted binding
+        // would show up as a fresh ChannelBind within the window.
+        let mut saw_indication = false;
+        for _ in 0..200 {
+            socket
+                .try_send(&transmit(b"after-failure", peer))
+                .expect("relay send");
+            pump_once(&socket).await;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    FakeTurnEvent::Bind(..) => {
+                        panic!("a failed bind must not be retried in a spin");
+                    }
+                    FakeTurnEvent::ErrorSent(_) => {}
+                    FakeTurnEvent::SendIndication => saw_indication = true,
+                    FakeTurnEvent::ChannelData(..) => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            saw_indication,
+            "traffic must continue as Send Indications after a bind failure"
+        );
+
+        receive_pong(&socket).await;
+        server_task.abort();
     }
 }
