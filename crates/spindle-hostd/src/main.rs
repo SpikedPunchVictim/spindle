@@ -100,7 +100,10 @@
 mod config;
 
 use std::env;
-use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::io::{IsTerminal as _, Write as _};
+// Only `read_phrase_file` (cfg(unix)) calls `Read::read_to_string`.
+#[cfg(unix)]
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
