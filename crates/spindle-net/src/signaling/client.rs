@@ -218,25 +218,44 @@ impl SignalingClient {
         self.connect_timed(host, opts).await.map(|(c, _)| c)
     }
 
-    /// [`Self::connect`], plus the phase-by-phase [`ConnectTimings`] for the attempt. Separate
-    /// entry point rather than a changed return type so the common case stays a one-value
-    /// `Result`; the connect flow itself is identical (`connect` is a thin wrapper over this).
-    ///
-    /// # `member_cap` is not surfaced here (td-c74122 / S18)
-    ///
-    /// The host puts its current member capability in every successful answer unconditionally
-    /// (DESIGN.md:286/:289-290 -- see [`super::authorize::ConnectDecision::Allow::member_cap`]'s
-    /// doc comment), but neither `connect` nor `connect_timed` returns it: no consumer exists to
-    /// receive it until `spindle-client-core` is built (Stage 7), and inventing a return-type
-    /// shape now with no consumer would be guessing rather than building to evidence. This is a
-    /// deliberate scope cut, not an oversight -- S18's bar is the no-lockout path, which
-    /// [`Self::refresh_capability`] serves for the one case that actually needs the cap before a
-    /// full session exists.
+    /// [`Self::connect`], plus the phase-by-phase [`ConnectTimings`] for the attempt.
     pub async fn connect_timed(
         &self,
         host: &HostIdentity,
         opts: ConnectOptions,
     ) -> Result<(ControlStream, ConnectTimings), SignalingError> {
+        self.connect_core(host, opts)
+            .await
+            .map(|(control, _, timings)| (control, timings))
+    }
+
+    /// [`Self::connect`], plus the member capability the host put in its answer (Stage 7's
+    /// client session is the consumer). `None` when the answer carried none; a host that admits
+    /// the capability bundle always includes its current member cap.
+    pub async fn connect_with_cap(
+        &self,
+        host: &HostIdentity,
+        opts: ConnectOptions,
+    ) -> Result<(ControlStream, Option<Capability>), SignalingError> {
+        self.connect_core(host, opts)
+            .await
+            .map(|(control, member_cap, _)| (control, member_cap))
+    }
+
+    /// The one connect flow behind [`Self::connect`], [`Self::connect_timed`] and
+    /// [`Self::connect_with_cap`]; it always carries the answer's `member_cap` internally.
+    ///
+    /// # `member_cap`
+    ///
+    /// The host puts its current member capability in every successful answer unconditionally
+    /// (DESIGN.md:286/:289-290 -- see [`super::authorize::ConnectDecision::Allow::member_cap`]'s
+    /// doc comment). The callers above choose whether to surface it; `spindle-client-core`'s
+    /// device session does, and persists it.
+    async fn connect_core(
+        &self,
+        host: &HostIdentity,
+        opts: ConnectOptions,
+    ) -> Result<(ControlStream, Option<Capability>, ConnectTimings), SignalingError> {
         let cert = SessionCert::generate()?;
         // The client is always the ICE-controlling side (matches `s2-connect.rs`'s convention:
         // the offerer controls).
@@ -758,7 +777,7 @@ impl SignalingClient {
             offer_to_quic_complete: quic_complete.duration_since(exchange.offer_sent),
             transport,
         };
-        Ok((control, timings))
+        Ok((control, answer.member_cap, timings))
     }
 
     /// The offer/answer exchange shared by [`Self::connect_timed`] and [`Self::refresh_capability`]:

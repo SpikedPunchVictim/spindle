@@ -3632,6 +3632,7 @@ name = "spindle-client-core"
 version = "0.1.0"
 dependencies = [
  "async-nats",
+ "base64",
  "nkeys",
  "rand 0.8.7",
  "serde",
@@ -3645,6 +3646,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "x25519-dalek",
 ]
 
 [[package]]

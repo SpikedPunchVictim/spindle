@@ -29,11 +29,13 @@
 
 pub mod pinning;
 pub mod self_revocation;
+pub mod session;
 pub mod turn_credentials;
 pub mod vfs_client;
 
 pub use pinning::{HostObservation, HostPin, MemoryPinStore, PinStore, Pinning, PinningError};
 pub use self_revocation::{deposit_self_revocation, mint_self_revocation, DepositError};
+pub use session::{connect_device, DeviceSession, DeviceSessionError, DeviceSessionParams};
 pub use turn_credentials::{
     fetch_turn_credentials, TurnCredentialError, TurnCredentialTransport, TurnCredentialsReply,
 };

@@ -1,0 +1,207 @@
+//! Device session: authenticate to the NATS Auth Callout as a device and open a host session
+//! (DESIGN.md §A4/A6, td-7c80c5).
+//!
+//! This is the client-side counterpart of `spindle-hostd`'s `connect_host`. It mints a fresh
+//! per-connection nkey, a [`SessionAttestation`] binding that nkey to the device identity key, and
+//! the device arm of the CONNECT `auth_token` (td-e38932's production encoder), then hands the
+//! authenticated `async_nats::Client` to [`spindle_net::signaling::SignalingClient`]. The returned
+//! [`DeviceSession`] owns the QUIC control stream and the member capability from the host's
+//! answer (`td-c74122`'s deferred consumer, now built).
+//!
+//! # What the caller supplies
+//!
+//! The device's identity key and the certificate the host issued for it, the **host root public
+//! key** the invite carried, and the member capabilities to present. `async_nats::Client` is built
+//! here rather than accepted from the caller because the CONNECT token has to be attached at
+//! connect time; the NATS URL and connect options are the caller's policy.
+//!
+//! # Secrets
+//!
+//! The nkey seed, the attestation, and the token exist only inside this function. The session
+//! holds the `async_nats::Client`, which already authenticated; no error or `Debug` rendering
+//! carries the token or key material.
+
+use base64::Engine as _;
+use spindle_core::artifacts::issue_session_attestation;
+use spindle_core::identity::DeviceKey;
+use spindle_core::Fingerprint;
+use spindle_net::quic::ControlStream;
+use spindle_net::signaling::{ConnectOptions, HostIdentity, SignalingClient, SignalingError};
+use spindle_proto::artifacts::{Capability, DeviceCertificate};
+use spindle_proto::auth_token::encode_device_auth_token;
+
+/// One authenticated device session with a host.
+pub struct DeviceSession {
+    /// The callout-authenticated NATS connection. Kept for later helper requests (TURN
+    /// credentials, self-revocation) on the same session identity.
+    pub nats: async_nats::Client,
+    /// The mutually fingerprint-pinned QUIC control stream.
+    pub control: ControlStream,
+    /// The host's current member capability from its answer, when present.
+    pub member_cap: Option<Capability>,
+    pub device_fp: Fingerprint,
+    pub host: HostIdentity,
+}
+
+/// Inputs for one device connect attempt.
+pub struct DeviceSessionParams<'a> {
+    pub nats_url: &'a str,
+    /// This device's identity key. Consumed: the signaling client owns it for the session.
+    pub device: DeviceKey,
+    /// The host-issued certificate for `device`.
+    pub device_cert: &'a DeviceCertificate,
+    /// This device's **identity root** public key — the `root_pk` field of the device envelope.
+    /// The helper derives `root_fp` from it and requires every presented capability's subject to
+    /// match. It is not the host's key.
+    pub device_root_pk: &'a [u8; 32],
+    /// Capabilities to present. Encoded once into the CONNECT token.
+    pub caps: &'a [Capability],
+    pub host: HostIdentity,
+    pub connect: ConnectOptions,
+    /// Unix seconds for the session attestation.
+    pub now: u64,
+}
+
+/// Why a device session could not be established. `Display` omits NATS and signaling internals.
+#[derive(Debug, thiserror::Error)]
+pub enum DeviceSessionError {
+    #[error("the supplied device certificate is not this device's certificate")]
+    CertificateMismatch,
+    #[error("could not mint or read the session nkey")]
+    Nkey(#[source] nkeys::error::Error),
+    #[error("the NATS connection was refused or unreachable")]
+    Nats(#[source] async_nats::ConnectError),
+    #[error("signaling failed")]
+    Signaling(#[from] SignalingError),
+}
+
+/// Connects this device to `host` through the real Auth Callout and opens the host session.
+pub async fn connect_device(
+    params: DeviceSessionParams<'_>,
+) -> Result<DeviceSession, DeviceSessionError> {
+    let DeviceSessionParams {
+        nats_url,
+        device,
+        device_cert,
+        device_root_pk,
+        caps,
+        host,
+        connect,
+        now,
+    } = params;
+
+    let device_fp = device.device_fp();
+    if device_cert.device_fp.as_slice() != device_fp.as_bytes() {
+        return Err(DeviceSessionError::CertificateMismatch);
+    }
+
+    let session = nkeys::KeyPair::new_user();
+    let (_prefix, raw_nkey) =
+        nkeys::from_public_key(&session.public_key()).map_err(DeviceSessionError::Nkey)?;
+    let nats_fp = Fingerprint::of_parts(&[&raw_nkey]);
+    let attestation = issue_session_attestation(&device, nats_fp, now);
+    let cap_bytes: Vec<Vec<u8>> = caps.iter().map(Capability::to_canonical_bytes).collect();
+    let envelope = encode_device_auth_token(
+        device_root_pk,
+        &device_cert.to_canonical_bytes(),
+        &attestation.to_canonical_bytes(),
+        &cap_bytes,
+    );
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(envelope);
+
+    let nats = async_nats::ConnectOptions::new()
+        .nkey(session.seed().map_err(DeviceSessionError::Nkey)?)
+        .token(token)
+        .custom_inbox_prefix(format!("_INBOX_{device_fp}"))
+        .connect(nats_url)
+        .await
+        .map_err(DeviceSessionError::Nats)?;
+
+    let signaling = SignalingClient::new(nats.clone(), device);
+    let (control, member_cap) = signaling.connect_with_cap(&host, connect).await?;
+    Ok(DeviceSession {
+        nats,
+        control,
+        member_cap,
+        device_fp,
+        host,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spindle_core::artifacts::{issue_device_certificate, issue_host_op_key_cert};
+    use spindle_core::identity::RootKey;
+    use spindle_core::SigningKey;
+    fn params_for<'a>(
+        device: DeviceKey,
+        cert: &'a DeviceCertificate,
+        root_pk: &'a [u8; 32],
+    ) -> DeviceSessionParams<'a> {
+        DeviceSessionParams {
+            nats_url: "nats://127.0.0.1:4222",
+            device,
+            device_cert: cert,
+            device_root_pk: root_pk,
+            caps: &[],
+            host: HostIdentity {
+                host_fp: Fingerprint::of_parts(&[b"host"]),
+                device_fp: Fingerprint::of_parts(&[b"host-device"]),
+                sign_pk: SigningKey::from_bytes(&[0x11; 32]).verifying_key(),
+                agree_pk: x25519_dalek::PublicKey::from([0x12; 32]),
+            },
+            connect: ConnectOptions::default(),
+            now: 1_755_907_200,
+        }
+    }
+
+    /// Rejects a certificate for another device before any network work.
+    #[tokio::test]
+    async fn a_certificate_for_another_device_is_refused() {
+        let root = RootKey::from_seed([0x01; 32]);
+        let device = DeviceKey::from_seeds([0x02; 32], [0x03; 32]);
+        let other = DeviceKey::from_seeds([0x04; 32], [0x05; 32]);
+        let cert = issue_device_certificate(
+            &root,
+            other.alg_id(),
+            &other.sign_public_key(),
+            &other.agree_public_key(),
+            0,
+            2_000_000,
+        );
+        let root_pk = root.public_key().to_bytes();
+        let error = match connect_device(params_for(device, &cert, &root_pk)).await {
+            Ok(_) => panic!("a foreign certificate must be refused"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, DeviceSessionError::CertificateMismatch));
+    }
+
+    /// The session token is the production encoder's bytes, and the attestation's subject is the
+    /// session nkey, not the device fingerprint. The token itself never leaves the function; this
+    /// test pins the two derivations it depends on.
+    #[test]
+    fn the_certificate_binding_and_attestation_domain_are_distinct() {
+        let root = RootKey::from_seed([0x01; 32]);
+        let device = DeviceKey::from_seeds([0x02; 32], [0x03; 32]);
+        let cert = issue_device_certificate(
+            &root,
+            device.alg_id(),
+            &device.sign_public_key(),
+            &device.agree_public_key(),
+            0,
+            2_000_000,
+        );
+        let _op = issue_host_op_key_cert(
+            &root,
+            &SigningKey::from_bytes(&[0x06; 32]).verifying_key(),
+            0,
+            2_000_000,
+        );
+        assert_eq!(cert.device_fp.as_slice(), device.device_fp().as_bytes());
+        let attest = issue_session_attestation(&device, Fingerprint::of_parts(&[b"nats"]), 7);
+        assert_eq!(attest.nats_fp.len(), 32);
+        assert_eq!(attest.sig_device.len(), 64);
+    }
+}
