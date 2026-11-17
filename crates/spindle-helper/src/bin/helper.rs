@@ -185,6 +185,9 @@ struct Config {
     /// Prometheus scrape listener (td-323db0). `Some` → the process installs the exporter once in
     /// `main`; `None` → no recorder is installed and every metrics macro is a no-op.
     metrics_addr: Option<String>,
+    /// `ADMIN_ALLOW_PLAINTEXT=1` (env only, dev stacks): permit `registry.admin.>` on a non-TLS
+    /// NATS URL. Default false — A3b requires the mTLS profile for the admin plane.
+    admin_allow_plaintext: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -248,6 +251,8 @@ Every flag has an env-var equivalent (flags override the env var if both are set
     --metrics-addr <addr>       METRICS_ADDR          (optional; Prometheus scrape listener, e.g.
                                                        127.0.0.1:9100 or 0.0.0.0:9100. Unset →
                                                        no recorder is installed and metrics are no-ops)
+                                ADMIN_ALLOW_PLAINTEXT (env only; 1 permits registry.admin.> on a
+                                                       non-TLS URL for local dev — A3b requires mTLS)
     -h, --help                  show this message
 "#;
 
@@ -410,6 +415,10 @@ impl Config {
             turn_ttl_secs,
             turn_monthly_quota,
             metrics_addr,
+            admin_allow_plaintext: matches!(
+                env::var("ADMIN_ALLOW_PLAINTEXT").as_deref(),
+                Ok("1") | Ok("true")
+            ),
         })
     }
 }
@@ -785,6 +794,66 @@ async fn run(config: Config) -> anyhow::Result<()> {
             None
         }
     };
+
+    // `registry.admin.>` — the A3b admin plane (td-efea19 slice 2). The command signature is the
+    // authorization; the operator identity is the NATS/mTLS connection, so the deployment gate
+    // refuses a plaintext URL unless the operator opted out for a local dev stack. Replies are
+    // published to the request's inbox (A5: `allow_responses`); the plane has no session.
+    if config.operator_seed.is_some() {
+        match spindle_helper::admin::admin_plane_allowed(
+            &config.nats_url,
+            true,
+            config.admin_allow_plaintext,
+        ) {
+            Ok(()) => {
+                if let Some(client) = &app_client {
+                    match client.subscribe("registry.admin.>").await {
+                        Ok(mut sub) => {
+                            let service = std::sync::Arc::new(tokio::sync::Mutex::new(
+                                spindle_helper::admin::AdminService::new(
+                                    operator_pk,
+                                    spindle_core::identity::root_fp_of(&operator_pk),
+                                    spindle_helper::admin::InMemoryAdminReplay::default(),
+                                ),
+                            ));
+                            let client = client.clone();
+                            tokio::spawn(async move {
+                                while let Some(msg) = sub.next().await {
+                                    let reply =
+                                        service.lock().await.handle(&msg.payload, now_secs());
+                                    if let Some(reply_subject) = msg.reply.clone() {
+                                        if let Err(error) =
+                                            client.publish(reply_subject, reply.into()).await
+                                        {
+                                            tracing::warn!(
+                                                error = %error, // redaction-ok: publish errors name the subject (registry.admin.<documented>) and a fixed kind, never a credential or payload
+                                                "failed to publish the admin reply"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                            tracing::info!("admin plane subscribed on registry.admin.>");
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                error = %error, // redaction-ok: SubscribeError Display names the fixed subject pattern, never a credential or payload
+                                "failed to subscribe the admin plane"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "APP_CONN_SEED not set — registry.admin.> is disabled (the admin plane needs \
+                         the application-account connection)"
+                    );
+                }
+            }
+            Err(error) => tracing::error!(error = %error, "admin plane disabled"),
+        }
+    } else {
+        tracing::warn!("OPERATOR_SEED not set — registry.admin.> is disabled");
+    }
 
     // `helper.turn.get.*` — DESIGN.md §A5 v0.9.7 (A12 #45): the subject is parametrized by the
     // caller's own `nats_fp` (the callout only ever grants `pub helper.turn.get.<own_nats_fp>`,

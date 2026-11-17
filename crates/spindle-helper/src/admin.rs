@@ -128,6 +128,35 @@ impl AdminReplayState for InMemoryAdminReplay {
     }
 }
 
+/// Why the admin plane is not started.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AdminPlaneError {
+    #[error("no operator key is configured; the admin plane is disabled")]
+    NoOperatorKey,
+    #[error(
+        "the admin plane requires a TLS NATS_URL (A3b mTLS); set ADMIN_ALLOW_PLAINTEXT=1 only for a \
+         local dev stack"
+    )]
+    PlaintextRefused,
+}
+
+/// Deployment gate for the admin plane. The command signature is the authorization; transport
+/// authentication is the operator identity's NATS/mTLS connection (DESIGN.md §A3b), so a plaintext
+/// NATS URL is refused unless the operator explicitly opts out for a dev stack.
+pub fn admin_plane_allowed(
+    nats_url: &str,
+    operator_configured: bool,
+    allow_plaintext: bool,
+) -> Result<(), AdminPlaneError> {
+    if !operator_configured {
+        return Err(AdminPlaneError::NoOperatorKey);
+    }
+    if !allow_plaintext && !nats_url.starts_with("tls://") {
+        return Err(AdminPlaneError::PlaintextRefused);
+    }
+    Ok(())
+}
+
 /// The command surface, matching `@spindle/admin`'s documented names and ADR-007.
 pub const ADMIN_COMMANDS: &[&str] = &[
     "set_mode",
@@ -342,6 +371,26 @@ mod tests {
         assert_eq!(
             decode_reply(&service.handle(b"not cbor", NOW)),
             (false, Some("malformed".into()))
+        );
+    }
+
+    #[test]
+    fn the_admin_deployment_gate_requires_a_tls_url_unless_opted_out() {
+        assert_eq!(
+            admin_plane_allowed("nats://localhost:4222", false, true),
+            Err(AdminPlaneError::NoOperatorKey)
+        );
+        assert_eq!(
+            admin_plane_allowed("nats://localhost:4222", true, false),
+            Err(AdminPlaneError::PlaintextRefused)
+        );
+        assert_eq!(
+            admin_plane_allowed("nats://localhost:4222", true, true),
+            Ok(())
+        );
+        assert_eq!(
+            admin_plane_allowed("tls://registry:4222", true, false),
+            Ok(())
         );
     }
 
