@@ -8,6 +8,7 @@ use spindle_core::identity::DeviceKey;
 use spindle_core::{Fingerprint, SigningKey};
 use spindle_host_core::{serve_control_stream, SessionContext, VfsRpcServer};
 use spindle_net::quic::{QuicClient, QuicServer, SessionCert};
+use spindle_proto::vfs_rpc::{MAX_READ_CHUNK, MAX_UPLOAD_CHUNK};
 use spindle_vfs::model::{DevicePublicKeys, MemberId, Perms, ShareFlags, ShareId, VirtualPath};
 use spindle_vfs::store::Store;
 use tempfile::TempDir;
@@ -136,7 +137,10 @@ async fn list_stat_read_and_upload_over_a_real_quic_control_stream() {
         },
     );
     let photos_root = h.share_real_root(photos);
-    std::fs::write(photos_root.join("a.txt"), b"hello, spindle!").expect("write a.txt");
+    let read_body: Vec<u8> = (0..(2 * MAX_READ_CHUNK as usize + 123))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(photos_root.join("a.txt"), &read_body).expect("write a.txt");
     h.grant(
         member_id,
         photos,
@@ -186,14 +190,18 @@ async fn list_stat_read_and_upload_over_a_real_quic_control_stream() {
 
     let stat = client.stat("Photos/a.txt").await.expect("stat");
     match stat {
-        spindle_proto::vfs_rpc::VfsReply::Stat { size, .. } => assert_eq!(size, 15),
+        spindle_proto::vfs_rpc::VfsReply::Stat { size, .. } => {
+            assert_eq!(size, read_body.len() as u64)
+        }
         other => panic!("unexpected stat reply: {other:?}"),
     }
 
     let body = client.read_all("Photos/a.txt").await.expect("read_all");
-    assert_eq!(body, b"hello, spindle!");
+    assert_eq!(body, read_body, "multi-chunk read_all");
 
-    let upload = b"uploaded through the production client".to_vec();
+    let upload: Vec<u8> = (0..(2 * MAX_UPLOAD_CHUNK as usize + 17))
+        .map(|i| (i % 253) as u8)
+        .collect();
     let hash = sha256(&upload);
     let upload_path = "Photos/uploaded.bin";
     let sig = sign_manifest(&signing_key, upload_path, upload.len() as u64, &hash);
@@ -203,7 +211,42 @@ async fn list_stat_read_and_upload_over_a_real_quic_control_stream() {
         .expect("upload_file");
     assert_eq!(
         std::fs::read(photos_root.join("uploaded.bin")).expect("read uploaded"),
-        upload
+        upload,
+        "multi-chunk upload_file"
+    );
+
+    // A resumed upload: send one chunk, then let upload_file reopen the same session and finish.
+    let resumed_path = "Photos/resumed.bin";
+    let resumed_hash = sha256(&upload);
+    let resumed_sig = sign_manifest(
+        &signing_key,
+        resumed_path,
+        upload.len() as u64,
+        &resumed_hash,
+    );
+    let (session_id, offset) = client
+        .upload_open(
+            resumed_path,
+            upload.len() as u64,
+            resumed_hash.clone(),
+            resumed_sig.clone(),
+        )
+        .await
+        .expect("open upload");
+    assert_eq!(offset, 0);
+    let first = client
+        .upload_chunk(&session_id, 0, upload[..MAX_UPLOAD_CHUNK as usize].to_vec())
+        .await
+        .expect("first chunk");
+    assert_eq!(first, MAX_UPLOAD_CHUNK as u64);
+    client
+        .upload_file(resumed_path, &upload, resumed_hash, resumed_sig)
+        .await
+        .expect("resume and commit");
+    assert_eq!(
+        std::fs::read(photos_root.join("resumed.bin")).expect("read resumed"),
+        upload,
+        "resumed upload"
     );
 
     let denied = client

@@ -40,6 +40,8 @@ pub enum VfsClientError {
     OffsetMismatch { expected: u64, actual: u64 },
     #[error("upload chunk of {len} bytes exceeds the {MAX_UPLOAD_CHUNK}-byte cap")]
     ChunkTooLarge { len: usize },
+    #[error("read length {len} is invalid; a read must request 1..={MAX_READ_CHUNK} bytes")]
+    InvalidReadLen { len: u32 },
     #[error("host resumed upload at offset {offset}, beyond the supplied {len}-byte payload")]
     ResumeBeyondPayload { offset: u64, len: usize },
 }
@@ -117,7 +119,7 @@ where
         len: u32,
     ) -> Result<(Vec<u8>, bool), VfsClientError> {
         if len == 0 || len > MAX_READ_CHUNK {
-            return Err(VfsClientError::ChunkTooLarge { len: len as usize });
+            return Err(VfsClientError::InvalidReadLen { len });
         }
         match self
             .request(VfsRequest::Read {
@@ -242,9 +244,10 @@ where
     }
 
     /// Opens/resumes, sends `data` from the host's next-expected offset in `MAX_UPLOAD_CHUNK`
-    /// pieces, then commits. On any failure the session is aborted best-effort and the original
-    /// error is returned. `hash`/`manifest_sig` are the caller's whole-file declarations; the host
-    /// verifies both before the staged file is moved into place.
+    /// pieces, then commits. On a refusal that leaves the control stream in sync, the session is
+    /// aborted best-effort before the original error is returned (a transport/wire failure cannot
+    /// carry an abort, so it is returned without one). `hash`/`manifest_sig` are the caller's
+    /// whole-file declarations; the host verifies both before the staged file is moved into place.
     pub async fn upload_file(
         &mut self,
         path: impl Into<String>,
@@ -252,9 +255,26 @@ where
         hash: Vec<u8>,
         manifest_sig: Vec<u8>,
     ) -> Result<(), VfsClientError> {
-        let (session_id, mut offset) = self
+        let (session_id, offset) = self
             .upload_open(path, data.len() as u64, hash, manifest_sig)
             .await?;
+        match self.upload_from(&session_id, data, offset).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if !matches!(error, VfsClientError::Framing(_) | VfsClientError::Wire(_)) {
+                    let _ = self.upload_abort(&session_id).await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn upload_from(
+        &mut self,
+        session_id: &[u8],
+        data: &[u8],
+        mut offset: u64,
+    ) -> Result<(), VfsClientError> {
         if offset > data.len() as u64 {
             return Err(VfsClientError::ResumeBeyondPayload {
                 offset,
@@ -265,7 +285,7 @@ where
             let start = offset as usize;
             let end = (start + MAX_UPLOAD_CHUNK as usize).min(data.len());
             let next = self
-                .upload_chunk(&session_id, offset, data[start..end].to_vec())
+                .upload_chunk(session_id, offset, data[start..end].to_vec())
                 .await?;
             let expected = end as u64;
             if next != expected {
@@ -276,6 +296,6 @@ where
             }
             offset = next;
         }
-        self.upload_commit(&session_id).await
+        self.upload_commit(session_id).await
     }
 }

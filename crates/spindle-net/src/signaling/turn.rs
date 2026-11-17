@@ -1165,6 +1165,8 @@ mod tests {
         Success,
         /// First Refresh gets a 438 with `nonce-2`; later ones succeed.
         StaleNonceOnce,
+        /// Every Refresh gets a 438 (the anti-spin bound).
+        StaleNonceAlways,
     }
 
     /// `XOR-RELAYED-ADDRESS` setter for the fake server's Allocate success.
@@ -1305,8 +1307,11 @@ mod tests {
                         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                         .unwrap_or_default();
                     events.send(FakeTurnEvent::Refresh(nonce)).ok();
-                    let stale =
-                        matches!(refresh_reply, RefreshReply::StaleNonceOnce) && refreshes == 1;
+                    let stale = match refresh_reply {
+                        RefreshReply::Success => false,
+                        RefreshReply::StaleNonceOnce => refreshes == 1,
+                        RefreshReply::StaleNonceAlways => true,
+                    };
                     let raw = if stale {
                         events.send(FakeTurnEvent::ErrorSent(438)).ok();
                         stun_response(
@@ -1610,6 +1615,70 @@ mod tests {
         );
 
         receive_pong(&socket).await;
+        server_task.abort();
+    }
+
+    /// td-8cc6d4: the retry is bounded. A server that 438s every Refresh must not produce a
+    /// request per round trip; after the one retry the client waits for the scheduled refresh.
+    #[tokio::test]
+    async fn repeated_refresh_stale_nonces_do_not_spin() {
+        let peer: SocketAddr = TEST_PEER.parse().expect("peer");
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake TURN server");
+        let server_addr = server.local_addr().expect("server addr");
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server_task = tokio::spawn(fake_turn_server(
+            server,
+            events,
+            BindReply::StaleNonce,
+            2,
+            RefreshReply::StaleNonceAlways,
+        ));
+        let cfg = TurnConfig {
+            server: server_addr,
+            credentials: TurnCredentials::Static {
+                username: "user".to_string(),
+                credential: "pass".to_string(),
+            },
+        };
+        let mut guard = allocate(&cfg, IpAddr::from([127, 0, 0, 1]), Duration::from_secs(5))
+            .await
+            .expect("allocate");
+        create_permission(
+            guard.allocation_mut().expect("live allocation"),
+            peer,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("permission");
+        let socket = guard
+            .into_relay_socket(server_addr, peer)
+            .expect("relay socket");
+        spawn_driver(socket.clone());
+
+        let FakeTurnEvent::Refresh(_) = next_event(&mut rx).await else {
+            panic!("expected the scheduled allocation refresh");
+        };
+        // Give the one retry time to arrive and be answered, but stay well inside the next
+        // scheduled refresh (a full lifetime/2 = 1 s after the first).
+        let deadline = Instant::now() + Duration::from_millis(700);
+        let mut refreshes = 1;
+        while Instant::now() < deadline {
+            pump_once(&socket).await;
+            while let Ok(event) = rx.try_recv() {
+                if matches!(event, FakeTurnEvent::Refresh(_)) {
+                    refreshes += 1;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            refreshes <= 3,
+            "a 438ing server produced {refreshes} Refreshes in 700 ms; the retry must be bounded \
+             (one initial request, at most one retransmit, and one retry)"
+        );
+
         server_task.abort();
     }
 

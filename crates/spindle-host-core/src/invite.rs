@@ -229,6 +229,8 @@ pub enum RedeemInviteError {
     Verify(#[source] ArtifactError),
     #[error("capability is not an invite (kind {0:?})")]
     NotAnInvite(CapKind),
+    #[error("invite was issued by a different host")]
+    WrongHost,
     #[error("invite subject does not match the presenting root fingerprint")]
     SubjectMismatch,
     #[error("no member on this host has the presenting root fingerprint")]
@@ -250,9 +252,15 @@ impl From<StoreError> for RedeemInviteError {
 }
 
 /// Redeems an invite capability (DESIGN.md §A4): verifies the host-signed chain and expiry,
-/// requires kind `invite`, binds `subject` to the presenting root fingerprint (A10.46 — invites
-/// are addressed, not bearer), resolves the pre-created `invited` member, then burns the nonce,
-/// records `issued_cap`, and activates the member in one store transaction.
+/// requires kind `invite`, requires the invite to name **this host** (`host_fp`), binds `subject`
+/// to the presenting root fingerprint (A10.46 — invites are addressed, not bearer), resolves the
+/// pre-created `invited` member, then burns the nonce, records `issued_cap`, and activates the
+/// member in one store transaction.
+///
+/// `host_fp` must be this host's own identity, from configuration — not from the invite. Without
+/// it, an invite minted by host A would redeem on host B whenever B already had an `invited`
+/// member for the same `root_fp`. `presenting_root_fp` must likewise be the authenticated
+/// presenter's root fingerprint from the session, never a value decoded from the request body.
 ///
 /// The caller supplies `issued_cap` (the host mints the member capability); this function owns
 /// verification, member resolution, and the atomic store transition, not policy about what the
@@ -261,6 +269,7 @@ impl From<StoreError> for RedeemInviteError {
 /// a `revoked` member, both without partial writes.
 pub fn redeem_invite(
     store: &mut Store,
+    host_fp: &Fingerprint,
     invite: &Capability,
     presenting_root_fp: &Fingerprint,
     issued_cap: &[u8],
@@ -269,6 +278,9 @@ pub fn redeem_invite(
     verify_capability(invite, now)?;
     if invite.kind != CapKind::Invite {
         return Err(RedeemInviteError::NotAnInvite(invite.kind));
+    }
+    if invite.host_fp.as_slice() != host_fp.as_bytes() {
+        return Err(RedeemInviteError::WrongHost);
     }
     if invite.subject.as_slice() != presenting_root_fp.as_bytes() {
         return Err(RedeemInviteError::SubjectMismatch);
@@ -326,6 +338,7 @@ mod tests {
     struct RedemptionFixture {
         store: Store,
         issuer: InviteIssuer,
+        host_root: RootKey,
         invitee: RootKey,
         member_id: MemberId,
         payload: InvitePayload,
@@ -333,6 +346,7 @@ mod tests {
 
     fn redemption_fixture() -> RedemptionFixture {
         let store = Store::open_in_memory().expect("in-memory store");
+        let host_root = RootKey::from_seed([0x90; 32]);
         let issuer = realistic_invite_issuer(NOW);
         let invitee = RootKey::from_seed([0xA0; 32]);
         let subject = invitee.root_fp();
@@ -348,6 +362,7 @@ mod tests {
         RedemptionFixture {
             store,
             issuer,
+            host_root,
             invitee,
             member_id,
             payload,
@@ -360,6 +375,7 @@ mod tests {
         let issued_cap = vec![0xAA; 424];
         let redeemed = redeem_invite(
             &mut f.store,
+            &f.host_root.root_fp(),
             &f.payload.cap,
             &f.invitee.root_fp(),
             &issued_cap,
@@ -385,6 +401,7 @@ mod tests {
         let mut f = redemption_fixture();
         let first = redeem_invite(
             &mut f.store,
+            &f.host_root.root_fp(),
             &f.payload.cap,
             &f.invitee.root_fp(),
             &[0xAA; 424],
@@ -393,6 +410,7 @@ mod tests {
         .expect("first redemption");
         let replay = redeem_invite(
             &mut f.store,
+            &f.host_root.root_fp(),
             &f.payload.cap,
             &f.invitee.root_fp(),
             &[0xBB; 100],
@@ -410,6 +428,7 @@ mod tests {
         let after_exp = f.payload.cap.exp + 1;
         let error = redeem_invite(
             &mut f.store,
+            &f.host_root.root_fp(),
             &f.payload.cap,
             &f.invitee.root_fp(),
             &[0xAA; 32],
@@ -431,6 +450,7 @@ mod tests {
         let other = RootKey::from_seed([0xA1; 32]);
         let error = redeem_invite(
             &mut f.store,
+            &f.host_root.root_fp(),
             &f.payload.cap,
             &other.root_fp(),
             &[0xAA; 32],
@@ -443,6 +463,7 @@ mod tests {
         // burned nothing.
         redeem_invite(
             &mut f.store,
+            &f.host_root.root_fp(),
             &f.payload.cap,
             &f.invitee.root_fp(),
             &[0xAA; 32],
@@ -463,6 +484,7 @@ mod tests {
             .expect("issue");
         let error = redeem_invite(
             &mut f.store,
+            &f.host_root.root_fp(),
             &payload.cap,
             &stranger.root_fp(),
             &[0xAA; 32],
@@ -479,6 +501,7 @@ mod tests {
         tampered.sig[0] ^= 0xFF;
         let error = redeem_invite(
             &mut f.store,
+            &f.host_root.root_fp(),
             &tampered,
             &f.invitee.root_fp(),
             &[0xAA; 32],
@@ -486,6 +509,28 @@ mod tests {
         )
         .expect_err("tampered signature");
         assert!(matches!(error, RedeemInviteError::Verify(_)), "{error:?}");
+    }
+
+    #[test]
+    fn an_invite_naming_another_host_is_refused() {
+        let mut f = redemption_fixture();
+        let other_host = RootKey::from_seed([0xE1; 32]);
+        let error = redeem_invite(
+            &mut f.store,
+            &other_host.root_fp(),
+            &f.payload.cap,
+            &f.invitee.root_fp(),
+            &[0xAA; 32],
+            NOW,
+        )
+        .expect_err("invite names a different host");
+        assert!(matches!(error, RedeemInviteError::WrongHost));
+        let member = f
+            .store
+            .get_member(f.member_id)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(member.status, MemberStatus::Invited);
     }
 
     #[test]
@@ -509,6 +554,7 @@ mod tests {
         );
         let error = redeem_invite(
             &mut f.store,
+            &f.host_root.root_fp(),
             &member_cap,
             &f.invitee.root_fp(),
             &[0xAA; 32],
@@ -528,6 +574,7 @@ mod tests {
         let mut f = redemption_fixture();
         redeem_invite(
             &mut f.store,
+            &f.host_root.root_fp(),
             &f.payload.cap,
             &f.invitee.root_fp(),
             &[0xAA; 32],
@@ -560,6 +607,7 @@ mod tests {
             .expect("revoke");
         let error = redeem_invite(
             &mut f.store,
+            &f.host_root.root_fp(),
             &f.payload.cap,
             &f.invitee.root_fp(),
             &[0xAA; 32],
@@ -573,6 +621,18 @@ mod tests {
             .expect("get")
             .expect("exists");
         assert_eq!(member.status, MemberStatus::Revoked);
+
+        // The refusal rolled the whole transaction back: the nonce is still redeemable for a
+        // different member (a committed burn would return InviteRedeemedByAnotherMember). This is
+        // the assertion that fails if the single-transaction burn+activate is ever split.
+        let other = RootKey::from_seed([0xA4; 32]);
+        let other_id = f
+            .store
+            .add_member(other.root_fp(), "other", 0)
+            .expect("add member");
+        f.store
+            .redeem_invite(&f.payload.cap.nonce, other_id, &[0xCC; 32], NOW)
+            .expect("a refused redemption must not burn the nonce");
     }
 
     /// The exact baseline whose size [`MEASURED_INVITE_BYTES`] names.

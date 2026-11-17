@@ -48,6 +48,9 @@ pub(crate) struct RelayState {
     /// spindle patch (td-8cc6d4): one in-flight stale-nonce retry for the allocation refresh.
     /// Reset on a successful refresh, so a later expiry is retried too.
     refresh_retried: bool,
+    /// The lifetime the outstanding Refresh requested, so a 438 retry re-requests the same value
+    /// (including the zero-lifetime release from `close()`). `None` between transactions.
+    last_refresh_lifetime: Option<Duration>,
 }
 
 impl RelayState {
@@ -68,6 +71,7 @@ impl RelayState {
             refresh_alloc_timer: Instant::now().add(lifetime / 2),
             refresh_perms_timer: Instant::now().add(PERM_REFRESH_INTERVAL),
             refresh_retried: false,
+            last_refresh_lifetime: None,
         }
     }
 
@@ -364,6 +368,7 @@ impl Relay<'_> {
     pub(super) fn refresh_allocation(&mut self, lifetime: Duration) -> Result<()> {
         let (username, realm) = (self.client.username(), self.client.realm());
         if let Some(relay) = self.client.relays.get_mut(&self.relayed_addr) {
+            relay.last_refresh_lifetime = Some(lifetime);
             let mut msg = Message::new();
             msg.build(&[
                 Box::new(TransactionId::new()),
@@ -405,10 +410,13 @@ impl Relay<'_> {
                     // falls through rather than looping.
                     if !relay.refresh_retried {
                         relay.refresh_retried = true;
-                        retry_lifetime = Some(relay.lifetime);
+                        retry_lifetime =
+                            Some(relay.last_refresh_lifetime.unwrap_or(relay.lifetime));
                     }
+                    relay.last_refresh_lifetime = None;
                     Ok(())
                 } else {
+                    relay.last_refresh_lifetime = None;
                     Err(Error::Other(format!("{} (error {})", res.typ, code)))
                 }
             } else {
@@ -418,6 +426,7 @@ impl Relay<'_> {
 
                 relay.lifetime = updated_lifetime.0;
                 relay.refresh_retried = false;
+                relay.last_refresh_lifetime = None;
                 debug!("updated lifetime: {} seconds", relay.lifetime.as_secs());
 
                 // A zero lifetime is the server confirming deallocation — the reply to the
