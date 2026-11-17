@@ -1,9 +1,9 @@
 //! `spindle-client-core` — the client library: sessions, the pinning store, the transfer queue,
-//! and key custody. This slice depends directly on `spindle-core` and `spindle-proto`; the
-//! finished crate will also depend on `spindle-net` and `spindle-vfs`. Per A9c boundary rule 3
-//! nothing below `apps/*/src-tauri` depends on `tauri` — the `apps/client` Tauri shell is a thin
-//! IPC layer over this crate, and private key material never leaves it (keys/seeds/caps are never
-//! sent over IPC).
+//! and key custody. It depends directly on `spindle-core`, `spindle-proto`, and `spindle-net`
+//! (framing and transport types); `spindle-vfs` remains a dev-dependency for the integration
+//! test that drives a real host store. Per A9c boundary rule 3 nothing below `apps/*/src-tauri`
+//! depends on `tauri` — the `apps/client` Tauri shell is a thin IPC layer over this crate, and
+//! private key material never leaves it (keys/seeds/caps are never sent over IPC).
 //!
 //! # Modules
 //! - [`self_revocation`] — minting a root-signed `spindle-self-rev-v1` record (only the primary
@@ -17,13 +17,18 @@
 //!   `helper.turn.get.<own nfp>` through the [`turn_credentials::TurnCredentialTransport`] seam.
 //!   Identity comes from the callout-granted subject token, the helper mints per `root_fp` against
 //!   its quota, and the returned ICE URIs are handed back verbatim for the caller to turn into a
-//!   transport config. **No app wires this yet** either; the module is the library-level client
-//!   half.
+//!   transport config. **No app wires this yet**; the module is the library-level client half.
+//! - [`vfs_client`] — the client half of the VFS RPC control stream: framed request/reply over
+//!   any `AsyncRead`/`AsyncWrite` pair, plus list/stat/read/mkdir/delete and the chunked upload
+//!   state machine. No QUIC or key material: the session layer authenticates the transport above
+//!   this module.
 
 pub mod self_revocation;
 pub mod turn_credentials;
+pub mod vfs_client;
 
 pub use self_revocation::{deposit_self_revocation, mint_self_revocation, DepositError};
 pub use turn_credentials::{
     fetch_turn_credentials, TurnCredentialError, TurnCredentialTransport, TurnCredentialsReply,
 };
+pub use vfs_client::{VfsClient, VfsClientError};

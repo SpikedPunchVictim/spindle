@@ -12,6 +12,10 @@ edition.workspace = true
 [dependencies]
 spindle-proto = { path = "../spindle-proto" }
 spindle-core = { path = "../spindle-core" }
+# VFS RPC client transport (td-6e3e90): the length-prefixed control-stream framing and, in tests,
+# the QUIC client. The crate itself only names the framing/io types, not quinn.
+spindle-net = { path = "../spindle-net" }
+tokio = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = { workspace = true }
@@ -27,6 +31,10 @@ tokio = { workspace = true }
 # key exactly as `spindle-net/tests/live_signaling.rs`'s revoked-reconnect probe does. All four
 # are test-only: the library itself stays runtime-neutral (see `[dependencies]` above).
 spindle-test-fixtures = { path = "../spindle-test-fixtures" }
+# The VFS client integration test runs the real host-core serve loop, store, and QUIC pair.
+spindle-host-core = { path = "../spindle-host-core" }
+spindle-vfs = { path = "../spindle-vfs" }
+tempfile = "3"
 async-nats = { workspace = true }
 rand = { workspace = true }
 nkeys = "0.4"
