@@ -908,3 +908,11 @@ until the container was stopped (131 → 146 lines). Read coturn evidence only a
 
 **Limits:** one kernel (Docker Desktop's Linux VM), simulated NATs, liveness frames rather than
 throughput. Not S19's real-two-host leg.
+
+## Limitation restated (td-c694b2, 2026-11-17)
+
+Envelope `seq` behaviour under **real reordering** remains unmeasured. DESIGN v0.9.14 settles the
+semantics (a retry is a new envelope with a fresh `seq`, never a byte-identical retransmit), and a
+reordering-capable substrate exists (netem `reorder 25% 50%`), but no test drives envelope-level
+reordering. Do not report S2 as fully met on this basis; items 1 (srflx/relay gathering) and 2
+(across-NAT relay number) are closed, item 3 is this limitation.
