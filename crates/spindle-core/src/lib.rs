@@ -20,9 +20,10 @@
 //! - [`clock_diagnostics`] — DESIGN.md §A10.42 leg (1), the local clock bound check a client MUST
 //!   run before minting a `SessionAttestation`: compares a caller-supplied `local_now` against
 //!   `max(HostOpKeyCert.ts)` from already-verified artifacts and reports a [`ClockDiagnosis`].
-//!   **Nothing in this workspace calls it** — there is no client yet, so the requirement is
-//!   tracked (td-f3d7fa) rather than enforced by a test. Diagnostic only — [`ClockOffset`] has no
-//!   conversion into a timestamp, because a time source is not an authenticated channel.
+//!   `spindle_client_core::session::connect_device` runs it before minting and refuses with
+//!   `DeviceSessionError::ClockProvablyBehind` when the local clock is behind that bound
+//!   (td-f3d7fa). Diagnostic only — [`ClockOffset`] has no conversion into a timestamp, because a
+//!   time source is not an authenticated channel.
 //!
 //! # Design notes and ambiguities (reported, not silently resolved)
 //!

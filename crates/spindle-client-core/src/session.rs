@@ -23,6 +23,9 @@
 
 use base64::Engine as _;
 use spindle_core::artifacts::issue_session_attestation;
+use spindle_core::clock_diagnostics::{
+    diagnose_clock_from_capabilities, ClockDiagnosis, ClockDiagnosticError,
+};
 use spindle_core::identity::DeviceKey;
 use spindle_core::Fingerprint;
 use spindle_net::quic::ControlStream;
@@ -84,6 +87,15 @@ pub enum DeviceSessionError {
     Signaling(#[from] SignalingError),
     #[error("TURN credential request failed")]
     Turn(#[from] TurnCredentialError),
+    #[error(
+        "local clock is {behind_by_seconds}s behind the signed op-cert lower bound (A10.42);          refusing to mint a SessionAttestation that cannot be accepted"
+    )]
+    ClockProvablyBehind {
+        behind_by_seconds: i64,
+        bound_ts: u64,
+    },
+    #[error("a held capability's embedded op cert could not be decoded for the clock check")]
+    ClockDiagnostics(#[source] ClockDiagnosticError),
 }
 
 /// The helper credential transport over this session's authenticated NATS connection.
@@ -121,6 +133,26 @@ pub async fn connect_device(
     let device_fp = device.device_fp();
     if device_cert.device_fp.as_slice() != device_fp.as_bytes() {
         return Err(DeviceSessionError::CertificateMismatch);
+    }
+
+    // A10.42 leg (1): before minting, prove the local clock is not behind a signed lower bound
+    // already carried by the held bundle. This is a diagnostic, never an input to validity; a
+    // provably-behind clock makes the attestation's `ts` unacceptable to the host's ±2 min window,
+    // so refusing here is the honest failure. The ambiguous (all caps expired) case still
+    // proceeds — a connect-only cap refresh is legitimate.
+    match diagnose_clock_from_capabilities(now, caps, &[])
+        .map_err(DeviceSessionError::ClockDiagnostics)?
+    {
+        ClockDiagnosis::ProvablyBehind {
+            behind_by,
+            bound_ts,
+        } => {
+            return Err(DeviceSessionError::ClockProvablyBehind {
+                behind_by_seconds: behind_by.diagnostic_seconds(),
+                bound_ts,
+            })
+        }
+        ClockDiagnosis::Ambiguous { .. } | ClockDiagnosis::NoEvidenceOfSkew => {}
     }
 
     let session = nkeys::KeyPair::new_user();
@@ -244,5 +276,57 @@ mod tests {
         let attest = issue_session_attestation(&device, Fingerprint::of_parts(&[b"nats"]), 7);
         assert_eq!(attest.nats_fp.len(), 32);
         assert_eq!(attest.sig_device.len(), 64);
+    }
+
+    /// A10.42 leg (1) negative test: a local clock provably behind the signed op-cert lower bound
+    /// refuses before any network attempt (the URL here is unreachable; a network error would
+    /// prove the ordering wrong).
+    #[tokio::test]
+    async fn a_provably_behind_clock_refuses_before_connecting() {
+        use spindle_core::artifacts::{issue_capability, issue_host_op_key_cert};
+        use spindle_proto::artifacts::CapKind;
+
+        let now = 1_755_907_200u64;
+        let root = RootKey::from_seed([0x21; 32]);
+        let device = DeviceKey::from_seeds([0x22; 32], [0x23; 32]);
+        let cert = issue_device_certificate(
+            &root,
+            device.alg_id(),
+            &device.sign_public_key(),
+            &device.agree_public_key(),
+            now,
+            now + 86_400,
+        );
+        let op_signing = SigningKey::from_bytes(&[0x24; 32]);
+        // Issued an hour in the future: local `now` is provably behind this signed bound.
+        let op_cert = issue_host_op_key_cert(
+            &root,
+            &op_signing.verifying_key(),
+            now + 3_600,
+            now + 86_400,
+        );
+        let cap = issue_capability(
+            &root.public_key(),
+            &op_cert,
+            &op_signing,
+            CapKind::Member,
+            root.root_fp(),
+            0,
+            now + 7_200,
+            vec![0x25; 32],
+        );
+        let root_pk = root.public_key().to_bytes();
+        let mut params = params_for(device, &cert, &root_pk);
+        params.caps = std::slice::from_ref(&cap);
+        params.nats_url = "nats://127.0.0.1:1";
+
+        let error = match connect_device(params).await {
+            Ok(_) => panic!("a provably-behind clock must refuse"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, DeviceSessionError::ClockProvablyBehind { .. }),
+            "expected the clock check to run before NATS, got {error:?}"
+        );
     }
 }
