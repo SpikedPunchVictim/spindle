@@ -107,6 +107,7 @@
 //! key via an embedded `HostOpKeyCert`, so both functions derive the same root-based `host_fp` —
 //! see `authz.rs`'s `TestHost` doc comment).
 
+pub mod admin;
 pub mod auth_token;
 pub mod authz;
 pub mod devcert;
