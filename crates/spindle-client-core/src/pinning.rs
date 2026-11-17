@@ -7,7 +7,11 @@
 //!   and envelope-key rotation — A10.43/A10.44 keep `host_fp = hash(host_root_pk)` stable, so a
 //!   rotation must not re-wall a member;
 //! - a different root presented for an already-pinned identity is a **key-change wall**: no API
-//!   here auto-accepts it or overwrites the pin, and the caller must make the user decide;
+//!   here auto-accepts it or overwrites the pin, and the caller must make the user decide. It is
+//!   observable only through [`Pinning::verify_pinned`], which takes the expected fingerprint
+//!   from the caller's own store; [`Pinning::observe`] keys on the root's *derived* `host_fp`, so
+//!   a substituted root looks like a never-seen host there. Every connect path must call
+//!   `verify_pinned` against the fp it already holds; `observe` is first-use only.
 //! - an unknown `host_fp` is simply not pinned yet; it is not silently trusted.
 //!
 //! Storage is a narrow trait so the Tauri/keychain implementation lands later; the in-memory
@@ -119,9 +123,14 @@ impl<S: PinStore> Pinning<S> {
         Self { store }
     }
 
-    /// Observes a host identity root. Returns the pin when this exact root was previously pinned;
-    /// `Unknown` when no decision exists. A stored record that does not rehash to its own key is
-    /// treated as corruption, never as a missing pin.
+    /// Observes a host identity root and returns its pin if this exact root was previously
+    /// pinned, else `Unknown`. **First-use only:** because the lookup key is derived from the
+    /// presented root, a substituted root is indistinguishable here from a new host. A connect
+    /// path that already knows which host it intends to reach must use [`Self::verify_pinned`]
+    /// with that expected fingerprint, which is what surfaces a key change as a wall.
+    ///
+    /// A stored record that does not rehash to its own key is treated as corruption, never as a
+    /// missing pin.
     pub fn observe(&self, host_root_pk: &[u8; 32]) -> Result<HostObservation, PinningError> {
         let host_fp = fingerprint_of(host_root_pk)?;
         match self.store.get(&host_fp)? {
