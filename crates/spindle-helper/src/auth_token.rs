@@ -24,9 +24,10 @@
 //! the **host** arm:
 //! [`spindle_proto::auth_token::encode_host_auth_token`] (td-539ffa; `spindle-hostd`'s headless
 //! binary mints its own CONNECT token with it). The responder in this crate still only ever
-//! *decodes* one. The **device** arm remains fixture-only: its sole builder is
-//! `spindle_test_fixtures::fixtures::device_auth_token`, and no production device encoder exists
-//! anywhere in this workspace yet. `spindle_test_fixtures::fixtures::host_auth_token` likewise
+//! *decodes* one. The **device** arm now has a production encoder too:
+//! [`spindle_proto::auth_token::encode_device_auth_token`] (td-e38932). The test-only
+//! `spindle_test_fixtures::fixtures::device_auth_token` remains as the independent builder this
+//! crate's tests and the live harness compare against, not as the only way to produce a token. `spindle_test_fixtures::fixtures::host_auth_token` likewise
 //! stays test-code-only, as the fixture-side cross-check for the production host encoder.
 //!
 //! `session_attest` (device arm added v0.9.29, td-0bcab4 §A4 step 2; host arm added v0.9.31,
@@ -271,7 +272,7 @@ mod tests {
     use spindle_core::identity::{DeviceKey, RootKey};
     use spindle_core::FINGERPRINT_LEN;
     use spindle_proto::artifacts::CapKind;
-    use spindle_proto::auth_token::encode_host_auth_token;
+    use spindle_proto::auth_token::{encode_device_auth_token, encode_host_auth_token};
     use spindle_test_fixtures::fixtures::{device_auth_token, host_auth_token};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -588,6 +589,72 @@ mod tests {
             now + TWENTY_ONE_DAYS,
             vec![0xAA; FINGERPRINT_LEN], // matches default_member_cap_nonce's actual length
         )
+    }
+
+    /// td-e38932: the production device encoder must agree byte-for-byte with the fixture builder
+    /// the live path and the measured-size test use, and its 32-cap token must still fit the
+    /// raised `max_control_line`. This is the cross-check that makes the production encoder a
+    /// pin on the shape rather than a fourth hand-kept copy of it.
+    #[test]
+    fn production_device_encoder_matches_the_fixture_and_the_measured_size() {
+        let now = 1_755_907_200u64;
+        let root = RootKey::from_seed([0xF0; 32]);
+        let device = DeviceKey::from_seeds([0xF1; 32], [0xF2; 32]);
+        let device_cert = issue_device_certificate(
+            &root,
+            device.alg_id(),
+            &device.sign_public_key(),
+            &device.agree_public_key(),
+            now,
+            now + 90 * 86_400,
+        );
+        let session_attest =
+            issue_session_attestation(&device, Fingerprint::of_parts(&[b"nats"]), now);
+        let subject = root.root_fp();
+        let caps: Vec<Capability> = (0u8..32)
+            .map(|i| {
+                realistic_member_cap(0xC0u8.wrapping_add(i), 0xD0u8.wrapping_add(i), subject, now)
+            })
+            .collect();
+
+        let cap_bytes: Vec<Vec<u8>> = caps.iter().map(Capability::to_canonical_bytes).collect();
+        let production = encode_device_auth_token(
+            &root.public_key().to_bytes(),
+            &device_cert.to_canonical_bytes(),
+            &session_attest.to_canonical_bytes(),
+            &cap_bytes,
+        );
+        let token = b64url(&production);
+        let fixture = device_auth_token(
+            &root.public_key().to_bytes(),
+            &device_cert,
+            &session_attest,
+            &caps,
+        );
+
+        assert_eq!(
+            token, fixture,
+            "the production encoder must emit the same bytes as the fixture builder (td-e38932)"
+        );
+        assert_eq!(
+            token.len(),
+            MEASURED_32_CAP_TOKEN_B64_BYTES,
+            "a 32-cap token built through the production encoder must keep the pinned measured size"
+        );
+        assert!(
+            token.len() < NATS_MAX_CONTROL_LINE_BYTES,
+            "a 32-cap token must fit under nats-server's raised max_control_line"
+        );
+
+        // Field-for-field agreement with the responder the token is presented to.
+        let decoded = decode_auth_token(&token).expect("helper decodes the production token");
+        let DecodedAuthToken::Device(d) = decoded else {
+            panic!("expected a device payload");
+        };
+        assert_eq!(d.root_pk_bytes, root.public_key().to_bytes());
+        assert_eq!(d.device_cert, device_cert);
+        assert_eq!(d.session_attest, session_attest);
+        assert_eq!(d.caps, caps);
     }
 
     #[test]

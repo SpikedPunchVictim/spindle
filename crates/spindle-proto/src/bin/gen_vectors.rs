@@ -16,6 +16,7 @@ use spindle_proto::artifacts::{
     HostOpKeyCert, HostSessionAttestation, RevocationRecord, SelfRevocationRecord,
     SessionAttestation,
 };
+use spindle_proto::auth_token::encode_device_auth_token;
 use spindle_proto::bootstrap::{
     BundleEntry, DeviceBootstrapBundle, BUNDLE_CURRENT_V, MAX_REGISTRY_LEN,
 };
@@ -251,6 +252,7 @@ fn main() {
         "session-attestation.json",
         session_attestation_vectors(),
     );
+    write_vector_file(&vectors_dir, "auth-token.json", auth_token_vectors());
     write_vector_file(
         &vectors_dir,
         "revocation-record.json",
@@ -502,6 +504,91 @@ fn admission_token_vectors() -> Json {
 }
 
 // ---- DeviceCertificate ----
+
+// ---- Device CONNECT auth_token envelope ----
+
+/// The device arm of the CONNECT `auth_token` (DESIGN.md §A4, td-e38932). Not one of the eleven
+/// A7b signed artifacts: this envelope has no domain tag and no signature, and only re-embeds
+/// artifacts that are already signed individually. Cases pin the map shape and the empty-`caps`
+/// array; the production encoder's 32-cap size is pinned in `spindle-helper`'s tests.
+fn auth_token_vectors() -> Json {
+    let device_cert = DeviceCertificate {
+        device_fp: rep(0x71, 32),
+        alg_id: 1,
+        sign_pk: rep(0x77, 32),
+        agree_pk: rep(0x78, 32),
+        ts: 1_755_907_200,
+        exp: 1_787_443_200,
+        sig_root: rep(0x73, 64),
+    };
+    let session_attest = SessionAttestation {
+        nats_fp: rep(0xb1, 32),
+        ts: 1_755_907_200,
+        sig_device: rep(0xb2, 64),
+    };
+    let root_pk: [u8; 32] = rep(0x91, 32).try_into().expect("32 bytes");
+    let device_cert_bytes = device_cert.to_canonical_bytes();
+    let session_attest_bytes = session_attest.to_canonical_bytes();
+
+    let member_cap = |nonce: u8, sig: u8| Capability {
+        v: 1,
+        host_fp: rep(0x10, 32),
+        host_root_pk: rep(0x20, 32),
+        op_cert: rep(0x30, 20),
+        kind: CapKind::Member,
+        subject: rep(0x40, 32),
+        cap_epoch: 0,
+        exp: 1_759_017_600,
+        nonce: rep(nonce, 32),
+        sig: rep(sig, 64),
+    };
+
+    let make_case = |name: &'static str, description: &'static str, caps: Vec<Capability>| {
+        let cap_bytes: Vec<Vec<u8>> = caps.iter().map(|c| c.to_canonical_bytes()).collect();
+        let bytes = encode_device_auth_token(
+            &root_pk,
+            &device_cert_bytes,
+            &session_attest_bytes,
+            &cap_bytes,
+        );
+        Json::Obj(vec![
+            ("name", Json::Str(name.into())),
+            ("description", Json::Str(description.into())),
+            (
+                "decoded",
+                Json::Obj(vec![
+                    ("kind", Json::Str("device".into())),
+                    ("root_pk", Json::hex(&root_pk)),
+                    ("device_cert", Json::hex(&device_cert_bytes)),
+                    ("session_attest", Json::hex(&session_attest_bytes)),
+                    ("caps", Json::hex_array(&cap_bytes)),
+                ]),
+            ),
+            ("canonical_cbor_hex", Json::hex(&bytes)),
+        ])
+    };
+
+    Json::Obj(vec![
+        ("artifact", Json::Str("DeviceAuthToken".into())),
+        (
+            "cases",
+            Json::Arr(vec![
+                make_case(
+                    "no_caps",
+                    "A device token with an empty `caps` array: the key is present and encodes as \
+                     an empty CBOR array, never omitted (the helper's decoder requires it).",
+                    vec![],
+                ),
+                make_case(
+                    "two_member_caps",
+                    "Two member capabilities, each embedded as its own canonical-CBOR byte string. \
+                     `root_pk` is the device's identity root, not a device fingerprint.",
+                    vec![member_cap(0x51, 0x52), member_cap(0x53, 0x54)],
+                ),
+            ]),
+        ),
+    ])
+}
 
 fn device_certificate_vectors() -> Json {
     // alg_id/sign_pk/agree_pk are structural filler here, not a real preimage of device_fp: this
