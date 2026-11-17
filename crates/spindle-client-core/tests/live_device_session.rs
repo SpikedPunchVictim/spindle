@@ -144,6 +144,7 @@ async fn a_device_session_authenticates_and_surfaces_the_member_cap() {
             ..ConnectOptions::default()
         },
         now,
+        use_helper_turn: false,
     })
     .await
     .expect("device session");

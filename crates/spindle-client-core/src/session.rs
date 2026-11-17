@@ -30,6 +30,11 @@ use spindle_net::signaling::{ConnectOptions, HostIdentity, SignalingClient, Sign
 use spindle_proto::artifacts::{Capability, DeviceCertificate};
 use spindle_proto::auth_token::encode_device_auth_token;
 
+use crate::self_revocation::TransportError;
+use crate::turn_credentials::{
+    fetch_turn_ice_config, TurnCredentialError, TurnCredentialTransport,
+};
+
 /// One authenticated device session with a host.
 pub struct DeviceSession {
     /// The callout-authenticated NATS connection. Kept for later helper requests (TURN
@@ -60,6 +65,10 @@ pub struct DeviceSessionParams<'a> {
     pub connect: ConnectOptions,
     /// Unix seconds for the session attestation.
     pub now: u64,
+    /// When true, fetch a helper-minted TURN credential over this session and overwrite
+    /// `connect.ice.turn` (STUN list and punch window are preserved). A refusal or an unusable URI
+    /// fails the session; the caller decides whether to retry without TURN.
+    pub use_helper_turn: bool,
 }
 
 /// Why a device session could not be established. `Display` omits NATS and signaling internals.
@@ -73,6 +82,24 @@ pub enum DeviceSessionError {
     Nats(#[source] async_nats::ConnectError),
     #[error("signaling failed")]
     Signaling(#[from] SignalingError),
+    #[error("TURN credential request failed")]
+    Turn(#[from] TurnCredentialError),
+}
+
+/// The helper credential transport over this session's authenticated NATS connection.
+struct NatsTurnTransport {
+    nats: async_nats::Client,
+}
+
+impl TurnCredentialTransport for NatsTurnTransport {
+    async fn request(&self, subject: &str, payload: Vec<u8>) -> Result<Vec<u8>, TransportError> {
+        let reply = self
+            .nats
+            .request(subject.to_string(), payload.into())
+            .await
+            .map_err(|error| Box::new(error) as TransportError)?;
+        Ok(reply.payload.to_vec())
+    }
 }
 
 /// Connects this device to `host` through the real Auth Callout and opens the host session.
@@ -88,6 +115,7 @@ pub async fn connect_device(
         host,
         connect,
         now,
+        use_helper_turn,
     } = params;
 
     let device_fp = device.device_fp();
@@ -116,6 +144,18 @@ pub async fn connect_device(
         .connect(nats_url)
         .await
         .map_err(DeviceSessionError::Nats)?;
+
+    let mut connect = connect;
+    if use_helper_turn {
+        let transport = NatsTurnTransport { nats: nats.clone() };
+        connect.ice = fetch_turn_ice_config(
+            &transport,
+            &nats_fp.to_string(),
+            connect.ice.punch_window,
+            connect.ice.stun_servers.clone(),
+        )
+        .await?;
+    }
 
     let signaling = SignalingClient::new(nats.clone(), device);
     let (control, member_cap) = signaling.connect_with_cap(&host, connect).await?;
@@ -153,6 +193,7 @@ mod tests {
             },
             connect: ConnectOptions::default(),
             now: 1_755_907_200,
+            use_helper_turn: false,
         }
     }
 

@@ -111,6 +111,77 @@ pub enum TurnCredentialError {
     /// (e.g. `"no active session"`, `"TURN quota exceeded"`, `"TURN not configured"`).
     #[error("helper refused the TURN credential request: {0}")]
     Rejected(String),
+    /// The reply carried no URI this client can use. Only `turn:<ip:port>[?transport=udp]` is
+    /// supported: `turns:`/`tcp` would need a TLS or TCP TURN client, and a hostname cannot be
+    /// resolved by the synchronous conversion.
+    #[error("helper returned no usable TURN URI (only turn:<ip:port>?transport=udp is supported)")]
+    NoUsableTurnUri,
+}
+
+/// Converts a minted credential into the ICE configuration the transport stack consumes
+/// (td-4f469c). The URI's server address becomes `TurnConfig.server`, the minted username and
+/// credential are used as static credentials (the helper already signed the expiry into them), and
+/// the caller's STUN list and punch window are preserved.
+///
+/// Only `turn:<ip:port>` with no transport or `?transport=udp` is accepted. `turns:` and
+/// `?transport=tcp` need a TLS/TCP TURN client this stack does not have; hostnames cannot be
+/// resolved here (the conversion is synchronous and the credential has a short TTL). A reply with
+/// no usable URI is [`TurnCredentialError::NoUsableTurnUri`].
+pub fn reply_to_ice_config(
+    reply: &TurnCredentialsReply,
+    punch_window: std::time::Duration,
+    stun_servers: Vec<std::net::SocketAddr>,
+) -> Result<spindle_net::signaling::IceConfig, TurnCredentialError> {
+    let server = reply
+        .uris
+        .iter()
+        .find_map(|uri| parse_turn_uri(uri))
+        .ok_or(TurnCredentialError::NoUsableTurnUri)?;
+    Ok(spindle_net::signaling::IceConfig {
+        stun_servers,
+        turn: Some(spindle_net::signaling::TurnConfig {
+            server,
+            credentials: spindle_net::signaling::TurnCredentials::Static {
+                username: reply.username.clone(),
+                credential: reply.credential.clone(),
+            },
+        }),
+        punch_window,
+    })
+}
+
+fn parse_turn_uri(uri: &str) -> Option<std::net::SocketAddr> {
+    let rest = uri.strip_prefix("turn:")?;
+    let (authority, query) = match rest.split_once('?') {
+        Some((authority, query)) => (authority, Some(query)),
+        None => (rest, None),
+    };
+    if let Some(query) = query {
+        let mut transport = None;
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=')?;
+            if key == "transport" {
+                transport = Some(value);
+            }
+        }
+        match transport {
+            None | Some("udp") => {}
+            Some(_) => return None,
+        }
+    }
+    authority.parse().ok()
+}
+
+/// Fetches a helper-minted credential and converts it (see [`reply_to_ice_config`]). `nats_fp` is
+/// the caller's own session-nkey fingerprint, exactly as [`fetch_turn_credentials`] requires.
+pub async fn fetch_turn_ice_config(
+    transport: &impl TurnCredentialTransport,
+    nats_fp: &str,
+    punch_window: std::time::Duration,
+    stun_servers: Vec<std::net::SocketAddr>,
+) -> Result<spindle_net::signaling::IceConfig, TurnCredentialError> {
+    let reply = fetch_turn_credentials(transport, nats_fp).await?;
+    reply_to_ice_config(&reply, punch_window, stun_servers)
 }
 
 /// The subset of the helper's `turn::TurnGetReply` wire shape this module reads.
@@ -450,5 +521,83 @@ mod tests {
             .expect("unknown fields must be ignored, not rejected");
 
         assert_eq!(reply.ttl_secs, 3600);
+    }
+
+    // ---- URI conversion and session wiring (td-4f469c) ----
+
+    fn reply_with_uris(uris: &[&str]) -> TurnCredentialsReply {
+        TurnCredentialsReply {
+            uris: uris.iter().map(|uri| uri.to_string()).collect(),
+            username: "1700003600:root".to_string(),
+            credential: "hmac".to_string(),
+            ttl_secs: 3600,
+        }
+    }
+
+    #[test]
+    fn a_udp_turn_uri_becomes_a_turn_config_and_preserves_stun_and_window() {
+        let stun: std::net::SocketAddr = "192.0.2.1:3478".parse().expect("stun");
+        let ice = reply_to_ice_config(
+            &reply_with_uris(&["turn:198.51.100.7:3478?transport=udp"]),
+            std::time::Duration::from_secs(3),
+            vec![stun],
+        )
+        .expect("convert");
+        assert_eq!(ice.stun_servers, vec![stun]);
+        assert_eq!(ice.punch_window, std::time::Duration::from_secs(3));
+        let turn = ice.turn.expect("turn present");
+        assert_eq!(turn.server, "198.51.100.7:3478".parse().expect("addr"));
+        assert_eq!(
+            turn.credentials,
+            spindle_net::signaling::TurnCredentials::Static {
+                username: "1700003600:root".to_string(),
+                credential: "hmac".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unsupported_or_unusable_uris_are_refused() {
+        for uris in [
+            &["turns:198.51.100.7:5349?transport=udp"][..],
+            &["turn:198.51.100.7:3478?transport=tcp"][..],
+            &["turn:turn.example.org:3478"][..],
+            &[][..],
+        ] {
+            let error = reply_to_ice_config(
+                &reply_with_uris(uris),
+                std::time::Duration::from_secs(3),
+                Vec::new(),
+            )
+            .expect_err("no usable URI");
+            assert!(matches!(error, TurnCredentialError::NoUsableTurnUri));
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_turn_ice_config_uses_the_minted_credential() {
+        let transport = FakeTransport::replying(
+            serde_json::json!({
+                "username": "1700003600:root",
+                "credential": "hmac",
+                "ttl": 3600,
+                "uris": ["turn:198.51.100.7:3478?transport=udp", "turn:198.51.100.8:3478"],
+            })
+            .to_string()
+            .into_bytes(),
+        );
+        let ice = fetch_turn_ice_config(
+            &transport,
+            NATS_FP,
+            std::time::Duration::from_secs(3),
+            Vec::new(),
+        )
+        .await
+        .expect("fetch and convert");
+        assert_eq!(
+            ice.turn.expect("turn").server,
+            "198.51.100.7:3478".parse().expect("addr")
+        );
+        assert_eq!(transport.calls().len(), 1);
     }
 }
