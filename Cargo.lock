@@ -3681,6 +3681,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "spindle-core",
  "spindle-proto",
  "spindle-test-fixtures",

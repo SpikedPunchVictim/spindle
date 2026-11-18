@@ -68,6 +68,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `query_as` API, never the compile-time `query!` macros — CI has no live Postgres to compile
 # against.
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "migrate"] }
+# Admin audit hash chain (td-efea19).
+sha2 = { workspace = true }
 # hmac/sha1: TURN REST credential minting (`turn.rs`), mirroring
 # `spikes/s19-quic-transport/src/bin/quic-peer.rs`'s `mint_turn_credentials` (same crate choices
 # and versions — small, pure-Rust, no C-toolchain requirement).

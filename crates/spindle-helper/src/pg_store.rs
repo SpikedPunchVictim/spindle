@@ -69,6 +69,8 @@ use spindle_core::{Fingerprint, VerifyingKey};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
+use crate::admin::{AdminState, AdminStateError};
+
 use crate::authz::{AdmissionMode, AdmissionRecord, HelperView};
 use crate::session::SessionRecord;
 
@@ -702,6 +704,126 @@ impl HelperView for PgStore {
             let _ = PgStore::purge_expired_sessions(self, now).await;
         })
     }
+}
+
+impl AdminState for PgStore {
+    fn is_replay(
+        &self,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+    ) -> Result<bool, AdminStateError> {
+        run_blocking(self.admin_is_replay_async(signer_fp, seq, nonce))
+            .map_err(|_| AdminStateError::Backend)
+    }
+
+    fn commit(
+        &mut self,
+        ts: u64,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+        cmd: &str,
+        result_code: &str,
+    ) -> Result<bool, AdminStateError> {
+        run_blocking(self.admin_commit_async(ts, signer_fp, seq, nonce, cmd, result_code))
+            .map_err(|_| AdminStateError::Backend)
+    }
+}
+
+impl PgStore {
+    async fn admin_is_replay_async(
+        &self,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+    ) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM admin_replay WHERE signer_fp = $1 AND seq >= $2) \
+                    OR EXISTS(SELECT 1 FROM admin_replay WHERE signer_fp = $1 AND nonce = $3)",
+        )
+        .bind(fp_bytes(signer_fp))
+        .bind(seq as i64)
+        .bind(nonce.to_vec())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<bool, _>(0))
+    }
+
+    async fn admin_commit_async(
+        &self,
+        ts: u64,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+        cmd: &str,
+        result_code: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Serializes the hash-chain append; the replay insert below is already atomic on its PK.
+        sqlx::query("SELECT pg_advisory_xact_lock(0x5350494E444C)")
+            .execute(&mut *tx)
+            .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO admin_replay (signer_fp, seq, nonce, ts) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(fp_bytes(signer_fp))
+        .bind(seq as i64)
+        .bind(nonce.to_vec())
+        .bind(ts as i64)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            return Ok(false);
+        }
+
+        let prev: Option<Vec<u8>> =
+            sqlx::query("SELECT hash FROM admin_audit ORDER BY id DESC LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.get::<Vec<u8>, _>(0));
+        let prev = prev.unwrap_or_else(|| vec![0u8; 32]);
+        let hash = admin_audit_hash(&prev, ts, signer_fp, seq, cmd, result_code);
+
+        sqlx::query(
+            "INSERT INTO admin_audit (ts, signer_fp, seq, cmd, result_code, prev_hash, hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(ts as i64)
+        .bind(fp_bytes(signer_fp))
+        .bind(seq as i64)
+        .bind(cmd)
+        .bind(result_code)
+        .bind(prev)
+        .bind(hash)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
+fn admin_audit_hash(
+    prev: &[u8],
+    ts: u64,
+    signer_fp: &Fingerprint,
+    seq: u64,
+    cmd: &str,
+    result_code: &str,
+) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update((prev.len() as u64).to_be_bytes());
+    hasher.update(prev);
+    hasher.update(ts.to_be_bytes());
+    hasher.update(signer_fp.as_bytes());
+    hasher.update(seq.to_be_bytes());
+    hasher.update((cmd.len() as u64).to_be_bytes());
+    hasher.update(cmd.as_bytes());
+    hasher.update((result_code.len() as u64).to_be_bytes());
+    hasher.update(result_code.as_bytes());
+    hasher.finalize().to_vec()
 }
 
 #[cfg(test)]

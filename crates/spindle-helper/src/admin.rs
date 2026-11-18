@@ -76,6 +76,8 @@ pub enum AdminRefusal {
     UnknownCommand,
     #[error("command is not implemented yet")]
     NotImplemented,
+    #[error("admin state store failed")]
+    State(#[source] AdminStateError),
 }
 
 impl AdminRefusal {
@@ -86,17 +88,40 @@ impl AdminRefusal {
             Self::Replay => "replay",
             Self::UnknownCommand => "unknown_command",
             Self::NotImplemented => "not_implemented",
+            Self::State(_) => "state_failed",
         }
     }
 }
 
-/// Durable-state seam for the replay guard. The in-memory implementation backs tests; the
-/// Postgres-backed slice implements the same contract durably and leader-only (A10.23).
-pub trait AdminReplayState {
-    fn last_seq(&self, signer_fp: &Fingerprint) -> Option<u64>;
-    fn nonce_seen(&self, signer_fp: &Fingerprint, nonce: &[u8]) -> bool;
-    /// Records `(seq, nonce)` as used. Returns false (and records nothing) on a conflict.
-    fn record(&mut self, signer_fp: &Fingerprint, seq: u64, nonce: &[u8]) -> bool;
+/// Why the durable admin state could not be read or written.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AdminStateError {
+    #[error("admin state store failed")]
+    Backend,
+}
+
+/// Durable-state seam: the anti-replay guard and the hash-chained audit append. The in-memory
+/// implementation backs tests; `PgStore` implements it durably (migration 0005).
+pub trait AdminState {
+    /// True if `seq` is not strictly newer than this signer's last accepted seq, or the nonce was
+    /// already used.
+    fn is_replay(
+        &self,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+    ) -> Result<bool, AdminStateError>;
+    /// Records `(seq, nonce)` and appends the audit entry in one transaction. Returns false (and
+    /// records nothing) if another writer won the same seq/nonce.
+    fn commit(
+        &mut self,
+        ts: u64,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+        cmd: &str,
+        result_code: &str,
+    ) -> Result<bool, AdminStateError>;
 }
 
 /// Process-lifetime replay state. Not durable; the Postgres slice replaces it.
@@ -106,7 +131,7 @@ pub struct InMemoryAdminReplay {
     nonces: HashSet<([u8; 32], Vec<u8>)>,
 }
 
-impl AdminReplayState for InMemoryAdminReplay {
+impl InMemoryAdminReplay {
     fn last_seq(&self, signer_fp: &Fingerprint) -> Option<u64> {
         self.seqs.get(signer_fp.as_bytes()).copied()
     }
@@ -115,16 +140,34 @@ impl AdminReplayState for InMemoryAdminReplay {
         self.nonces
             .contains(&(*signer_fp.as_bytes(), nonce.to_vec()))
     }
+}
 
-    fn record(&mut self, signer_fp: &Fingerprint, seq: u64, nonce: &[u8]) -> bool {
-        if self.last_seq(signer_fp).is_some_and(|last| seq <= last)
-            || self.nonce_seen(signer_fp, nonce)
-        {
-            return false;
+impl AdminState for InMemoryAdminReplay {
+    fn is_replay(
+        &self,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+    ) -> Result<bool, AdminStateError> {
+        Ok(self.last_seq(signer_fp).is_some_and(|last| seq <= last)
+            || self.nonce_seen(signer_fp, nonce))
+    }
+
+    fn commit(
+        &mut self,
+        _ts: u64,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+        _cmd: &str,
+        _result_code: &str,
+    ) -> Result<bool, AdminStateError> {
+        if self.is_replay(signer_fp, seq, nonce)? {
+            return Ok(false);
         }
         self.seqs.insert(*signer_fp.as_bytes(), seq);
         self.nonces.insert((*signer_fp.as_bytes(), nonce.to_vec()));
-        true
+        Ok(true)
     }
 }
 
@@ -172,13 +215,13 @@ pub const ADMIN_COMMANDS: &[&str] = &[
 ];
 
 /// Verifies, replay-checks, and dispatches admin commands.
-pub struct AdminService<S: AdminReplayState> {
+pub struct AdminService<S: AdminState> {
     operator_pk: VerifyingKey,
     expected_signer_fp: Fingerprint,
     replay: S,
 }
 
-impl<S: AdminReplayState> AdminService<S> {
+impl<S: AdminState> AdminService<S> {
     pub fn new(operator_pk: VerifyingKey, expected_signer_fp: Fingerprint, replay: S) -> Self {
         Self {
             operator_pk,
@@ -209,15 +252,31 @@ impl<S: AdminReplayState> AdminService<S> {
         if !ADMIN_COMMANDS.contains(&command.cmd.as_str()) {
             return Err(AdminRefusal::UnknownCommand);
         }
-        if !self
+        if self
             .replay
-            .record(&self.expected_signer_fp, command.seq, &command.nonce)
+            .is_replay(&self.expected_signer_fp, command.seq, &command.nonce)
+            .map_err(AdminRefusal::State)?
         {
             return Err(AdminRefusal::Replay);
         }
 
         // The stateful command implementations are the next slice of td-efea19. A typed
         // not_implemented is deliberately distinguishable from a malformed/replayed command.
+        let result_code = AdminRefusal::NotImplemented.code();
+        if !self
+            .replay
+            .commit(
+                now,
+                &self.expected_signer_fp,
+                command.seq,
+                &command.nonce,
+                &command.cmd,
+                result_code,
+            )
+            .map_err(AdminRefusal::State)?
+        {
+            return Err(AdminRefusal::Replay);
+        }
         Err(AdminRefusal::NotImplemented)
     }
 }

@@ -517,6 +517,43 @@ enum Store {
     Pg(PgStore),
 }
 
+/// Admin-plane durable state: Postgres when configured, process-lifetime memory otherwise.
+enum AdminBackend {
+    Memory(spindle_helper::admin::InMemoryAdminReplay),
+    Pg(PgStore),
+}
+
+impl spindle_helper::admin::AdminState for AdminBackend {
+    fn is_replay(
+        &self,
+        signer_fp: &spindle_core::Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+    ) -> Result<bool, spindle_helper::admin::AdminStateError> {
+        match self {
+            AdminBackend::Memory(state) => state.is_replay(signer_fp, seq, nonce),
+            AdminBackend::Pg(state) => state.is_replay(signer_fp, seq, nonce),
+        }
+    }
+
+    fn commit(
+        &mut self,
+        ts: u64,
+        signer_fp: &spindle_core::Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+        cmd: &str,
+        result_code: &str,
+    ) -> Result<bool, spindle_helper::admin::AdminStateError> {
+        match self {
+            AdminBackend::Memory(state) => {
+                state.commit(ts, signer_fp, seq, nonce, cmd, result_code)
+            }
+            AdminBackend::Pg(state) => state.commit(ts, signer_fp, seq, nonce, cmd, result_code),
+        }
+    }
+}
+
 impl HelperView for Store {
     fn revocation_epoch(&mut self, host_fp: &spindle_core::Fingerprint) -> u64 {
         match self {
@@ -795,6 +832,38 @@ async fn run(config: Config) -> anyhow::Result<()> {
         }
     };
 
+    // Durable admin state is opened only when the plane is enabled: Postgres when configured,
+    // otherwise process-lifetime memory (logged as such). A second PgPool is deliberate — the
+    // command loop owns the main store and this task must not contend on its lock.
+    let mut admin_backend: Option<AdminBackend> = if config.operator_seed.is_some()
+        && config.app_conn_seed.is_some()
+        && spindle_helper::admin::admin_plane_allowed(
+            &config.nats_url,
+            true,
+            config.admin_allow_plaintext,
+        )
+        .is_ok()
+    {
+        match &config.database_url {
+            Some(url) => match PgStore::connect(url, config.admission_mode, operator_pk).await {
+                Ok(pg) => Some(AdminBackend::Pg(pg)),
+                Err(error) => {
+                    tracing::error!(
+                        error = %sqlx_error_summary(&error),
+                        "admin state store unavailable; admin plane disabled"
+                    );
+                    None
+                }
+            },
+            None => {
+                tracing::warn!("DATABASE_URL unset — admin replay/audit is process-lifetime only");
+                Some(AdminBackend::Memory(Default::default()))
+            }
+        }
+    } else {
+        None
+    };
+
     // `registry.admin.>` — the A3b admin plane (td-efea19 slice 2). The command signature is the
     // authorization; the operator identity is the NATS/mTLS connection, so the deployment gate
     // refuses a plaintext URL unless the operator opted out for a local dev stack. Replies are
@@ -806,47 +875,49 @@ async fn run(config: Config) -> anyhow::Result<()> {
             config.admin_allow_plaintext,
         ) {
             Ok(()) => {
-                if let Some(client) = &app_client {
-                    match client.subscribe("registry.admin.>").await {
-                        Ok(mut sub) => {
-                            let service = std::sync::Arc::new(tokio::sync::Mutex::new(
-                                spindle_helper::admin::AdminService::new(
-                                    operator_pk,
-                                    spindle_core::identity::root_fp_of(&operator_pk),
-                                    spindle_helper::admin::InMemoryAdminReplay::default(),
-                                ),
-                            ));
-                            let client = client.clone();
-                            tokio::spawn(async move {
-                                while let Some(msg) = sub.next().await {
-                                    let reply =
-                                        service.lock().await.handle(&msg.payload, now_secs());
-                                    if let Some(reply_subject) = msg.reply.clone() {
-                                        if let Err(error) =
-                                            client.publish(reply_subject, reply.into()).await
-                                        {
-                                            tracing::warn!(
-                                                error = %error, // redaction-ok: publish errors name the subject (registry.admin.<documented>) and a fixed kind, never a credential or payload
-                                                "failed to publish the admin reply"
-                                            );
+                if let Some(backend) = admin_backend.take() {
+                    if let Some(client) = &app_client {
+                        match client.subscribe("registry.admin.>").await {
+                            Ok(mut sub) => {
+                                let service = std::sync::Arc::new(tokio::sync::Mutex::new(
+                                    spindle_helper::admin::AdminService::new(
+                                        operator_pk,
+                                        spindle_core::identity::root_fp_of(&operator_pk),
+                                        backend,
+                                    ),
+                                ));
+                                let client = client.clone();
+                                tokio::spawn(async move {
+                                    while let Some(msg) = sub.next().await {
+                                        let reply =
+                                            service.lock().await.handle(&msg.payload, now_secs());
+                                        if let Some(reply_subject) = msg.reply.clone() {
+                                            if let Err(error) =
+                                                client.publish(reply_subject, reply.into()).await
+                                            {
+                                                tracing::warn!(
+                                                    error = %error, // redaction-ok: publish errors name the subject (registry.admin.<documented>) and a fixed kind, never a credential or payload
+                                                    "failed to publish the admin reply"
+                                                );
+                                            }
                                         }
                                     }
-                                }
-                            });
-                            tracing::info!("admin plane subscribed on registry.admin.>");
+                                });
+                                tracing::info!("admin plane subscribed on registry.admin.>");
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    error = %error, // redaction-ok: SubscribeError Display names the fixed subject pattern, never a credential or payload
+                                    "failed to subscribe the admin plane"
+                                );
+                            }
                         }
-                        Err(error) => {
-                            tracing::error!(
-                                error = %error, // redaction-ok: SubscribeError Display names the fixed subject pattern, never a credential or payload
-                                "failed to subscribe the admin plane"
-                            );
-                        }
-                    }
-                } else {
-                    tracing::warn!(
+                    } else {
+                        tracing::warn!(
                         "APP_CONN_SEED not set — registry.admin.> is disabled (the admin plane needs \
                          the application-account connection)"
                     );
+                    }
                 }
             }
             Err(error) => tracing::error!(error = %error, "admin plane disabled"),
