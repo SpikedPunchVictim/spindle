@@ -16,6 +16,15 @@ build:
     pnpm -r build
     cargo build --workspace
 
+# Remove all build artifacts (full rebuild afterwards).
+clean:
+    cargo clean
+
+# Drop incremental artifacts (safe; only rebuild speed is affected) and report the target size.
+prune:
+    rm -rf target/debug/incremental
+    du -sh target
+
 # Test everything: TS packages/apps, then the Rust workspace.
 test:
     pnpm install --frozen-lockfile

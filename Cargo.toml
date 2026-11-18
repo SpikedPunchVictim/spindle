@@ -19,6 +19,12 @@ members = [
 # apps/*/src-tauri join this workspace once the Tauri apps are initialized (IMPLEMENTATION_PLAN
 # Stage 7), e.g. "apps/host/src-tauri", "apps/client/src-tauri".
 
+# Keep dependency debug info out of target/debug (the bulk of `deps/`); workspace crates keep full
+# debug info. Backtraces into dependencies lose line tables, not symbols. Use `just prune` to drop
+# incremental artifacts.
+[profile.dev.package."*"]
+debug = false
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
