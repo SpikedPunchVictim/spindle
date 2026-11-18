@@ -192,6 +192,39 @@ impl PgStore {
         .get::<bool, _>("revoked")
     }
 
+    async fn admin_pre_register_host_async(
+        &self,
+        host_fp: &Fingerprint,
+        label: &str,
+        quota_profile: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO admission_records (host_fp, label, admitted_at, quota_profile) \
+             VALUES ($1, $2, (EXTRACT(EPOCH FROM now()))::bigint, $3) \
+             ON CONFLICT (host_fp) DO NOTHING",
+        )
+        .bind(fp_bytes(host_fp))
+        .bind(label)
+        .bind(quota_profile)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn admin_set_quota_async(
+        &self,
+        host_fp: &Fingerprint,
+        quota_profile: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let updated =
+            sqlx::query("UPDATE admission_records SET quota_profile = $2 WHERE host_fp = $1")
+                .bind(fp_bytes(host_fp))
+                .bind(quota_profile)
+                .execute(&self.pool)
+                .await?;
+        Ok(updated.rows_affected() > 0)
+    }
+
     async fn admission_mode_async(&self) -> Result<AdmissionMode, sqlx::Error> {
         let mode: String = sqlx::query("SELECT admission_mode FROM registry_state WHERE id = 1")
             .fetch_one(&self.pool)
@@ -774,6 +807,25 @@ impl AdminState for PgStore {
     fn set_mode(&mut self, mode: AdmissionMode) -> Result<(), AdminStateError> {
         run_blocking(self.set_admission_mode_async(mode)).map_err(|_| AdminStateError::Backend)
     }
+
+    fn pre_register_host(
+        &mut self,
+        host_fp: &Fingerprint,
+        label: &str,
+        quota_profile: &str,
+    ) -> Result<(), AdminStateError> {
+        run_blocking(self.admin_pre_register_host_async(host_fp, label, quota_profile))
+            .map_err(|_| AdminStateError::Backend)
+    }
+
+    fn set_quota_profile(
+        &mut self,
+        host_fp: &Fingerprint,
+        quota_profile: &str,
+    ) -> Result<bool, AdminStateError> {
+        run_blocking(self.admin_set_quota_async(host_fp, quota_profile))
+            .map_err(|_| AdminStateError::Backend)
+    }
 }
 
 impl PgStore {
@@ -1109,6 +1161,39 @@ mod tests {
         .await
         .expect("truncate tables between tests");
         Some(store)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admin_pre_register_and_quota_write_admission_records() {
+        let _guard = TEST_LOCK.lock().await;
+        let Some(mut store) = test_store().await else {
+            return;
+        };
+        let host = fp(b"admin-host");
+        store
+            .pre_register_host(&host, "label", "gold")
+            .expect("pre-register");
+        let record = store.admission_record(&host).expect("record exists");
+        assert_eq!(record.label, "label");
+        assert_eq!(record.quota_profile, "gold");
+
+        // Idempotent: a second pre-register does not rewrite the existing record.
+        store
+            .pre_register_host(&host, "other", "bronze")
+            .expect("idempotent");
+        assert_eq!(
+            store.admission_record(&host).expect("record").label,
+            "label"
+        );
+
+        assert!(store.set_quota_profile(&host, "silver").expect("update"));
+        assert_eq!(
+            store.admission_record(&host).expect("record").quota_profile,
+            "silver"
+        );
+        assert!(!store
+            .set_quota_profile(&fp(b"absent"), "silver")
+            .expect("no-op"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

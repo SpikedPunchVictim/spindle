@@ -82,6 +82,8 @@ pub enum AdminRefusal {
     NotImplemented,
     #[error("command arguments are malformed")]
     BadArgs,
+    #[error("target host was not found")]
+    NotFound,
     #[error("admin state store failed")]
     State(#[source] AdminStateError),
 }
@@ -95,6 +97,7 @@ impl AdminRefusal {
             Self::UnknownCommand => "unknown_command",
             Self::NotImplemented => "not_implemented",
             Self::BadArgs => "invalid_args",
+            Self::NotFound => "not_found",
             Self::State(state) => state.code(),
         }
     }
@@ -149,6 +152,20 @@ pub trait AdminState {
     fn read_audit_log(&mut self, limit: u32) -> Result<CborValue, AdminStateError>;
     /// Durable admission-mode change (A3b `set_mode`). Backends without durable mode refuse.
     fn set_mode(&mut self, mode: AdmissionMode) -> Result<(), AdminStateError>;
+    /// Pre-register a host (A3b) by creating its admission record. Idempotent for an existing
+    /// record: it does not rewrite label/quota.
+    fn pre_register_host(
+        &mut self,
+        host_fp: &Fingerprint,
+        label: &str,
+        quota_profile: &str,
+    ) -> Result<(), AdminStateError>;
+    /// Update an existing admission record's quota profile. False when no record exists.
+    fn set_quota_profile(
+        &mut self,
+        host_fp: &Fingerprint,
+        quota_profile: &str,
+    ) -> Result<bool, AdminStateError>;
 }
 
 /// Process-lifetime replay state. Not durable; the Postgres slice replaces it.
@@ -216,6 +233,23 @@ impl AdminState for InMemoryAdminReplay {
         Err(AdminStateError::Unsupported)
     }
 
+    fn pre_register_host(
+        &mut self,
+        _host_fp: &Fingerprint,
+        _label: &str,
+        _quota_profile: &str,
+    ) -> Result<(), AdminStateError> {
+        Err(AdminStateError::Unsupported)
+    }
+
+    fn set_quota_profile(
+        &mut self,
+        _host_fp: &Fingerprint,
+        _quota_profile: &str,
+    ) -> Result<bool, AdminStateError> {
+        Err(AdminStateError::Unsupported)
+    }
+
     fn read_audit_log(&mut self, limit: u32) -> Result<CborValue, AdminStateError> {
         let rows = self
             .audit
@@ -234,6 +268,36 @@ impl AdminState for InMemoryAdminReplay {
             .collect();
         Ok(CborValue::array(rows))
     }
+}
+
+fn parse_host_args(args: &CborValue, needs_label: bool) -> Option<(Fingerprint, String, String)> {
+    let map = args.as_map()?;
+    let host_fp = map
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("host_fp"))
+        .and_then(|(_, v)| v.as_bytes())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .and_then(|bytes| Fingerprint::from_slice(&bytes).ok())?;
+    let quota = map
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("quota_profile"))
+        .and_then(|(_, v)| v.as_text())?;
+    if quota.is_empty() {
+        return None;
+    }
+    let label = if needs_label {
+        let label = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("label"))
+            .and_then(|(_, v)| v.as_text())?;
+        if label.is_empty() {
+            return None;
+        }
+        label.to_string()
+    } else {
+        String::new()
+    };
+    Some((host_fp, label, quota.to_string()))
 }
 
 fn parse_mode(args: &CborValue) -> Option<AdmissionMode> {
@@ -348,6 +412,57 @@ impl<S: AdminState> AdminService<S> {
                 },
                 "ok",
             ),
+            "pre_register_host" => match parse_host_args(&command.args, true) {
+                Some((host_fp, label, quota)) => {
+                    match self.replay.pre_register_host(&host_fp, &label, &quota) {
+                        Ok(()) => (AdminReply::Ok { result: None }, "ok"),
+                        Err(AdminStateError::Unsupported) => (
+                            AdminReply::Refused {
+                                code: AdminRefusal::NotImplemented.code().to_string(),
+                                message: None,
+                            },
+                            "not_implemented",
+                        ),
+                        Err(error) => return Err(AdminRefusal::State(error)),
+                    }
+                }
+                None => (
+                    AdminReply::Refused {
+                        code: AdminRefusal::BadArgs.code().to_string(),
+                        message: None,
+                    },
+                    "invalid_args",
+                ),
+            },
+            "set_quota_profile" => match parse_host_args(&command.args, false) {
+                Some((host_fp, _label, quota)) => {
+                    match self.replay.set_quota_profile(&host_fp, &quota) {
+                        Ok(true) => (AdminReply::Ok { result: None }, "ok"),
+                        Ok(false) => (
+                            AdminReply::Refused {
+                                code: AdminRefusal::NotFound.code().to_string(),
+                                message: None,
+                            },
+                            "not_found",
+                        ),
+                        Err(AdminStateError::Unsupported) => (
+                            AdminReply::Refused {
+                                code: AdminRefusal::NotImplemented.code().to_string(),
+                                message: None,
+                            },
+                            "not_implemented",
+                        ),
+                        Err(error) => return Err(AdminRefusal::State(error)),
+                    }
+                }
+                None => (
+                    AdminReply::Refused {
+                        code: AdminRefusal::BadArgs.code().to_string(),
+                        message: None,
+                    },
+                    "invalid_args",
+                ),
+            },
             "set_mode" => match parse_mode(&command.args) {
                 None => (
                     AdminReply::Refused {
@@ -582,6 +697,65 @@ mod tests {
             decode_reply(&bad_args.handle(&missing.to_canonical_bytes(), NOW))
                 .1
                 .as_deref(),
+            Some("invalid_args")
+        );
+    }
+
+    #[test]
+    fn host_commands_on_the_memory_backend_are_not_implemented_and_validate_args() {
+        let op = operator();
+        let host_fp = Fingerprint::of_parts(&[b"host"]);
+        let args = |label: Option<&str>, quota: &str| {
+            let mut entries = vec![
+                ("host_fp", CborValue::bytes(host_fp.as_bytes().to_vec())),
+                ("quota_profile", CborValue::text(quota)),
+            ];
+            if let Some(label) = label {
+                entries.push(("label", CborValue::text(label)));
+            }
+            CborValue::map(entries)
+        };
+        let cmd = |name: &str, args: CborValue, seq: u64, nonce: u8| {
+            issue_admin_command(
+                &op,
+                1,
+                name.to_string(),
+                args,
+                signer_fp().to_vec(),
+                seq,
+                vec![nonce; 16],
+                NOW,
+            )
+        };
+
+        let mut first = service();
+        assert_eq!(
+            decode_reply(&first.handle(
+                &cmd("pre_register_host", args(Some("h"), "gold"), 1, 0x31).to_canonical_bytes(),
+                NOW
+            ))
+            .1
+            .as_deref(),
+            Some("not_implemented")
+        );
+        let mut second = service();
+        assert_eq!(
+            decode_reply(&second.handle(
+                &cmd("pre_register_host", args(None, "gold"), 1, 0x32).to_canonical_bytes(),
+                NOW
+            ))
+            .1
+            .as_deref(),
+            Some("invalid_args")
+        );
+        let mut third = service();
+        assert_eq!(
+            decode_reply(&third.handle(
+                &cmd("set_quota_profile", args(None, ""), 1, 0x33).to_canonical_bytes(),
+                NOW
+            ))
+            .1
+            .as_deref(),
             Some("invalid_args")
         );
     }

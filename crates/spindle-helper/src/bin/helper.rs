@@ -581,6 +581,29 @@ impl spindle_helper::admin::AdminState for AdminBackend {
             AdminBackend::Pg(state) => state.set_mode(mode),
         }
     }
+
+    fn pre_register_host(
+        &mut self,
+        host_fp: &spindle_core::Fingerprint,
+        label: &str,
+        quota_profile: &str,
+    ) -> Result<(), spindle_helper::admin::AdminStateError> {
+        match self {
+            AdminBackend::Memory(state) => state.pre_register_host(host_fp, label, quota_profile),
+            AdminBackend::Pg(state) => state.pre_register_host(host_fp, label, quota_profile),
+        }
+    }
+
+    fn set_quota_profile(
+        &mut self,
+        host_fp: &spindle_core::Fingerprint,
+        quota_profile: &str,
+    ) -> Result<bool, spindle_helper::admin::AdminStateError> {
+        match self {
+            AdminBackend::Memory(state) => state.set_quota_profile(host_fp, quota_profile),
+            AdminBackend::Pg(state) => state.set_quota_profile(host_fp, quota_profile),
+        }
+    }
 }
 
 impl HelperView for Store {
