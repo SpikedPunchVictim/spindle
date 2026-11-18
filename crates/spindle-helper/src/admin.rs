@@ -18,6 +18,8 @@ use std::collections::{HashMap, HashSet};
 use spindle_core::artifacts::{verify_admin_command, ArtifactError};
 use spindle_core::Fingerprint;
 use spindle_core::VerifyingKey;
+
+use crate::authz::AdmissionMode;
 use spindle_proto::artifacts::AdminCommand;
 use spindle_proto::canonical::{canonical_encode, CborValue};
 
@@ -78,6 +80,8 @@ pub enum AdminRefusal {
     UnknownCommand,
     #[error("command is not implemented yet")]
     NotImplemented,
+    #[error("command arguments are malformed")]
+    BadArgs,
     #[error("admin state store failed")]
     State(#[source] AdminStateError),
 }
@@ -90,7 +94,8 @@ impl AdminRefusal {
             Self::Replay => "replay",
             Self::UnknownCommand => "unknown_command",
             Self::NotImplemented => "not_implemented",
-            Self::State(_) => "state_failed",
+            Self::BadArgs => "invalid_args",
+            Self::State(state) => state.code(),
         }
     }
 }
@@ -100,6 +105,19 @@ impl AdminRefusal {
 pub enum AdminStateError {
     #[error("admin state store failed")]
     Backend,
+    /// This backend cannot perform the command yet (the in-memory dev backend has no durable
+    /// admission mode to change).
+    #[error("admin command is not supported by this backend")]
+    Unsupported,
+}
+
+impl AdminStateError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Backend => "state_failed",
+            Self::Unsupported => "not_implemented",
+        }
+    }
 }
 
 /// Durable-state seam: the anti-replay guard and the hash-chained audit append. The in-memory
@@ -129,6 +147,8 @@ pub trait AdminState {
     fn list_hosts(&mut self) -> Result<CborValue, AdminStateError>;
     /// The most recent `limit` audit rows, newest first.
     fn read_audit_log(&mut self, limit: u32) -> Result<CborValue, AdminStateError>;
+    /// Durable admission-mode change (A3b `set_mode`). Backends without durable mode refuse.
+    fn set_mode(&mut self, mode: AdmissionMode) -> Result<(), AdminStateError>;
 }
 
 /// Process-lifetime replay state. Not durable; the Postgres slice replaces it.
@@ -192,6 +212,10 @@ impl AdminState for InMemoryAdminReplay {
         Ok(CborValue::array(Vec::new()))
     }
 
+    fn set_mode(&mut self, _mode: AdmissionMode) -> Result<(), AdminStateError> {
+        Err(AdminStateError::Unsupported)
+    }
+
     fn read_audit_log(&mut self, limit: u32) -> Result<CborValue, AdminStateError> {
         let rows = self
             .audit
@@ -209,6 +233,20 @@ impl AdminState for InMemoryAdminReplay {
             })
             .collect();
         Ok(CborValue::array(rows))
+    }
+}
+
+fn parse_mode(args: &CborValue) -> Option<AdmissionMode> {
+    let map = args.as_map()?;
+    let mode = map
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("mode"))
+        .and_then(|(_, v)| v.as_text())?;
+    match mode {
+        "open" => Some(AdmissionMode::Open),
+        "invite" => Some(AdmissionMode::Invite),
+        "closed" => Some(AdmissionMode::Closed),
+        _ => None,
     }
 }
 
@@ -310,6 +348,26 @@ impl<S: AdminState> AdminService<S> {
                 },
                 "ok",
             ),
+            "set_mode" => match parse_mode(&command.args) {
+                None => (
+                    AdminReply::Refused {
+                        code: AdminRefusal::BadArgs.code().to_string(),
+                        message: None,
+                    },
+                    "invalid_args",
+                ),
+                Some(mode) => match self.replay.set_mode(mode) {
+                    Ok(()) => (AdminReply::Ok { result: None }, "ok"),
+                    Err(AdminStateError::Unsupported) => (
+                        AdminReply::Refused {
+                            code: AdminRefusal::NotImplemented.code().to_string(),
+                            message: None,
+                        },
+                        "not_implemented",
+                    ),
+                    Err(error) => return Err(AdminRefusal::State(error)),
+                },
+            },
             "read_audit_log" => (
                 AdminReply::Ok {
                     result: Some(
@@ -413,7 +471,7 @@ mod tests {
         let op = operator();
         let mut service = service();
         let reply = service.handle(
-            &command(&op, "set_mode", 1, 0x01, NOW).to_canonical_bytes(),
+            &command(&op, "evict_host", 1, 0x01, NOW).to_canonical_bytes(),
             NOW,
         );
         assert_eq!(
@@ -450,19 +508,19 @@ mod tests {
     fn a_replayed_sequence_or_nonce_is_refused() {
         let op = operator();
         let mut service = service();
-        let first = command(&op, "set_mode", 7, 3, NOW).to_canonical_bytes();
+        let first = command(&op, "evict_host", 7, 3, NOW).to_canonical_bytes();
         assert_eq!(
             decode_reply(&service.handle(&first, NOW)).1.as_deref(),
             Some("not_implemented")
         );
         // Same seq, fresh nonce.
-        let same_seq = command(&op, "set_mode", 7, 4, NOW).to_canonical_bytes();
+        let same_seq = command(&op, "evict_host", 7, 4, NOW).to_canonical_bytes();
         assert_eq!(
             decode_reply(&service.handle(&same_seq, NOW)).1.as_deref(),
             Some("replay")
         );
         // Later seq, same nonce.
-        let same_nonce = command(&op, "set_mode", 8, 3, NOW).to_canonical_bytes();
+        let same_nonce = command(&op, "evict_host", 8, 3, NOW).to_canonical_bytes();
         assert_eq!(
             decode_reply(&service.handle(&same_nonce, NOW)).1.as_deref(),
             Some("replay")
@@ -477,6 +535,55 @@ mod tests {
             .and_then(|(_, v)| v.as_array())
             .map(|rows| rows.len())
             .expect("result array")
+    }
+
+    #[test]
+    fn set_mode_requires_a_valid_argument_and_a_durable_backend() {
+        let op = operator();
+        let with_mode = |mode: &str| {
+            issue_admin_command(
+                &op,
+                1,
+                "set_mode".to_string(),
+                CborValue::map(vec![("mode", CborValue::text(mode))]),
+                signer_fp().to_vec(),
+                1,
+                vec![0x21; 16],
+                NOW,
+            )
+        };
+        let mut durable = service();
+        assert_eq!(
+            decode_reply(&durable.handle(&with_mode("closed").to_canonical_bytes(), NOW))
+                .1
+                .as_deref(),
+            Some("not_implemented"),
+            "the in-memory backend has no durable mode"
+        );
+        let mut bad_mode = service();
+        assert_eq!(
+            decode_reply(&bad_mode.handle(&with_mode("bogus").to_canonical_bytes(), NOW))
+                .1
+                .as_deref(),
+            Some("invalid_args")
+        );
+        let missing = issue_admin_command(
+            &op,
+            1,
+            "set_mode".to_string(),
+            CborValue::Null,
+            signer_fp().to_vec(),
+            1,
+            vec![0x22; 16],
+            NOW,
+        );
+        let mut bad_args = service();
+        assert_eq!(
+            decode_reply(&bad_args.handle(&missing.to_canonical_bytes(), NOW))
+                .1
+                .as_deref(),
+            Some("invalid_args")
+        );
     }
 
     #[test]

@@ -571,6 +571,16 @@ impl spindle_helper::admin::AdminState for AdminBackend {
             AdminBackend::Pg(state) => state.read_audit_log(limit),
         }
     }
+
+    fn set_mode(
+        &mut self,
+        mode: spindle_helper::authz::AdmissionMode,
+    ) -> Result<(), spindle_helper::admin::AdminStateError> {
+        match self {
+            AdminBackend::Memory(state) => state.set_mode(mode),
+            AdminBackend::Pg(state) => state.set_mode(mode),
+        }
+    }
 }
 
 impl HelperView for Store {

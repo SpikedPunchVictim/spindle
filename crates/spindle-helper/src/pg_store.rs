@@ -85,12 +85,19 @@ const TURN_PERIOD_SECS: u64 = 30 * 86_400;
 /// unreachable").
 pub struct PgStore {
     pool: PgPool,
-    admission_mode: AdmissionMode,
     operator_pk: VerifyingKey,
 }
 
 fn run_blocking<F: Future>(fut: F) -> F::Output {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
+}
+
+fn admission_mode_str(mode: AdmissionMode) -> &'static str {
+    match mode {
+        AdmissionMode::Open => "open",
+        AdmissionMode::Invite => "invite",
+        AdmissionMode::Closed => "closed",
+    }
 }
 
 fn fp_bytes(fp: &Fingerprint) -> Vec<u8> {
@@ -152,11 +159,15 @@ impl PgStore {
             .connect(database_url)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self {
-            pool,
-            admission_mode,
-            operator_pk,
-        })
+        // Seed the durable mode once; later starts keep whatever the admin plane set.
+        sqlx::query(
+            "INSERT INTO registry_state (id, admission_mode) VALUES (1, $1) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(admission_mode_str(admission_mode))
+        .execute(&pool)
+        .await?;
+        Ok(Self { pool, operator_pk })
     }
 
     async fn revocation_epoch_async(&self, host_fp: &Fingerprint) -> u64 {
@@ -179,6 +190,26 @@ impl PgStore {
         .await
         .expect("is_revoked query")
         .get::<bool, _>("revoked")
+    }
+
+    async fn admission_mode_async(&self) -> Result<AdmissionMode, sqlx::Error> {
+        let mode: String = sqlx::query("SELECT admission_mode FROM registry_state WHERE id = 1")
+            .fetch_one(&self.pool)
+            .await?
+            .get(0);
+        Ok(match mode.as_str() {
+            "open" => AdmissionMode::Open,
+            "invite" => AdmissionMode::Invite,
+            _ => AdmissionMode::Closed,
+        })
+    }
+
+    async fn set_admission_mode_async(&self, mode: AdmissionMode) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE registry_state SET admission_mode = $1 WHERE id = 1")
+            .bind(admission_mode_str(mode))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn admission_record_async(&self, host_fp: &Fingerprint) -> Option<AdmissionRecord> {
@@ -613,7 +644,8 @@ impl HelperView for PgStore {
     }
 
     fn admission_mode(&mut self) -> AdmissionMode {
-        self.admission_mode
+        // Fail closed on a store error: refusing new hosts is safer than opening them.
+        run_blocking(self.admission_mode_async()).unwrap_or(AdmissionMode::Closed)
     }
 
     fn admission_record(&mut self, host_fp: &Fingerprint) -> Option<AdmissionRecord> {
@@ -737,6 +769,10 @@ impl AdminState for PgStore {
 
     fn read_audit_log(&mut self, limit: u32) -> Result<CborValue, AdminStateError> {
         run_blocking(self.admin_read_audit_async(limit)).map_err(|_| AdminStateError::Backend)
+    }
+
+    fn set_mode(&mut self, mode: AdmissionMode) -> Result<(), AdminStateError> {
+        run_blocking(self.set_admission_mode_async(mode)).map_err(|_| AdminStateError::Backend)
     }
 }
 
@@ -1066,12 +1102,41 @@ mod tests {
         sqlx::query(
             "TRUNCATE revocation_epochs, revoked_subjects, admission_records, \
              burned_admission_nonces, session_records, turn_usage, \
-             self_revocation_epochs, self_revocations, host_device_certs",
+             self_revocation_epochs, self_revocations, host_device_certs, \
+             admin_replay, admin_audit",
         )
         .execute(&store.pool)
         .await
         .expect("truncate tables between tests");
         Some(store)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admin_set_mode_is_durable_and_a_restart_seed_does_not_overwrite_it() {
+        let _guard = TEST_LOCK.lock().await;
+        let Some(mut store) = test_store().await else {
+            return;
+        };
+        store
+            .set_mode(AdmissionMode::Open)
+            .expect("durable mode write");
+        assert_eq!(store.admission_mode(), AdmissionMode::Open);
+
+        // A second process start with a different configured default must not overwrite the
+        // durable row (migration seed is INSERT ... ON CONFLICT DO NOTHING).
+        let mut reopened = PgStore::connect(
+            &std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL"),
+            AdmissionMode::Closed,
+            store.operator_pk,
+        )
+        .await
+        .expect("reopen");
+        assert_eq!(reopened.admission_mode(), AdmissionMode::Open);
+
+        // Leave the shared test database as other tests expect.
+        reopened
+            .set_mode(AdmissionMode::Invite)
+            .expect("restore mode");
     }
 
     #[tokio::test(flavor = "multi_thread")]
