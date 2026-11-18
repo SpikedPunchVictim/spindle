@@ -939,7 +939,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
                     }
                 }
             }
-            Err(error) => tracing::error!(error = %error, "admin plane disabled"),
+            Err(error) => tracing::error!(
+                error = %error, // redaction-ok: AdminPlaneError Display is static text (NoOperatorKey/PlaintextRefused), no URL, credential, or peer bytes
+                "admin plane disabled"
+            ),
         }
     } else {
         tracing::warn!("OPERATOR_SEED not set — registry.admin.> is disabled");
