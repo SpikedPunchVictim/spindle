@@ -552,6 +552,25 @@ impl spindle_helper::admin::AdminState for AdminBackend {
             AdminBackend::Pg(state) => state.commit(ts, signer_fp, seq, nonce, cmd, result_code),
         }
     }
+
+    fn list_hosts(
+        &mut self,
+    ) -> Result<spindle_proto::canonical::CborValue, spindle_helper::admin::AdminStateError> {
+        match self {
+            AdminBackend::Memory(state) => state.list_hosts(),
+            AdminBackend::Pg(state) => state.list_hosts(),
+        }
+    }
+
+    fn read_audit_log(
+        &mut self,
+        limit: u32,
+    ) -> Result<spindle_proto::canonical::CborValue, spindle_helper::admin::AdminStateError> {
+        match self {
+            AdminBackend::Memory(state) => state.read_audit_log(limit),
+            AdminBackend::Pg(state) => state.read_audit_log(limit),
+        }
+    }
 }
 
 impl HelperView for Store {

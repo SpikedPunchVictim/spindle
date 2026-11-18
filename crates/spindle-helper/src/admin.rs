@@ -23,6 +23,8 @@ use spindle_proto::canonical::{canonical_encode, CborValue};
 
 /// Reply envelope version this module emits and understands.
 pub const ADMIN_REPLY_V: u8 = 1;
+/// Maximum audit rows returned by `read_audit_log`.
+pub const MAX_AUDIT_PAGE: u32 = 500;
 
 /// The reply shapes `@spindle/admin` decodes: `{v, ok, result?}` or `{v, ok, error:{code,message?}}`.
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +124,11 @@ pub trait AdminState {
         cmd: &str,
         result_code: &str,
     ) -> Result<bool, AdminStateError>;
+
+    /// Read-only commands. The memory backend has no admission records, so its list is empty.
+    fn list_hosts(&mut self) -> Result<CborValue, AdminStateError>;
+    /// The most recent `limit` audit rows, newest first.
+    fn read_audit_log(&mut self, limit: u32) -> Result<CborValue, AdminStateError>;
 }
 
 /// Process-lifetime replay state. Not durable; the Postgres slice replaces it.
@@ -129,6 +136,7 @@ pub trait AdminState {
 pub struct InMemoryAdminReplay {
     seqs: HashMap<[u8; 32], u64>,
     nonces: HashSet<([u8; 32], Vec<u8>)>,
+    audit: Vec<(u64, [u8; 32], u64, String, String)>,
 }
 
 impl InMemoryAdminReplay {
@@ -167,7 +175,40 @@ impl AdminState for InMemoryAdminReplay {
         }
         self.seqs.insert(*signer_fp.as_bytes(), seq);
         self.nonces.insert((*signer_fp.as_bytes(), nonce.to_vec()));
+        self.audit.push((
+            _ts,
+            *signer_fp.as_bytes(),
+            seq,
+            _cmd.to_string(),
+            _result_code.to_string(),
+        ));
+        if self.audit.len() > 1024 {
+            self.audit.remove(0);
+        }
         Ok(true)
+    }
+
+    fn list_hosts(&mut self) -> Result<CborValue, AdminStateError> {
+        Ok(CborValue::array(Vec::new()))
+    }
+
+    fn read_audit_log(&mut self, limit: u32) -> Result<CborValue, AdminStateError> {
+        let rows = self
+            .audit
+            .iter()
+            .rev()
+            .take(limit as usize)
+            .map(|(ts, signer, seq, cmd, code)| {
+                CborValue::map(vec![
+                    ("ts", CborValue::uint(*ts)),
+                    ("signer_fp", CborValue::bytes(signer.to_vec())),
+                    ("seq", CborValue::uint(*seq)),
+                    ("cmd", CborValue::text(cmd.clone())),
+                    ("result_code", CborValue::text(code.clone())),
+                ])
+            })
+            .collect();
+        Ok(CborValue::array(rows))
     }
 }
 
@@ -260,9 +301,33 @@ impl<S: AdminState> AdminService<S> {
             return Err(AdminRefusal::Replay);
         }
 
-        // The stateful command implementations are the next slice of td-efea19. A typed
-        // not_implemented is deliberately distinguishable from a malformed/replayed command.
-        let result_code = AdminRefusal::NotImplemented.code();
+        // Read-only commands are implemented here; the stateful ones remain typed not_implemented
+        // until their store transitions exist (slice 4 of td-efea19).
+        let (reply, result_code) = match command.cmd.as_str() {
+            "list_hosts" => (
+                AdminReply::Ok {
+                    result: Some(self.replay.list_hosts().map_err(AdminRefusal::State)?),
+                },
+                "ok",
+            ),
+            "read_audit_log" => (
+                AdminReply::Ok {
+                    result: Some(
+                        self.replay
+                            .read_audit_log(MAX_AUDIT_PAGE)
+                            .map_err(AdminRefusal::State)?,
+                    ),
+                },
+                "ok",
+            ),
+            _ => (
+                AdminReply::Refused {
+                    code: AdminRefusal::NotImplemented.code().to_string(),
+                    message: None,
+                },
+                AdminRefusal::NotImplemented.code(),
+            ),
+        };
         if !self
             .replay
             .commit(
@@ -277,7 +342,7 @@ impl<S: AdminState> AdminService<S> {
         {
             return Err(AdminRefusal::Replay);
         }
-        Err(AdminRefusal::NotImplemented)
+        Ok(reply.to_canonical_bytes())
     }
 }
 
@@ -385,22 +450,55 @@ mod tests {
     fn a_replayed_sequence_or_nonce_is_refused() {
         let op = operator();
         let mut service = service();
-        let first = command(&op, "list_hosts", 7, 3, NOW).to_canonical_bytes();
+        let first = command(&op, "set_mode", 7, 3, NOW).to_canonical_bytes();
         assert_eq!(
             decode_reply(&service.handle(&first, NOW)).1.as_deref(),
             Some("not_implemented")
         );
         // Same seq, fresh nonce.
-        let same_seq = command(&op, "list_hosts", 7, 4, NOW).to_canonical_bytes();
+        let same_seq = command(&op, "set_mode", 7, 4, NOW).to_canonical_bytes();
         assert_eq!(
             decode_reply(&service.handle(&same_seq, NOW)).1.as_deref(),
             Some("replay")
         );
         // Later seq, same nonce.
-        let same_nonce = command(&op, "list_hosts", 8, 3, NOW).to_canonical_bytes();
+        let same_nonce = command(&op, "set_mode", 8, 3, NOW).to_canonical_bytes();
         assert_eq!(
             decode_reply(&service.handle(&same_nonce, NOW)).1.as_deref(),
             Some("replay")
+        );
+    }
+
+    fn result_array_len(bytes: &[u8]) -> usize {
+        let map = canonical_decode(bytes).expect("canonical reply");
+        let map = map.as_map().expect("reply map");
+        map.iter()
+            .find(|(k, _)| k.as_text() == Some("result"))
+            .and_then(|(_, v)| v.as_array())
+            .map(|rows| rows.len())
+            .expect("result array")
+    }
+
+    #[test]
+    fn read_only_commands_return_results() {
+        let op = operator();
+        let mut service = service();
+        let list = service.handle(
+            &command(&op, "list_hosts", 1, 0x11, NOW).to_canonical_bytes(),
+            NOW,
+        );
+        assert_eq!(decode_reply(&list), (true, None));
+        assert_eq!(result_array_len(&list), 0);
+
+        let audit = service.handle(
+            &command(&op, "read_audit_log", 2, 0x12, NOW).to_canonical_bytes(),
+            NOW,
+        );
+        assert_eq!(decode_reply(&audit), (true, None));
+        assert_eq!(
+            result_array_len(&audit),
+            1,
+            "the audit read sees the previous list_hosts entry, not itself"
         );
     }
 

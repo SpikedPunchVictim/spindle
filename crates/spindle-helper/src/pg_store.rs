@@ -70,6 +70,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
 use crate::admin::{AdminState, AdminStateError};
+use spindle_proto::canonical::CborValue;
 
 use crate::authz::{AdmissionMode, AdmissionRecord, HelperView};
 use crate::session::SessionRecord;
@@ -729,9 +730,61 @@ impl AdminState for PgStore {
         run_blocking(self.admin_commit_async(ts, signer_fp, seq, nonce, cmd, result_code))
             .map_err(|_| AdminStateError::Backend)
     }
+
+    fn list_hosts(&mut self) -> Result<CborValue, AdminStateError> {
+        run_blocking(self.admin_list_hosts_async()).map_err(|_| AdminStateError::Backend)
+    }
+
+    fn read_audit_log(&mut self, limit: u32) -> Result<CborValue, AdminStateError> {
+        run_blocking(self.admin_read_audit_async(limit)).map_err(|_| AdminStateError::Backend)
+    }
 }
 
 impl PgStore {
+    async fn admin_list_hosts_async(&self) -> Result<CborValue, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT host_fp, label, admitted_at, quota_profile FROM admission_records \
+             ORDER BY admitted_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(CborValue::array(
+            rows.into_iter()
+                .map(|row| {
+                    CborValue::map(vec![
+                        ("host_fp", CborValue::bytes(row.get::<Vec<u8>, _>(0))),
+                        ("label", CborValue::text(row.get::<String, _>(1))),
+                        ("admitted_at", CborValue::uint(row.get::<i64, _>(2) as u64)),
+                        ("quota_profile", CborValue::text(row.get::<String, _>(3))),
+                    ])
+                })
+                .collect(),
+        ))
+    }
+
+    async fn admin_read_audit_async(&self, limit: u32) -> Result<CborValue, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT ts, signer_fp, seq, cmd, result_code FROM admin_audit \
+             ORDER BY id DESC LIMIT $1",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(CborValue::array(
+            rows.into_iter()
+                .map(|row| {
+                    CborValue::map(vec![
+                        ("ts", CborValue::uint(row.get::<i64, _>(0) as u64)),
+                        ("signer_fp", CborValue::bytes(row.get::<Vec<u8>, _>(1))),
+                        ("seq", CborValue::uint(row.get::<i64, _>(2) as u64)),
+                        ("cmd", CborValue::text(row.get::<String, _>(3))),
+                        ("result_code", CborValue::text(row.get::<String, _>(4))),
+                    ])
+                })
+                .collect(),
+        ))
+    }
+
     async fn admin_is_replay_async(
         &self,
         signer_fp: &Fingerprint,
