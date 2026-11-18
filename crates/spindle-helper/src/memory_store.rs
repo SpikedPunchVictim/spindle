@@ -17,7 +17,7 @@
 use spindle_core::{Fingerprint, VerifyingKey};
 use std::collections::{HashMap, HashSet};
 
-use crate::authz::{AdmissionMode, AdmissionRecord, HelperView};
+use crate::authz::{AdmissionMode, AdmissionRecord, HelperView, HostState};
 use crate::session::SessionRecord;
 
 /// Bucket width for [`InMemoryHelperView`]'s TURN-usage counter — see
@@ -33,6 +33,7 @@ pub struct InMemoryHelperView {
     revoked: HashMap<(Fingerprint, Fingerprint), bool>,
     epochs: HashMap<Fingerprint, u64>,
     admitted: HashMap<Fingerprint, AdmissionRecord>,
+    host_states: HashMap<Fingerprint, HostState>,
     /// Keyed by nonce **alone** (not `(host_fp, nonce)`) — this is what makes cross-host reuse of
     /// the same single-use nonce detectable at all. A bug found while graduating this module: the
     /// S1 spike's own `InMemoryHelperView` (`spikes/s1-callout/src/bin/responder.rs`) keyed this
@@ -71,6 +72,7 @@ impl InMemoryHelperView {
             revoked: HashMap::new(),
             epochs: HashMap::new(),
             admitted: HashMap::new(),
+            host_states: HashMap::new(),
             burned_nonces: HashMap::new(),
             sessions: HashMap::new(),
             turn_usage: HashMap::new(),
@@ -81,6 +83,10 @@ impl InMemoryHelperView {
 }
 
 impl HelperView for InMemoryHelperView {
+    fn host_state(&mut self, host_fp: &Fingerprint) -> HostState {
+        self.host_states.get(host_fp).copied().unwrap_or_default()
+    }
+
     fn revocation_epoch(&mut self, host_fp: &Fingerprint) -> u64 {
         self.epochs.get(host_fp).copied().unwrap_or(0)
     }

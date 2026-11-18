@@ -72,7 +72,7 @@ use sqlx::{PgPool, Row};
 use crate::admin::{AdminState, AdminStateError};
 use spindle_proto::canonical::CborValue;
 
-use crate::authz::{AdmissionMode, AdmissionRecord, HelperView};
+use crate::authz::{AdmissionMode, AdmissionRecord, HelperView, HostState};
 use crate::session::SessionRecord;
 
 /// Bucket width for the `turn_usage` counter — see [`HelperView::record_turn_issuance`]'s doc
@@ -192,6 +192,30 @@ impl PgStore {
         .get::<bool, _>("revoked")
     }
 
+    async fn admin_set_host_state_async(
+        &self,
+        host_fp: &Fingerprint,
+        state: HostState,
+    ) -> Result<(), sqlx::Error> {
+        let (suspended, evicted) = match state {
+            HostState::Active => (false, false),
+            HostState::Suspended => (true, false),
+            HostState::Evicted => (false, true),
+        };
+        sqlx::query(
+            "INSERT INTO host_states (host_fp, suspended, evicted, updated_at) \
+             VALUES ($1, $2, $3, (EXTRACT(EPOCH FROM now()))::bigint) \
+             ON CONFLICT (host_fp) DO UPDATE SET suspended = excluded.suspended, \
+             evicted = excluded.evicted, updated_at = excluded.updated_at",
+        )
+        .bind(fp_bytes(host_fp))
+        .bind(suspended)
+        .bind(evicted)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn admin_pre_register_host_async(
         &self,
         host_fp: &Fingerprint,
@@ -223,6 +247,19 @@ impl PgStore {
                 .execute(&self.pool)
                 .await?;
         Ok(updated.rows_affected() > 0)
+    }
+
+    async fn host_state_async(&self, host_fp: &Fingerprint) -> Result<HostState, sqlx::Error> {
+        let row = sqlx::query("SELECT suspended, evicted FROM host_states WHERE host_fp = $1")
+            .bind(fp_bytes(host_fp))
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            None => HostState::Active,
+            Some(row) if row.get::<bool, _>(1) => HostState::Evicted,
+            Some(row) if row.get::<bool, _>(0) => HostState::Suspended,
+            Some(_) => HostState::Active,
+        })
     }
 
     async fn admission_mode_async(&self) -> Result<AdmissionMode, sqlx::Error> {
@@ -668,6 +705,10 @@ impl PgStore {
 }
 
 impl HelperView for PgStore {
+    fn host_state(&mut self, host_fp: &Fingerprint) -> HostState {
+        run_blocking(self.host_state_async(host_fp)).unwrap_or(HostState::Evicted)
+    }
+
     fn revocation_epoch(&mut self, host_fp: &Fingerprint) -> u64 {
         run_blocking(self.revocation_epoch_async(host_fp))
     }
@@ -824,6 +865,15 @@ impl AdminState for PgStore {
         quota_profile: &str,
     ) -> Result<bool, AdminStateError> {
         run_blocking(self.admin_set_quota_async(host_fp, quota_profile))
+            .map_err(|_| AdminStateError::Backend)
+    }
+
+    fn set_host_state(
+        &mut self,
+        host_fp: &Fingerprint,
+        state: HostState,
+    ) -> Result<(), AdminStateError> {
+        run_blocking(self.admin_set_host_state_async(host_fp, state))
             .map_err(|_| AdminStateError::Backend)
     }
 }
@@ -1161,6 +1211,28 @@ mod tests {
         .await
         .expect("truncate tables between tests");
         Some(store)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admin_host_state_updates_are_visible_to_the_callout_lookup() {
+        let _guard = TEST_LOCK.lock().await;
+        let Some(mut store) = test_store().await else {
+            return;
+        };
+        let host = fp(b"state-host");
+        assert_eq!(store.host_state(&host), HostState::Active);
+        store
+            .set_host_state(&host, HostState::Suspended)
+            .expect("suspend");
+        assert_eq!(store.host_state(&host), HostState::Suspended);
+        store
+            .set_host_state(&host, HostState::Evicted)
+            .expect("evict");
+        assert_eq!(store.host_state(&host), HostState::Evicted);
+        store
+            .set_host_state(&host, HostState::Active)
+            .expect("clear");
+        assert_eq!(store.host_state(&host), HostState::Active);
     }
 
     #[tokio::test(flavor = "multi_thread")]

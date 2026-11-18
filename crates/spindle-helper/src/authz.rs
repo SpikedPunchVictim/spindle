@@ -133,6 +133,10 @@ pub enum RefusalReason {
     BadCapabilitySignature,
     #[error("host operating-key certificate expired")]
     HostCertificateExpired,
+    #[error("host is suspended")]
+    HostSuspended,
+    #[error("host is evicted")]
+    HostEvicted,
     /// v0.9.31 (td-583db5). A **single** reason covers every way
     /// [`spindle_core::artifacts::verify_host_session_attestation`] (or the cheap pre-check in
     /// [`decide_host_connect`]) can fail: a mismatched `nats_fp`, a `ts` outside the skew window,
@@ -162,6 +166,14 @@ pub enum RefusalReason {
 // ================================================================================================
 // HelperView — the store lookups the callout needs
 // ================================================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HostState {
+    #[default]
+    Active,
+    Suspended,
+    Evicted,
+}
 
 /// Registry admission mode (DESIGN.md §A3b), switchable at runtime via signed admin commands
 /// (not this module's concern — [`HelperView::admission_mode`] just reports the current value).
@@ -194,6 +206,10 @@ pub struct AdmissionRecord {
 /// implementation may want to cache or instrument lookups, and there is no benefit to this crate
 /// in forcing interior mutability on implementors for what is, either way, a stateful store.
 pub trait HelperView {
+    /// Operator-set lifecycle state for `host_fp` (A3b suspend/evict). Defaults to `Active` when
+    /// no row exists.
+    fn host_state(&mut self, host_fp: &Fingerprint) -> HostState;
+
     /// The revocation epoch high-water mark for `host_fp` (DESIGN.md §A7b: max-wins, never
     /// decreases). `0` if the helper has seen no revocation record for this host yet.
     fn revocation_epoch(&mut self, host_fp: &Fingerprint) -> u64;
@@ -752,6 +768,12 @@ pub fn decide_host_connect(
     // 2. Cheap hash.
     let host_fp = root_fp_of(&presented.host_root_pk);
 
+    match view.host_state(&host_fp) {
+        HostState::Active => {}
+        HostState::Suspended => return AuthzDecision::Refused(RefusalReason::HostSuspended),
+        HostState::Evicted => return AuthzDecision::Refused(RefusalReason::HostEvicted),
+    }
+
     // 3. Cheap store lookups only, resolving how (or whether) this host may proceed, before any
     //    crypto. An already-admitted host skips mode/token checks entirely (DESIGN.md §A3b:
     //    "the host connects on its cert alone; the callout checks the admission record").
@@ -910,6 +932,7 @@ mod tests {
 
     #[derive(Default)]
     struct MockView {
+        host_state: HostState,
         revoked: HashSet<(Fingerprint, Fingerprint)>,
         epochs: HashMap<Fingerprint, u64>,
         mode: AdmissionMode,
@@ -931,6 +954,10 @@ mod tests {
     }
 
     impl HelperView for MockView {
+        fn host_state(&mut self, _host_fp: &Fingerprint) -> HostState {
+            self.host_state
+        }
+
         fn revocation_epoch(&mut self, host_fp: &Fingerprint) -> u64 {
             *self.epochs.get(host_fp).unwrap_or(&0)
         }
@@ -2328,6 +2355,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn suspended_and_evicted_hosts_are_refused_before_admission() {
+        for (state, reason) in [
+            (HostState::Suspended, RefusalReason::HostSuspended),
+            (HostState::Evicted, RefusalReason::HostEvicted),
+        ] {
+            let session_fp = fp(b"host-session-state");
+            let (host_root, _op, cert, attest, _hfp) = host_setup(session_fp);
+            let presented = HostConnectPresented {
+                host_root_pk: host_root.public_key(),
+                host_op_cert: cert,
+                session_attest: attest,
+                admission_token: None,
+                nats_fp: session_fp,
+            };
+            // Open mode: without the state check this host would be admitted.
+            let mut view = MockView {
+                mode: AdmissionMode::Open,
+                host_state: state,
+                ..Default::default()
+            };
+            assert_eq!(
+                decide_host_connect(&presented, || true, 1_500, &mut view, 0),
+                AuthzDecision::Refused(reason)
+            );
+        }
+    }
+
     // ---- uniform refusal --------------------------------------------------------------------
 
     #[test]
@@ -2381,6 +2436,8 @@ mod tests {
             AdmissionTokenExpired,
             BadAdmissionToken,
             AdmissionTokenAlreadyUsed,
+            HostSuspended,
+            HostEvicted,
         );
     }
 }

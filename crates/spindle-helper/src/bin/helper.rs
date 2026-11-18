@@ -604,9 +604,30 @@ impl spindle_helper::admin::AdminState for AdminBackend {
             AdminBackend::Pg(state) => state.set_quota_profile(host_fp, quota_profile),
         }
     }
+
+    fn set_host_state(
+        &mut self,
+        host_fp: &spindle_core::Fingerprint,
+        host_state: spindle_helper::authz::HostState,
+    ) -> Result<(), spindle_helper::admin::AdminStateError> {
+        match self {
+            AdminBackend::Memory(backend) => backend.set_host_state(host_fp, host_state),
+            AdminBackend::Pg(backend) => backend.set_host_state(host_fp, host_state),
+        }
+    }
 }
 
 impl HelperView for Store {
+    fn host_state(
+        &mut self,
+        host_fp: &spindle_core::Fingerprint,
+    ) -> spindle_helper::authz::HostState {
+        match self {
+            Store::Memory(s) => s.host_state(host_fp),
+            Store::Pg(s) => s.host_state(host_fp),
+        }
+    }
+
     fn revocation_epoch(&mut self, host_fp: &spindle_core::Fingerprint) -> u64 {
         match self {
             Store::Memory(s) => s.revocation_epoch(host_fp),

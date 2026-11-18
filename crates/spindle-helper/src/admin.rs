@@ -19,7 +19,7 @@ use spindle_core::artifacts::{verify_admin_command, ArtifactError};
 use spindle_core::Fingerprint;
 use spindle_core::VerifyingKey;
 
-use crate::authz::AdmissionMode;
+use crate::authz::{AdmissionMode, HostState};
 use spindle_proto::artifacts::AdminCommand;
 use spindle_proto::canonical::{canonical_encode, CborValue};
 
@@ -166,6 +166,12 @@ pub trait AdminState {
         host_fp: &Fingerprint,
         quota_profile: &str,
     ) -> Result<bool, AdminStateError>;
+    /// Set the operator lifecycle flag. `Evicted` is terminal for new connections.
+    fn set_host_state(
+        &mut self,
+        host_fp: &Fingerprint,
+        state: HostState,
+    ) -> Result<(), AdminStateError>;
 }
 
 /// Process-lifetime replay state. Not durable; the Postgres slice replaces it.
@@ -250,6 +256,14 @@ impl AdminState for InMemoryAdminReplay {
         Err(AdminStateError::Unsupported)
     }
 
+    fn set_host_state(
+        &mut self,
+        _host_fp: &Fingerprint,
+        _state: HostState,
+    ) -> Result<(), AdminStateError> {
+        Err(AdminStateError::Unsupported)
+    }
+
     fn read_audit_log(&mut self, limit: u32) -> Result<CborValue, AdminStateError> {
         let rows = self
             .audit
@@ -268,6 +282,15 @@ impl AdminState for InMemoryAdminReplay {
             .collect();
         Ok(CborValue::array(rows))
     }
+}
+
+fn parse_host_fp(args: &CborValue) -> Option<Fingerprint> {
+    let map = args.as_map()?;
+    map.iter()
+        .find(|(k, _)| k.as_text() == Some("host_fp"))
+        .and_then(|(_, v)| v.as_bytes())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .and_then(|bytes| Fingerprint::from_slice(&bytes).ok())
 }
 
 fn parse_host_args(args: &CborValue, needs_label: bool) -> Option<(Fingerprint, String, String)> {
@@ -463,6 +486,33 @@ impl<S: AdminState> AdminService<S> {
                     "invalid_args",
                 ),
             },
+            "suspend_host" | "evict_host" => match parse_host_fp(&command.args) {
+                None => (
+                    AdminReply::Refused {
+                        code: AdminRefusal::BadArgs.code().to_string(),
+                        message: None,
+                    },
+                    "invalid_args",
+                ),
+                Some(host_fp) => {
+                    let state = if command.cmd == "evict_host" {
+                        HostState::Evicted
+                    } else {
+                        HostState::Suspended
+                    };
+                    match self.replay.set_host_state(&host_fp, state) {
+                        Ok(()) => (AdminReply::Ok { result: None }, "ok"),
+                        Err(AdminStateError::Unsupported) => (
+                            AdminReply::Refused {
+                                code: AdminRefusal::NotImplemented.code().to_string(),
+                                message: None,
+                            },
+                            "not_implemented",
+                        ),
+                        Err(error) => return Err(AdminRefusal::State(error)),
+                    }
+                }
+            },
             "set_mode" => match parse_mode(&command.args) {
                 None => (
                     AdminReply::Refused {
@@ -586,7 +636,7 @@ mod tests {
         let op = operator();
         let mut service = service();
         let reply = service.handle(
-            &command(&op, "evict_host", 1, 0x01, NOW).to_canonical_bytes(),
+            &command(&op, "mint_invite", 1, 0x01, NOW).to_canonical_bytes(),
             NOW,
         );
         assert_eq!(
@@ -623,19 +673,19 @@ mod tests {
     fn a_replayed_sequence_or_nonce_is_refused() {
         let op = operator();
         let mut service = service();
-        let first = command(&op, "evict_host", 7, 3, NOW).to_canonical_bytes();
+        let first = command(&op, "mint_invite", 7, 3, NOW).to_canonical_bytes();
         assert_eq!(
             decode_reply(&service.handle(&first, NOW)).1.as_deref(),
             Some("not_implemented")
         );
         // Same seq, fresh nonce.
-        let same_seq = command(&op, "evict_host", 7, 4, NOW).to_canonical_bytes();
+        let same_seq = command(&op, "mint_invite", 7, 4, NOW).to_canonical_bytes();
         assert_eq!(
             decode_reply(&service.handle(&same_seq, NOW)).1.as_deref(),
             Some("replay")
         );
         // Later seq, same nonce.
-        let same_nonce = command(&op, "evict_host", 8, 3, NOW).to_canonical_bytes();
+        let same_nonce = command(&op, "mint_invite", 8, 3, NOW).to_canonical_bytes();
         assert_eq!(
             decode_reply(&service.handle(&same_nonce, NOW)).1.as_deref(),
             Some("replay")
@@ -752,6 +802,48 @@ mod tests {
         assert_eq!(
             decode_reply(&third.handle(
                 &cmd("set_quota_profile", args(None, ""), 1, 0x33).to_canonical_bytes(),
+                NOW
+            ))
+            .1
+            .as_deref(),
+            Some("invalid_args")
+        );
+    }
+
+    #[test]
+    fn host_lifecycle_commands_validate_args_and_refuse_on_memory() {
+        let op = operator();
+        let host_fp = Fingerprint::of_parts(&[b"host"]);
+        let args = CborValue::map(vec![(
+            "host_fp",
+            CborValue::bytes(host_fp.as_bytes().to_vec()),
+        )]);
+        let cmd = |name: &str, args: CborValue, seq: u64, nonce: u8| {
+            issue_admin_command(
+                &op,
+                1,
+                name.to_string(),
+                args,
+                signer_fp().to_vec(),
+                seq,
+                vec![nonce; 16],
+                NOW,
+            )
+        };
+        let mut backend = service();
+        assert_eq!(
+            decode_reply(&backend.handle(
+                &cmd("suspend_host", args, 1, 0x41).to_canonical_bytes(),
+                NOW
+            ))
+            .1
+            .as_deref(),
+            Some("not_implemented")
+        );
+        let mut bad = service();
+        assert_eq!(
+            decode_reply(&bad.handle(
+                &cmd("evict_host", CborValue::Null, 1, 0x42).to_canonical_bytes(),
                 NOW
             ))
             .1
