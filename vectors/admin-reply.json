@@ -1,0 +1,26 @@
+{
+  "artifact": "AdminReply",
+  "description": "Reply envelope for registry.admin.> (A3b, td-efea19): {v, ok, result?} or {v, ok, error:{code,message?}}. Not a signed A7b artifact; the command is signed, the reply is not.",
+  "cases": [
+    {
+      "name": "ok_no_result",
+      "description": "A successful command with no value (set_mode, suspend_host, ...).",
+      "canonical_cbor_hex": "a2617601626f6bf5"
+    },
+    {
+      "name": "ok_with_result",
+      "description": "A successful read (list_hosts/read_audit_log); result is an opaque CBOR value.",
+      "canonical_cbor_hex": "a3617601626f6bf566726573756c74657265616479"
+    },
+    {
+      "name": "refused_code_only",
+      "description": "A replay refusal: the code is the machine-readable reason and no human detail is added.",
+      "canonical_cbor_hex": "a3617601626f6bf4656572726f72a164636f6465667265706c6179"
+    },
+    {
+      "name": "refused_code_and_message",
+      "description": "A malformed-argument refusal with a human-readable detail.",
+      "canonical_cbor_hex": "a3617601626f6bf4656572726f72a264636f64656c696e76616c69645f61726773676d6573736167657818686f73745f6670206d757374206265203332206279746573"
+    }
+  ]
+}

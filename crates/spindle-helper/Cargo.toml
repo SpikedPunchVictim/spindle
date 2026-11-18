@@ -97,3 +97,7 @@ spindle-test-fixtures = { path = "../spindle-test-fixtures" }
 [[bin]]
 name = "spindle-helper"
 path = "src/bin/helper.rs"
+
+[[bin]]
+name = "gen-admin-reply-vectors"
+path = "src/bin/gen_admin_reply_vectors.rs"

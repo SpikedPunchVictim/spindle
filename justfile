@@ -45,6 +45,7 @@ lint:
 vectors:
     cargo run -p spindle-proto --bin gen-vectors
     cargo run -p spindle-core --bin gen-crypto-vectors
+    cargo run -p spindle-helper --bin gen-admin-reply-vectors
     git diff --exit-code vectors/
     pnpm --filter @spindle/proto test
     pnpm --filter @spindle/crypto test

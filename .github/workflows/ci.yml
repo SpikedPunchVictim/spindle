@@ -94,6 +94,7 @@ jobs:
         run: |
           cargo run -p spindle-proto --bin gen-vectors
           cargo run -p spindle-core --bin gen-crypto-vectors
+          cargo run -p spindle-helper --bin gen-admin-reply-vectors
           git diff --exit-code vectors/
 
       - name: Cross-check @spindle/proto's TypeScript canonical CBOR encoder against vectors/
