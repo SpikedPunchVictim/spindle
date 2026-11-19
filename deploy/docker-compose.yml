@@ -98,6 +98,12 @@ services:
       CALLOUT_USER_SEED: "SUAP32HDCRWO6KRJBIRSNCD5NZGDP33A6RKOG2KZNZBQDC7MHQL5KWLDOM"
       APP_ACCOUNT_SEED: "SAAODS72DAQRLQ2OKCAR4AHZPNKOR6YNYRPVBHXQA7T3GBUURXFECWCMXU"
       APP_CONN_SEED: "SUAFWWQRCTGQTS6DKVAJKMMFMIJKFZ3MRFGFQ4WCRZ5RVZ5WFRB4CXPYBY"
+      # Dev-only admin operator (throwaway, like every other seed here). The helper derives the
+      # operator Ed25519 key from this seed; an operator CLI signs registry.admin.> commands with
+      # the same seed's raw bytes. ADMIN_ALLOW_PLAINTEXT is required only because this stack has no
+      # TLS listener (A3b requires mTLS for the admin plane in production).
+      OPERATOR_SEED: "SUAOLFPBPF7WNOWHBE7ZLHCWSLTT7I5DHRA4VXCH2E44Q7XQX7A3E46STA"
+      ADMIN_ALLOW_PLAINTEXT: "1"
       # Dedicated genuine-SYS-account connection for `$SYS.ACCOUNT.*.CONNECT`/`.DISCONNECT`
       # presence event subscriptions — spikes/s5-presence (docs/SPIKES.md §S5) found that
       # CALLOUT_USER's AUTH-account membership is NOT sufficient to receive these (only

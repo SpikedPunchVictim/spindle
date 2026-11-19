@@ -118,3 +118,27 @@ compose network, unaffected.)
   `POSTGRES_DB`/`TURN_SECRET`; every one of these has a dev-only default baked into
   `docker-compose.yml` so the stack runs with zero setup, but never reuse those defaults outside a
   throwaway local stack.
+
+## Admin plane (`registry.admin.>`)
+
+The helper serves the A3b admin plane when `OPERATOR_SEED` is set. The operator signs each
+`AdminCommand` with the Ed25519 key derived from that seed (`SigningKey::from_bytes(raw_seed)`),
+names the matching `signer_fp` (SHA-256 of the public key), and publishes on
+`registry.admin.<command>` with a reply inbox; the helper verifies (version, signer binding,
+signature, ±120 s), enforces the per-signer monotonic `seq` + nonce replay guard in Postgres,
+appends the hash-chained audit entry, and answers with the `vectors/admin-reply.json` envelope.
+
+**Transport.** DESIGN §A3b requires the mTLS profile for the admin plane. The helper refuses to
+start the subscription on a non-TLS `NATS_URL` unless `ADMIN_ALLOW_PLAINTEXT=1` is set. The
+compose stack has no TLS listener, so it sets that dev-only opt-out together with a throwaway
+`OPERATOR_SEED`; never carry either into a deployed registry. In production, give the operator a
+dedicated NATS identity with `pub registry.admin.>` and `sub`/reply rights on its own inboxes over
+the mTLS listener; the command signature, not the transport, is the authorization.
+
+Dev proof: `cargo test -p spindle-helper --test live_admin -- --ignored` (stack up; the test signs
+with the compose seed, runs `set_mode`/`list_hosts`, and restores `open`).
+
+Implemented commands: `set_mode`, `pre_register_host`, `list_hosts`, `suspend_host`,
+`evict_host`, `set_quota_profile`, `read_audit_log`. `mint_invite`, `revoke_invite`, and
+`rotate_admission_key` answer the typed `not_implemented` code. Suspension/eviction refuses new
+host connections; kicking already-live sessions is tracked separately as td-186674. Atomic state+audit is td-6b9a00.
