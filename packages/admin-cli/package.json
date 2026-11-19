@@ -4,13 +4,25 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
-    "spindle-admin": "src/index.ts"
+    "spindle-admin": "dist/index.js"
   },
   "scripts": {
-    "build": "echo \"spindle-admin build: not implemented — see IMPLEMENTATION_PLAN.md\" && exit 0",
-    "test": "echo \"spindle-admin test: not implemented — see IMPLEMENTATION_PLAN.md\" && exit 0"
+    "build": "tsc -b && esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:nats --external:commander",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@spindle/admin": "workspace:^",
+    "@spindle/proto": "workspace:^",
+    "commander": "^15.1.0",
+    "nats": "^2.29.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
   }
 }
