@@ -123,6 +123,30 @@ impl AdminStateError {
     }
 }
 
+/// A stateful command whose SQL must share one transaction with the replay insert and audit row.
+pub enum AdminMutation<'a> {
+    SetMode(AdmissionMode),
+    PreRegisterHost {
+        host_fp: &'a Fingerprint,
+        label: &'a str,
+        quota_profile: &'a str,
+    },
+    SetQuotaProfile {
+        host_fp: &'a Fingerprint,
+        quota_profile: &'a str,
+    },
+    SetHostState {
+        host_fp: &'a Fingerprint,
+        state: HostState,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationOutcome {
+    Applied,
+    NotFound,
+}
+
 /// Durable-state seam: the anti-replay guard and the hash-chained audit append. The in-memory
 /// implementation backs tests; `PgStore` implements it durably (migration 0005).
 pub trait AdminState {
@@ -172,6 +196,18 @@ pub trait AdminState {
         host_fp: &Fingerprint,
         state: HostState,
     ) -> Result<(), AdminStateError>;
+
+    /// Executes a stateful command, its replay insert, and its audit row in one transaction.
+    /// `Ok(None)` means the seq/nonce was already used and nothing was written.
+    fn commit_mutation(
+        &mut self,
+        ts: u64,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+        cmd: &str,
+        mutation: AdminMutation<'_>,
+    ) -> Result<Option<MutationOutcome>, AdminStateError>;
 }
 
 /// Process-lifetime replay state. Not durable; the Postgres slice replaces it.
@@ -264,6 +300,18 @@ impl AdminState for InMemoryAdminReplay {
         Err(AdminStateError::Unsupported)
     }
 
+    fn commit_mutation(
+        &mut self,
+        _ts: u64,
+        _signer_fp: &Fingerprint,
+        _seq: u64,
+        _nonce: &[u8],
+        _cmd: &str,
+        _mutation: AdminMutation<'_>,
+    ) -> Result<Option<MutationOutcome>, AdminStateError> {
+        Err(AdminStateError::Unsupported)
+    }
+
     fn read_audit_log(&mut self, limit: u32) -> Result<CborValue, AdminStateError> {
         let rows = self
             .audit
@@ -282,6 +330,14 @@ impl AdminState for InMemoryAdminReplay {
             .collect();
         Ok(CborValue::array(rows))
     }
+}
+
+fn refusal_bytes(refusal: &AdminRefusal) -> Vec<u8> {
+    AdminReply::Refused {
+        code: refusal.code().to_string(),
+        message: None,
+    }
+    .to_canonical_bytes()
 }
 
 fn parse_host_fp(args: &CborValue) -> Option<Fingerprint> {
@@ -409,6 +465,49 @@ impl<S: AdminState> AdminService<S> {
         }
     }
 
+    /// Stateful commands execute their SQL, replay insert, and audit row in one backend
+    /// transaction. A backend without durable commands falls back to an audited
+    /// `not_implemented`, so the seq/nonce is still consumed exactly once.
+    fn commit_stateful(
+        &mut self,
+        now: u64,
+        command: &AdminCommand,
+        mutation: AdminMutation<'_>,
+    ) -> Result<Vec<u8>, AdminRefusal> {
+        match self.replay.commit_mutation(
+            now,
+            &self.expected_signer_fp,
+            command.seq,
+            &command.nonce,
+            &command.cmd,
+            mutation,
+        ) {
+            Ok(Some(MutationOutcome::Applied)) => {
+                Ok(AdminReply::Ok { result: None }.to_canonical_bytes())
+            }
+            Ok(Some(MutationOutcome::NotFound)) => Ok(refusal_bytes(&AdminRefusal::NotFound)),
+            Ok(None) => Err(AdminRefusal::Replay),
+            Err(AdminStateError::Unsupported) => {
+                if !self
+                    .replay
+                    .commit(
+                        now,
+                        &self.expected_signer_fp,
+                        command.seq,
+                        &command.nonce,
+                        &command.cmd,
+                        AdminRefusal::NotImplemented.code(),
+                    )
+                    .map_err(AdminRefusal::State)?
+                {
+                    return Err(AdminRefusal::Replay);
+                }
+                Ok(refusal_bytes(&AdminRefusal::NotImplemented))
+            }
+            Err(error) => Err(AdminRefusal::State(error)),
+        }
+    }
+
     fn try_handle(&mut self, bytes: &[u8], now: u64) -> Result<Vec<u8>, AdminRefusal> {
         let command =
             AdminCommand::from_canonical_bytes(bytes).map_err(|_| AdminRefusal::Malformed)?;
@@ -437,17 +536,15 @@ impl<S: AdminState> AdminService<S> {
             ),
             "pre_register_host" => match parse_host_args(&command.args, true) {
                 Some((host_fp, label, quota)) => {
-                    match self.replay.pre_register_host(&host_fp, &label, &quota) {
-                        Ok(()) => (AdminReply::Ok { result: None }, "ok"),
-                        Err(AdminStateError::Unsupported) => (
-                            AdminReply::Refused {
-                                code: AdminRefusal::NotImplemented.code().to_string(),
-                                message: None,
-                            },
-                            "not_implemented",
-                        ),
-                        Err(error) => return Err(AdminRefusal::State(error)),
-                    }
+                    return self.commit_stateful(
+                        now,
+                        &command,
+                        AdminMutation::PreRegisterHost {
+                            host_fp: &host_fp,
+                            label: &label,
+                            quota_profile: &quota,
+                        },
+                    )
                 }
                 None => (
                     AdminReply::Refused {
@@ -459,24 +556,14 @@ impl<S: AdminState> AdminService<S> {
             },
             "set_quota_profile" => match parse_host_args(&command.args, false) {
                 Some((host_fp, _label, quota)) => {
-                    match self.replay.set_quota_profile(&host_fp, &quota) {
-                        Ok(true) => (AdminReply::Ok { result: None }, "ok"),
-                        Ok(false) => (
-                            AdminReply::Refused {
-                                code: AdminRefusal::NotFound.code().to_string(),
-                                message: None,
-                            },
-                            "not_found",
-                        ),
-                        Err(AdminStateError::Unsupported) => (
-                            AdminReply::Refused {
-                                code: AdminRefusal::NotImplemented.code().to_string(),
-                                message: None,
-                            },
-                            "not_implemented",
-                        ),
-                        Err(error) => return Err(AdminRefusal::State(error)),
-                    }
+                    return self.commit_stateful(
+                        now,
+                        &command,
+                        AdminMutation::SetQuotaProfile {
+                            host_fp: &host_fp,
+                            quota_profile: &quota,
+                        },
+                    )
                 }
                 None => (
                     AdminReply::Refused {
@@ -495,22 +582,19 @@ impl<S: AdminState> AdminService<S> {
                     "invalid_args",
                 ),
                 Some(host_fp) => {
-                    let state = if command.cmd == "evict_host" {
+                    let host_state = if command.cmd == "evict_host" {
                         HostState::Evicted
                     } else {
                         HostState::Suspended
                     };
-                    match self.replay.set_host_state(&host_fp, state) {
-                        Ok(()) => (AdminReply::Ok { result: None }, "ok"),
-                        Err(AdminStateError::Unsupported) => (
-                            AdminReply::Refused {
-                                code: AdminRefusal::NotImplemented.code().to_string(),
-                                message: None,
-                            },
-                            "not_implemented",
-                        ),
-                        Err(error) => return Err(AdminRefusal::State(error)),
-                    }
+                    return self.commit_stateful(
+                        now,
+                        &command,
+                        AdminMutation::SetHostState {
+                            host_fp: &host_fp,
+                            state: host_state,
+                        },
+                    );
                 }
             },
             "set_mode" => match parse_mode(&command.args) {
@@ -521,17 +605,9 @@ impl<S: AdminState> AdminService<S> {
                     },
                     "invalid_args",
                 ),
-                Some(mode) => match self.replay.set_mode(mode) {
-                    Ok(()) => (AdminReply::Ok { result: None }, "ok"),
-                    Err(AdminStateError::Unsupported) => (
-                        AdminReply::Refused {
-                            code: AdminRefusal::NotImplemented.code().to_string(),
-                            message: None,
-                        },
-                        "not_implemented",
-                    ),
-                    Err(error) => return Err(AdminRefusal::State(error)),
-                },
+                Some(mode) => {
+                    return self.commit_stateful(now, &command, AdminMutation::SetMode(mode))
+                }
             },
             "read_audit_log" => (
                 AdminReply::Ok {

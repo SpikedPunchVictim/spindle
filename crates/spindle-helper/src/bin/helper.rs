@@ -615,6 +615,28 @@ impl spindle_helper::admin::AdminState for AdminBackend {
             AdminBackend::Pg(backend) => backend.set_host_state(host_fp, host_state),
         }
     }
+
+    fn commit_mutation(
+        &mut self,
+        ts: u64,
+        signer_fp: &spindle_core::Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+        cmd: &str,
+        mutation: spindle_helper::admin::AdminMutation<'_>,
+    ) -> Result<
+        Option<spindle_helper::admin::MutationOutcome>,
+        spindle_helper::admin::AdminStateError,
+    > {
+        match self {
+            AdminBackend::Memory(backend) => {
+                backend.commit_mutation(ts, signer_fp, seq, nonce, cmd, mutation)
+            }
+            AdminBackend::Pg(backend) => {
+                backend.commit_mutation(ts, signer_fp, seq, nonce, cmd, mutation)
+            }
+        }
+    }
 }
 
 impl HelperView for Store {

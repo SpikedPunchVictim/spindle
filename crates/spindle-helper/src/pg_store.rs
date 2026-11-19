@@ -69,7 +69,7 @@ use spindle_core::{Fingerprint, VerifyingKey};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use crate::admin::{AdminState, AdminStateError};
+use crate::admin::{AdminMutation, AdminState, AdminStateError, MutationOutcome};
 use spindle_proto::canonical::CborValue;
 
 use crate::authz::{AdmissionMode, AdmissionRecord, HelperView, HostState};
@@ -190,6 +190,124 @@ impl PgStore {
         .await
         .expect("is_revoked query")
         .get::<bool, _>("revoked")
+    }
+
+    async fn admin_commit_mutation_async(
+        &self,
+        ts: u64,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+        cmd: &str,
+        mutation: AdminMutation<'_>,
+    ) -> Result<Option<MutationOutcome>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(0x5350494E444C)")
+            .execute(&mut *tx)
+            .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO admin_replay (signer_fp, seq, nonce, ts) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(fp_bytes(signer_fp))
+        .bind(seq as i64)
+        .bind(nonce.to_vec())
+        .bind(ts as i64)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        let outcome = match mutation {
+            AdminMutation::SetMode(mode) => {
+                sqlx::query("UPDATE registry_state SET admission_mode = $1 WHERE id = 1")
+                    .bind(admission_mode_str(mode))
+                    .execute(&mut *tx)
+                    .await?;
+                MutationOutcome::Applied
+            }
+            AdminMutation::PreRegisterHost {
+                host_fp,
+                label,
+                quota_profile,
+            } => {
+                sqlx::query(
+                    "INSERT INTO admission_records (host_fp, label, admitted_at, quota_profile) \
+                     VALUES ($1, $2, (EXTRACT(EPOCH FROM now()))::bigint, $3) \
+                     ON CONFLICT (host_fp) DO NOTHING",
+                )
+                .bind(fp_bytes(host_fp))
+                .bind(label)
+                .bind(quota_profile)
+                .execute(&mut *tx)
+                .await?;
+                MutationOutcome::Applied
+            }
+            AdminMutation::SetQuotaProfile {
+                host_fp,
+                quota_profile,
+            } => {
+                let updated = sqlx::query(
+                    "UPDATE admission_records SET quota_profile = $2 WHERE host_fp = $1",
+                )
+                .bind(fp_bytes(host_fp))
+                .bind(quota_profile)
+                .execute(&mut *tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    MutationOutcome::NotFound
+                } else {
+                    MutationOutcome::Applied
+                }
+            }
+            AdminMutation::SetHostState { host_fp, state } => {
+                let (suspended, evicted) = match state {
+                    HostState::Active => (false, false),
+                    HostState::Suspended => (true, false),
+                    HostState::Evicted => (false, true),
+                };
+                sqlx::query(
+                    "INSERT INTO host_states (host_fp, suspended, evicted, updated_at) \
+                     VALUES ($1, $2, $3, (EXTRACT(EPOCH FROM now()))::bigint) \
+                     ON CONFLICT (host_fp) DO UPDATE SET suspended = excluded.suspended, \
+                     evicted = excluded.evicted, updated_at = excluded.updated_at",
+                )
+                .bind(fp_bytes(host_fp))
+                .bind(suspended)
+                .bind(evicted)
+                .execute(&mut *tx)
+                .await?;
+                MutationOutcome::Applied
+            }
+        };
+
+        let result_code = match outcome {
+            MutationOutcome::Applied => "ok",
+            MutationOutcome::NotFound => "not_found",
+        };
+        let prev: Option<Vec<u8>> =
+            sqlx::query("SELECT hash FROM admin_audit ORDER BY id DESC LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.get::<Vec<u8>, _>(0));
+        let prev = prev.unwrap_or_else(|| vec![0u8; 32]);
+        let hash = admin_audit_hash(&prev, ts, signer_fp, seq, cmd, result_code);
+        sqlx::query(
+            "INSERT INTO admin_audit (ts, signer_fp, seq, cmd, result_code, prev_hash, hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(ts as i64)
+        .bind(fp_bytes(signer_fp))
+        .bind(seq as i64)
+        .bind(cmd)
+        .bind(result_code)
+        .bind(prev)
+        .bind(hash)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(outcome))
     }
 
     async fn admin_set_host_state_async(
@@ -876,6 +994,19 @@ impl AdminState for PgStore {
         run_blocking(self.admin_set_host_state_async(host_fp, state))
             .map_err(|_| AdminStateError::Backend)
     }
+
+    fn commit_mutation(
+        &mut self,
+        ts: u64,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        nonce: &[u8],
+        cmd: &str,
+        mutation: AdminMutation<'_>,
+    ) -> Result<Option<MutationOutcome>, AdminStateError> {
+        run_blocking(self.admin_commit_mutation_async(ts, signer_fp, seq, nonce, cmd, mutation))
+            .map_err(|_| AdminStateError::Backend)
+    }
 }
 
 impl PgStore {
@@ -1211,6 +1342,69 @@ mod tests {
         .await
         .expect("truncate tables between tests");
         Some(store)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admin_mutation_rolls_back_state_replay_and_audit_together() {
+        let _guard = TEST_LOCK.lock().await;
+        let Some(mut store) = test_store().await else {
+            return;
+        };
+        store.set_mode(AdmissionMode::Invite).expect("baseline");
+        let signer = fp(b"atomic-signer");
+
+        sqlx::query(
+            "CREATE FUNCTION admin_audit_fail() RETURNS trigger AS $$ BEGIN \
+             RAISE EXCEPTION 'injected audit failure'; END; $$ LANGUAGE plpgsql",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("create failure function");
+        sqlx::query(
+            "CREATE TRIGGER admin_audit_fail BEFORE INSERT ON admin_audit \
+             FOR EACH ROW EXECUTE FUNCTION admin_audit_fail()",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("create failing trigger");
+
+        let result = store.commit_mutation(
+            1_000,
+            &signer,
+            1,
+            &[0x77; 16],
+            "set_mode",
+            AdminMutation::SetMode(AdmissionMode::Closed),
+        );
+        assert!(
+            result.is_err(),
+            "the audit trigger must fail the transaction"
+        );
+
+        sqlx::query("DROP TRIGGER admin_audit_fail ON admin_audit")
+            .execute(&store.pool)
+            .await
+            .expect("drop trigger");
+        sqlx::query("DROP FUNCTION admin_audit_fail()")
+            .execute(&store.pool)
+            .await
+            .expect("drop function");
+
+        assert_eq!(store.admission_mode(), AdmissionMode::Invite);
+        let replays: i64 = sqlx::query("SELECT count(*) FROM admin_replay WHERE signer_fp = $1")
+            .bind(fp_bytes(&signer))
+            .fetch_one(&store.pool)
+            .await
+            .expect("count replays")
+            .get(0);
+        assert_eq!(replays, 0, "replay row must roll back with the audit");
+        let audits: i64 = sqlx::query("SELECT count(*) FROM admin_audit WHERE signer_fp = $1")
+            .bind(fp_bytes(&signer))
+            .fetch_one(&store.pool)
+            .await
+            .expect("count audits")
+            .get(0);
+        assert_eq!(audits, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
