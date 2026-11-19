@@ -197,6 +197,17 @@ pub trait AdminState {
         state: HostState,
     ) -> Result<(), AdminStateError>;
 
+    /// Appends a follow-up audit row for a network action taken after the command transaction
+    /// (currently the host-lifecycle kick count). Does not touch the replay table.
+    fn append_audit_note(
+        &mut self,
+        ts: u64,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        cmd: &str,
+        result_code: &str,
+    ) -> Result<(), AdminStateError>;
+
     /// Executes a stateful command, its replay insert, and its audit row in one transaction.
     /// `Ok(None)` means the seq/nonce was already used and nothing was written.
     fn commit_mutation(
@@ -298,6 +309,27 @@ impl AdminState for InMemoryAdminReplay {
         _state: HostState,
     ) -> Result<(), AdminStateError> {
         Err(AdminStateError::Unsupported)
+    }
+
+    fn append_audit_note(
+        &mut self,
+        ts: u64,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        cmd: &str,
+        result_code: &str,
+    ) -> Result<(), AdminStateError> {
+        self.audit.push((
+            ts,
+            *signer_fp.as_bytes(),
+            seq,
+            cmd.to_string(),
+            result_code.to_string(),
+        ));
+        if self.audit.len() > 1024 {
+            self.audit.remove(0);
+        }
+        Ok(())
     }
 
     fn commit_mutation(
@@ -506,6 +538,18 @@ impl<S: AdminState> AdminService<S> {
             }
             Err(error) => Err(AdminRefusal::State(error)),
         }
+    }
+
+    /// See [`AdminState::append_audit_note`].
+    pub fn note(
+        &mut self,
+        ts: u64,
+        seq: u64,
+        cmd: &str,
+        result_code: &str,
+    ) -> Result<(), AdminStateError> {
+        self.replay
+            .append_audit_note(ts, &self.expected_signer_fp, seq, cmd, result_code)
     }
 
     fn try_handle(&mut self, bytes: &[u8], now: u64) -> Result<Vec<u8>, AdminRefusal> {

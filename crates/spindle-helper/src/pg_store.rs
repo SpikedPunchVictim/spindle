@@ -192,6 +192,42 @@ impl PgStore {
         .get::<bool, _>("revoked")
     }
 
+    async fn admin_append_audit_async(
+        &self,
+        ts: u64,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        cmd: &str,
+        result_code: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(0x5350494E444C)")
+            .execute(&mut *tx)
+            .await?;
+        let prev: Option<Vec<u8>> =
+            sqlx::query("SELECT hash FROM admin_audit ORDER BY id DESC LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.get::<Vec<u8>, _>(0));
+        let prev = prev.unwrap_or_else(|| vec![0u8; 32]);
+        let hash = admin_audit_hash(&prev, ts, signer_fp, seq, cmd, result_code);
+        sqlx::query(
+            "INSERT INTO admin_audit (ts, signer_fp, seq, cmd, result_code, prev_hash, hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(ts as i64)
+        .bind(fp_bytes(signer_fp))
+        .bind(seq as i64)
+        .bind(cmd)
+        .bind(result_code)
+        .bind(prev)
+        .bind(hash)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn admin_commit_mutation_async(
         &self,
         ts: u64,
@@ -992,6 +1028,18 @@ impl AdminState for PgStore {
         state: HostState,
     ) -> Result<(), AdminStateError> {
         run_blocking(self.admin_set_host_state_async(host_fp, state))
+            .map_err(|_| AdminStateError::Backend)
+    }
+
+    fn append_audit_note(
+        &mut self,
+        ts: u64,
+        signer_fp: &Fingerprint,
+        seq: u64,
+        cmd: &str,
+        result_code: &str,
+    ) -> Result<(), AdminStateError> {
+        run_blocking(self.admin_append_audit_async(ts, signer_fp, seq, cmd, result_code))
             .map_err(|_| AdminStateError::Backend)
     }
 

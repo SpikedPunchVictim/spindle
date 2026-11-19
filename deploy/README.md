@@ -141,4 +141,5 @@ with the compose seed, runs `set_mode`/`list_hosts`, and restores `open`).
 Implemented commands: `set_mode`, `pre_register_host`, `list_hosts`, `suspend_host`,
 `evict_host`, `set_quota_profile`, `read_audit_log`. `mint_invite`, `revoke_invite`, and
 `rotate_admission_key` answer the typed `not_implemented` code. Suspension/eviction refuses new
-host connections; kicking already-live sessions is tracked separately as td-186674. Atomic state+audit is td-6b9a00.
+host connections and kicks the host's live sessions through the existing kick relay (the count is
+audited as a follow-up row); state change and audit are one transaction (td-6b9a00).

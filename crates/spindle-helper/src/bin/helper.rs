@@ -616,6 +616,24 @@ impl spindle_helper::admin::AdminState for AdminBackend {
         }
     }
 
+    fn append_audit_note(
+        &mut self,
+        ts: u64,
+        signer_fp: &spindle_core::Fingerprint,
+        seq: u64,
+        cmd: &str,
+        result_code: &str,
+    ) -> Result<(), spindle_helper::admin::AdminStateError> {
+        match self {
+            AdminBackend::Memory(backend) => {
+                backend.append_audit_note(ts, signer_fp, seq, cmd, result_code)
+            }
+            AdminBackend::Pg(backend) => {
+                backend.append_audit_note(ts, signer_fp, seq, cmd, result_code)
+            }
+        }
+    }
+
     fn commit_mutation(
         &mut self,
         ts: u64,
@@ -927,6 +945,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
         }
     };
 
+    // Admin suspend/evict must kick the host's live sessions, which requires the main loop's
+    // KickMap and SYS connection. The admin task sends (host_fp, reply) here; the select arm below
+    // resolves targets and issues the KICKs, so there is one kick state, not a copy.
+    let (admin_kick_tx, mut admin_kick_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        spindle_core::Fingerprint,
+        tokio::sync::oneshot::Sender<usize>,
+    )>();
+
     // Durable admin state is opened only when the plane is enabled: Postgres when configured,
     // otherwise process-lifetime memory (logged as such). A second PgPool is deliberate — the
     // command loop owns the main store and this task must not contend on its lock.
@@ -982,10 +1008,43 @@ async fn run(config: Config) -> anyhow::Result<()> {
                                     ),
                                 ));
                                 let client = client.clone();
+                                let admin_kick_tx = admin_kick_tx.clone();
                                 tokio::spawn(async move {
                                     while let Some(msg) = sub.next().await {
                                         let reply =
                                             service.lock().await.handle(&msg.payload, now_secs());
+                                        if reply_succeeded(&reply) {
+                                            if let Some((host_fp, seq, cmd)) =
+                                                host_lifecycle_target(&msg.payload)
+                                            {
+                                                let (done_tx, done_rx) =
+                                                    tokio::sync::oneshot::channel();
+                                                if admin_kick_tx.send((host_fp, done_tx)).is_ok() {
+                                                    if let Ok(kicked) = done_rx.await {
+                                                        tracing::info!(
+                                                            host_fp = %host_fp.redacted(),
+                                                            kicked,
+                                                            "admin host-lifecycle kick"
+                                                        );
+                                                        if service
+                                                            .lock()
+                                                            .await
+                                                            .note(
+                                                                now_secs(),
+                                                                seq,
+                                                                &cmd,
+                                                                &format!("kicked:{kicked}"),
+                                                            )
+                                                            .is_err()
+                                                        {
+                                                            tracing::warn!(
+                                                                "failed to audit the admin kick count"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         if let Some(reply_subject) = msg.reply.clone() {
                                             if let Err(error) =
                                                 client.publish(reply_subject, reply.into()).await
@@ -1234,6 +1293,17 @@ async fn run(config: Config) -> anyhow::Result<()> {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("shutdown signal received, draining responder loop");
                 break;
+            }
+            Some((host_fp, done)) = admin_kick_rx.recv() => {
+                let kicked = kick_host_sessions(
+                    &host_fp,
+                    &mut store,
+                    &mut kick_map,
+                    Some(sys_ref),
+                    now_secs(),
+                )
+                .await;
+                let _ = done.send(kicked);
             }
             msg = sub.next() => {
                 let Some(msg) = msg else {
@@ -2003,6 +2073,76 @@ async fn execute_kick_plan(
 /// swallowed — never propagated — so one failed kick can never take the responder down or stop
 /// the rest of a revocation's batch of kicks from being attempted (`src/bin/helper.rs`'s only
 /// caller loops over every [`kick::KickTarget`] regardless of this call's outcome).
+/// Resolves `host_fp` to its live session records, maps each to a current `KickTarget`, and
+/// issues a KICK per target. Returns how many KICK requests were attempted.
+async fn kick_host_sessions(
+    host_fp: &spindle_core::Fingerprint,
+    store: &mut Store,
+    kick_map: &mut kick::KickMap,
+    sys_client: Option<&async_nats::Client>,
+    now: u64,
+) -> usize {
+    let Some(sys_client) = sys_client else {
+        tracing::warn!(
+            host_fp = %host_fp.redacted(),
+            "SYS connection unavailable; admin kick skipped"
+        );
+        return 0;
+    };
+    let mut kicked = 0;
+    for session in store.sessions_for_subject(host_fp, now) {
+        let unresolved = kick::UnresolvedSession {
+            nats_fp: session.nats_fp,
+            matched_subject: *host_fp,
+        };
+        if let Some(target) = kick_map.target_for(&unresolved) {
+            issue_kick(sys_client, &target).await;
+            kicked += 1;
+        } else {
+            tracing::warn!(
+                host_fp = %host_fp.redacted(),
+                nats_fp = %session.nats_fp.redacted(),
+                "admin kick: no live connection target for session"
+            );
+        }
+    }
+    kicked
+}
+
+/// The host fingerprint of a suspend/evict command, read only after the admin handler has
+/// accepted it (this parse is not a second verification).
+fn host_lifecycle_target(bytes: &[u8]) -> Option<(spindle_core::Fingerprint, u64, String)> {
+    let command = spindle_proto::artifacts::AdminCommand::from_canonical_bytes(bytes).ok()?;
+    if command.cmd != "suspend_host" && command.cmd != "evict_host" {
+        return None;
+    }
+    let map = command.args.as_map()?;
+    let host_fp = map
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("host_fp"))
+        .and_then(|(_, v)| v.as_bytes())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .and_then(|bytes| spindle_core::Fingerprint::from_slice(&bytes).ok())?;
+    Some((host_fp, command.seq, command.cmd))
+}
+
+/// True when the reply envelope has `ok: true`.
+fn reply_succeeded(bytes: &[u8]) -> bool {
+    spindle_proto::canonical::canonical_decode(bytes)
+        .ok()
+        .and_then(|value| {
+            value.as_map().and_then(|map| {
+                map.iter()
+                    .find(|(k, _)| k.as_text() == Some("ok"))
+                    .and_then(|(_, v)| match v {
+                        spindle_proto::canonical::CborValue::Bool(ok) => Some(*ok),
+                        _ => None,
+                    })
+            })
+        })
+        .unwrap_or(false)
+}
+
 async fn issue_kick(sys_client: &async_nats::Client, target: &kick::KickTarget) {
     let subject = format!("$SYS.REQ.SERVER.{}.KICK", target.server_id);
     let payload = match serde_json::to_vec(&serde_json::json!({ "cid": target.cid })) {
